@@ -213,7 +213,11 @@ lazy_static! {
         // on TerminalView on all platforms.
         Keystroke::parse("ctrl-c").expect("should be able to construct ctrl-c keystroke"),
         // The resume conversation binding uses cmd-shift-R on Mac and should be allowed
-        Keystroke::parse("cmd-shift-R").expect("should be able to construct cmd-shift-R keystroke")
+        Keystroke::parse("cmd-shift-R").expect("should be able to construct cmd-shift-R keystroke"),
+        // oh-my-warp: the tmux-style leader/prefix key (default ctrl-b) is
+        // intentionally captured from the PTY so it can begin a `<leader> <key>`
+        // chord. See `crate::util::leader`. Keep in sync with `leader::LEADER`.
+        Keystroke::parse("ctrl-b").expect("should be able to construct ctrl-b keystroke")
     ]);
 }
 

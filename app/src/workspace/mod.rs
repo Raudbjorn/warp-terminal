@@ -85,6 +85,10 @@ pub fn init(app: &mut AppContext) {
     use warpui::keymap::macros::*;
     app.register_binding_validator::<Workspace>(is_binding_pty_compliant);
 
+    // oh-my-warp: register tmux-style <leader> chords (e.g. `ctrl-b ,` = rename
+    // the active tab) on the Workspace context. See `crate::util::leader`.
+    crate::util::leader::register_leader_bindings(app);
+
     modal::init(app);
     native_modal::init(app);
     lightbox_view::init(app);
