@@ -1402,6 +1402,8 @@ pub struct FeaturesPageView {
     #[cfg(feature = "local_tty")]
     startup_shell_view: ViewHandle<features::StartupShellView>,
     undo_close_view: ViewHandle<features::UndoCloseView>,
+    // oh-my-warp: selector for the active server/agent backend.
+    backend_selector_view: ViewHandle<features::BackendSelectorView>,
 
     max_block_size_input_editor: ViewHandle<EditorView>,
     valid_max_block_size: bool,
@@ -2421,6 +2423,7 @@ impl FeaturesPageView {
         let startup_shell_view = ctx.add_typed_action_view(features::StartupShellView::new);
 
         let undo_close_view = ctx.add_typed_action_view(features::UndoCloseView::new);
+        let backend_selector_view = ctx.add_typed_action_view(features::BackendSelectorView::new);
 
         let appearance_handle = Appearance::handle(ctx);
 
@@ -2626,6 +2629,7 @@ impl FeaturesPageView {
             #[cfg(feature = "local_tty")]
             startup_shell_view,
             undo_close_view,
+            backend_selector_view,
 
             max_block_size_input_editor: block_size_editor,
             valid_max_block_size: true,
@@ -2683,6 +2687,8 @@ impl FeaturesPageView {
 
         general_widgets.push(Box::new(SnackbarHeaderWidget::default()));
         general_widgets.push(Box::new(LinkTooltipWidget::default()));
+        // oh-my-warp: "Default backend" selector row.
+        general_widgets.push(Box::new(BackendSelectorWidget::default()));
 
         #[cfg(feature = "local_fs")]
         {
@@ -5367,6 +5373,36 @@ impl SettingsWidget for DesktopNotificationsWidget {
         }
 
         column.finish()
+    }
+}
+
+// oh-my-warp: Settings widget rendering the "Default backend" selector row.
+#[derive(Default)]
+struct BackendSelectorWidget {}
+
+impl SettingsWidget for BackendSelectorWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "backend server agent default oh-my-warp"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        Flex::column()
+            .with_children([
+                render_sub_sub_header(
+                    appearance,
+                    "Default backend (applies after restart)".to_string(),
+                    None,
+                ),
+                ChildView::new(&view.backend_selector_view).finish(),
+            ])
+            .finish()
     }
 }
 

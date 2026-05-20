@@ -1,3 +1,6 @@
+pub mod agent_backend;
+pub use agent_backend::BackendSelectorView;
+
 pub mod undo_close;
 pub use undo_close::UndoCloseView;
 
