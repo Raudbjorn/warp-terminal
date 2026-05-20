@@ -598,6 +598,13 @@ pub fn run() -> Result<()> {
     // Parse command-line arguments.
     let args = warp_cli::Args::from_env();
 
+    // oh-my-warp: apply the user-selected server/agent backend (configurable via
+    // agent_backends.toml + the Settings "Default backend" dropdown). Done before
+    // the CLI overrides below so an explicit `--server-root-url` still wins, and
+    // unconditionally (unlike the dev-only CLI gate) since picking a backend is a
+    // deliberate fork feature.
+    crate::util::agent_backends::apply_selected_backend();
+
     // Server URL overrides are only honored on internal dev channels. Release channels silently
     // ignore `--server-root-url` / `--ws-server-url` / `--session-sharing-server-url` (and their
     // `WARP_*` env-var equivalents) so shipped builds can't be redirected away from their

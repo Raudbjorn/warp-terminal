@@ -1,3 +1,4 @@
+pub mod agent_backends;
 pub mod bindings;
 pub mod clipboard;
 pub mod color;
