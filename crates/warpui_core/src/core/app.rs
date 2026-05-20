@@ -603,6 +603,12 @@ pub struct AppContext {
     rendering_config: rendering::Config,
     global_actions: HashMap<String, Vec<Box<GlobalActionCallback>>>,
     keystroke_matcher: Matcher,
+    /// oh-my-warp: snapshot of the matcher's current pending multi-keystroke
+    /// sequence (the "leader engaged" state). Drives the leader indicator and an
+    /// auto-cancel timeout. `None` when no sequence is in progress.
+    keymap_pending: Option<Vec<Keystroke>>,
+    /// oh-my-warp: in-flight auto-cancel timer for `keymap_pending`.
+    keymap_pending_timeout: Option<ForegroundTask>,
     next_task_id: usize,
     weak_self: rc::Weak<RefCell<Self>>,
     pub(super) subscriptions: HashMap<EntityId, Vec<Subscription>>,
@@ -764,6 +770,8 @@ impl AppContext {
             presenters: Default::default(),
             rendering_config: Default::default(),
             keystroke_matcher: Default::default(),
+            keymap_pending: None,
+            keymap_pending_timeout: None,
             disabled_key_bindings_windows: Default::default(),
             next_task_id: 0,
             weak_self: rc::Weak::default(),
@@ -979,6 +987,46 @@ impl AppContext {
         // Mark all views in all windows as invalid.
         for window_id in self.windows.keys().cloned().collect_vec() {
             self.invalidate_all_views_for_window(window_id)
+        }
+    }
+
+    /// oh-my-warp: returns the matcher's current in-progress (pending)
+    /// multi-keystroke sequence, if a "leader"/prefix chord is engaged. Views can
+    /// read this to render a "leader engaged" indicator.
+    pub fn keymap_pending_keystrokes(&self) -> Option<Vec<Keystroke>> {
+        self.keystroke_matcher.pending_keystrokes()
+    }
+
+    /// oh-my-warp: synchronize `keymap_pending` with the matcher after a
+    /// keystroke, request a redraw when it changes, and (re)arm a timeout that
+    /// auto-cancels a stranded pending sequence so the indicator can't get stuck.
+    fn update_keymap_pending_indicator(&mut self, window_id: WindowId) {
+        let pending = self.keystroke_matcher.pending_keystrokes();
+        if pending == self.keymap_pending {
+            return;
+        }
+        self.keymap_pending = pending.clone();
+        self.invalidate_all_views_for_window(window_id);
+
+        // Drop any previous timer; (re)arm only while a sequence is pending.
+        self.keymap_pending_timeout = None;
+        if let Some(active) = pending {
+            let weak_app = self.weak_self.clone();
+            let task = self.foreground.spawn(async move {
+                Timer::after(std::time::Duration::from_millis(1500)).await;
+                if let Some(app) = weak_app.upgrade() {
+                    let mut app = app.borrow_mut();
+                    // Only cancel if the very same sequence is still pending.
+                    if app.keymap_pending.as_deref() == Some(active.as_slice()) {
+                        app.keystroke_matcher.clear_pending();
+                        app.keymap_pending = None;
+                        app.keymap_pending_timeout = None;
+                        app.invalidate_all_views_for_window(window_id);
+                        app.update_windows();
+                    }
+                }
+            });
+            self.keymap_pending_timeout = Some(task);
         }
     }
 
@@ -3264,6 +3312,12 @@ impl AppContext {
                     }
                 }
             }
+        }
+
+        // oh-my-warp: keep the leader/prefix "engaged" indicator in sync with the
+        // matcher's pending multi-keystroke state (and arm its auto-cancel timeout).
+        if matches!(event, Event::KeyDown { .. }) {
+            self.update_keymap_pending_indicator(window_id);
         }
 
         let mut result = crate::windowing::EventDispatchResult::default();

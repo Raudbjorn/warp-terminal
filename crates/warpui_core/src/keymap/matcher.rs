@@ -345,6 +345,24 @@ impl Matcher {
         }
     }
 
+    /// oh-my-warp: returns the in-progress (pending) multi-keystroke sequence for
+    /// any view, if one is currently engaged (e.g. a tmux-style leader prefix has
+    /// been pressed and we're waiting for the next key). Used to drive a
+    /// "leader engaged" UI indicator.
+    pub fn pending_keystrokes(&self) -> Option<Vec<Keystroke>> {
+        self.pending
+            .values()
+            .map(|p| &p.keystrokes)
+            .find(|keystrokes| !keystrokes.is_empty())
+            .cloned()
+    }
+
+    /// oh-my-warp: clears any in-progress pending keystroke sequences (used by the
+    /// leader auto-cancel timeout).
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
     // Attempt to match with a StandardAction.
     // This returns None or Action, never Pending.
     pub fn match_standard(&self, action: StandardAction, ctx: &Context) -> MatchResult {

@@ -19956,6 +19956,40 @@ impl Workspace {
         .finish()
     }
 
+    /// oh-my-warp: renders the "leader engaged" pill shown in the tab bar while a
+    /// leader/prefix chord is pending (e.g. after pressing `ctrl-b`), or `None`
+    /// when no chord is in progress. The pending state comes from the keymap
+    /// matcher via `AppContext::keymap_pending_keystrokes`.
+    fn render_leader_indicator(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        let pending = ctx.keymap_pending_keystrokes()?;
+        if pending.is_empty() {
+            return None;
+        }
+        let label = pending
+            .iter()
+            .map(|keystroke| keystroke.displayed())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = Text::new_inline(format!("LEADER {label}"), appearance.ui_font_family(), 11.)
+            .with_color(PhenomenonStyle::body_text())
+            .with_selectable(false)
+            .finish();
+        let pill = Container::new(text)
+            .with_padding_left(8.)
+            .with_padding_right(8.)
+            .with_padding_top(2.)
+            .with_padding_bottom(2.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_background_color(blended_colors::neutral_1(appearance.theme()))
+            .with_margin_right(8.)
+            .finish();
+        Some(pill)
+    }
+
     fn render_tab_bar_contents(
         &self,
         hover_fixed_width: Option<f32>,
@@ -19963,6 +19997,10 @@ impl Workspace {
         ctx: &AppContext,
     ) -> Box<dyn Element> {
         let mut tab_bar = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        // oh-my-warp: show the leader/prefix indicator while a chord is pending.
+        if let Some(indicator) = self.render_leader_indicator(appearance, ctx) {
+            tab_bar.add_child(indicator);
+        }
         let is_web_anonymous_user = self
             .auth_state
             .is_user_web_anonymous_user()
