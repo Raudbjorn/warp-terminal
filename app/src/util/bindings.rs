@@ -811,6 +811,8 @@ pub enum BindingGroup {
     Notifications,
     EnvVarCollection,
     Terminal,
+    /// oh-my-warp: tmux-style leader/prefix chords (see `crate::util::leader`).
+    Leader,
 }
 
 impl BindingGroup {
@@ -829,6 +831,7 @@ impl BindingGroup {
             Self::Notifications => "notifications",
             Self::EnvVarCollection => "env_var_collections",
             Self::Terminal => "terminal",
+            Self::Leader => "leader",
         }
     }
 
