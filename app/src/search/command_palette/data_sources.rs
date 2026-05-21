@@ -12,6 +12,8 @@ use crate::search::action::CommandBindingDataSource;
 use crate::search::binding_source::BindingSource;
 use crate::search::command_palette::mixer::{CommandPaletteItemAction, ItemSummary};
 use crate::search::command_palette::new_session::NewSessionDataSource;
+#[cfg(feature = "plugin_host")]
+use crate::search::command_palette::plugin_command_data_source::PluginCommandDataSource;
 use crate::search::command_palette::repos::RepoDataSource;
 use crate::search::command_palette::{files, launch_config, navigation, tabs, CommandPaletteMixer};
 use crate::search::data_source::QueryResult;
@@ -31,6 +33,8 @@ pub struct DataSourceStore {
     all_conversation_data_source: ModelHandle<conversations::DataSource>,
     repo_data_source: ModelHandle<RepoDataSource>,
     tabs_data_source: Option<ModelHandle<tabs::DataSource>>,
+    #[cfg(feature = "plugin_host")]
+    plugin_command_data_source: ModelHandle<PluginCommandDataSource>,
 }
 
 impl DataSourceStore {
@@ -58,6 +62,9 @@ impl DataSourceStore {
 
         let repo_data_source = ctx.add_model(|_| RepoDataSource::new());
 
+        #[cfg(feature = "plugin_host")]
+        let plugin_command_data_source = ctx.add_model(|_| PluginCommandDataSource);
+
         Self {
             actions_data_source,
             sessions_data_source,
@@ -67,6 +74,8 @@ impl DataSourceStore {
             all_conversation_data_source,
             repo_data_source,
             tabs_data_source: None,
+            #[cfg(feature = "plugin_host")]
+            plugin_command_data_source,
         }
     }
 
@@ -110,6 +119,12 @@ impl DataSourceStore {
 
             mixer.add_sync_source(
                 self.actions_data_source.clone(),
+                HashSet::from([QueryFilter::Actions]),
+            );
+
+            #[cfg(feature = "plugin_host")]
+            mixer.add_sync_source(
+                self.plugin_command_data_source.clone(),
                 HashSet::from([QueryFilter::Actions]),
             );
 

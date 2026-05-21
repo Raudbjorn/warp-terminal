@@ -7,6 +7,8 @@ pub mod mixer;
 pub mod navigation;
 #[cfg_attr(not(feature = "local_tty"), allow(dead_code))]
 pub mod new_session;
+#[cfg(feature = "plugin_host")]
+pub mod plugin_command_data_source;
 pub mod render_util;
 pub mod repos;
 mod selected_items;
