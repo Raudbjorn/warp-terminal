@@ -1,5 +1,6 @@
 pub(crate) mod app;
 pub(crate) mod commands;
+pub(crate) mod events;
 pub(crate) mod service;
 
 #[cfg_attr(not(target_family = "wasm"), path = "host/native/mod.rs")]

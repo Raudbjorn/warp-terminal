@@ -6,7 +6,10 @@ use anyhow::anyhow;
 use rquickjs::Context;
 use warp_js::{JsFunctionId, JsFunctionRegistry, SerializedJsValue};
 
-use crate::plugin::service::{RegisterCommandRequest, RegisterCommandService};
+use crate::plugin::service::{
+    RegisterCommandRequest, RegisterCommandService, RegisterEventHandlerRequest,
+    RegisterEventHandlerService,
+};
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "completions_v2")] {
@@ -46,6 +49,7 @@ impl PluginHandle {
 /// Container struct for holding ipc `ServiceCaller` dependencies of `Plugin`.
 pub(super) struct AppServiceCallers {
     register_command_caller: Box<dyn ipc::ServiceCaller<RegisterCommandService>>,
+    register_event_handler_caller: Box<dyn ipc::ServiceCaller<RegisterEventHandlerService>>,
     #[cfg(feature = "completions_v2")]
     register_command_signatures_caller:
         Box<dyn ipc::ServiceCaller<RegisterCommandSignatureService>>,
@@ -55,6 +59,9 @@ impl AppServiceCallers {
     pub fn new(app_client: Arc<ipc::Client>) -> Self {
         Self {
             register_command_caller: ipc::service_caller::<RegisterCommandService>(
+                app_client.clone(),
+            ),
+            register_event_handler_caller: ipc::service_caller::<RegisterEventHandlerService>(
                 app_client.clone(),
             ),
             #[cfg(feature = "completions_v2")]
@@ -124,6 +131,17 @@ impl Plugin {
             },
         )) {
             log::warn!("Failed to register plugin command: {e:?}");
+        }
+    }
+
+    /// Registers a JS callback (by its `function_id`) as a handler for the given terminal event.
+    pub(super) fn register_event_handler(&mut self, event: String, function_id: JsFunctionId) {
+        if let Err(e) = warpui::r#async::block_on(
+            self.app_services
+                .register_event_handler_caller
+                .call(RegisterEventHandlerRequest { event, function_id }),
+        ) {
+            log::warn!("Failed to register plugin event handler: {e:?}");
         }
     }
 

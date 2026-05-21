@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use command::blocking::Command;
-use service_impl::{LogServiceImpl, PluginHostBootstrapServiceImpl, RegisterCommandServiceImpl};
+use service_impl::{
+    LogServiceImpl, PluginHostBootstrapServiceImpl, RegisterCommandServiceImpl,
+    RegisterEventHandlerServiceImpl,
+};
 use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::{PLUGIN_HOST_ADDRESS_ENV_VAR, PLUGIN_HOST_FLAG};
@@ -67,7 +70,8 @@ impl PluginHost {
         let server_builder = ipc::ServerBuilder::default()
             .with_service(plugin_host_bootstrap_service)
             .with_service(LogServiceImpl::new())
-            .with_service(RegisterCommandServiceImpl::new());
+            .with_service(RegisterCommandServiceImpl::new())
+            .with_service(RegisterEventHandlerServiceImpl::new());
 
         #[cfg(feature = "completions_v2")]
         let server_builder =
