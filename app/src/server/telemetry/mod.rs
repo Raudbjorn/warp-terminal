@@ -419,13 +419,9 @@ impl TelemetryApi {
             RudderMessage::Batch(_) => "/v1/batch",
         };
 
-        self.client
-            .post(&format!("{}{}", rudder_stack_destination.root_url, path))
-            .basic_auth(rudder_stack_destination.write_key, Some(""))
-            .json(&msg)
-            .send()
-            .await?
-            .error_for_status()?;
+        // oh-my-warp: observability stripped — drop the telemetry request instead
+        // of POSTing it to RudderStack so no data ever leaves the machine.
+        let _ = (&self.client, &msg, path, rudder_stack_destination);
 
         Ok(())
     }
