@@ -69,6 +69,7 @@ impl AppServiceCallers {
 /// This ultimately the main backing data structure behind the JS plugin API exposed to plugins
 /// (see [`super::js_api`]).
 pub(super) struct Plugin {
+    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
     app_services: AppServiceCallers,
     js_function_registry: JsFunctionRegistry,
 }
@@ -103,6 +104,7 @@ impl Plugin {
         }
     }
 
+    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
     pub(super) fn js_function_registry_mut(&mut self) -> &mut JsFunctionRegistry {
         &mut self.js_function_registry
     }

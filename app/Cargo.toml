@@ -504,6 +504,8 @@ creating_shared_sessions = []
 cross_repo_context = []
 codebase_index_persistence = ["full_source_code_embedding"]
 default = [
+    # oh-my-warp: enable the JavaScript plugin host (see PLUGIN_SPEC.md)
+    "omw_plugins",
     "agent_mode",
     "viewing_shared_sessions",
     "render_continuous_block_selections_with_single_border",
@@ -803,6 +805,10 @@ read_image_files = []
 # directly, rather than via the `FeatureFlag` enum, because its value is
 # required early in the app lifecycle prior to `FeatureFlag` initialization.
 plugin_host = ["dep:rquickjs", "dep:warp_js", "warp_cli/plugin_host"]
+# oh-my-warp: umbrella feature that turns the JavaScript plugin host on in the
+# default build, without dragging in the completions_v2 classic-vs-v2 machinery.
+# See PLUGIN_SPEC.md.
+omw_plugins = ["plugin_host"]
 # Enable this feature to automatically perform CPU profiling via pprof.  The
 # generated profile will be written to profile.pb in the current directory.
 # NOTE: This may slow down program execution.

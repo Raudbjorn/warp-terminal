@@ -16,6 +16,7 @@ pub(super) enum PluginLoadError {
 /// default (e.g. Completions/Command Signatures)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum BuiltInPluginType {
+    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
     Completions,
 }
 
@@ -43,6 +44,7 @@ pub(super) enum PluginRef {
     Path(PathBuf),
 
     /// Refers to a "built-in" plugin bundled with the Warp binary.
+    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
     BuiltIn(BuiltInPluginType),
 }
 
