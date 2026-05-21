@@ -55,9 +55,14 @@ pub struct Backend {
     /// agent operations to this host. Optional; empty = a plain URL-override backend.
     #[serde(default)]
     pub grpc_endpoint: String,
-    /// Harness to spawn on the gRPC host (e.g. `claude`, `pi-mono`, `demo`).
+    /// Harness to spawn on the gRPC host (e.g. `claude`, `pi-mono`, `demo`). This
+    /// is the *selected* harness, set by the Settings → Features dropdown.
     #[serde(default)]
     pub grpc_harness: String,
+    /// Options shown in the Settings "Agent harness (gRPC)" dropdown. Should match
+    /// the harnesses your host serves (its `harnesses.toml`).
+    #[serde(default)]
+    pub grpc_harnesses: Vec<String>,
     /// Bearer token sent to the gRPC host's auth interceptor (optional).
     #[serde(default)]
     pub grpc_token: String,
@@ -175,6 +180,23 @@ pub fn selected_grpc_target() -> Option<GrpcTarget> {
         harness: backend.grpc_harness.clone(),
         token: backend.grpc_token.clone(),
     })
+}
+
+/// Persists the selected gRPC harness on the currently-selected backend (called by
+/// the Settings → Features "Agent harness (gRPC)" dropdown). No-op for the built-in
+/// Warp backend. Takes effect on the next launch.
+pub fn set_grpc_harness(harness: &str) {
+    let mut config = load();
+    let selected_id = config.selected_id().to_string();
+    if let Some(backend) = config.backends.iter_mut().find(|b| b.id == selected_id) {
+        backend.grpc_harness = harness.to_string();
+        if let Err(e) = save(&config) {
+            log::error!(
+                "oh-my-warp: failed to write {}: {e:#}",
+                config_path().display()
+            );
+        }
+    }
 }
 
 /// Applies the selected backend's URLs by overriding `ChannelState`. No-op for

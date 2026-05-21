@@ -1404,6 +1404,8 @@ pub struct FeaturesPageView {
     undo_close_view: ViewHandle<features::UndoCloseView>,
     // oh-my-warp: selector for the active server/agent backend.
     backend_selector_view: ViewHandle<features::BackendSelectorView>,
+    // oh-my-warp: selector for the active gRPC harness.
+    grpc_harness_selector_view: ViewHandle<features::GrpcHarnessSelectorView>,
 
     max_block_size_input_editor: ViewHandle<EditorView>,
     valid_max_block_size: bool,
@@ -2424,6 +2426,8 @@ impl FeaturesPageView {
 
         let undo_close_view = ctx.add_typed_action_view(features::UndoCloseView::new);
         let backend_selector_view = ctx.add_typed_action_view(features::BackendSelectorView::new);
+        let grpc_harness_selector_view =
+            ctx.add_typed_action_view(features::GrpcHarnessSelectorView::new);
 
         let appearance_handle = Appearance::handle(ctx);
 
@@ -2630,6 +2634,7 @@ impl FeaturesPageView {
             startup_shell_view,
             undo_close_view,
             backend_selector_view,
+            grpc_harness_selector_view,
 
             max_block_size_input_editor: block_size_editor,
             valid_max_block_size: true,
@@ -2689,6 +2694,8 @@ impl FeaturesPageView {
         general_widgets.push(Box::new(LinkTooltipWidget::default()));
         // oh-my-warp: "Default backend" selector row.
         general_widgets.push(Box::new(BackendSelectorWidget::default()));
+        // oh-my-warp: "Agent harness (gRPC)" selector row.
+        general_widgets.push(Box::new(GrpcHarnessSelectorWidget::default()));
 
         #[cfg(feature = "local_fs")]
         {
@@ -5401,6 +5408,36 @@ impl SettingsWidget for BackendSelectorWidget {
                     None,
                 ),
                 ChildView::new(&view.backend_selector_view).finish(),
+            ])
+            .finish()
+    }
+}
+
+// oh-my-warp: Settings widget rendering the "Agent harness (gRPC)" selector row.
+#[derive(Default)]
+struct GrpcHarnessSelectorWidget {}
+
+impl SettingsWidget for GrpcHarnessSelectorWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "harness grpc agent claude pi-mono oh-my-warp"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        Flex::column()
+            .with_children([
+                render_sub_sub_header(
+                    appearance,
+                    "Agent harness (gRPC, applies after restart)".to_string(),
+                    None,
+                ),
+                ChildView::new(&view.grpc_harness_selector_view).finish(),
             ])
             .finish()
     }
