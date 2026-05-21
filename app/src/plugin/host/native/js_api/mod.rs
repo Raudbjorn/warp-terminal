@@ -1,4 +1,4 @@
-use rquickjs::{function::Opt, Ctx, Function, Object};
+use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
 
 use super::plugin::PluginHandle;
 
@@ -9,7 +9,7 @@ pub const PLUGIN_API_VERSION: &str = "1.0.0";
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "completions_v2")] {
-        use rquickjs::{prelude::MutFn, Value};
+        use rquickjs::Value;
         use warp_completer::signatures::CommandSignature;
         use warp_js::FromWarpJs;
     }
@@ -21,13 +21,12 @@ cfg_if::cfg_if! {
 /// * `warp.version: string` — the [`PLUGIN_API_VERSION`] of the `warp.*` surface.
 /// * `warp.log(message: string, level?: "info" | "warn" | "error")` — logs through the
 ///   host logger (which is relayed to the app via the IPC `LogService`).
+/// * `warp.commands.register(id, title, callback)` — registers a command-palette command;
+///   `callback()` returns a string that is shown as a toast when the command runs.
 ///
 /// Additional namespaces are added behind feature flags (e.g. `completions` under
 /// `completions_v2`). See PLUGIN_SPEC.md for the planned surface.
-pub fn warp(
-    #[allow(unused_variables)] plugin: PluginHandle,
-    ctx: Ctx<'_>,
-) -> rquickjs::Result<Object<'_>> {
+pub fn warp(plugin: PluginHandle, ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> {
     let api = Object::new(ctx)?;
 
     api.set("version", PLUGIN_API_VERSION)?;
@@ -41,10 +40,36 @@ pub fn warp(
             }
         }),
     )?;
+    api.set("commands", commands(plugin.clone(), ctx)?)?;
 
     #[cfg(feature = "completions_v2")]
     api.set("completions", completions(plugin, ctx)?)?;
     Ok(api)
+}
+
+/// Returns a JS object representing the Commands namespace for the Warp Plugin API.
+///
+/// API methods:
+///
+/// `register(id: string, title: string, callback: () => string)`: Registers a command-palette
+///     command. When the user runs it, `callback` executes in the plugin host and its returned
+///     string (if any) is shown to the user as a toast.
+fn commands<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+    let commands = Object::new(ctx)?;
+    commands.set(
+        "register",
+        Function::new(
+            ctx,
+            MutFn::from(move |id: String, title: String, callback: Function<'js>| {
+                let mut plugin = plugin.get_mut();
+                let func_ref = plugin
+                    .js_function_registry_mut()
+                    .register_js_function::<String, String>(callback, ctx);
+                plugin.register_command(id, title, func_ref.id);
+            }),
+        ),
+    )?;
+    Ok(commands)
 }
 
 /// Returns a JS object to be used as a the `console` global, implementing `console.log()` and

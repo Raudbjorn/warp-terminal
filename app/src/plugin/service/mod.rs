@@ -5,9 +5,11 @@ cfg_if::cfg_if! {
     }
 }
 mod call_js_function;
+mod commands;
 mod logging;
 mod plugin_host_bootstrap;
 
 pub use call_js_function::*;
+pub use commands::*;
 pub use logging::*;
 pub use plugin_host_bootstrap::*;

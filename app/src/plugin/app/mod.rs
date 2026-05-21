@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use command::blocking::Command;
-use service_impl::{LogServiceImpl, PluginHostBootstrapServiceImpl};
+use service_impl::{LogServiceImpl, PluginHostBootstrapServiceImpl, RegisterCommandServiceImpl};
 use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::{PLUGIN_HOST_ADDRESS_ENV_VAR, PLUGIN_HOST_FLAG};
@@ -66,7 +66,8 @@ impl PluginHost {
 
         let server_builder = ipc::ServerBuilder::default()
             .with_service(plugin_host_bootstrap_service)
-            .with_service(LogServiceImpl::new());
+            .with_service(LogServiceImpl::new())
+            .with_service(RegisterCommandServiceImpl::new());
 
         #[cfg(feature = "completions_v2")]
         let server_builder =
@@ -109,7 +110,6 @@ impl PluginHost {
     ///
     /// `S` is assumed to be served by the plugin host process; the returned service caller directs
     /// requests over the IPC connection to the plugin host process.
-    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
     pub fn plugin_service_caller<S: ipc::Service>(&self) -> Option<Box<dyn ipc::ServiceCaller<S>>> {
         self.host_client.clone().map(ipc::service_caller::<S>)
     }

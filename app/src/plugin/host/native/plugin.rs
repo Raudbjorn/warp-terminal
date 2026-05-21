@@ -6,6 +6,8 @@ use anyhow::anyhow;
 use rquickjs::Context;
 use warp_js::{JsFunctionId, JsFunctionRegistry, SerializedJsValue};
 
+use crate::plugin::service::{RegisterCommandRequest, RegisterCommandService};
+
 cfg_if::cfg_if! {
     if #[cfg(feature = "completions_v2")] {
         use warp_completer::signatures::CommandSignature;
@@ -43,14 +45,18 @@ impl PluginHandle {
 
 /// Container struct for holding ipc `ServiceCaller` dependencies of `Plugin`.
 pub(super) struct AppServiceCallers {
+    register_command_caller: Box<dyn ipc::ServiceCaller<RegisterCommandService>>,
     #[cfg(feature = "completions_v2")]
     register_command_signatures_caller:
         Box<dyn ipc::ServiceCaller<RegisterCommandSignatureService>>,
 }
 
 impl AppServiceCallers {
-    pub fn new(#[allow(unused_variables)] app_client: Arc<ipc::Client>) -> Self {
+    pub fn new(app_client: Arc<ipc::Client>) -> Self {
         Self {
+            register_command_caller: ipc::service_caller::<RegisterCommandService>(
+                app_client.clone(),
+            ),
             #[cfg(feature = "completions_v2")]
             register_command_signatures_caller: ipc::service_caller::<
                 RegisterCommandSignatureService,
@@ -69,7 +75,6 @@ impl AppServiceCallers {
 /// This ultimately the main backing data structure behind the JS plugin API exposed to plugins
 /// (see [`super::js_api`]).
 pub(super) struct Plugin {
-    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
     app_services: AppServiceCallers,
     js_function_registry: JsFunctionRegistry,
 }
@@ -104,7 +109,24 @@ impl Plugin {
         }
     }
 
-    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
+    /// Registers a command-palette command backed by a JS callback (by its `function_id`).
+    pub(super) fn register_command(
+        &mut self,
+        command_id: String,
+        title: String,
+        function_id: JsFunctionId,
+    ) {
+        if let Err(e) = warpui::r#async::block_on(self.app_services.register_command_caller.call(
+            RegisterCommandRequest {
+                command_id,
+                title,
+                function_id,
+            },
+        )) {
+            log::warn!("Failed to register plugin command: {e:?}");
+        }
+    }
+
     pub(super) fn js_function_registry_mut(&mut self) -> &mut JsFunctionRegistry {
         &mut self.js_function_registry
     }
