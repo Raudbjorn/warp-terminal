@@ -1,3 +1,4 @@
+mod app_request;
 mod js_api;
 mod logging;
 mod plugin;
@@ -42,6 +43,10 @@ pub fn run() -> Result<()> {
         // Initialize logging, which internally transmits logs from this process to the warp app
         // process via `LogService`.
         initialize_logging(&client, &executor);
+
+        // Relay host→app requests (warp.ui.toast / warp.keymap.bind) via a background task, so the
+        // blocking IPC never runs on a plugin runner thread inside a JS callback.
+        app_request::initialize_app_request_relay(&client, &executor);
 
         // Spawn plugin runners for each plugin.
         let (plugin_request_tx, plugin_request_rx) = async_channel::unbounded();

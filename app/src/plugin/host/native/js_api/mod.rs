@@ -49,8 +49,8 @@ pub fn warp(plugin: PluginHandle, ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> 
     )?;
     api.set("commands", commands(plugin.clone(), ctx)?)?;
     api.set("terminal", terminal(plugin.clone(), ctx)?)?;
-    api.set("ui", ui(plugin.clone(), ctx)?)?;
-    api.set("keymap", keymap(plugin.clone(), ctx)?)?;
+    api.set("ui", ui(ctx)?)?;
+    api.set("keymap", keymap(ctx)?)?;
 
     #[cfg(feature = "completions_v2")]
     api.set("completions", completions(plugin, ctx)?)?;
@@ -60,23 +60,21 @@ pub fn warp(plugin: PluginHandle, ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> 
 /// Returns a JS object representing the UI namespace for the Warp Plugin API.
 ///
 /// `toast(message: string, kind?: "info" | "warn" | "error")` — shows a transient toast.
-fn ui<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+///
+/// The request is enqueued (non-blocking) and relayed to the app on a background task; we must not
+/// do the blocking IPC inline on the plugin runner thread (see `super::app_request`).
+fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
     let ui = Object::new(ctx)?;
     ui.set(
         "toast",
-        Function::new(
-            ctx,
-            MutFn::from(move |message: String, kind: Opt<String>| {
-                let kind = match kind.0.as_deref() {
-                    Some("error") => ToastKind::Error,
-                    Some("warn") => ToastKind::Warn,
-                    _ => ToastKind::Info,
-                };
-                plugin
-                    .get_mut()
-                    .send_app_request(PluginAppRequest::ShowToast { message, kind });
-            }),
-        ),
+        Function::new(ctx, |message: String, kind: Opt<String>| {
+            let kind = match kind.0.as_deref() {
+                Some("error") => ToastKind::Error,
+                Some("warn") => ToastKind::Warn,
+                _ => ToastKind::Info,
+            };
+            super::app_request::send_app_request(PluginAppRequest::ShowToast { message, kind });
+        }),
     )?;
     Ok(ui)
 }
@@ -85,18 +83,13 @@ fn ui<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>>
 ///
 /// `bind(commandId: string, keys: string)` — binds a key sequence (e.g. `"ctrl-b g"`) to a
 ///     command registered via `warp.commands.register`. The user's `keybindings.yaml` overrides it.
-fn keymap<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+fn keymap<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
     let keymap = Object::new(ctx)?;
     keymap.set(
         "bind",
-        Function::new(
-            ctx,
-            MutFn::from(move |command_id: String, keys: String| {
-                plugin
-                    .get_mut()
-                    .send_app_request(PluginAppRequest::BindKey { keys, command_id });
-            }),
-        ),
+        Function::new(ctx, |command_id: String, keys: String| {
+            super::app_request::send_app_request(PluginAppRequest::BindKey { keys, command_id });
+        }),
     )?;
     Ok(keymap)
 }
