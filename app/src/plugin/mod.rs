@@ -10,7 +10,11 @@ pub use host::run as run_plugin_host;
 
 /// Flag to be passed to the warp executable when executing the warp binary as the plugin host
 /// process rather than the main app.
-pub const PLUGIN_HOST_FLAG: &str = "--plugin_host";
+///
+/// Must match the clap `long_flag` on `warp_cli::WorkerCommand::PluginHost` (`"plugin-host"`).
+/// Upstream defines this constant with an underscore (`--plugin_host`), which clap rejects, so the
+/// spawned host exits immediately on arg parsing; use the hyphenated form so the host launches.
+pub const PLUGIN_HOST_FLAG: &str = "--plugin-host";
 
 /// The name of the environment variable used to pass connection address for the app server to the
 /// plugin host process.
