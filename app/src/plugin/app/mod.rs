@@ -130,6 +130,7 @@ impl PluginHost {
     ///
     /// `S` is assumed to be served by the plugin host process; the returned service caller directs
     /// requests over the IPC connection to the plugin host process.
+    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
     pub fn plugin_service_caller<S: ipc::Service>(&self) -> Option<Box<dyn ipc::ServiceCaller<S>>> {
         self.host_client.clone().map(ipc::service_caller::<S>)
     }
