@@ -90,7 +90,9 @@ pub fn run_plugin_command<V: warpui::View>(command_id: &str, ctx: &mut warpui::V
         },
         move |_view, response, ctx| {
             if let Ok(CallJsFunctionResponse::Success(output)) = response {
-                if let Ok(message) = output.to_value::<String>() {
+                if let Ok(crate::plugin::events::OptionalToast(Some(message))) =
+                    output.to_value::<crate::plugin::events::OptionalToast>()
+                {
                     if !message.trim().is_empty() {
                         ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
                             toast_stack.add_ephemeral_toast(

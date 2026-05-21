@@ -752,8 +752,10 @@ impl View {
             move |_view, response, ctx| {
                 let toast = match response {
                     Ok(CallJsFunctionResponse::Success(output)) => {
-                        match output.to_value::<String>() {
-                            Ok(message) if !message.trim().is_empty() => {
+                        match output.to_value::<crate::plugin::events::OptionalToast>() {
+                            Ok(crate::plugin::events::OptionalToast(Some(message)))
+                                if !message.trim().is_empty() =>
+                            {
                                 Some(DismissibleToast::new(message, ToastFlavor::Default))
                             }
                             _ => None,

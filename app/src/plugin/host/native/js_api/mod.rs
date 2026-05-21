@@ -141,9 +141,9 @@ fn terminal<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object
 ///
 /// API methods:
 ///
-/// `register(id: string, title: string, callback: () => string)`: Registers a command-palette
-///     command. When the user runs it, `callback` executes in the plugin host and its returned
-///     string (if any) is shown to the user as a toast.
+/// `register(id: string, title: string, callback: () => string | void)`: Registers a
+///     command-palette command. When the user runs it, `callback` executes in the plugin host; if
+///     it returns a string, that string is shown to the user as a toast (returning nothing is fine).
 fn commands<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
     let commands = Object::new(ctx)?;
     commands.set(
@@ -152,9 +152,12 @@ fn commands<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object
             ctx,
             MutFn::from(move |id: String, title: String, callback: Function<'js>| {
                 let mut plugin = plugin.get_mut();
+                // Output is `OptionalToast` (lenient): a command may return a string to toast, or
+                // nothing. Using `String` would error on a void return and drop the response
+                // (surfacing as "oneshot cancelled").
                 let func_ref = plugin
                     .js_function_registry_mut()
-                    .register_js_function::<String, String>(callback, ctx);
+                    .register_js_function::<String, OptionalToast>(callback, ctx);
                 plugin.register_command(id, title, func_ref.id);
             }),
         ),
