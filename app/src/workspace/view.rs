@@ -23083,6 +23083,12 @@ impl TypedActionView for Workspace {
         }
 
         match action {
+            RunPluginCommand(command_id) => {
+                #[cfg(feature = "plugin_host")]
+                crate::plugin::commands::run_plugin_command(command_id, ctx);
+                #[cfg(not(feature = "plugin_host"))]
+                let _ = command_id;
+            }
             ActivateTab(index) => self.activate_tab(*index, ctx),
             ActivateTabByNumber(num) => self.activate_tab(num.saturating_sub(1), ctx),
             ActivatePrevTab => self.activate_prev_tab(ctx),

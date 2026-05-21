@@ -6,9 +6,10 @@ use anyhow::anyhow;
 use rquickjs::Context;
 use warp_js::{JsFunctionId, JsFunctionRegistry, SerializedJsValue};
 
+use crate::plugin::app_requests::PluginAppRequest;
 use crate::plugin::service::{
-    RegisterCommandRequest, RegisterCommandService, RegisterEventHandlerRequest,
-    RegisterEventHandlerService,
+    PluginAppRequestEnvelope, PluginAppRequestService, RegisterCommandRequest,
+    RegisterCommandService, RegisterEventHandlerRequest, RegisterEventHandlerService,
 };
 
 cfg_if::cfg_if! {
@@ -50,6 +51,7 @@ impl PluginHandle {
 pub(super) struct AppServiceCallers {
     register_command_caller: Box<dyn ipc::ServiceCaller<RegisterCommandService>>,
     register_event_handler_caller: Box<dyn ipc::ServiceCaller<RegisterEventHandlerService>>,
+    app_request_caller: Box<dyn ipc::ServiceCaller<PluginAppRequestService>>,
     #[cfg(feature = "completions_v2")]
     register_command_signatures_caller:
         Box<dyn ipc::ServiceCaller<RegisterCommandSignatureService>>,
@@ -64,6 +66,7 @@ impl AppServiceCallers {
             register_event_handler_caller: ipc::service_caller::<RegisterEventHandlerService>(
                 app_client.clone(),
             ),
+            app_request_caller: ipc::service_caller::<PluginAppRequestService>(app_client.clone()),
             #[cfg(feature = "completions_v2")]
             register_command_signatures_caller: ipc::service_caller::<
                 RegisterCommandSignatureService,
@@ -142,6 +145,18 @@ impl Plugin {
                 .call(RegisterEventHandlerRequest { event, function_id }),
         ) {
             log::warn!("Failed to register plugin event handler: {e:?}");
+        }
+    }
+
+    /// Sends a request to be handled on the app's foreground executor (`warp.ui.toast`,
+    /// `warp.keymap.bind`).
+    pub(super) fn send_app_request(&mut self, request: PluginAppRequest) {
+        if let Err(e) = warpui::r#async::block_on(
+            self.app_services
+                .app_request_caller
+                .call(PluginAppRequestEnvelope { request }),
+        ) {
+            log::warn!("Failed to send plugin app request: {e:?}");
         }
     }
 

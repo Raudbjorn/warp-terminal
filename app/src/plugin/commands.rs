@@ -47,3 +47,61 @@ pub fn all() -> Vec<PluginCommand> {
 pub fn function_id(id: &str) -> Option<JsFunctionId> {
     REGISTRY.lock().unwrap().get(id).map(|c| c.function_id)
 }
+
+/// Returns the display title for the command with the given id, if registered.
+pub fn title(id: &str) -> Option<String> {
+    REGISTRY.lock().unwrap().get(id).map(|c| c.title.clone())
+}
+
+/// Runs the registered plugin command with the given id by invoking its JS callback in the plugin
+/// host; a non-empty returned string is shown as a toast. Generic over the view so it can be
+/// invoked both from the command palette and from keybinding handlers.
+pub fn run_plugin_command<V: warpui::View>(command_id: &str, ctx: &mut warpui::ViewContext<V>) {
+    use crate::plugin::service::{
+        CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
+    };
+    use crate::plugin::PluginHost;
+    use crate::view_components::{DismissibleToast, ToastFlavor};
+    use crate::workspace::ToastStack;
+    use warp_js::SerializedJsValue;
+    use warpui::SingletonEntity;
+
+    let Some(function_id) = function_id(command_id) else {
+        return;
+    };
+    let window_id = ctx.window_id();
+    let Some(caller) = PluginHost::handle(ctx)
+        .as_ref(ctx)
+        .plugin_service_caller::<CallJsFunctionService>()
+    else {
+        return;
+    };
+    let Ok(input) = SerializedJsValue::from_value(String::new()) else {
+        return;
+    };
+    ctx.spawn(
+        async move {
+            caller
+                .call(CallJsFunctionRequest {
+                    id: function_id,
+                    serialized_input: input,
+                })
+                .await
+        },
+        move |_view, response, ctx| {
+            if let Ok(CallJsFunctionResponse::Success(output)) = response {
+                if let Ok(message) = output.to_value::<String>() {
+                    if !message.trim().is_empty() {
+                        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                            toast_stack.add_ephemeral_toast(
+                                DismissibleToast::new(message, ToastFlavor::Default),
+                                window_id,
+                                ctx,
+                            );
+                        });
+                    }
+                }
+            }
+        },
+    );
+}

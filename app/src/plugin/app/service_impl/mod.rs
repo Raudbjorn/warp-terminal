@@ -4,11 +4,13 @@ cfg_if::cfg_if! {
         pub use completions::*;
     }
 }
+mod app_requests;
 mod commands;
 mod events;
 mod logging;
 mod plugin_host_bootstrap;
 
+pub(super) use app_requests::*;
 pub(super) use commands::*;
 pub(super) use events::*;
 pub(super) use logging::*;

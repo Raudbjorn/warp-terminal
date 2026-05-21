@@ -1,4 +1,5 @@
 pub(crate) mod app;
+pub(crate) mod app_requests;
 pub(crate) mod commands;
 pub(crate) mod events;
 pub(crate) mod service;

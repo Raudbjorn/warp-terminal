@@ -2,12 +2,16 @@ mod service_impl;
 
 use std::sync::Arc;
 
+use crate::plugin::app_requests::{PluginAppRequest, ToastKind};
+use crate::view_components::{DismissibleToast, ToastFlavor};
+use crate::workspace::{ToastStack, WorkspaceAction};
 use anyhow::{Context, Result};
 use command::blocking::Command;
 use service_impl::{
-    LogServiceImpl, PluginHostBootstrapServiceImpl, RegisterCommandServiceImpl,
-    RegisterEventHandlerServiceImpl,
+    LogServiceImpl, PluginAppRequestServiceImpl, PluginHostBootstrapServiceImpl,
+    RegisterCommandServiceImpl, RegisterEventHandlerServiceImpl,
 };
+use warpui::keymap::EditableBinding;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::{PLUGIN_HOST_ADDRESS_ENV_VAR, PLUGIN_HOST_FLAG};
@@ -38,6 +42,15 @@ impl PluginHost {
     pub fn new(ctx: &mut ModelContext<Self>) -> Result<Self> {
         let plugin_host_bootstrap_service = PluginHostBootstrapServiceImpl::new();
         let connection_address_rx = plugin_host_bootstrap_service.connection_address_rx();
+
+        // Drain host→app requests (warp.ui.toast / warp.keymap.bind) on the foreground executor,
+        // where we have the `ModelContext` needed to touch app state. See `super::app_requests`.
+        let app_request_rx = crate::plugin::app_requests::init_channel();
+        ctx.spawn_stream_local(
+            app_request_rx,
+            |me, request, ctx| me.handle_app_request(request, ctx),
+            |_, _| {},
+        );
 
         // Schedule a task that awaits a request containing the connection address for the plugin
         // host process and uses it to instantiate a Client when it's received.
@@ -71,7 +84,8 @@ impl PluginHost {
             .with_service(plugin_host_bootstrap_service)
             .with_service(LogServiceImpl::new())
             .with_service(RegisterCommandServiceImpl::new())
-            .with_service(RegisterEventHandlerServiceImpl::new());
+            .with_service(RegisterEventHandlerServiceImpl::new())
+            .with_service(PluginAppRequestServiceImpl::new());
 
         #[cfg(feature = "completions_v2")]
         let server_builder =
@@ -116,6 +130,44 @@ impl PluginHost {
     /// requests over the IPC connection to the plugin host process.
     pub fn plugin_service_caller<S: ipc::Service>(&self) -> Option<Box<dyn ipc::ServiceCaller<S>>> {
         self.host_client.clone().map(ipc::service_caller::<S>)
+    }
+
+    /// Handles a host→app request on the foreground executor (see [`super::app_requests`]).
+    fn handle_app_request(&mut self, request: PluginAppRequest, ctx: &mut ModelContext<Self>) {
+        match request {
+            PluginAppRequest::ShowToast { message, kind } => {
+                let Some(window_id) = ctx.windows().active_window() else {
+                    return;
+                };
+                let flavor = match kind {
+                    ToastKind::Error => ToastFlavor::Error,
+                    ToastKind::Info | ToastKind::Warn => ToastFlavor::Default,
+                };
+                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    toast_stack.add_ephemeral_toast(
+                        DismissibleToast::new(message, flavor),
+                        window_id,
+                        ctx,
+                    );
+                });
+            }
+            PluginAppRequest::BindKey { keys, command_id } => {
+                let title = crate::plugin::commands::title(&command_id)
+                    .unwrap_or_else(|| command_id.clone());
+                // `EditableBinding::new` takes a `&'static str` name; plugin command ids are
+                // dynamic, so leak the (small, session-lived) binding name.
+                let name: &'static str =
+                    Box::leak(format!("plugin-keymap:{command_id}").into_boxed_str());
+                let binding = EditableBinding::new(
+                    name,
+                    title,
+                    WorkspaceAction::RunPluginCommand(command_id),
+                )
+                .with_context_predicate(warpui::id!("Workspace"))
+                .with_key_binding(keys);
+                ctx.register_editable_bindings([binding]);
+            }
+        }
     }
 }
 

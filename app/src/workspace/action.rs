@@ -124,6 +124,10 @@ pub enum AutoCloudHandoffTrigger {
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceAction {
+    /// oh-my-warp: run a plugin command (registered via `warp.commands.register`) by id. Used as
+    /// the action for plugin keybindings registered via `warp.keymap.bind`. See PLUGIN_SPEC.md (M3).
+    #[cfg_attr(not(feature = "plugin_host"), allow(dead_code))]
+    RunPluginCommand(String),
     ActivateTab(usize),
     ActivatePrevTab,
     ActivateNextTab,
@@ -852,6 +856,8 @@ impl WorkspaceAction {
     pub fn should_save_app_state_on_action(&self) -> bool {
         use WorkspaceAction::*;
         match self {
+            // oh-my-warp: running a plugin command shouldn't trigger app-state saves.
+            RunPluginCommand(_) => false,
             #[cfg(not(target_family = "wasm"))]
             ContinueConversationLocally { .. } => true,
             ActivateTab(_)
