@@ -15,6 +15,7 @@
 //! and every request/response type without re-importing them.
 
 use super::*;
+use crate::ai::ambient_agents::task::AmbientAgentTaskState;
 use crate::util::agent_backends::GrpcTarget;
 use std::sync::Arc;
 use warp_agent_grpc::pb::{self, agent_service_client::AgentServiceClient};
@@ -269,7 +270,34 @@ impl AIClient for GrpcBridgeAIClient {
         &self,
         task_id: &AmbientAgentTaskId,
     ) -> anyhow::Result<AmbientAgentTask, anyhow::Error> {
-        self.inner.get_ambient_agent_task(task_id).await
+        // oh-my-warp: the run lives on the gRPC host, not Warp's cloud — so synthesize
+        // a minimal "in progress" task rather than 404ing against Warp (which produced
+        // the "conversation ended" tombstone). Step 1: state only; real host-backed
+        // status (Succeeded/Failed, prompt, timestamps) follows once the host exposes it.
+        let now = Utc::now();
+        Ok(AmbientAgentTask {
+            task_id: task_id.clone(),
+            parent_run_id: None,
+            title: format!("Local harness run ({})", self.target.harness),
+            state: AmbientAgentTaskState::InProgress,
+            prompt: String::new(),
+            created_at: now,
+            started_at: Some(now),
+            updated_at: now,
+            status_message: None,
+            source: None,
+            session_id: None,
+            session_link: None,
+            creator: None,
+            executor: None,
+            conversation_id: None,
+            request_usage: None,
+            is_sandbox_running: true,
+            agent_config_snapshot: None,
+            artifacts: vec![],
+            last_event_sequence: None,
+            children: vec![],
+        })
     }
 
     async fn get_agent_run_raw(
