@@ -270,6 +270,15 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
             super::app_request::send_app_request(PluginAppRequest::ShowToast { message, kind });
         }),
     )?;
+    ui.set(
+        "showMarkdown",
+        Function::new(ctx, |title: String, markdown: String| {
+            super::app_request::send_app_request(PluginAppRequest::ShowMarkdown {
+                title,
+                markdown,
+            });
+        }),
+    )?;
     Ok(ui)
 }
 

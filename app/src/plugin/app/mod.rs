@@ -168,8 +168,21 @@ impl PluginHost {
                 .with_key_binding(keys);
                 ctx.register_editable_bindings([binding]);
             }
+            PluginAppRequest::ShowMarkdown { title, markdown } => {
+                // The Workspace owns the modal; emit an event it subscribes to (it has the window
+                // context to open the modal). See `workspace::view`.
+                ctx.emit(PluginHostEvent::ShowMarkdown { title, markdown });
+            }
         }
     }
+}
+
+/// Events emitted by the [`PluginHost`] singleton for the `Workspace` to act on (it has the
+/// window/view context that some plugin UI requests need). See PLUGIN_SPEC.md (M4).
+#[derive(Clone, Debug)]
+pub enum PluginHostEvent {
+    /// Show a markdown panel (`warp.ui.showMarkdown`).
+    ShowMarkdown { title: String, markdown: String },
 }
 
 impl Drop for PluginHost {
@@ -192,7 +205,7 @@ impl Drop for PluginHost {
 }
 
 impl Entity for PluginHost {
-    type Event = ();
+    type Event = PluginHostEvent;
 }
 
 impl SingletonEntity for PluginHost {}

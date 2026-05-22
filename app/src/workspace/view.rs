@@ -12,6 +12,7 @@ pub(crate) mod left_panel;
 pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
+mod plugin_markdown_modal;
 pub(crate) mod right_panel;
 mod startup_directory;
 mod tab_grouping;
@@ -505,6 +506,7 @@ use crate::workspace::view::openwarp_launch_modal::{
 use crate::workspace::view::orchestration_launch_modal::{
     OrchestrationLaunchModal, OrchestrationLaunchModalEvent,
 };
+use crate::workspace::view::plugin_markdown_modal::PluginMarkdownModal;
 use crate::workspace::view::right_panel::{RightPanelEvent, RightPanelView};
 use crate::workspace::{ForkFromExchange, ForkedConversationDestination};
 use crate::workspaces::user_workspaces::UserWorkspaces;
@@ -1057,6 +1059,8 @@ pub struct Workspace {
     pending_session_config_tab_config_chip_tutorial:
         Option<PendingSessionConfigTabConfigChipTutorial>,
     new_worktree_modal: ModalViewState<Modal<NewWorktreeModal>>,
+    // oh-my-warp: modal that renders markdown a plugin requested via `warp.ui.showMarkdown` (M4).
+    plugin_markdown_modal: ModalViewState<Modal<PluginMarkdownModal>>,
     close_session_confirmation_dialog: ViewHandle<CloseSessionConfirmationDialog>,
     rewind_confirmation_dialog: ViewHandle<RewindConfirmationDialog>,
     delete_conversation_confirmation_dialog: ViewHandle<DeleteConversationConfirmationDialog>,
@@ -2098,6 +2102,60 @@ impl Workspace {
         ModalViewState::new(modal)
     }
 
+    // oh-my-warp: builds the modal that renders plugin-supplied markdown (`warp.ui.showMarkdown`).
+    fn build_plugin_markdown_modal(
+        ctx: &mut ViewContext<Self>,
+    ) -> ModalViewState<Modal<PluginMarkdownModal>> {
+        let body = ctx.add_view(PluginMarkdownModal::new);
+        let modal = ctx.add_typed_action_view(|ctx| {
+            Modal::new(Some("Plugin".to_string()), body, ctx)
+                .with_dismiss_on_click()
+                .with_modal_style(UiComponentStyles {
+                    width: Some(560.),
+                    height: Some(520.),
+                    ..Default::default()
+                })
+        });
+        ctx.subscribe_to_view(&modal, |me, _, event, ctx| {
+            if matches!(event, ModalEvent::Close) {
+                me.plugin_markdown_modal.close();
+                ctx.notify();
+            }
+        });
+        ModalViewState::new(modal)
+    }
+
+    /// Opens the plugin markdown modal with the given title/body (`warp.ui.showMarkdown`, M4).
+    #[cfg(feature = "plugin_host")]
+    fn show_plugin_markdown(
+        &mut self,
+        title: String,
+        markdown: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.plugin_markdown_modal.view.update(ctx, |modal, ctx| {
+            modal.set_title(Some(title));
+            modal.body().update(ctx, |body, ctx| {
+                body.set_markdown(&markdown, ctx);
+            });
+        });
+        self.plugin_markdown_modal.open();
+        ctx.focus(&self.plugin_markdown_modal.view);
+        ctx.notify();
+    }
+
+    /// Subscribes to [`crate::plugin::PluginHostEvent`]s so plugin UI requests can open
+    /// workspace-owned surfaces (e.g. the markdown modal). See PLUGIN_SPEC.md (M4).
+    #[cfg(feature = "plugin_host")]
+    fn subscribe_to_plugin_host(ctx: &mut ViewContext<Self>) {
+        let plugin_host = crate::plugin::PluginHost::handle(ctx);
+        ctx.subscribe_to_model(&plugin_host, |me, _, event, ctx| match event {
+            crate::plugin::PluginHostEvent::ShowMarkdown { title, markdown } => {
+                me.show_plugin_markdown(title.clone(), markdown.clone(), ctx);
+            }
+        });
+    }
+
     fn build_new_worktree_modal(
         ctx: &mut ViewContext<Self>,
     ) -> ModalViewState<Modal<NewWorktreeModal>> {
@@ -2922,6 +2980,7 @@ impl Workspace {
 
         let tab_config_params_modal = Self::build_tab_config_params_modal(ctx);
         let new_worktree_modal = Self::build_new_worktree_modal(ctx);
+        let plugin_markdown_modal = Self::build_plugin_markdown_modal(ctx);
 
         let session_config_modal = Self::build_session_config_modal(ctx);
 
@@ -3170,6 +3229,9 @@ impl Workspace {
         Self::observe_server_api(ctx);
 
         Self::subscribe_to_workspace_toast_stack(toast_stack.clone(), ctx);
+        // oh-my-warp: open plugin UI surfaces (markdown panel) on PluginHost events (M4).
+        #[cfg(feature = "plugin_host")]
+        Self::subscribe_to_plugin_host(ctx);
         Self::subscribe_to_tab_config_errors(toast_stack.clone(), ctx);
         Self::subscribe_to_settings_errors(ctx);
         Self::subscribe_to_shared_session_manager(ctx);
@@ -3315,6 +3377,7 @@ impl Workspace {
             show_session_config_tab_config_chip: false,
             pending_session_config_tab_config_chip_tutorial: None,
             new_worktree_modal,
+            plugin_markdown_modal,
             close_session_confirmation_dialog,
             rewind_confirmation_dialog,
             delete_conversation_confirmation_dialog,
@@ -26242,6 +26305,11 @@ impl View for Workspace {
 
         if self.new_worktree_modal.is_open() {
             stack.add_child(self.new_worktree_modal.render());
+        }
+
+        // oh-my-warp: plugin markdown modal (`warp.ui.showMarkdown`, M4).
+        if self.plugin_markdown_modal.is_open() {
+            stack.add_child(self.plugin_markdown_modal.render());
         }
 
         if self.workflow_modal.as_ref(app).is_open() {

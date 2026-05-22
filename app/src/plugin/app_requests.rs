@@ -28,6 +28,8 @@ pub enum PluginAppRequest {
     ShowToast { message: String, kind: ToastKind },
     /// Bind a key sequence to a registered plugin command (`warp.keymap.bind`).
     BindKey { keys: String, command_id: String },
+    /// Show a markdown panel (`warp.ui.showMarkdown`).
+    ShowMarkdown { title: String, markdown: String },
 }
 
 static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();

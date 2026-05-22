@@ -11,7 +11,7 @@ pub(crate) mod service;
 #[cfg_attr(target_family = "wasm", path = "host/wasm/mod.rs")]
 mod host;
 
-pub(crate) use app::PluginHost;
+pub(crate) use app::{PluginHost, PluginHostEvent};
 pub use host::run as run_plugin_host;
 
 /// Flag to be passed to the warp executable when executing the warp binary as the plugin host
