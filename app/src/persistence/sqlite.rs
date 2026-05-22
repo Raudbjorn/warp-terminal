@@ -1134,7 +1134,9 @@ fn save_pane_state(
         LeafContents::ExecutionProfileEditor => EXECUTION_PROFILE_EDITOR_PANE_KIND,
         LeafContents::GetStarted => GET_STARTED_PANE_KIND,
         LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
-        LeafContents::EnvironmentManagement(_) | LeafContents::NetworkLog => {
+        LeafContents::EnvironmentManagement(_)
+        | LeafContents::NetworkLog
+        | LeafContents::Browser => {
             // These pane types are filtered out before this function is
             // called; see `LeafContents::is_persisted` and the skip in
             // `save_app_state`. Reaching this arm would mean a `pane_nodes`
@@ -1363,6 +1365,9 @@ fn save_pane_state(
                 .execute(conn)?;
         }
         LeafContents::NetworkLog => {
+            // Unreachable: filtered by `is_persisted` in `save_app_state`.
+        }
+        LeafContents::Browser => {
             // Unreachable: filtered by `is_persisted` in `save_app_state`.
         }
     }

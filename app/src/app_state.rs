@@ -149,6 +149,14 @@ pub enum LeafContents {
     /// The in-app network log pane. Not persisted across restarts because the
     /// backing log is an in-memory ring buffer that starts empty on launch.
     NetworkLog,
+    /// The embedded browser pane (oh-my-warp). Not persisted: each owns a live
+    /// Chrome + CDP screencast session created at open time.
+    Browser,
+    /// An entrypoint pane type to launch other pane types from a search palette. The default view
+    /// when creating a tab.
+    Welcome {
+        startup_directory: Option<PathBuf>,
+    },
     /// A new first-time user experience which prioritizes choosing a coding repository.
     GetStarted,
 }
@@ -172,7 +180,9 @@ impl LeafContents {
             LeafContents::NetworkLog
             // Environment management panes are opened on-demand via workspace
             // actions and have no persistable state.
-            | LeafContents::EnvironmentManagement(_) => false,
+            | LeafContents::EnvironmentManagement(_)
+            // Browser panes (oh-my-warp) own a live CDP session, not restorable state.
+            | LeafContents::Browser => false,
             LeafContents::Terminal(_)
             | LeafContents::Notebook(_)
             | LeafContents::AIDocument(_)

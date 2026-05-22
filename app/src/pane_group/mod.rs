@@ -177,6 +177,7 @@ mod tests;
 
 pub use pane::ai_document_pane::AIDocumentPane;
 pub use pane::ai_fact_pane::AIFactPane;
+pub use pane::browser_pane::BrowserPane;
 pub use pane::code_diff_pane::CodeDiffPane;
 pub use pane::code_pane::CodePane;
 pub use pane::env_var_collection_pane::EnvVarCollectionPane;
@@ -1946,6 +1947,21 @@ impl PaneGroup {
                 Err(anyhow::anyhow!(
                     "Network log pane should not have been persisted, as it cannot be restored"
                 ))
+            }
+            LeafContents::Browser => {
+                // Browser panes (oh-my-warp) construct a fresh Chrome + CDP
+                // session here. This arm is reached for newly-opened panes/tabs
+                // (e.g. "New Web Tab"); it is never reached during session
+                // restore because `is_persisted()` is false (so `save_pane_state`
+                // never writes a browser leaf to restore).
+                let pane: Box<dyn AnyPaneContent + 'static> = Box::new(BrowserPane::new(ctx));
+                let pane_id = pane.as_pane().id();
+                pane_contents.insert(pane_id, pane);
+                let focus = InitialFocus {
+                    focused_pane: leaf.is_focused.then_some(pane_id),
+                    active_session: None,
+                };
+                Ok((PaneData::new(pane_id), focus))
             }
             LeafContents::GetStarted => {
                 if !FeatureFlag::GetStartedTab.is_enabled() {
