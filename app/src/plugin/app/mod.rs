@@ -2,7 +2,7 @@ mod service_impl;
 
 use std::sync::Arc;
 
-use crate::plugin::app_requests::{PluginAppRequest, ToastKind};
+use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
 use crate::view_components::{DismissibleToast, ToastFlavor};
 use crate::workspace::{ToastStack, WorkspaceAction};
 use anyhow::{Context, Result};
@@ -173,6 +173,9 @@ impl PluginHost {
                 // context to open the modal). See `workspace::view`.
                 ctx.emit(PluginHostEvent::ShowMarkdown { title, markdown });
             }
+            PluginAppRequest::ShowPalette { title, items } => {
+                ctx.emit(PluginHostEvent::ShowPalette { title, items });
+            }
         }
     }
 }
@@ -183,6 +186,11 @@ impl PluginHost {
 pub enum PluginHostEvent {
     /// Show a markdown panel (`warp.ui.showMarkdown`).
     ShowMarkdown { title: String, markdown: String },
+    /// Show a picker; selecting an item invokes its callback (`warp.ui.showPalette`).
+    ShowPalette {
+        title: String,
+        items: Vec<PalettePluginItem>,
+    },
 }
 
 impl Drop for PluginHost {

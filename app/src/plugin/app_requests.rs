@@ -12,6 +12,19 @@ use std::sync::OnceLock;
 use async_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
+/// One entry of a plugin-driven picker (`warp.ui.showPalette`): a label plus the id of the plugin
+/// command (registered via `warp.commands.register`) to run when the user picks it.
+///
+/// Items reference command ids — not inline callbacks — on purpose: the command is dispatched as a
+/// fresh top-level `WorkspaceAction::RunPluginCommand`. Registering a callback at `showPalette` time
+/// would re-enter `plugin.get_mut()` while the calling command callback already holds that borrow,
+/// panicking the plugin host (`BorrowMutError`). See PLUGIN_SPEC.md (M4).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PalettePluginItem {
+    pub label: String,
+    pub command_id: String,
+}
+
 /// Severity of a toast requested via `warp.ui.toast`.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub enum ToastKind {
@@ -30,6 +43,11 @@ pub enum PluginAppRequest {
     BindKey { keys: String, command_id: String },
     /// Show a markdown panel (`warp.ui.showMarkdown`).
     ShowMarkdown { title: String, markdown: String },
+    /// Show a picker; selecting an item invokes its callback (`warp.ui.showPalette`).
+    ShowPalette {
+        title: String,
+        items: Vec<PalettePluginItem>,
+    },
 }
 
 static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();

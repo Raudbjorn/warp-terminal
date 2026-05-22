@@ -13,6 +13,7 @@ pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
 mod plugin_markdown_modal;
+mod plugin_palette_modal;
 pub(crate) mod right_panel;
 mod startup_directory;
 mod tab_grouping;
@@ -507,6 +508,7 @@ use crate::workspace::view::orchestration_launch_modal::{
     OrchestrationLaunchModal, OrchestrationLaunchModalEvent,
 };
 use crate::workspace::view::plugin_markdown_modal::PluginMarkdownModal;
+use crate::workspace::view::plugin_palette_modal::{PluginPaletteEvent, PluginPaletteModal};
 use crate::workspace::view::right_panel::{RightPanelEvent, RightPanelView};
 use crate::workspace::{ForkFromExchange, ForkedConversationDestination};
 use crate::workspaces::user_workspaces::UserWorkspaces;
@@ -1061,6 +1063,8 @@ pub struct Workspace {
     new_worktree_modal: ModalViewState<Modal<NewWorktreeModal>>,
     // oh-my-warp: modal that renders markdown a plugin requested via `warp.ui.showMarkdown` (M4).
     plugin_markdown_modal: ModalViewState<Modal<PluginMarkdownModal>>,
+    // oh-my-warp: picker a plugin requested via `warp.ui.showPalette` (M4).
+    plugin_palette_modal: ModalViewState<Modal<PluginPaletteModal>>,
     close_session_confirmation_dialog: ViewHandle<CloseSessionConfirmationDialog>,
     rewind_confirmation_dialog: ViewHandle<RewindConfirmationDialog>,
     delete_conversation_confirmation_dialog: ViewHandle<DeleteConversationConfirmationDialog>,
@@ -2144,6 +2148,57 @@ impl Workspace {
         ctx.notify();
     }
 
+    // oh-my-warp: builds the picker modal for `warp.ui.showPalette`.
+    fn build_plugin_palette_modal(
+        ctx: &mut ViewContext<Self>,
+    ) -> ModalViewState<Modal<PluginPaletteModal>> {
+        let body = ctx.add_typed_action_view(PluginPaletteModal::new);
+        ctx.subscribe_to_view(&body, |me, _, event, ctx| match event {
+            PluginPaletteEvent::Selected(command_id) => {
+                me.plugin_palette_modal.close();
+                ctx.notify();
+                // Run the picked command as a fresh top-level invocation (the calling plugin
+                // callback has already returned, so no re-entrant `plugin.get_mut()`).
+                crate::plugin::commands::run_plugin_command(command_id, ctx);
+            }
+        });
+        let modal = ctx.add_typed_action_view(|ctx| {
+            Modal::new(Some("Plugin".to_string()), body, ctx)
+                .with_dismiss_on_click()
+                .with_modal_style(UiComponentStyles {
+                    width: Some(420.),
+                    height: Some(480.),
+                    ..Default::default()
+                })
+        });
+        ctx.subscribe_to_view(&modal, |me, _, event, ctx| {
+            if matches!(event, ModalEvent::Close) {
+                me.plugin_palette_modal.close();
+                ctx.notify();
+            }
+        });
+        ModalViewState::new(modal)
+    }
+
+    /// Opens the picker modal with the given title/items (`warp.ui.showPalette`, M4).
+    #[cfg(feature = "plugin_host")]
+    fn show_plugin_palette(
+        &mut self,
+        title: String,
+        items: Vec<crate::plugin::app_requests::PalettePluginItem>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.plugin_palette_modal.view.update(ctx, |modal, ctx| {
+            modal.set_title(Some(title));
+            modal.body().update(ctx, |body, ctx| {
+                body.set_items(items, ctx);
+            });
+        });
+        self.plugin_palette_modal.open();
+        ctx.focus(&self.plugin_palette_modal.view);
+        ctx.notify();
+    }
+
     /// Subscribes to [`crate::plugin::PluginHostEvent`]s so plugin UI requests can open
     /// workspace-owned surfaces (e.g. the markdown modal). See PLUGIN_SPEC.md (M4).
     #[cfg(feature = "plugin_host")]
@@ -2152,6 +2207,9 @@ impl Workspace {
         ctx.subscribe_to_model(&plugin_host, |me, _, event, ctx| match event {
             crate::plugin::PluginHostEvent::ShowMarkdown { title, markdown } => {
                 me.show_plugin_markdown(title.clone(), markdown.clone(), ctx);
+            }
+            crate::plugin::PluginHostEvent::ShowPalette { title, items } => {
+                me.show_plugin_palette(title.clone(), items.clone(), ctx);
             }
         });
     }
@@ -2981,6 +3039,7 @@ impl Workspace {
         let tab_config_params_modal = Self::build_tab_config_params_modal(ctx);
         let new_worktree_modal = Self::build_new_worktree_modal(ctx);
         let plugin_markdown_modal = Self::build_plugin_markdown_modal(ctx);
+        let plugin_palette_modal = Self::build_plugin_palette_modal(ctx);
 
         let session_config_modal = Self::build_session_config_modal(ctx);
 
@@ -3378,6 +3437,7 @@ impl Workspace {
             pending_session_config_tab_config_chip_tutorial: None,
             new_worktree_modal,
             plugin_markdown_modal,
+            plugin_palette_modal,
             close_session_confirmation_dialog,
             rewind_confirmation_dialog,
             delete_conversation_confirmation_dialog,
@@ -26310,6 +26370,11 @@ impl View for Workspace {
         // oh-my-warp: plugin markdown modal (`warp.ui.showMarkdown`, M4).
         if self.plugin_markdown_modal.is_open() {
             stack.add_child(self.plugin_markdown_modal.render());
+        }
+
+        // oh-my-warp: plugin picker modal (`warp.ui.showPalette`, M4).
+        if self.plugin_palette_modal.is_open() {
+            stack.add_child(self.plugin_palette_modal.render());
         }
 
         if self.workflow_modal.as_ref(app).is_open() {

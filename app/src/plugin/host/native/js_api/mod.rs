@@ -3,7 +3,7 @@ use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
 use super::manifest::Manifest;
 use super::plugin::PluginHandle;
 use crate::plugin::ai_tools::ToolOutput;
-use crate::plugin::app_requests::{PluginAppRequest, ToastKind};
+use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
 use crate::plugin::events::{
     CommandFinishedEvent, CommandStartedEvent, OptionalToast, EVENT_COMMAND_FINISHED,
     EVENT_COMMAND_STARTED,
@@ -276,6 +276,27 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
             super::app_request::send_app_request(PluginAppRequest::ShowMarkdown {
                 title,
                 markdown,
+            });
+        }),
+    )?;
+    // `showPalette(title, items)` — `items` is `[{ label, command }]` where `command` is a command
+    // id registered via `warp.commands.register`. On selection the app dispatches that command as a
+    // fresh `RunPluginCommand`. Items reference command ids (not inline callbacks) so this never
+    // re-enters `plugin.get_mut()` from inside the calling callback. See PLUGIN_SPEC.md (M4).
+    ui.set(
+        "showPalette",
+        Function::new(ctx, |title: String, items: Vec<Object<'js>>| {
+            let palette_items: Vec<PalettePluginItem> = items
+                .into_iter()
+                .filter_map(|item| {
+                    let label: String = item.get("label").ok()?;
+                    let command_id: String = item.get("command").ok()?;
+                    Some(PalettePluginItem { label, command_id })
+                })
+                .collect();
+            super::app_request::send_app_request(PluginAppRequest::ShowPalette {
+                title,
+                items: palette_items,
             });
         }),
     )?;
