@@ -77,6 +77,24 @@ pub fn warp<'js>(
     if manifest.permits("ai") {
         api.set("ai", ai(plugin.clone(), ctx)?)?;
     }
+    // High-sensitivity capabilities (PLUGIN_SPEC.md §7): only exposed when explicitly granted in
+    // the manifest. `fs:read` and `fs:write` are independent grants gating individual methods.
+    if manifest.permits("fs:read") || manifest.permits("fs:write") {
+        api.set(
+            "fs",
+            fs_api(
+                manifest.permits("fs:read"),
+                manifest.permits("fs:write"),
+                ctx,
+            )?,
+        )?;
+    }
+    if manifest.permits("process") {
+        api.set("process", process_api(ctx)?)?;
+    }
+    if manifest.permits("network") {
+        api.set("network", network_api(ctx)?)?;
+    }
 
     #[cfg(feature = "completions_v2")]
     if manifest.permits("completions") {
@@ -120,6 +138,117 @@ fn ai<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>>
         ),
     )?;
     Ok(ai)
+}
+
+/// Returns the `warp.fs` namespace (capability-gated; PLUGIN_SPEC.md §7).
+///
+/// `readFile(path) -> string` / `readDir(path) -> string[]` (require `fs:read`);
+/// `writeFile(path, content)` (requires `fs:write`). Runs synchronously in the plugin host (a
+/// crash-isolated subprocess); errors throw a catchable JS exception. Every access is logged.
+fn fs_api<'js>(can_read: bool, can_write: bool, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+    let fs = Object::new(ctx)?;
+    if can_read {
+        fs.set(
+            "readFile",
+            Function::new(ctx, move |path: String| -> rquickjs::Result<String> {
+                log::info!("plugin warp.fs.readFile {path:?}");
+                std::fs::read_to_string(&path).map_err(|e| {
+                    rquickjs::Exception::throw_message(ctx, &format!("readFile {path:?}: {e}"))
+                })
+            }),
+        )?;
+        fs.set(
+            "readDir",
+            Function::new(ctx, move |path: String| -> rquickjs::Result<Vec<String>> {
+                log::info!("plugin warp.fs.readDir {path:?}");
+                let entries = std::fs::read_dir(&path).map_err(|e| {
+                    rquickjs::Exception::throw_message(ctx, &format!("readDir {path:?}: {e}"))
+                })?;
+                Ok(entries
+                    .flatten()
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect())
+            }),
+        )?;
+    }
+    if can_write {
+        fs.set(
+            "writeFile",
+            Function::new(
+                ctx,
+                move |path: String, content: String| -> rquickjs::Result<()> {
+                    log::info!(
+                        "plugin warp.fs.writeFile {path:?} ({} bytes)",
+                        content.len()
+                    );
+                    std::fs::write(&path, content).map_err(|e| {
+                        rquickjs::Exception::throw_message(ctx, &format!("writeFile {path:?}: {e}"))
+                    })
+                },
+            ),
+        )?;
+    }
+    Ok(fs)
+}
+
+/// Returns the `warp.process` namespace (capability-gated; requires `process`).
+///
+/// `exec(command, args?) -> { stdout, stderr, code }` — spawns a subprocess and waits for it. Runs
+/// synchronously in the plugin host; errors throw a catchable JS exception. Every spawn is logged.
+fn process_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+    let process = Object::new(ctx)?;
+    process.set(
+        "exec",
+        Function::new(
+            ctx,
+            move |command: String, args: Opt<Vec<String>>| -> rquickjs::Result<Object<'js>> {
+                let args = args.0.unwrap_or_default();
+                log::info!("plugin warp.process.exec {command:?} {args:?}");
+                let output = std::process::Command::new(&command)
+                    .args(&args)
+                    .output()
+                    .map_err(|e| {
+                        rquickjs::Exception::throw_message(ctx, &format!("exec {command:?}: {e}"))
+                    })?;
+                let result = Object::new(ctx)?;
+                result.set(
+                    "stdout",
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                )?;
+                result.set(
+                    "stderr",
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                )?;
+                result.set("code", output.status.code().unwrap_or(-1))?;
+                Ok(result)
+            },
+        ),
+    )?;
+    Ok(process)
+}
+
+/// Returns the `warp.network` namespace (capability-gated; requires `network`).
+///
+/// `fetch(url) -> { status, body }` — performs a blocking HTTP GET. Runs synchronously in the
+/// plugin host; errors throw a catchable JS exception. Every request is logged.
+fn network_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+    let network = Object::new(ctx)?;
+    network.set(
+        "fetch",
+        Function::new(ctx, move |url: String| -> rquickjs::Result<Object<'js>> {
+            log::info!("plugin warp.network.fetch {url:?}");
+            let response = reqwest::blocking::get(&url).map_err(|e| {
+                rquickjs::Exception::throw_message(ctx, &format!("fetch {url:?}: {e}"))
+            })?;
+            let status = i32::from(response.status().as_u16());
+            let body = response.text().unwrap_or_default();
+            let result = Object::new(ctx)?;
+            result.set("status", status)?;
+            result.set("body", body)?;
+            Ok(result)
+        }),
+    )?;
+    Ok(network)
 }
 
 /// Returns a JS object representing the UI namespace for the Warp Plugin API.
