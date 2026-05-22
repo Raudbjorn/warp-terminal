@@ -1,6 +1,7 @@
 mod app_request;
 mod js_api;
 mod logging;
+mod manifest;
 mod plugin;
 mod plugin_caller;
 mod plugin_ref;

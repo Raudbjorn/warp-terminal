@@ -1,5 +1,6 @@
 use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
 
+use super::manifest::Manifest;
 use super::plugin::PluginHandle;
 use crate::plugin::app_requests::{PluginAppRequest, ToastKind};
 use crate::plugin::events::{
@@ -33,10 +34,21 @@ cfg_if::cfg_if! {
 ///
 /// Additional namespaces are added behind feature flags (e.g. `completions` under
 /// `completions_v2`). See PLUGIN_SPEC.md for the planned surface.
-pub fn warp(plugin: PluginHandle, ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> {
+pub fn warp<'js>(
+    plugin: PluginHandle,
+    manifest: &Manifest,
+    plugin_id: &str,
+    plugin_dir: &str,
+    ctx: Ctx<'js>,
+) -> rquickjs::Result<Object<'js>> {
     let api = Object::new(ctx)?;
 
+    // Always-on base surface: API version, plugin identity, and logging.
     api.set("version", PLUGIN_API_VERSION)?;
+    let plugin_info = Object::new(ctx)?;
+    plugin_info.set("id", plugin_id)?;
+    plugin_info.set("dir", plugin_dir)?;
+    api.set("plugin", plugin_info)?;
     api.set(
         "log",
         Function::new(ctx, |message: String, level: Opt<String>| {
@@ -47,13 +59,26 @@ pub fn warp(plugin: PluginHandle, ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> 
             }
         }),
     )?;
-    api.set("commands", commands(plugin.clone(), ctx)?)?;
-    api.set("terminal", terminal(plugin.clone(), ctx)?)?;
-    api.set("ui", ui(ctx)?)?;
-    api.set("keymap", keymap(ctx)?)?;
+
+    // Capability-gated namespaces (PLUGIN_SPEC.md §7). A legacy (no-`plugin.json`) plugin is
+    // granted everything for back-compat; a manifest plugin gets only what it declares in
+    // `permissions`. `keymap` rides with `commands` (it binds command ids to keys).
+    if manifest.permits("commands") {
+        api.set("commands", commands(plugin.clone(), ctx)?)?;
+        api.set("keymap", keymap(ctx)?)?;
+    }
+    if manifest.permits("terminal:events") {
+        api.set("terminal", terminal(plugin.clone(), ctx)?)?;
+    }
+    if manifest.permits("ui") {
+        api.set("ui", ui(ctx)?)?;
+    }
 
     #[cfg(feature = "completions_v2")]
-    api.set("completions", completions(plugin, ctx)?)?;
+    if manifest.permits("completions") {
+        api.set("completions", completions(plugin, ctx)?)?;
+    }
+
     Ok(api)
 }
 

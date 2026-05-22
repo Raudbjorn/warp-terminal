@@ -183,6 +183,7 @@ rust-embed.workspace = true
 sentry-log = { workspace = true, optional = true }
 inventory = "0.3"
 schemars = "1"
+semver = "1"
 serde.workspace = true
 serde_bytes.workspace = true
 serde-bytes-repr.workspace = true

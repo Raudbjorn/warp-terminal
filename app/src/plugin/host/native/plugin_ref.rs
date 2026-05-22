@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::{fs, io};
 
+use super::manifest::Manifest;
+
 pub(super) const PLUGIN_ENTRYPOINT_JS_FILE_NAME: &str = "main.js";
 
 #[derive(thiserror::Error, Debug)]
@@ -59,6 +61,31 @@ impl PluginRef {
                 Some(bytes) => Ok(bytes),
                 None => Err(PluginLoadError::MissingBuiltin(*builtin_plugin_type)),
             },
+        }
+    }
+
+    /// Loads this plugin's [`Manifest`] (`plugin.json`). Bare `main.js` directories and built-ins
+    /// yield a legacy manifest (full pre-M4 surface, any API version).
+    pub(super) fn manifest(&self) -> Manifest {
+        match self {
+            PluginRef::Path(path) => Manifest::load(path),
+            PluginRef::BuiltIn(_) => Manifest::legacy(),
+        }
+    }
+
+    /// The plugin's effective id: the manifest `id`, else the directory name, else a `builtin:` tag.
+    pub(super) fn effective_id(&self, manifest: &Manifest) -> String {
+        match self {
+            PluginRef::Path(path) => manifest.effective_id(path),
+            PluginRef::BuiltIn(builtin) => format!("builtin:{builtin:?}").to_lowercase(),
+        }
+    }
+
+    /// A display path for the plugin's directory; empty for built-ins (no on-disk directory).
+    pub(super) fn display_dir(&self) -> String {
+        match self {
+            PluginRef::Path(path) => path.to_string_lossy().into_owned(),
+            PluginRef::BuiltIn(_) => String::new(),
         }
     }
 }

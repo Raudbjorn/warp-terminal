@@ -14887,6 +14887,7 @@ dependencies = [
  "rustls",
  "schemars",
  "security-framework-sys",
+ "semver",
  "sentry",
  "sentry-log",
  "serde",
