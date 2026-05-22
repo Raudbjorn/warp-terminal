@@ -297,6 +297,11 @@ tracing-subscriber = { version = "0.3.22", default-features = false, features = 
   "registry",
   "std",
 ] }
+# Blocking WebSocket client for the embedded browser pane's CDP screencast channel
+# (oh-my-warp). This is already in the tree transitively (async-tungstenite wraps
+# it); we use it directly on a dedicated thread to avoid async-runtime integration.
+# `handshake` is the only feature needed for a ws:// localhost client (no TLS).
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 arborium = { version = "2", default-features = false, features = [
   "lang-rust",
   "lang-go",

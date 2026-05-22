@@ -11,6 +11,7 @@ mod auth;
 mod autoupdate;
 mod banner;
 mod billing;
+mod browser;
 mod changelog_model;
 mod chip_configurator;
 mod cloud_object;

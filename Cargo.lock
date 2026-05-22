@@ -14935,6 +14935,7 @@ dependencies = [
  "tracing-futures",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "tungstenite",
  "typed-path 0.10.0",
  "ui_components",
  "unicase",
