@@ -3,6 +3,8 @@ pub(crate) mod app;
 pub(crate) mod app_requests;
 pub(crate) mod commands;
 pub(crate) mod events;
+#[cfg(feature = "plugin_host")]
+pub(crate) mod installed;
 pub(crate) mod service;
 
 #[cfg_attr(not(target_family = "wasm"), path = "host/native/mod.rs")]

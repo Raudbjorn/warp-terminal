@@ -2696,6 +2696,9 @@ impl FeaturesPageView {
         general_widgets.push(Box::new(BackendSelectorWidget::default()));
         // oh-my-warp: "Agent harness (gRPC)" selector row.
         general_widgets.push(Box::new(GrpcHarnessSelectorWidget::default()));
+        // oh-my-warp: installed-plugins list.
+        #[cfg(feature = "plugin_host")]
+        general_widgets.push(Box::new(PluginsWidget::default()));
 
         #[cfg(feature = "local_fs")]
         {
@@ -5380,6 +5383,74 @@ impl SettingsWidget for DesktopNotificationsWidget {
         }
 
         column.finish()
+    }
+}
+
+// oh-my-warp: Settings widget listing installed plugins (M4). A read-only view of the
+// `~/.warp/plugins` manifests; the plugin host parses the same manifests independently to gate
+// capabilities. See PLUGIN_SPEC.md.
+#[cfg(feature = "plugin_host")]
+#[derive(Default)]
+struct PluginsWidget {}
+
+#[cfg(feature = "plugin_host")]
+impl SettingsWidget for PluginsWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "plugins extensions manifest permissions oh-my-warp"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        use super::settings_page::{render_sub_header, render_sub_header_with_description};
+
+        let mut children: Vec<Box<dyn Element>> = vec![render_sub_header(
+            appearance,
+            "Plugins (~/.warp/plugins)".to_string(),
+            None,
+        )];
+        let plugins = crate::plugin::installed::installed_plugins();
+        if plugins.is_empty() {
+            children.push(render_sub_header_with_description(
+                appearance,
+                "No plugins installed".to_string(),
+                "Drop a folder containing main.js (and an optional plugin.json) into \
+                 ~/.warp/plugins."
+                    .to_string(),
+            ));
+        } else {
+            for plugin in plugins {
+                let title = format!("{} · {} · v{}", plugin.name, plugin.id, plugin.version);
+                let permissions = if plugin.permissions.is_empty() {
+                    "none".to_string()
+                } else {
+                    plugin.permissions.join(", ")
+                };
+                let manifest_note = if plugin.has_manifest {
+                    String::new()
+                } else {
+                    " · no plugin.json (legacy)".to_string()
+                };
+                let mut description = format!(
+                    "permissions: {permissions} · engines.warp {}{manifest_note}",
+                    plugin.engines_warp
+                );
+                if !plugin.description.is_empty() {
+                    description = format!("{} · {description}", plugin.description);
+                }
+                children.push(render_sub_header_with_description(
+                    appearance,
+                    title,
+                    description,
+                ));
+            }
+        }
+        Flex::column().with_children(children).finish()
     }
 }
 
