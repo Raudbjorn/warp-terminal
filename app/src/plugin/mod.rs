@@ -1,3 +1,4 @@
+pub(crate) mod ai_tools;
 pub(crate) mod app;
 pub(crate) mod app_requests;
 pub(crate) mod commands;

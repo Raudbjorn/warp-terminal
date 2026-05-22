@@ -153,6 +153,31 @@ pub struct ConversationData {
     pub existing_suggestions: Option<Suggestions>,
 }
 
+/// oh-my-warp: the AI tools registered by JS plugins (`warp.ai.registerTool`), built as `rmcp`
+/// tools to inject into the model's MCP context. They are dispatched in-process by the tool-call
+/// executor (`crate::ai::blocklist::action_model::execute::call_mcp_tool`). See PLUGIN_SPEC.md (M4).
+#[cfg(feature = "plugin_host")]
+fn plugin_ai_tools() -> Vec<rmcp::model::Tool> {
+    crate::plugin::ai_tools::all()
+        .into_iter()
+        .filter_map(|tool| {
+            let schema: serde_json::Value = serde_json::from_str(&tool.schema_json)
+                .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
+            serde_json::from_value(serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": schema,
+            }))
+            .ok()
+        })
+        .collect()
+}
+
+/// oh-my-warp: synthetic MCP "server" id grouping plugin-registered tools in the model request.
+/// A fixed UUID so it never collides with a real installed MCP server.
+#[cfg(feature = "plugin_host")]
+const PLUGIN_TOOLS_SERVER_ID: &str = "0a0a0a0a-0b0b-4c0c-8d0d-0e0e0e0e0e0e";
+
 impl RequestParams {
     pub fn new(
         terminal_view_id: Option<EntityId>,
@@ -194,7 +219,8 @@ impl RequestParams {
                     .values(),
             );
 
-            let servers: Vec<MCPServer> = active_servers
+            #[cfg_attr(not(feature = "plugin_host"), allow(unused_mut))]
+            let mut servers: Vec<MCPServer> = active_servers
                 .into_iter()
                 .map(|server| MCPServer {
                     name: server.name().to_string(),
@@ -204,6 +230,22 @@ impl RequestParams {
                     tools: server.tools().to_vec(),
                 })
                 .collect();
+
+            // oh-my-warp: surface plugin-registered AI tools as a synthetic MCP server so the
+            // model can call them; the call is dispatched in-process (see `call_mcp_tool`).
+            #[cfg(feature = "plugin_host")]
+            {
+                let plugin_tools = plugin_ai_tools();
+                if !plugin_tools.is_empty() {
+                    servers.push(MCPServer {
+                        name: "oh-my-warp plugins".to_string(),
+                        description: "Tools registered by oh-my-warp plugins".to_string(),
+                        id: PLUGIN_TOOLS_SERVER_ID.to_string(),
+                        resources: vec![],
+                        tools: plugin_tools,
+                    });
+                }
+            }
 
             if servers.is_empty() {
                 None
@@ -222,7 +264,11 @@ impl RequestParams {
                 .resources()
                 .cloned()
                 .collect::<Vec<_>>();
-            let tools = templatable_mcp_manager.tools().cloned().collect::<Vec<_>>();
+            #[cfg_attr(not(feature = "plugin_host"), allow(unused_mut))]
+            let mut tools = templatable_mcp_manager.tools().cloned().collect::<Vec<_>>();
+            // oh-my-warp: include plugin-registered AI tools (dispatched in-process).
+            #[cfg(feature = "plugin_host")]
+            tools.extend(plugin_ai_tools());
 
             #[allow(deprecated)]
             (!resources.is_empty() || !tools.is_empty()).then_some(MCPContext {

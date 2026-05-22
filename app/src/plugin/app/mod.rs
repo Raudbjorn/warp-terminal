@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use command::blocking::Command;
 use service_impl::{
     LogServiceImpl, PluginAppRequestServiceImpl, PluginHostBootstrapServiceImpl,
-    RegisterCommandServiceImpl, RegisterEventHandlerServiceImpl,
+    RegisterCommandServiceImpl, RegisterEventHandlerServiceImpl, RegisterToolServiceImpl,
 };
 use warpui::keymap::EditableBinding;
 use warpui::{Entity, ModelContext, SingletonEntity};
@@ -85,6 +85,7 @@ impl PluginHost {
             .with_service(LogServiceImpl::new())
             .with_service(RegisterCommandServiceImpl::new())
             .with_service(RegisterEventHandlerServiceImpl::new())
+            .with_service(RegisterToolServiceImpl::new())
             .with_service(PluginAppRequestServiceImpl::new());
 
         #[cfg(feature = "completions_v2")]

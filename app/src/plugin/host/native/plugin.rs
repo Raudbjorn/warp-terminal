@@ -8,7 +8,7 @@ use warp_js::{JsFunctionId, JsFunctionRegistry, SerializedJsValue};
 
 use crate::plugin::service::{
     RegisterCommandRequest, RegisterCommandService, RegisterEventHandlerRequest,
-    RegisterEventHandlerService,
+    RegisterEventHandlerService, RegisterToolRequest, RegisterToolService,
 };
 
 cfg_if::cfg_if! {
@@ -50,6 +50,7 @@ impl PluginHandle {
 pub(super) struct AppServiceCallers {
     register_command_caller: Box<dyn ipc::ServiceCaller<RegisterCommandService>>,
     register_event_handler_caller: Box<dyn ipc::ServiceCaller<RegisterEventHandlerService>>,
+    register_tool_caller: Box<dyn ipc::ServiceCaller<RegisterToolService>>,
     #[cfg(feature = "completions_v2")]
     register_command_signatures_caller:
         Box<dyn ipc::ServiceCaller<RegisterCommandSignatureService>>,
@@ -64,6 +65,7 @@ impl AppServiceCallers {
             register_event_handler_caller: ipc::service_caller::<RegisterEventHandlerService>(
                 app_client.clone(),
             ),
+            register_tool_caller: ipc::service_caller::<RegisterToolService>(app_client.clone()),
             #[cfg(feature = "completions_v2")]
             register_command_signatures_caller: ipc::service_caller::<
                 RegisterCommandSignatureService,
@@ -142,6 +144,26 @@ impl Plugin {
                 .call(RegisterEventHandlerRequest { event, function_id }),
         ) {
             log::warn!("Failed to register plugin event handler: {e:?}");
+        }
+    }
+
+    /// Registers a JS `run` callback (by its `function_id`) as an AI agent tool.
+    pub(super) fn register_tool(
+        &mut self,
+        name: String,
+        description: String,
+        schema_json: String,
+        function_id: JsFunctionId,
+    ) {
+        if let Err(e) = warpui::r#async::block_on(self.app_services.register_tool_caller.call(
+            RegisterToolRequest {
+                name,
+                description,
+                schema_json,
+                function_id,
+            },
+        )) {
+            log::warn!("Failed to register plugin AI tool: {e:?}");
         }
     }
 

@@ -2,6 +2,7 @@ use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
 
 use super::manifest::Manifest;
 use super::plugin::PluginHandle;
+use crate::plugin::ai_tools::ToolOutput;
 use crate::plugin::app_requests::{PluginAppRequest, ToastKind};
 use crate::plugin::events::{
     CommandFinishedEvent, CommandStartedEvent, OptionalToast, EVENT_COMMAND_FINISHED,
@@ -73,6 +74,9 @@ pub fn warp<'js>(
     if manifest.permits("ui") {
         api.set("ui", ui(ctx)?)?;
     }
+    if manifest.permits("ai") {
+        api.set("ai", ai(plugin.clone(), ctx)?)?;
+    }
 
     #[cfg(feature = "completions_v2")]
     if manifest.permits("completions") {
@@ -80,6 +84,42 @@ pub fn warp<'js>(
     }
 
     Ok(api)
+}
+
+/// Returns a JS object representing the AI namespace for the Warp Plugin API.
+///
+/// `registerTool({ name, description, schema, run })` — registers a tool the Warp AI agent can
+/// call. `schema` is a JSON Schema **string** for the argument object; `run(argsJson)` receives the
+/// model's arguments as a JSON string and returns a string result. The tool is injected into the
+/// agent's MCP context and dispatched in-process back to this callback. Requires the `ai`
+/// permission. See PLUGIN_SPEC.md (M4).
+fn ai<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+    let ai = Object::new(ctx)?;
+    ai.set(
+        "registerTool",
+        Function::new(
+            ctx,
+            MutFn::from(move |tool: Object<'js>| {
+                let name: String = tool.get("name").unwrap_or_default();
+                let description: String = tool.get("description").unwrap_or_default();
+                let schema_json: String = tool.get("schema").unwrap_or_default();
+                let Ok(run) = tool.get::<_, Function>("run") else {
+                    log::warn!("warp.ai.registerTool: tool {name:?} is missing a 'run' function");
+                    return;
+                };
+                if name.is_empty() {
+                    log::warn!("warp.ai.registerTool: ignoring tool with empty 'name'");
+                    return;
+                }
+                let mut plugin = plugin.get_mut();
+                let func_ref = plugin
+                    .js_function_registry_mut()
+                    .register_js_function::<String, ToolOutput>(run, ctx);
+                plugin.register_tool(name, description, schema_json, func_ref.id);
+            }),
+        ),
+    )?;
+    Ok(ai)
 }
 
 /// Returns a JS object representing the UI namespace for the Warp Plugin API.
