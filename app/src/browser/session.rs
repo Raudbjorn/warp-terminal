@@ -297,7 +297,10 @@ fn start_screencast(socket: &mut WebSocket<TcpStream>, next_id: &mut i64) -> Res
         socket,
         next_id,
         "Page.startScreencast",
-        json!({ "format": "jpeg", "quality": 70, "maxWidth": 1600, "maxHeight": 1000, "everyNthFrame": 1 }),
+        // High caps + quality so a Retina pane (rendered at deviceScaleFactor 2)
+        // isn't downscaled then upscaled (which looked blurry). The actual frame
+        // size tracks the pane, so small panes stay cheap.
+        json!({ "format": "jpeg", "quality": 90, "maxWidth": 4096, "maxHeight": 2560, "everyNthFrame": 1 }),
     )
 }
 

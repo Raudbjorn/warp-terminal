@@ -22,12 +22,14 @@ use std::time::Duration;
 
 use instant::Instant;
 
+use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
-    Border, BoundsSink, ChildView, Clipped, ConstrainedBox, Container, CornerRadius,
+    Border, BoundsSink, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container, CornerRadius,
     CrossAxisAlignment, DispatchEventResult, Empty, EventHandler, Expanded, Flex, FrameImage,
-    MainAxisSize, MouseStateHandle, ParentElement, Radius, SizeSink,
+    MainAxisSize, MouseStateHandle, OffsetPositioning, ParentElement, PositionedElementAnchor,
+    PositionedElementOffsetBounds, Radius, SavePosition, SizeSink, Stack,
 };
-use warpui::geometry::vector::Vector2F;
+use warpui::geometry::vector::{vec2f, Vector2F};
 use warpui::image_cache::StaticImage;
 use warpui::keymap::Keystroke;
 use warpui::text_layout::ClipConfig;
@@ -42,6 +44,7 @@ use crate::appearance::Appearance;
 use crate::editor::{
     BaselinePositionComputationMethod, EditorView, Event as EditorEvent, SingleLineEditorOptions,
 };
+use crate::menu::{Event as MenuEvent, Menu, MenuItem, MenuItemFields};
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::pane::view::{self, HeaderContent, StandardHeader, StandardHeaderOptions};
 use crate::pane_group::{BackingView, PaneConfiguration, PaneEvent};
@@ -53,6 +56,11 @@ pub const BROWSER_HEADER_TEXT: &str = "Browser";
 
 /// Multiplier applied to scroll-wheel deltas before forwarding to CDP. Tunable.
 const SCROLL_SCALE: f64 = 1.0;
+
+/// `SavePosition` id for the viewport cell. The right-click context menu anchors
+/// to it (rather than to the pane/window) so it lands under the cursor no matter
+/// where the pane sits in the window (e.g. a right-hand split).
+const BROWSER_VIEWPORT_POSITION_ID: &str = "oh_my_warp_browser_viewport";
 
 /// The CSS viewport size the current frame represents (shared with input
 /// closures so they can map pointer positions without borrowing the view).
@@ -79,6 +87,20 @@ pub enum BrowserViewAction {
     /// Move keyboard focus to the page (so typing forwards to the browser, not
     /// the address bar). Dispatched when the viewport is clicked.
     FocusViewport,
+    /// Open the page context menu at the given window-space position (x, y as
+    /// integer logical px so the action stays `Eq`).
+    OpenContextMenu {
+        x: i32,
+        y: i32,
+    },
+    /// Context-menu / navigation actions.
+    Back,
+    Forward,
+    Reload,
+    /// Copy the current page URL to the system clipboard.
+    CopyUrl,
+    /// Open the current page URL in the system default browser.
+    OpenInSystemBrowser,
 }
 
 /// A pane view that renders a live, interactive browser viewport over CDP.
@@ -112,6 +134,11 @@ pub struct BrowserView {
     /// by `on_focus`/`on_blur`; key-forwarding checks this so we stop forwarding
     /// the instant focus leaves (rather than relying on the sticky focus target).
     page_focused: Rc<Cell<bool>>,
+    /// The page right-click context menu, shown at `show_right_click_menu`.
+    right_click_menu: ViewHandle<Menu<BrowserViewAction>>,
+    /// Viewport-relative offset to render the context menu at, when open. Anchored
+    /// to the viewport `SavePosition`, so it tracks the pane's window position.
+    show_right_click_menu: Option<Vector2F>,
     back_button: MouseStateHandle,
     forward_button: MouseStateHandle,
     reload_button: MouseStateHandle,
@@ -160,6 +187,15 @@ impl BrowserView {
             },
         );
 
+        // Page right-click context menu; hide it when it closes.
+        let right_click_menu = ctx.add_typed_action_view(|_| Menu::<BrowserViewAction>::new());
+        ctx.subscribe_to_view(&right_click_menu, |me: &mut Self, _, event, ctx| {
+            if let MenuEvent::Close { .. } = event {
+                me.show_right_click_menu = None;
+                ctx.notify();
+            }
+        });
+
         ctx.spawn_stream_local(
             update_rx,
             |view: &mut Self, update, ctx| {
@@ -194,6 +230,8 @@ impl BrowserView {
             click_state: Rc::new(Cell::new((None, 0))),
             focus_target: Rc::new(Cell::new(FocusTarget::AddressBar)),
             page_focused: Rc::new(Cell::new(false)),
+            right_click_menu,
+            show_right_click_menu: None,
             back_button: MouseStateHandle::default(),
             forward_button: MouseStateHandle::default(),
             reload_button: MouseStateHandle::default(),
@@ -224,6 +262,41 @@ impl BrowserView {
             .try_send(BrowserCommand::Navigate(normalize_url(&input)));
         self.focus_target.set(FocusTarget::Page);
         ctx.focus_self();
+    }
+
+    /// Populates and shows the page right-click context menu at `pos`.
+    fn open_context_menu(&mut self, pos: Vector2F, ctx: &mut ViewContext<Self>) {
+        let items = vec![
+            MenuItemFields::new("Back")
+                .with_on_select_action(BrowserViewAction::Back)
+                .into_item(),
+            MenuItemFields::new("Forward")
+                .with_on_select_action(BrowserViewAction::Forward)
+                .into_item(),
+            MenuItemFields::new("Reload")
+                .with_on_select_action(BrowserViewAction::Reload)
+                .into_item(),
+            MenuItem::Separator,
+            MenuItemFields::new("Copy Page URL")
+                .with_on_select_action(BrowserViewAction::CopyUrl)
+                .into_item(),
+            MenuItemFields::new("Open in System Browser")
+                .with_on_select_action(BrowserViewAction::OpenInSystemBrowser)
+                .into_item(),
+        ];
+        self.right_click_menu.update(ctx, |menu, view_ctx| {
+            menu.set_items(items, view_ctx);
+        });
+        // `pos` is window-space; the menu anchors to the viewport's `SavePosition`,
+        // so store it relative to the viewport's drawn origin. Fall back to the raw
+        // position if the viewport hasn't reported its rect yet.
+        let offset = match self.viewport_rect.get() {
+            Some(rect) => pos - rect.origin(),
+            None => pos,
+        };
+        self.show_right_click_menu = Some(offset);
+        ctx.focus(&self.right_click_menu);
+        ctx.notify();
     }
 
     /// A toolbar nav button that sends `command` when clicked.
@@ -415,6 +488,14 @@ impl BrowserView {
                 }
                 DispatchEventResult::StopPropagation
             })
+            .on_right_mouse_down(move |ctx, _app, pos| {
+                // Open the page context menu at the cursor.
+                ctx.dispatch_typed_action(BrowserViewAction::OpenContextMenu {
+                    x: pos.x() as i32,
+                    y: pos.y() as i32,
+                });
+                DispatchEventResult::StopPropagation
+            })
             .on_left_mouse_up(move |_ctx, _app, pos| {
                 if let Some((x, y)) = map_to_css(&vp_up, &css_up, pos) {
                     let click_count = click_up.get().1.max(1);
@@ -540,6 +621,13 @@ fn normalize_url(input: &str) -> String {
     }
 }
 
+/// Opens `url` in the system default browser (macOS `open`).
+fn open_in_system_browser(url: &str) {
+    if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
+        log::warn!("[omw-browser] failed to open {url} in system browser: {e}");
+    }
+}
+
 impl Entity for BrowserView {
     type Event = BrowserViewEvent;
 }
@@ -561,11 +649,29 @@ impl View for BrowserView {
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         // Keep Chrome's viewport sized to the pane (from the last layout).
         self.sync_viewport_size();
-        Flex::column()
+        let viewport =
+            SavePosition::new(self.render_viewport(), BROWSER_VIEWPORT_POSITION_ID).finish();
+        let content = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
             .with_child(self.render_toolbar(app))
-            .with_child(Expanded::new(1.0, self.render_viewport()).finish())
-            .finish()
+            .with_child(Expanded::new(1.0, viewport).finish())
+            .finish();
+
+        let mut stack = Stack::new();
+        stack.add_child(content);
+        if let Some(offset) = self.show_right_click_menu {
+            stack.add_positioned_overlay_child(
+                ChildView::new(&self.right_click_menu).finish(),
+                OffsetPositioning::offset_from_save_position_element(
+                    BROWSER_VIEWPORT_POSITION_ID,
+                    offset,
+                    PositionedElementOffsetBounds::WindowByPosition,
+                    PositionedElementAnchor::TopLeft,
+                    ChildAnchor::TopLeft,
+                ),
+            );
+        }
+        stack.finish()
     }
 }
 
@@ -581,6 +687,25 @@ impl TypedActionView for BrowserView {
                 self.focus_target.set(FocusTarget::Page);
                 ctx.focus_self();
                 ctx.emit(BrowserViewEvent::Pane(PaneEvent::FocusSelf));
+            }
+            BrowserViewAction::OpenContextMenu { x, y } => {
+                self.open_context_menu(vec2f(*x as f32, *y as f32), ctx);
+            }
+            BrowserViewAction::Back => {
+                let _ = self.cmd_tx.try_send(BrowserCommand::Back);
+            }
+            BrowserViewAction::Forward => {
+                let _ = self.cmd_tx.try_send(BrowserCommand::Forward);
+            }
+            BrowserViewAction::Reload => {
+                let _ = self.cmd_tx.try_send(BrowserCommand::Reload);
+            }
+            BrowserViewAction::CopyUrl => {
+                ctx.clipboard()
+                    .write(ClipboardContent::plain_text(self.url.clone()));
+            }
+            BrowserViewAction::OpenInSystemBrowser => {
+                open_in_system_browser(&self.url);
             }
         }
     }
