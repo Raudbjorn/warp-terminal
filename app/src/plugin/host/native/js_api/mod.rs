@@ -253,9 +253,10 @@ fn network_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
 
 /// Returns a JS object representing the UI namespace for the Warp Plugin API.
 ///
-/// `toast(message: string, kind?: "info" | "warn" | "error")` — shows a transient toast.
+/// `toast(message, kind?)` — transient toast; `showMarkdown(title, markdown)` — markdown panel;
+/// `showPalette(title, items)` — command picker; `openWebTab(url)` — open an embedded browser pane.
 ///
-/// The request is enqueued (non-blocking) and relayed to the app on a background task; we must not
+/// Each request is enqueued (non-blocking) and relayed to the app on a background task; we must not
 /// do the blocking IPC inline on the plugin runner thread (see `super::app_request`).
 fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
     let ui = Object::new(ctx)?;
@@ -298,6 +299,14 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
                 title,
                 items: palette_items,
             });
+        }),
+    )?;
+    // `openWebTab(url)` — opens an embedded browser pane navigated to `url` (a bare host like
+    // `example.com` is upgraded to `https://`). Fire-and-forget, like the other `ui.*` relays.
+    ui.set(
+        "openWebTab",
+        Function::new(ctx, |url: String| {
+            super::app_request::send_app_request(PluginAppRequest::OpenWebTab { url });
         }),
     )?;
     Ok(ui)

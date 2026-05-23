@@ -62,6 +62,22 @@ const SCROLL_SCALE: f64 = 1.0;
 /// where the pane sits in the window (e.g. a right-hand split).
 const BROWSER_VIEWPORT_POSITION_ID: &str = "oh_my_warp_browser_viewport";
 
+thread_local! {
+    /// One-shot initial-URL override for the next [`BrowserView::new`], set by
+    /// `warp.ui.openWebTab(url)` immediately before the pane is constructed (same
+    /// UI-thread call stack, so it is consumed before any other pane is built).
+    /// `None` falls back to the configured home page.
+    static NEXT_BROWSER_URL: Cell<Option<String>> = const { Cell::new(None) };
+}
+
+/// Sets the initial URL for the *next* browser pane created (consumed once by
+/// [`BrowserView::new`]). Backs the `warp.ui.openWebTab` plugin bridge; the input
+/// is normalized like an address-bar entry (bare hosts gain `https://`, non-URLs
+/// become a web search) via [`normalize_url`].
+pub fn set_next_browser_url(url: String) {
+    NEXT_BROWSER_URL.with(|cell| cell.set(Some(normalize_url(&url))));
+}
+
 /// The CSS viewport size the current frame represents (shared with input
 /// closures so they can map pointer positions without borrowing the view).
 type CssSize = Rc<Cell<Option<(f32, f32)>>>;
@@ -150,7 +166,10 @@ impl BrowserView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new(BROWSER_HEADER_TEXT));
         let config = load_config();
-        let url = config.home.clone();
+        // A pending `warp.ui.openWebTab(url)` override wins over the configured home.
+        let url = NEXT_BROWSER_URL
+            .with(|cell| cell.take())
+            .unwrap_or_else(|| config.home.clone());
         let scroll_sign = if config.reverse_scroll { -1.0 } else { 1.0 };
 
         // session updates out (frames + URL), commands in (clicks / nav).

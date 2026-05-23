@@ -2212,6 +2212,12 @@ impl Workspace {
             crate::plugin::PluginHostEvent::ShowPalette { title, items } => {
                 me.show_plugin_palette(title.clone(), items.clone(), ctx);
             }
+            crate::plugin::PluginHostEvent::OpenWebTab { url } => {
+                // Set the one-shot initial-URL override, then open a browser tab;
+                // `BrowserView::new` consumes it synchronously during construction.
+                crate::browser::view::set_next_browser_url(url.clone());
+                me.open_web_tab(ctx);
+            }
         });
     }
 

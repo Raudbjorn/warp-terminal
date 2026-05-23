@@ -48,6 +48,8 @@ pub enum PluginAppRequest {
         title: String,
         items: Vec<PalettePluginItem>,
     },
+    /// Open an embedded browser pane navigated to `url` (`warp.ui.openWebTab`).
+    OpenWebTab { url: String },
 }
 
 static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();

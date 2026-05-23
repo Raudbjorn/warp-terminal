@@ -176,6 +176,9 @@ impl PluginHost {
             PluginAppRequest::ShowPalette { title, items } => {
                 ctx.emit(PluginHostEvent::ShowPalette { title, items });
             }
+            PluginAppRequest::OpenWebTab { url } => {
+                ctx.emit(PluginHostEvent::OpenWebTab { url });
+            }
         }
     }
 }
@@ -191,6 +194,8 @@ pub enum PluginHostEvent {
         title: String,
         items: Vec<PalettePluginItem>,
     },
+    /// Open an embedded browser pane navigated to `url` (`warp.ui.openWebTab`).
+    OpenWebTab { url: String },
 }
 
 impl Drop for PluginHost {
