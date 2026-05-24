@@ -180,6 +180,9 @@ pub struct BrowserSession {
     child: Option<Child>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    /// CDP port Chrome was spawned on (also published in [`endpoint_file_path`]).
+    /// Used by `Drop` to clear the published endpoint only if it's still ours.
+    port: u16,
 }
 
 impl BrowserSession {
@@ -231,6 +234,7 @@ impl BrowserSession {
             child: Some(child),
             stop,
             thread: Some(thread),
+            port,
         })
     }
 }
@@ -238,6 +242,9 @@ impl BrowserSession {
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        // Best-effort: only clear the published endpoint if it still points at *our*
+        // Chrome (a newer pane may have already overwritten the file).
+        clear_endpoint_if_ours(self.port);
         // Killing Chrome closes the CDP socket, which unblocks the thread's read
         // so it exits on its own; we don't join (avoid stalling the UI thread).
         if let Some(mut child) = self.child.take() {
@@ -252,6 +259,52 @@ impl Drop for BrowserSession {
 fn free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
     Ok(listener.local_addr()?.port())
+}
+
+/// Where the most-recently-opened browser pane publishes its CDP endpoint, so
+/// plugins (e.g. the `agent-browser` plugin) can attach a CDP client to the same
+/// Chrome the pane is screencasting. Last writer wins; we don't track multiple
+/// panes (sufficient for the agent-driven workflow). Falls back to `$TMPDIR` if
+/// `$HOME` is unset.
+fn endpoint_file_path() -> std::path::PathBuf {
+    let dir = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|h| h.join(".warp/oh-my-warp"))
+        .unwrap_or_else(|| std::env::temp_dir().join("oh-my-warp"));
+    dir.join("browser-active.json")
+}
+
+/// Publishes the current pane's CDP `port`/`wsUrl` for plugins to attach to.
+/// Best-effort: a write failure is logged but doesn't abort the session.
+fn write_endpoint(port: u16, ws_url: &str) {
+    let path = endpoint_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let body = json!({ "port": port, "wsUrl": ws_url }).to_string();
+    if let Err(e) = std::fs::write(&path, body) {
+        log::warn!(
+            "[omw-browser] failed to publish CDP endpoint to {}: {e}",
+            path.display()
+        );
+    } else {
+        log::info!("[omw-browser] published CDP endpoint to {}", path.display());
+    }
+}
+
+/// Removes the published endpoint file iff it still points at our `port` (i.e.
+/// a newer pane hasn't already overwritten it).
+fn clear_endpoint_if_ours(our_port: u16) {
+    let path = endpoint_file_path();
+    let Ok(body) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return;
+    };
+    if val.get("port").and_then(|p| p.as_u64()) == Some(our_port as u64) {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 /// Polls `GET /json` until a `page` target with a WebSocket URL is available.
@@ -408,6 +461,9 @@ fn run_session(
     stop: &AtomicBool,
 ) -> Result<()> {
     let ws_url = discover_target(port, stop)?;
+    // Publish the endpoint as soon as Chrome is reachable, so plugins can attach
+    // (e.g. `agent-browser --cdp <port>`) before screencast input/output starts.
+    write_endpoint(port, &ws_url);
     let stream = TcpStream::connect(("127.0.0.1", port)).context("connect CDP TCP socket")?;
     stream.set_nodelay(true).ok();
     let (mut socket, _resp) = tungstenite::client::client(ws_url.as_str(), stream)
