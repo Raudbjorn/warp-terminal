@@ -205,6 +205,10 @@ pub enum TerminalAction {
     SplitLeft(Option<AvailableShell>),
     SplitDown(Option<AvailableShell>),
     SplitUp(Option<AvailableShell>),
+    /// oh-my-warp: open an embedded browser pane as a right-split (dispatches
+    /// `WorkspaceAction::OpenBrowserPane`). Surfaced as "Launch Web Pane" in the
+    /// terminal context menu.
+    OpenBrowserPaneSplit,
     /// The context menu that's used for the prompt directly above input editor
     PromptContextMenu {
         position_offset_from_prompt: Vector2F,
@@ -565,6 +569,7 @@ impl fmt::Debug for TerminalAction {
             SplitLeft(_) => f.write_str("SplitLeft"),
             SplitDown(_) => f.write_str("SplitDown"),
             SplitUp(_) => f.write_str("SplitUp"),
+            OpenBrowserPaneSplit => f.write_str("OpenBrowserPaneSplit"),
             ToggleMaximizePane => f.write_str("ToggleMaximizeActivePane"),
             PromptContextMenu {
                 position_offset_from_prompt,

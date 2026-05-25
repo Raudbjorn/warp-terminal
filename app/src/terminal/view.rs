@@ -17382,6 +17382,10 @@ impl TerminalView {
                         ctx,
                     ))
                     .into_item(),
+                // oh-my-warp: launch an embedded browser pane as a right-split.
+                MenuItemFields::new("Launch Web Pane")
+                    .with_on_select_action(TerminalAction::OpenBrowserPaneSplit)
+                    .into_item(),
             ]);
         }
 
@@ -25881,6 +25885,7 @@ impl TypedActionView for TerminalView {
             | SplitLeft(_)
             | SplitDown(_)
             | SplitUp(_)
+            | OpenBrowserPaneSplit
             | OpenGridLink(_)
             | OpenRichContentLink(_)
             | ToggleGridSecret { .. }
@@ -26269,6 +26274,12 @@ impl TypedActionView for TerminalView {
             }
             SplitUp(chosen_shell) => {
                 ctx.emit(Event::Pane(PaneEvent::SplitUp(chosen_shell.to_owned())))
+            }
+            OpenBrowserPaneSplit => {
+                // oh-my-warp: split a browser pane to the right of the active
+                // pane group. Reuses the same workspace action the tab right-click
+                // menu and the leader chord use.
+                ctx.dispatch_typed_action(&WorkspaceAction::OpenBrowserPane);
             }
             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
             PromptContextMenu {

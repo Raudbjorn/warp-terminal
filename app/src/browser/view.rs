@@ -127,6 +127,10 @@ pub enum BrowserViewAction {
     CopyUrl,
     /// Open the current page URL in the system default browser.
     OpenInSystemBrowser,
+    /// Launch another embedded browser pane as a right-split (dispatches
+    /// `WorkspaceAction::OpenBrowserPane`). Surfaced as "Launch Web Pane"
+    /// in the page right-click menu.
+    LaunchWebPaneSplit,
 }
 
 /// A pane view that renders a live, interactive browser viewport over CDP.
@@ -311,6 +315,10 @@ impl BrowserView {
                 .into_item(),
             MenuItemFields::new("Open in System Browser")
                 .with_on_select_action(BrowserViewAction::OpenInSystemBrowser)
+                .into_item(),
+            MenuItem::Separator,
+            MenuItemFields::new("Launch Web Pane")
+                .with_on_select_action(BrowserViewAction::LaunchWebPaneSplit)
                 .into_item(),
         ];
         self.right_click_menu.update(ctx, |menu, view_ctx| {
@@ -735,6 +743,12 @@ impl TypedActionView for BrowserView {
             }
             BrowserViewAction::OpenInSystemBrowser => {
                 open_in_system_browser(&self.url);
+            }
+            BrowserViewAction::LaunchWebPaneSplit => {
+                // Reuse the workspace action the tab right-click menu and leader
+                // chord use, so the new pane lands as a right-split of the
+                // active pane group (with the configured home URL).
+                ctx.dispatch_typed_action(&crate::workspace::WorkspaceAction::OpenBrowserPane);
             }
         }
     }
