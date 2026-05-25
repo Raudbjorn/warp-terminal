@@ -93,6 +93,12 @@ fn leader_bindings() -> Vec<(&'static str, &'static str, &'static str, Workspace
             "w",
             WorkspaceAction::OpenBrowserPane,
         ), // oh-my-warp: embedded browser pane (w = web)
+        (
+            "leader:toggle_broadcast",
+            "Leader: Toggle Broadcast Input",
+            "s",
+            WorkspaceAction::ToggleSyncTerminalInputsInTab,
+        ), // tmux: synchronize-panes (s = sync) — type once, send to every pane in the tab
     ]
 }
 
