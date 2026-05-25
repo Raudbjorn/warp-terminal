@@ -2218,6 +2218,12 @@ impl Workspace {
                 // `BrowserView::new` via the one-shot URL override.
                 me.open_web_tab(Some(url.clone()), ctx);
             }
+            crate::plugin::PluginHostEvent::OpenProject { path } => {
+                // Backs the sessionizer plugin: focus an existing tab rooted at
+                // `path` if one is open, else open a new one (tmux-sessionizer's
+                // switch-or-create).
+                me.open_or_focus_project(path, ctx);
+            }
         });
     }
 
@@ -12755,6 +12761,36 @@ impl Workspace {
         }
     }
 
+    /// Switch-or-create for a project directory (backs `warp.ui.openProject`): if
+    /// any tab already has a terminal whose cwd is `path` (or a subdirectory of
+    /// it), activate that tab; otherwise open a fresh tab rooted at `path`. This
+    /// gives the sessionizer tmux-style "jump to the session if it exists" behavior
+    /// rather than piling up duplicate tabs.
+    fn open_or_focus_project(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
+        let target = PathBuf::from(path);
+        let mut existing_tab: Option<usize> = None;
+        for index in 0..self.tabs.len() {
+            let Some(pane_group) = self.get_pane_group_view(index).cloned() else {
+                continue;
+            };
+            let rooted_here = pane_group
+                .as_ref(ctx)
+                .terminal_view_working_directories(ctx)
+                .any(|(_, cwd)| match cwd {
+                    Some(LocalOrRemotePath::Local(p)) => p == target || p.starts_with(&target),
+                    _ => false,
+                });
+            if rooted_here {
+                existing_tab = Some(index);
+                break;
+            }
+        }
+        match existing_tab {
+            Some(index) => self.activate_tab(index, ctx),
+            None => self.handle_open_repository(path, ctx),
+        }
+    }
+
     fn handle_open_repository(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
         let path_buf = PathBuf::from(path);
         ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
@@ -23259,7 +23295,20 @@ impl TypedActionView for Workspace {
         match action {
             RunPluginCommand(command_id) => {
                 #[cfg(feature = "plugin_host")]
-                crate::plugin::commands::run_plugin_command(command_id, ctx);
+                {
+                    // oh-my-warp: a palette item whose command id is
+                    // `warp:openProject:<path>` opens that project (switch-or-create)
+                    // instead of running a registered plugin command. This lets
+                    // plugins (e.g. sessionizer) build fully-dynamic project pickers
+                    // via `showPalette` without registering a command per project —
+                    // which would re-enter `plugin.get_mut()` from inside the command
+                    // callback and crash the host.
+                    if let Some(path) = command_id.strip_prefix("warp:openProject:") {
+                        self.open_or_focus_project(path, ctx);
+                    } else {
+                        crate::plugin::commands::run_plugin_command(command_id, ctx);
+                    }
+                }
                 #[cfg(not(feature = "plugin_host"))]
                 let _ = command_id;
             }

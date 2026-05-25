@@ -254,7 +254,8 @@ fn network_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
 /// Returns a JS object representing the UI namespace for the Warp Plugin API.
 ///
 /// `toast(message, kind?)` — transient toast; `showMarkdown(title, markdown)` — markdown panel;
-/// `showPalette(title, items)` — command picker; `openWebTab(url)` — open an embedded browser pane.
+/// `showPalette(title, items)` — command picker; `openWebTab(url)` — open an embedded browser pane;
+/// `openProject(path)` — open a new tab with a terminal rooted at `path`.
 ///
 /// Each request is enqueued (non-blocking) and relayed to the app on a background task; we must not
 /// do the blocking IPC inline on the plugin runner thread (see `super::app_request`).
@@ -307,6 +308,14 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
         "openWebTab",
         Function::new(ctx, |url: String| {
             super::app_request::send_app_request(PluginAppRequest::OpenWebTab { url });
+        }),
+    )?;
+    // `openProject(path)` — opens a new tab with a terminal rooted at `path` (the tmux-sessionizer
+    // workflow). Fire-and-forget.
+    ui.set(
+        "openProject",
+        Function::new(ctx, |path: String| {
+            super::app_request::send_app_request(PluginAppRequest::OpenProject { path });
         }),
     )?;
     Ok(ui)

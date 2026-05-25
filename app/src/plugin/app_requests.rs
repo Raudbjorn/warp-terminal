@@ -50,6 +50,8 @@ pub enum PluginAppRequest {
     },
     /// Open an embedded browser pane navigated to `url` (`warp.ui.openWebTab`).
     OpenWebTab { url: String },
+    /// Open a new tab with a terminal rooted at `path` (`warp.ui.openProject`).
+    OpenProject { path: String },
 }
 
 static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();

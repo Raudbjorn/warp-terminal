@@ -179,6 +179,9 @@ impl PluginHost {
             PluginAppRequest::OpenWebTab { url } => {
                 ctx.emit(PluginHostEvent::OpenWebTab { url });
             }
+            PluginAppRequest::OpenProject { path } => {
+                ctx.emit(PluginHostEvent::OpenProject { path });
+            }
         }
     }
 }
@@ -196,6 +199,8 @@ pub enum PluginHostEvent {
     },
     /// Open an embedded browser pane navigated to `url` (`warp.ui.openWebTab`).
     OpenWebTab { url: String },
+    /// Open a new tab with a terminal rooted at `path` (`warp.ui.openProject`).
+    OpenProject { path: String },
 }
 
 impl Drop for PluginHost {
