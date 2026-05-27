@@ -2,6 +2,7 @@ mod service_impl;
 
 use std::sync::Arc;
 
+use crate::context_chips::plugin_prompt::PromptSegment;
 use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
 use crate::view_components::{DismissibleToast, ToastFlavor};
 use crate::workspace::{ToastStack, WorkspaceAction};
@@ -182,6 +183,15 @@ impl PluginHost {
             PluginAppRequest::OpenProject { path } => {
                 ctx.emit(PluginHostEvent::OpenProject { path });
             }
+            PluginAppRequest::SetPrompt {
+                plugin_id,
+                segments,
+            } => {
+                ctx.emit(PluginHostEvent::SetPrompt {
+                    plugin_id,
+                    segments,
+                });
+            }
         }
     }
 }
@@ -201,6 +211,11 @@ pub enum PluginHostEvent {
     OpenWebTab { url: String },
     /// Open a new tab with a terminal rooted at `path` (`warp.ui.openProject`).
     OpenProject { path: String },
+    /// Replace a plugin's prompt segments (`warp.prompt.set`; empty `segments` clears them).
+    SetPrompt {
+        plugin_id: String,
+        segments: Vec<PromptSegment>,
+    },
 }
 
 impl Drop for PluginHost {

@@ -2,6 +2,7 @@ use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
 
 use super::manifest::Manifest;
 use super::plugin::PluginHandle;
+use crate::context_chips::plugin_prompt::{PromptSegment, PromptSide};
 use crate::plugin::ai_tools::ToolOutput;
 use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
 use crate::plugin::events::{
@@ -73,6 +74,7 @@ pub fn warp<'js>(
     }
     if manifest.permits("ui") {
         api.set("ui", ui(ctx)?)?;
+        api.set("prompt", prompt(plugin_id.to_string(), ctx)?)?;
     }
     if manifest.permits("ai") {
         api.set("ai", ai(plugin.clone(), ctx)?)?;
@@ -319,6 +321,60 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
         }),
     )?;
     Ok(ui)
+}
+
+/// Returns the `warp.prompt` namespace (capability: `ui`) — plugin-contributed prompt segments.
+///
+/// `set(segments)` — `segments` is `[{ text, side?, tooltip? }]` (`side`: `"left"` | `"right"`,
+///     default left). Replaces *this plugin's* segments in the native prompt (empty array clears);
+///     `clear()` removes them. They render as native chips after the built-in ones. The plugin
+///     chooses when to refresh (e.g. from `terminal.onCommandFinished` or a timer). Fire-and-forget,
+///     like the other relays (see `super::app_request`). The calling plugin's id is captured so each
+///     plugin owns its own segments.
+fn prompt<'js>(plugin_id: String, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+    let prompt = Object::new(ctx)?;
+
+    let set_plugin_id = plugin_id.clone();
+    prompt.set(
+        "set",
+        Function::new(ctx, move |segments: Vec<Object<'js>>| {
+            let segments: Vec<PromptSegment> = segments
+                .into_iter()
+                .filter_map(|seg| {
+                    let text: String = seg.get("text").ok()?;
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let side = match seg.get::<_, String>("side").ok().as_deref() {
+                        Some("right") => PromptSide::Right,
+                        _ => PromptSide::Left,
+                    };
+                    let tooltip: Option<String> = seg.get("tooltip").ok();
+                    Some(PromptSegment {
+                        text,
+                        side,
+                        tooltip,
+                    })
+                })
+                .collect();
+            super::app_request::send_app_request(PluginAppRequest::SetPrompt {
+                plugin_id: set_plugin_id.clone(),
+                segments,
+            });
+        }),
+    )?;
+
+    prompt.set(
+        "clear",
+        Function::new(ctx, move || {
+            super::app_request::send_app_request(PluginAppRequest::SetPrompt {
+                plugin_id: plugin_id.clone(),
+                segments: Vec::new(),
+            });
+        }),
+    )?;
+
+    Ok(prompt)
 }
 
 /// Returns a JS object representing the Keymap namespace for the Warp Plugin API.

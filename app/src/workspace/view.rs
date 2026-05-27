@@ -2224,6 +2224,17 @@ impl Workspace {
                 // switch-or-create).
                 me.open_or_focus_project(path, ctx);
             }
+            crate::plugin::PluginHostEvent::SetPrompt {
+                plugin_id,
+                segments,
+            } => {
+                // Store the plugin's prompt segments (`warp.prompt.set`); every
+                // `PromptDisplay` observes this singleton model and re-renders.
+                crate::context_chips::plugin_prompt::PluginPromptModel::handle(ctx)
+                    .update(ctx, |model, ctx| {
+                        model.set(plugin_id.clone(), segments.clone(), ctx)
+                    });
+            }
         });
     }
 

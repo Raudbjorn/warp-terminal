@@ -1848,6 +1848,9 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(
         ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel::new,
     );
+    // oh-my-warp: holds plugin-contributed prompt segments (`warp.prompt.set`). Registered
+    // unconditionally so the prompt render path never depends on the plugin host being built in.
+    ctx.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
     ctx.add_singleton_model(
         ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::new,
     );

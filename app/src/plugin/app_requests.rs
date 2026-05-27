@@ -12,6 +12,8 @@ use std::sync::OnceLock;
 use async_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
+use crate::context_chips::plugin_prompt::PromptSegment;
+
 /// One entry of a plugin-driven picker (`warp.ui.showPalette`): a label plus the id of the plugin
 /// command (registered via `warp.commands.register`) to run when the user picks it.
 ///
@@ -52,6 +54,11 @@ pub enum PluginAppRequest {
     OpenWebTab { url: String },
     /// Open a new tab with a terminal rooted at `path` (`warp.ui.openProject`).
     OpenProject { path: String },
+    /// Replace a plugin's prompt segments (`warp.prompt.set`; empty `segments` clears them).
+    SetPrompt {
+        plugin_id: String,
+        segments: Vec<PromptSegment>,
+    },
 }
 
 static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();
