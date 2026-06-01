@@ -246,6 +246,12 @@ pub struct SpawnAgentRequest {
     /// Set by the client when cloud conversation storage is disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_disabled: Option<bool>,
+    /// True when the source conversation was part of an orchestration tree at
+    /// handoff time. Only set on local-to-cloud handoff spawns from an
+    /// orchestrated source; absent otherwise. The server uses it to inject the
+    /// universal hidden first-turn orchestration handoff message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orchestration_handoff: Option<bool>,
 }
 
 /// Server-minted token returned by `POST /agent/handoff/upload-snapshot` that scopes a batch

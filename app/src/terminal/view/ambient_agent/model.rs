@@ -160,6 +160,9 @@ pub(crate) struct PendingHandoff {
     /// stashed here so `maybe_auto_submit_handoff` can consume it once
     /// the touched workspace and snapshot upload have settled.
     pub(crate) auto_submit: Option<PendingCloudLaunch>,
+    /// True when the source conversation was orchestrated at handoff time.
+    /// Forwarded to the server as `SpawnAgentRequest.orchestration_handoff`.
+    pub(crate) orchestration_handoff: Option<bool>,
 }
 
 /// Status of the ambient agent run.
@@ -651,6 +654,10 @@ impl AmbientAgentViewModel {
             initial_snapshot_token,
             agent_identity_uid: None,
             snapshot_disabled: should_disable_snapshot(ctx).then_some(true),
+            orchestration_handoff: self
+                .pending_handoff
+                .as_ref()
+                .and_then(|h| h.orchestration_handoff),
         }
     }
 
@@ -1148,6 +1155,7 @@ impl AmbientAgentViewModel {
             conversation_id: None,
             initial_snapshot_token: None,
             snapshot_disabled: should_disable_snapshot(ctx).then_some(true),
+            orchestration_handoff: None,
         };
 
         self.spawn_internal(request, ctx);
