@@ -2113,11 +2113,23 @@ impl Workspace {
     ) -> ModalViewState<Modal<PluginMarkdownModal>> {
         let body = ctx.add_view(PluginMarkdownModal::new);
         let modal = ctx.add_typed_action_view(|ctx| {
+            // Wider canvas + uniform inner padding so headings/lists breathe; the body itself wraps
+            // the markdown in a ClippedScrollable so long docs stay inside the frame. Title is
+            // replaced by `show_plugin_markdown` with the plugin-supplied one.
             Modal::new(Some("Plugin".to_string()), body, ctx)
                 .with_dismiss_on_click()
                 .with_modal_style(UiComponentStyles {
-                    width: Some(560.),
-                    height: Some(520.),
+                    width: Some(640.),
+                    height: Some(560.),
+                    ..Default::default()
+                })
+                .with_body_style(UiComponentStyles {
+                    padding: Some(Coords {
+                        top: 20.,
+                        bottom: 20.,
+                        left: 28.,
+                        right: 28.,
+                    }),
                     ..Default::default()
                 })
         });
