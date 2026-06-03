@@ -2,7 +2,7 @@ use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
 
 use super::manifest::Manifest;
 use super::plugin::PluginHandle;
-use crate::context_chips::plugin_prompt::{PromptSegment, PromptSide};
+use crate::context_chips::plugin_prompt::{PromptKind, PromptSegment, PromptSide};
 use crate::plugin::ai_tools::ToolOutput;
 use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
 use crate::plugin::events::{
@@ -360,11 +360,24 @@ fn prompt<'js>(plugin_id: String, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>
                         Some("right") => PromptSide::Right,
                         _ => PromptSide::Left,
                     };
+                    // `kind` is optional; an unknown value silently falls back to Info so a
+                    // plugin shipped before the field existed (or one targeting a newer Warp)
+                    // still renders.
+                    let kind = match seg.get::<_, String>("kind").ok().as_deref() {
+                        Some("success") => PromptKind::Success,
+                        Some("warn") => PromptKind::Warn,
+                        Some("error") => PromptKind::Error,
+                        Some("accent") => PromptKind::Accent,
+                        _ => PromptKind::Info,
+                    };
                     let tooltip: Option<String> = seg.get("tooltip").ok();
+                    let icon: Option<String> = seg.get("icon").ok();
                     Some(PromptSegment {
                         text,
                         side,
                         tooltip,
+                        kind,
+                        icon,
                     })
                 })
                 .collect();
