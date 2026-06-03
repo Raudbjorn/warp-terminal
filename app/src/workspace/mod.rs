@@ -15,6 +15,8 @@ mod home;
 mod lightbox_view;
 mod native_modal;
 mod one_time_modal_model;
+// oh-my-warp: tab-bar status pills contributed by plugins (`warp.ui.setStatusItem`).
+pub(crate) mod plugin_status_items;
 mod registry;
 pub mod rewind_confirmation_dialog;
 pub mod sync_inputs;

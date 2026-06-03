@@ -2247,6 +2247,20 @@ impl Workspace {
                         model.set(plugin_id.clone(), segments.clone(), ctx)
                     });
             }
+            crate::plugin::PluginHostEvent::SetStatusItem {
+                plugin_id,
+                item_id,
+                item,
+            } => {
+                // Store the plugin's tab-bar pill (`warp.ui.setStatusItem`). The tab-bar render
+                // path observes the singleton (see `Workspace::new`) and re-renders.
+                crate::workspace::plugin_status_items::PluginStatusItemsModel::handle(ctx).update(
+                    ctx,
+                    |model, ctx| {
+                        model.set(plugin_id.clone(), item_id.clone(), item.clone(), ctx);
+                    },
+                );
+            }
         });
     }
 
@@ -2994,6 +3008,16 @@ impl Workspace {
         ctx.observe(&RelaunchModel::handle(ctx), |_, _, ctx| {
             ctx.notify();
         });
+
+        // oh-my-warp: re-render the tab bar when a plugin pushes a status pill
+        // (`warp.ui.setStatusItem`). The render path reads the singleton each frame; this just
+        // wakes us up when it changes.
+        ctx.observe(
+            &crate::workspace::plugin_status_items::PluginStatusItemsModel::handle(ctx),
+            |_, _, ctx| {
+                ctx.notify();
+            },
+        );
 
         let changelog_model = ChangelogModel::handle(ctx);
         ctx.subscribe_to_model(&changelog_model, |me, _, event, ctx| {
@@ -20233,6 +20257,13 @@ impl Workspace {
         // oh-my-warp: show the leader/prefix indicator while a chord is pending.
         if let Some(indicator) = self.render_leader_indicator(appearance, ctx) {
             tab_bar.add_child(indicator);
+        }
+        // oh-my-warp: render plugin-contributed status pills (`warp.ui.setStatusItem`) right of
+        // the leader indicator — same anchor, so they share the "system status" eyeline.
+        if let Some(pills) =
+            crate::workspace::plugin_status_items::render_plugin_status_items(ctx, appearance)
+        {
+            tab_bar.add_child(pills);
         }
         let is_web_anonymous_user = self
             .auth_state

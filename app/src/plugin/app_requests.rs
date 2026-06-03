@@ -13,6 +13,7 @@ use async_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
 use crate::context_chips::plugin_prompt::PromptSegment;
+use crate::workspace::plugin_status_items::StatusItem;
 
 /// One entry of a plugin-driven picker (`warp.ui.showPalette`): a label plus the id of the plugin
 /// command (registered via `warp.commands.register`) to run when the user picks it.
@@ -69,6 +70,14 @@ pub enum PluginAppRequest {
     SetPrompt {
         plugin_id: String,
         segments: Vec<PromptSegment>,
+    },
+    /// Set (or remove, when `item` is `None`) a plugin-contributed status pill in the tab bar
+    /// (`warp.ui.setStatusItem`). Identity is `(plugin_id, item_id)` so one plugin can publish
+    /// several pills (e.g. branch + CI + queue) and update them independently.
+    SetStatusItem {
+        plugin_id: String,
+        item_id: String,
+        item: Option<StatusItem>,
     },
 }
 

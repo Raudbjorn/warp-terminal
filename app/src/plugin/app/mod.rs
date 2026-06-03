@@ -192,6 +192,17 @@ impl PluginHost {
                     segments,
                 });
             }
+            PluginAppRequest::SetStatusItem {
+                plugin_id,
+                item_id,
+                item,
+            } => {
+                ctx.emit(PluginHostEvent::SetStatusItem {
+                    plugin_id,
+                    item_id,
+                    item,
+                });
+            }
         }
     }
 }
@@ -215,6 +226,14 @@ pub enum PluginHostEvent {
     SetPrompt {
         plugin_id: String,
         segments: Vec<PromptSegment>,
+    },
+    /// Set (or remove, when `item` is `None`) a plugin-contributed tab-bar status pill
+    /// (`warp.ui.setStatusItem`). The `Workspace` updates the `PluginStatusItemsModel` singleton,
+    /// which the tab bar observes for re-renders.
+    SetStatusItem {
+        plugin_id: String,
+        item_id: String,
+        item: Option<crate::workspace::plugin_status_items::StatusItem>,
     },
 }
 

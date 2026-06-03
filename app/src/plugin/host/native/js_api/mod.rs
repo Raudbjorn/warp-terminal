@@ -9,6 +9,7 @@ use crate::plugin::events::{
     CommandFinishedEvent, CommandStartedEvent, OptionalToast, EVENT_COMMAND_FINISHED,
     EVENT_COMMAND_STARTED,
 };
+use crate::workspace::plugin_status_items::{StatusItem, StatusItemKind};
 
 /// Semantic version of the `warp.*` plugin API surface. Plugins declare the range
 /// they target via `engines.warp` in their manifest; the surface evolves additively
@@ -73,7 +74,11 @@ pub fn warp<'js>(
         api.set("terminal", terminal(plugin.clone(), ctx)?)?;
     }
     if manifest.permits("ui") {
-        api.set("ui", ui(ctx)?)?;
+        let ui_obj = ui(ctx)?;
+        // `setStatusItem` needs the plugin id so each pill is identified per-plugin; install it as
+        // a per-plugin overlay on the shared `ui` object after the base namespace is built.
+        install_set_status_item(&ui_obj, plugin_id.to_string(), ctx)?;
+        api.set("ui", ui_obj)?;
         api.set("prompt", prompt(plugin_id.to_string(), ctx)?)?;
     }
     if manifest.permits("ai") {
@@ -332,6 +337,54 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
         }),
     )?;
     Ok(ui)
+}
+
+/// Returns the `warp.ui.setStatusItem`-aware bindings as a `(plugin_id, ui_object)` overlay. The
+/// `ui` namespace is shared across plugins (one function per method), so we install per-plugin
+/// `setStatusItem` separately in [`warp`] after building the base `ui` object — that way each
+/// plugin's call carries its own id without us threading it through every method.
+fn install_set_status_item<'js>(
+    ui: &Object<'js>,
+    plugin_id: String,
+    ctx: Ctx<'js>,
+) -> rquickjs::Result<()> {
+    // `setStatusItem(id, item|null)` — `item` is `{ text, kind?, tooltip?, command? }`. Passing
+    // `null` (or any non-object) removes the pill. The pill is identified by `(plugin_id, id)`, so
+    // a plugin can publish several pills and update each independently.
+    ui.set(
+        "setStatusItem",
+        Function::new(ctx, move |item_id: String, item: Opt<Object<'js>>| {
+            let item = item.0.and_then(|obj| {
+                let text: String = obj.get("text").ok()?;
+                if text.is_empty() {
+                    // Empty text is treated as a remove, so plugins don't need separate clear
+                    // call sites (`setStatusItem("ci", { text: "" })` is fine).
+                    return None;
+                }
+                let kind = match obj.get::<_, String>("kind").ok().as_deref() {
+                    Some("success") => StatusItemKind::Success,
+                    Some("warn") => StatusItemKind::Warn,
+                    Some("error") => StatusItemKind::Error,
+                    Some("accent") => StatusItemKind::Accent,
+                    _ => StatusItemKind::Info,
+                };
+                let tooltip: Option<String> = obj.get("tooltip").ok();
+                let command_id: Option<String> = obj.get("command").ok();
+                Some(StatusItem {
+                    text,
+                    kind,
+                    tooltip,
+                    command_id,
+                })
+            });
+            super::app_request::send_app_request(PluginAppRequest::SetStatusItem {
+                plugin_id: plugin_id.clone(),
+                item_id,
+                item,
+            });
+        }),
+    )?;
+    Ok(())
 }
 
 /// Returns the `warp.prompt` namespace (capability: `ui`) — plugin-contributed prompt segments.

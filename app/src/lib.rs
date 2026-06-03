@@ -1851,6 +1851,12 @@ pub(crate) fn initialize_app(
     // oh-my-warp: holds plugin-contributed prompt segments (`warp.prompt.set`). Registered
     // unconditionally so the prompt render path never depends on the plugin host being built in.
     ctx.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
+    // oh-my-warp: holds plugin-contributed tab-bar status pills (`warp.ui.setStatusItem`). Same
+    // pattern as `PluginPromptModel`: registered unconditionally so the tab-bar render path doesn't
+    // depend on the plugin host being built in (empty store ↔ no pills).
+    ctx.add_singleton_model(|_| {
+        crate::workspace::plugin_status_items::PluginStatusItemsModel::new()
+    });
     ctx.add_singleton_model(
         ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::new,
     );
