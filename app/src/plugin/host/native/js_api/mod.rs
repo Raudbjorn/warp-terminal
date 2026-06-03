@@ -283,10 +283,12 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
             });
         }),
     )?;
-    // `showPalette(title, items)` — `items` is `[{ label, command }]` where `command` is a command
-    // id registered via `warp.commands.register`. On selection the app dispatches that command as a
-    // fresh `RunPluginCommand`. Items reference command ids (not inline callbacks) so this never
-    // re-enters `plugin.get_mut()` from inside the calling callback. See PLUGIN_SPEC.md (M4).
+    // `showPalette(title, items)` — `items` is `[{ label, command, description?, icon?, kbd? }]`
+    // where `command` is a command id registered via `warp.commands.register`. On selection the app
+    // dispatches that command as a fresh `RunPluginCommand`. Items reference command ids (not inline
+    // callbacks) so this never re-enters `plugin.get_mut()` from inside the calling callback. The
+    // optional `description` / `icon` / `kbd` fields drive the row's decoration (see
+    // `PalettePluginItem`). See PLUGIN_SPEC.md (M4).
     ui.set(
         "showPalette",
         Function::new(ctx, |title: String, items: Vec<Object<'js>>| {
@@ -295,7 +297,16 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
                 .filter_map(|item| {
                     let label: String = item.get("label").ok()?;
                     let command_id: String = item.get("command").ok()?;
-                    Some(PalettePluginItem { label, command_id })
+                    let description: Option<String> = item.get("description").ok();
+                    let icon: Option<String> = item.get("icon").ok();
+                    let kbd: Option<String> = item.get("kbd").ok();
+                    Some(PalettePluginItem {
+                        label,
+                        command_id,
+                        description,
+                        icon,
+                        kbd,
+                    })
                 })
                 .collect();
             super::app_request::send_app_request(PluginAppRequest::ShowPalette {

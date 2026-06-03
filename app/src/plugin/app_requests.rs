@@ -21,10 +21,21 @@ use crate::context_chips::plugin_prompt::PromptSegment;
 /// fresh top-level `WorkspaceAction::RunPluginCommand`. Registering a callback at `showPalette` time
 /// would re-enter `plugin.get_mut()` while the calling command callback already holds that borrow,
 /// panicking the plugin host (`BorrowMutError`). See PLUGIN_SPEC.md (M4).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// `icon` / `description` / `kbd` are optional VS-Code-style decoration: a sigil rendered before the
+/// label, a dimmed inline subtitle (right-aligned), and a small monospace keystroke hint. They have
+/// no effect on the dispatched command id; they exist to help plugin authors build self-explanatory
+/// pickers without inventing their own UI.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PalettePluginItem {
     pub label: String,
     pub command_id: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub icon: Option<String>,
+    #[serde(default)]
+    pub kbd: Option<String>,
 }
 
 /// Severity of a toast requested via `warp.ui.toast`.
