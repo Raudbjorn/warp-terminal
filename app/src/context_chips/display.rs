@@ -11,10 +11,8 @@ use warpui::{
     View, ViewContext, ViewHandle,
 };
 
-use super::display_chip::{
-    render_udi_chip, DisplayChip, DisplayChipConfig, PromptDisplayChipEvent, UdiChipConfig,
-};
-use super::plugin_prompt::PluginPromptModel;
+use super::display_chip::{DisplayChip, DisplayChipConfig, PromptDisplayChipEvent};
+use super::plugin_prompt::{render_plugin_chips_for_side, PluginPromptModel, PromptSide};
 use super::prompt_type::PromptType;
 use super::{git_line_changes_from_chips, ChipResult, ContextChipKind};
 use crate::ai::blocklist::agent_view::AgentViewController;
@@ -443,16 +441,14 @@ impl View for PromptDisplay {
         });
 
         // oh-my-warp: append plugin-contributed segments (`warp.prompt.set`) as native chips —
-        // left-grouped segments first, then right-grouped. (True right-edge alignment is a follow-up;
-        // the modern UDI prompt has no rprompt region.)
-        let plugin_prompt = PluginPromptModel::as_ref(app);
-        if !plugin_prompt.is_empty() {
-            let appearance = Appearance::as_ref(app);
-            let color = appearance.theme().ansi_fg_blue();
-            for segment in plugin_prompt.ordered_segments() {
-                let config = UdiChipConfig::new(color, segment.text.clone());
-                row.add_child(render_udi_chip(config, appearance));
-            }
+        // left-grouped first, then right-grouped. (True right-edge alignment is a follow-up;
+        // the modern UDI prompt has no rprompt region.) Same helper feeds the agent input footer.
+        let appearance = Appearance::as_ref(app);
+        for elem in render_plugin_chips_for_side(PromptSide::Left, app, appearance) {
+            row.add_child(elem);
+        }
+        for elem in render_plugin_chips_for_side(PromptSide::Right, app, appearance) {
+            row.add_child(elem);
         }
 
         // This is a hack to apply horizontal clipping without vertical clipping (for padding).

@@ -13,7 +13,11 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use warpui::{Entity, ModelContext, SingletonEntity};
+use warpui::elements::Element;
+use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
+
+use super::display_chip::{render_udi_chip, UdiChipConfig};
+use crate::appearance::Appearance;
 
 /// Which side of the prompt a segment is grouped on. Left segments render first (after the built-in
 /// chips), then right segments. (True right-edge alignment is classic-mode only; see PLUGIN_SPEC.md.)
@@ -65,26 +69,40 @@ impl PluginPromptModel {
         ctx.notify();
     }
 
-    /// All segments in render order: every left segment (across plugins, by plugin id) then every
-    /// right segment.
-    pub fn ordered_segments(&self) -> Vec<&PromptSegment> {
-        let mut out: Vec<&PromptSegment> = Vec::new();
-        for seg in self.segments_by_plugin.values().flatten() {
-            if matches!(seg.side, PromptSide::Left) {
-                out.push(seg);
-            }
-        }
-        for seg in self.segments_by_plugin.values().flatten() {
-            if matches!(seg.side, PromptSide::Right) {
-                out.push(seg);
-            }
-        }
-        out
+    /// All segments for one side, across all plugins (plugin-id order, deterministic).
+    pub fn segments_for_side(&self, side: PromptSide) -> impl Iterator<Item = &PromptSegment> {
+        self.segments_by_plugin
+            .values()
+            .flatten()
+            .filter(move |s| s.side == side)
     }
 
     pub fn is_empty(&self) -> bool {
         self.segments_by_plugin.is_empty()
     }
+}
+
+/// Renders the plugin-pushed segments for one side as native chip elements. Returns an empty `Vec`
+/// when no plugin has pushed segments for that side; callers can `for elem in … { row.add_child(elem) }`
+/// without any guarding. Used by `PromptDisplay::render` (terminal prompt) and the agent input
+/// footer (`agent_view::agent_input_footer`) so plugin chips appear consistently in both surfaces.
+pub fn render_plugin_chips_for_side(
+    side: PromptSide,
+    app: &AppContext,
+    appearance: &Appearance,
+) -> Vec<Box<dyn Element>> {
+    let model = PluginPromptModel::as_ref(app);
+    if model.is_empty() {
+        return Vec::new();
+    }
+    let color = appearance.theme().ansi_fg_blue();
+    model
+        .segments_for_side(side)
+        .map(|seg| {
+            let config = UdiChipConfig::new(color, seg.text.clone());
+            render_udi_chip(config, appearance)
+        })
+        .collect()
 }
 
 pub enum PluginPromptEvent {

@@ -62,6 +62,7 @@ use crate::appearance::Appearance;
 use crate::auth::{AuthManager, AuthStateProvider};
 use crate::completer::SessionContext;
 use crate::context_chips::display_chip::{DisplayChip, DisplayChipConfig, PromptChipShellCommand};
+use crate::context_chips::plugin_prompt::{render_plugin_chips_for_side, PromptSide};
 use crate::context_chips::prompt_type::PromptType;
 use crate::context_chips::{self, ContextChipKind};
 use crate::features::FeatureFlag;
@@ -1584,6 +1585,10 @@ impl AgentInputFooter {
                 left_buttons.add_child(element);
             }
         }
+        // oh-my-warp: plugin-contributed prompt segments (`warp.prompt.set`).
+        for elem in render_plugin_chips_for_side(PromptSide::Left, app, appearance) {
+            left_buttons.add_child(elem);
+        }
 
         let mut right_buttons = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -1599,6 +1604,10 @@ impl AgentInputFooter {
             ) {
                 right_buttons.add_child(element);
             }
+        }
+        // oh-my-warp: plugin-contributed prompt segments (`warp.prompt.set`).
+        for elem in render_plugin_chips_for_side(PromptSide::Right, app, appearance) {
+            right_buttons.add_child(elem);
         }
 
         let content = Wrap::row()
@@ -2174,6 +2183,8 @@ impl View for AgentInputFooter {
         }
 
         let session_settings = SessionSettings::as_ref(app);
+        // oh-my-warp: used by `render_plugin_chips_for_side` below to render plugin chips.
+        let appearance = Appearance::as_ref(app);
         let left_items = session_settings.agent_footer_chip_selection.left_items();
         let right_items = session_settings.agent_footer_chip_selection.right_items();
 
@@ -2221,6 +2232,10 @@ impl View for AgentInputFooter {
                 left_buttons.add_child(element);
             }
         }
+        // oh-my-warp: plugin-contributed prompt segments (`warp.prompt.set`).
+        for elem in render_plugin_chips_for_side(PromptSide::Left, app, appearance) {
+            left_buttons.add_child(elem);
+        }
 
         let mut right_buttons = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -2248,6 +2263,11 @@ impl View for AgentInputFooter {
                     right_buttons.add_child(element);
                 }
             }
+        }
+        // oh-my-warp: plugin-contributed prompt segments (`warp.prompt.set`). Appended outside
+        // the alert branch so plugin chips persist even when a prompt-alert is shown on the right.
+        for elem in render_plugin_chips_for_side(PromptSide::Right, app, appearance) {
+            right_buttons.add_child(elem);
         }
 
         let content = Wrap::row()
