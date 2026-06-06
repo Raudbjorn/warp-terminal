@@ -1,0 +1,143 @@
+name: Publish latest Linux SSH Extension
+
+on:
+  push:
+    branches:
+      - byok
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: latest-linux-ssh-extension
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_CHANNEL: oss
+  REMOTE_SERVER_LATEST_TAG: remote-server-latest
+  REMOTE_SERVER_ASSET_X86_64: slipstream-remote-server-linux-x86_64.tar.gz
+
+jobs:
+  build_and_publish:
+    name: Build and publish latest Linux SSH extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/prepare_environment
+        with:
+          target_os: linux
+          is_self_hosted: false
+          cache_key: release-remote-server-linux-latest
+          cache_on_failure: true
+
+      - name: Install Linux musl cross toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get install -y curl xz-utils
+          MUSL_CROSS_TAG="20250929"
+          MUSL_CROSS_TARGET="x86_64-unknown-linux-musl"
+          MUSL_CROSS_SHA256="6534870abd7dc327fd2e14cc53972d0552b21f47db5769505534f788537e3544"
+          MUSL_CROSS_ARCHIVE="$MUSL_CROSS_TARGET.tar.xz"
+          curl -fsSLO "https://github.com/cross-tools/musl-cross/releases/download/$MUSL_CROSS_TAG/$MUSL_CROSS_ARCHIVE"
+          echo "$MUSL_CROSS_SHA256  $MUSL_CROSS_ARCHIVE" | sha256sum -c -
+          sudo mkdir -p /opt/x-tools
+          sudo tar -xf "$MUSL_CROSS_ARCHIVE" -C /opt/x-tools
+          MUSL_CROSS_BIN="/opt/x-tools/$MUSL_CROSS_TARGET/bin"
+          echo "$MUSL_CROSS_BIN" >> "$GITHUB_PATH"
+          export PATH="$MUSL_CROSS_BIN:$PATH"
+          command -v "$MUSL_CROSS_TARGET-gcc"
+          command -v "$MUSL_CROSS_TARGET-g++"
+          rustup target add "$MUSL_CROSS_TARGET"
+
+      - name: Build Linux SSH extension binary
+        shell: bash
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: x86_64-unknown-linux-musl-gcc
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS: -C symbol-mangling-version=v0
+          CC_x86_64_unknown_linux_musl: x86_64-unknown-linux-musl-gcc
+          CXX_x86_64_unknown_linux_musl: x86_64-unknown-linux-musl-g++
+        run: |
+          set -euo pipefail
+
+          cargo build \
+            --locked \
+            -p warp \
+            --bin warp-oss \
+            --target x86_64-unknown-linux-musl \
+            --profile release-cli \
+            --features release_bundle,crash_reporting,standalone,agent_mode_debug,remote_codebase_indexing
+
+      - name: Package Linux SSH extension asset
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          built_binary="target/x86_64-unknown-linux-musl/release-cli/warp-oss"
+          test -x "$built_binary"
+          "$built_binary" --version
+          "$built_binary" remote-server-protocol-version
+
+          mkdir -p dist remote-server-pkg
+          cp "$built_binary" remote-server-pkg/slipstream
+          chmod 755 remote-server-pkg/slipstream
+          tar -C remote-server-pkg -czf "dist/$REMOTE_SERVER_ASSET_X86_64" slipstream
+          (
+            cd dist
+            sha256sum "$REMOTE_SERVER_ASSET_X86_64" > SHA256SUMS
+          )
+
+          cat > dist/RELEASE_NOTES.md <<EOF
+          Latest Slipstream SSH extension build.
+
+          This moving release is overwritten by the latest successful Linux SSH extension build from the repository.
+
+          Source ref: \`$GITHUB_REF_NAME\`
+          Source commit: \`$GITHUB_SHA\`
+
+          Assets:
+          - \`$REMOTE_SERVER_ASSET_X86_64\`
+          - \`SHA256SUMS\`
+          EOF
+
+      - name: Publish latest SSH extension release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -f "$REMOTE_SERVER_LATEST_TAG" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$REMOTE_SERVER_LATEST_TAG"
+
+          if gh release view "$REMOTE_SERVER_LATEST_TAG" >/dev/null 2>&1; then
+            gh release upload "$REMOTE_SERVER_LATEST_TAG" \
+              "dist/$REMOTE_SERVER_ASSET_X86_64" \
+              dist/SHA256SUMS \
+              --clobber
+            gh release edit "$REMOTE_SERVER_LATEST_TAG" \
+              --title "Slipstream latest SSH extension" \
+              --notes-file dist/RELEASE_NOTES.md \
+              --prerelease \
+              --latest=false
+          else
+            gh release create "$REMOTE_SERVER_LATEST_TAG" \
+              "dist/$REMOTE_SERVER_ASSET_X86_64" \
+              dist/SHA256SUMS \
+              --target "$GITHUB_SHA" \
+              --title "Slipstream latest SSH extension" \
+              --notes-file dist/RELEASE_NOTES.md \
+              --prerelease \
+              --latest=false
+          fi

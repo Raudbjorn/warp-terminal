@@ -577,6 +577,11 @@ pub enum WorkerCommand {
     #[clap(hide = true)]
     RemoteServerDaemon(RemoteServerIdentityArgs),
 
+    /// Print the remote-server protocol compatibility key.
+    #[cfg(not(target_family = "wasm"))]
+    #[clap(hide = true)]
+    RemoteServerProtocolVersion,
+
     /// Run a headless ripgrep search worker.
     #[cfg(not(target_family = "wasm"))]
     #[clap(hide = true)]

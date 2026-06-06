@@ -676,6 +676,11 @@ pub fn run() -> Result<()> {
                 return crate::remote_server::run_daemon(args.identity_key.clone());
             }
             #[cfg(not(target_family = "wasm"))]
+            warp_cli::Command::Worker(warp_cli::WorkerCommand::RemoteServerProtocolVersion) => {
+                println!("{}", remote_server::protocol::REMOTE_SERVER_PROTOCOL_VERSION);
+                return Ok(());
+            }
+            #[cfg(not(target_family = "wasm"))]
             warp_cli::Command::Worker(warp_cli::WorkerCommand::RipgrepSearch {
                 parent,
                 ignore_case,

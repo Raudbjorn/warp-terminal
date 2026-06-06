@@ -10,6 +10,7 @@
 //! `Arc<dyn RemoteTransport>` for reconnection.
 //!
 //! [`RemoteServerManager`]: crate::manager::RemoteServerManager
+use std::fmt;
 use std::future::Future;
 #[cfg(not(target_family = "wasm"))]
 use std::path::PathBuf;
@@ -45,6 +46,78 @@ pub struct InstallOutcome {
     pub source: Option<InstallSource>,
     /// Whether the install succeeded.
     pub result: Result<(), Error>,
+}
+
+/// Result of checking the remote server binary before connecting to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BinaryCheckStatus {
+    /// The binary exists and is compatible enough to launch.
+    Installed,
+    /// The expected binary path is missing or not executable.
+    Missing,
+    /// A binary exists, but the local client should replace it before
+    /// attempting a protocol handshake.
+    UpdateRequired {
+        reason: BinaryUpdateReason,
+        installed_version: Option<String>,
+    },
+}
+
+impl BinaryCheckStatus {
+    pub fn is_found(&self) -> bool {
+        matches!(self, Self::Installed | Self::UpdateRequired { .. })
+    }
+
+    pub fn is_installed(&self) -> bool {
+        matches!(self, Self::Installed)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BinaryUpdateReason {
+    VersionMismatch {
+        expected: String,
+        found: String,
+    },
+    MissingVersion {
+        expected: String,
+    },
+    MissingClientVersion,
+    ProtocolMismatch {
+        expected: String,
+        found: Option<String>,
+    },
+}
+
+impl fmt::Display for BinaryUpdateReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::VersionMismatch { expected, found } => {
+                write!(f, "expected version {expected}, found {found}")
+            }
+            Self::MissingVersion { expected } => {
+                write!(
+                    f,
+                    "installed binary did not report a version, expected {expected}"
+                )
+            }
+            Self::MissingClientVersion => {
+                write!(
+                    f,
+                    "this client does not have a release version, so Warp cannot verify a \
+                     compatible remote binary"
+                )
+            }
+            Self::ProtocolMismatch { expected, found } => match found {
+                Some(found) => {
+                    write!(f, "expected protocol {expected}, found {found}")
+                }
+                None => {
+                    write!(f, "installed binary did not report protocol {expected}")
+                }
+            },
+        }
+    }
 }
 
 /// Structured error for user-facing display in the SSH remote-server
@@ -98,6 +171,9 @@ pub enum Error {
     /// A remote script ran but exited with a non-zero code.
     #[error("script failed (exit {exit_code}): {stderr}")]
     ScriptFailed { exit_code: i32, stderr: String },
+    /// The binary exists, but its reported version is not compatible with the client.
+    #[error("installed SSH extension is not compatible with this client: {reason}")]
+    IncompatibleBinary { reason: BinaryUpdateReason },
     /// Any other transport-level or unexpected failure.
     #[error(transparent)]
     Other(anyhow::Error),
@@ -133,6 +209,7 @@ impl Error {
                 };
                 Some(format!("Script exited with code {exit_code}: {truncated}"))
             }
+            Self::IncompatibleBinary { reason } => Some(reason.to_string()),
             Self::Other(_) => None,
         };
         UserFacingError { body, detail }
@@ -240,10 +317,14 @@ pub trait RemoteTransport: Send + Sync + std::fmt::Debug {
     /// ([`RemoteServerManager::check_binary`]) is responsible for emitting
     /// [`SetupStateChanged`] and [`BinaryCheckComplete`].
     ///
-    /// Returns `Ok(true)` if the binary is installed and executable,
-    /// `Ok(false)` if it is definitively not installed, and
+    /// Returns `Ok(BinaryCheckStatus::Installed)` if the binary is installed
+    /// and executable, `Ok(BinaryCheckStatus::Missing)` if it is definitively
+    /// not installed, `Ok(BinaryCheckStatus::UpdateRequired { .. })` if an
+    /// existing binary should be replaced before connecting, and
     /// `Err(_)` if the check failed (e.g. timeout or unreachable).
-    fn check_binary(&self) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send>>;
+    fn check_binary(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<BinaryCheckStatus, Error>> + Send>>;
 
     /// Checks whether the remote host already has an existing install
     /// of the remote server binary.
@@ -280,6 +361,14 @@ pub trait RemoteTransport: Send + Sync + std::fmt::Debug {
         &self,
         executor: std::sync::Arc<executor::Background>,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Connection>> + Send>>;
+
+    /// Returns whether a tagged server binary is allowed when the local
+    /// client has no baked release tag. This is only intended for binaries
+    /// installed by an explicit user-approved install/update in the current
+    /// session.
+    fn allow_tagged_server_with_untagged_client(&self) -> bool {
+        false
+    }
 
     /// Remove the remote server binary, forcing a reinstall on the next
     /// [`install_binary`] call.
