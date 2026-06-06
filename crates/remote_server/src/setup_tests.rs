@@ -763,6 +763,22 @@ fn remote_server_artifact_version_uses_latest_release_for_untagged_oss() {
 }
 
 #[test]
+fn production_download_url_is_stale_default_for_untagged_oss() {
+    assert!(is_stale_default_download_base_url(
+        PRODUCTION_DOWNLOAD_BASE_URL
+    ));
+    assert!(is_stale_default_download_base_url(&format!(
+        "{PRODUCTION_DOWNLOAD_BASE_URL}/"
+    )));
+    assert!(!is_stale_default_download_base_url(
+        SLIPSTREAM_RELEASES_BASE_URL
+    ));
+    assert!(!is_stale_default_download_base_url(
+        "https://downloads.example.com/warp/cli"
+    ));
+}
+
+#[test]
 fn slipstream_remote_server_asset_name_uses_platform() {
     assert_eq!(
         slipstream_remote_server_asset_name("linux", "aarch64"),

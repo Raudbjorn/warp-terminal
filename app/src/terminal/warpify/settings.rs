@@ -1,6 +1,7 @@
 use anyhow::Result;
 use lazy_static::lazy_static;
 use regex::Regex;
+use remote_server::setup::InstallScriptOptions;
 use settings::macros::{maybe_define_setting, register_settings_events};
 use settings::{
     ChangeEventReason, RespectUserSyncSetting, Setting, SupportedPlatforms, SyncToCloud,
@@ -414,6 +415,60 @@ impl SingletonEntity for WarpifySettings {}
 /// This is the other impl block for this model. This one contains the actual subshell-specific
 /// logic.
 impl WarpifySettings {
+    pub fn is_ssh_remote_server_enabled(app: &AppContext) -> bool {
+        let settings = Self::as_ref(app);
+        FeatureFlag::SshRemoteServer.is_enabled()
+            && settings
+                .enable_ssh_remote_server
+                .is_supported_on_current_platform()
+            && *settings.enable_ssh_warpification.value()
+            && *settings.enable_ssh_remote_server.value()
+    }
+
+    pub fn ssh_extension_install_options(&self) -> InstallScriptOptions {
+        InstallScriptOptions::new(
+            self.normalized_ssh_extension_download_base_url(),
+            self.normalized_ssh_extension_download_channel(),
+        )
+    }
+
+    pub fn normalize_ssh_extension_download_base_url(value: &str) -> Result<String> {
+        let trimmed = value.trim().trim_end_matches('/');
+        let parsed = Url::parse(trimmed)?;
+        match parsed.scheme() {
+            "http" | "https" => Ok(trimmed.to_string()),
+            scheme => anyhow::bail!(
+                "SSH extension download URL must use http:// or https://, not {scheme}://"
+            ),
+        }
+    }
+
+    pub fn normalize_ssh_extension_download_channel(value: &str) -> String {
+        let trimmed = value.trim();
+        if remote_server::setup::is_supported_download_channel(trimmed) {
+            trimmed.to_string()
+        } else {
+            remote_server::setup::default_download_channel().to_string()
+        }
+    }
+
+    fn normalized_ssh_extension_download_base_url(&self) -> String {
+        let normalized = Self::normalize_ssh_extension_download_base_url(
+            self.ssh_extension_download_base_url.value(),
+        );
+        match normalized {
+            Ok(url) if remote_server::setup::is_stale_default_download_base_url(&url) => {
+                remote_server::setup::default_download_base_url()
+            }
+            Ok(url) => url,
+            Err(_) => remote_server::setup::default_download_base_url(),
+        }
+    }
+
+    fn normalized_ssh_extension_download_channel(&self) -> String {
+        Self::normalize_ssh_extension_download_channel(self.ssh_extension_download_channel.value())
+    }
+
     fn is_built_in_subshell_match(command: &str) -> bool {
         for command_regex in SUBSHELL_COMMAND_REGEXES.iter() {
             if command_regex.is_match(command) {

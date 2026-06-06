@@ -640,6 +640,11 @@ pub fn default_download_base_url() -> String {
     }
 }
 
+pub fn is_stale_default_download_base_url(download_base_url: &str) -> bool {
+    matches!(ChannelState::channel(), Channel::Oss)
+        && download_base_url.trim().trim_end_matches('/') == PRODUCTION_DOWNLOAD_BASE_URL
+}
+
 pub fn default_download_channel() -> &'static str {
     download_channel()
 }
