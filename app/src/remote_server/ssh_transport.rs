@@ -13,11 +13,15 @@ use anyhow::Result;
 use remote_server::auth::RemoteServerAuthContext;
 use remote_server::client::RemoteServerClient;
 use remote_server::manager::RemoteServerExitStatus;
+use remote_server::protocol::REMOTE_SERVER_PROTOCOL_VERSION;
 use remote_server::setup::{
     parse_uname_output, remote_server_daemon_dir, PreinstallCheckResult, RemotePlatform,
 };
-use remote_server::ssh::ssh_args;
-use remote_server::transport::{Connection, ControlPath, Error, InstallOutcome, RemoteTransport};
+use remote_server::ssh::{run_ssh_command, ssh_args};
+use remote_server::transport::{
+    BinaryCheckStatus, BinaryUpdateReason, Connection, Error, InstallOutcome, RemoteTransport,
+};
+use warp_core::channel::ChannelState;
 use warpui::r#async::executor;
 
 #[path = "ssh_transport/installation.rs"]
@@ -33,11 +37,8 @@ pub(crate) mod installation;
 pub struct SshTransport {
     socket_path: PathBuf,
     auth_context: Arc<RemoteServerAuthContext>,
-    /// Whether Warp owns the ControlMaster behind `socket_path`. `false`
-    /// when the SSH wrapper attached to a master the user already had
-    /// running, in which case Warp must not run `ssh -O exit` against it
-    /// on teardown.
-    warp_owns_control_master: bool,
+    install_options: InstallScriptOptions,
+    allow_tagged_server_with_untagged_client: bool,
 }
 
 impl fmt::Debug for SshTransport {
@@ -58,8 +59,14 @@ impl SshTransport {
         Self {
             socket_path,
             auth_context,
-            warp_owns_control_master,
+            install_options,
+            allow_tagged_server_with_untagged_client: false,
         }
+    }
+
+    pub fn with_tagged_server_untagged_client_trust(mut self) -> Self {
+        self.allow_tagged_server_with_untagged_client = true;
+        self
     }
 
     pub fn socket_path(&self) -> &PathBuf {
@@ -97,7 +104,7 @@ impl SshTransport {
 /// Runs `uname -sm` on the remote host via the ControlMaster socket and
 /// parses the output into a [`RemotePlatform`].
 async fn detect_remote_platform(socket_path: &Path) -> Result<RemotePlatform, Error> {
-    let output = remote_server::ssh::run_ssh_command(
+    let output = run_ssh_command(
         socket_path,
         "uname -sm",
         remote_server::setup::CHECK_TIMEOUT,
@@ -111,6 +118,218 @@ async fn detect_remote_platform(socket_path: &Path) -> Result<RemotePlatform, Er
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(Error::Other(anyhow::anyhow!(
             "uname -sm exited with code {code}: {stderr}"
+        )))
+    }
+}
+
+fn parse_remote_server_version(stdout: &str) -> Option<&str> {
+    stdout.lines().rev().find_map(|line| {
+        line.split_whitespace().find_map(|token| {
+            let token = token.trim_matches(|c: char| {
+                matches!(c, '"' | '\'' | ',' | ';' | '(' | ')' | '[' | ']')
+            });
+            token.starts_with('v').then_some(token).filter(|token| {
+                token
+                    .as_bytes()
+                    .get(1)
+                    .is_some_and(|byte| byte.is_ascii_digit())
+            })
+        })
+    })
+}
+
+fn parse_remote_server_protocol_version(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("remote-server-protocol-"))
+}
+
+fn classify_binary_check_success(version_stdout: &str) -> BinaryCheckStatus {
+    classify_binary_check_success_with_client_version(version_stdout, ChannelState::app_version())
+}
+
+fn classify_binary_check_success_with_client_version(
+    version_stdout: &str,
+    client_version: Option<&str>,
+) -> BinaryCheckStatus {
+    let installed_version = parse_remote_server_version(version_stdout).map(str::to_string);
+
+    match (client_version, installed_version.as_deref()) {
+        (Some(expected), Some(found)) if found == expected => BinaryCheckStatus::Installed,
+        (Some(expected), Some(found)) => BinaryCheckStatus::UpdateRequired {
+            reason: BinaryUpdateReason::VersionMismatch {
+                expected: expected.to_string(),
+                found: found.to_string(),
+            },
+            installed_version,
+        },
+        (Some(expected), None) => BinaryCheckStatus::UpdateRequired {
+            reason: BinaryUpdateReason::MissingVersion {
+                expected: expected.to_string(),
+            },
+            installed_version,
+        },
+        // Local dev loops can have neither side reporting a release tag.
+        (None, None) => BinaryCheckStatus::Installed,
+        (None, Some(_)) => BinaryCheckStatus::UpdateRequired {
+            reason: BinaryUpdateReason::MissingClientVersion,
+            installed_version,
+        },
+    }
+}
+
+fn classify_protocol_check_success(protocol_stdout: &str) -> Result<(), BinaryUpdateReason> {
+    match parse_remote_server_protocol_version(protocol_stdout) {
+        Some(found) if found == REMOTE_SERVER_PROTOCOL_VERSION => Ok(()),
+        found => Err(BinaryUpdateReason::ProtocolMismatch {
+            expected: REMOTE_SERVER_PROTOCOL_VERSION.to_string(),
+            found: found.map(str::to_string),
+        }),
+    }
+}
+
+async fn check_remote_server_protocol(socket_path: &Path) -> Result<(), Error> {
+    let cmd = remote_server::setup::protocol_check_command();
+    let output = run_ssh_command(socket_path, &cmd, remote_server::setup::CHECK_TIMEOUT).await?;
+    let code = output.status.code();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    log::info!("Protocol check result: exit={code:?} stdout={stdout}");
+    match code {
+        Some(0) => classify_protocol_check_success(&stdout)
+            .map_err(|reason| Error::IncompatibleBinary { reason }),
+        Some(_) | None => Err(Error::IncompatibleBinary {
+            reason: BinaryUpdateReason::ProtocolMismatch {
+                expected: REMOTE_SERVER_PROTOCOL_VERSION.to_string(),
+                found: parse_remote_server_protocol_version(&stdout).map(str::to_string),
+            },
+        }),
+    }
+}
+
+async fn check_installed_binary_status(socket_path: &Path) -> Result<BinaryCheckStatus, Error> {
+    let cmd = remote_server::setup::binary_check_command();
+    let output = run_ssh_command(socket_path, &cmd, remote_server::setup::CHECK_TIMEOUT).await?;
+    let code = output.status.code();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    log::info!("Binary check result: exit={code:?} stdout={stdout}");
+    match code {
+        Some(0) => {
+            let status = classify_binary_check_success(&stdout);
+            match check_remote_server_protocol(socket_path).await {
+                Ok(()) => Ok(status),
+                Err(Error::IncompatibleBinary { reason }) => match status {
+                    BinaryCheckStatus::UpdateRequired {
+                        reason:
+                            BinaryUpdateReason::VersionMismatch { .. }
+                            | BinaryUpdateReason::MissingVersion { .. },
+                        ..
+                    } if ChannelState::app_version().is_some() => Ok(status),
+                    _ => Err(Error::IncompatibleBinary { reason }),
+                },
+                Err(err) => Err(err),
+            }
+        }
+        Some(126) | Some(127) => Ok(BinaryCheckStatus::Missing),
+        Some(code) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(Error::Other(anyhow::anyhow!(
+                "remote-server binary check exited with code {code}: {stderr}"
+            )))
+        }
+        None => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            Err(Error::Other(anyhow::anyhow!(
+                "remote-server binary check terminated without exit code: {stderr}"
+            )))
+        }
+    }
+}
+
+async fn verify_installed_binary_compatible(socket_path: &Path) -> Result<(), Error> {
+    match check_installed_binary_status(socket_path).await? {
+        BinaryCheckStatus::Installed => Ok(()),
+        BinaryCheckStatus::UpdateRequired {
+            reason: BinaryUpdateReason::MissingClientVersion,
+            ..
+        } => Ok(()),
+        BinaryCheckStatus::UpdateRequired { reason, .. } => {
+            Err(Error::IncompatibleBinary { reason })
+        }
+        BinaryCheckStatus::Missing => Err(Error::Other(anyhow::anyhow!(
+            "post-install compatibility check unexpectedly reported missing binary"
+        ))),
+    }
+}
+
+fn mark_incompatible_install(outcome: &mut InstallOutcome, error: Error) {
+    if outcome.result.is_ok() {
+        outcome.result = Err(error);
+    }
+}
+
+async fn verify_install_outcome(socket_path: &Path, mut outcome: InstallOutcome) -> InstallOutcome {
+    if outcome.result.is_ok() {
+        match verify_installed_binary_compatible(socket_path).await {
+            Ok(()) => {}
+            Err(error) => {
+                log::warn!("Remote server post-install compatibility check failed: {error}");
+                mark_incompatible_install(&mut outcome, error);
+            }
+        }
+    }
+    outcome
+}
+
+fn known_remote_server_install_dirs() -> [&'static str; 5] {
+    [
+        "~/.warp/remote-server",
+        "~/.warp-preview/remote-server",
+        "~/.warp-dev/remote-server",
+        "~/.warp-local/remote-server",
+        "~/.slipstream/remote-server",
+    ]
+}
+
+fn old_binary_check_command() -> String {
+    format!(
+        "for d in {}; do if [ -d \"$d\" ]; then exit 0; fi; done; exit 1",
+        known_remote_server_install_dirs().join(" ")
+    )
+}
+
+fn cleanup_remote_daemons_command(identity_key: &str) -> String {
+    let identity_dir = remote_server::setup::remote_server_identity_dir_name(identity_key);
+    let daemon_dirs = known_remote_server_install_dirs()
+        .map(|dir| format!("{dir}/{identity_dir}"))
+        .join(" ");
+    format!(
+        "for d in {daemon_dirs}; do \
+           [ -d \"$d\" ] || continue; \
+           for p in \"$d\"/server*.pid; do \
+             [ -e \"$p\" ] || continue; \
+             pid=$(cat \"$p\" 2>/dev/null || true); \
+             case \"$pid\" in ''|*[!0-9]*) continue ;; esac; \
+             cmdline=$(ps -p \"$pid\" -o args= 2>/dev/null || true); \
+             case \"$cmdline\" in *remote-server-daemon*) kill \"$pid\" 2>/dev/null || true ;; esac; \
+           done; \
+           rm -f \"$d\"/server*.pid \"$d\"/server*.sock 2>/dev/null || true; \
+         done"
+    )
+}
+
+async fn cleanup_remote_daemons(socket_path: &Path, identity_key: &str) -> Result<(), Error> {
+    let cmd = cleanup_remote_daemons_command(identity_key);
+    log::info!("Cleaning up stale remote-server daemons before install");
+    let output = run_ssh_command(socket_path, &cmd, remote_server::setup::CHECK_TIMEOUT).await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(Error::Other(anyhow::anyhow!(
+            "daemon cleanup exited with code {code}: {stderr}"
         )))
     }
 }
@@ -149,56 +368,29 @@ impl RemoteTransport for SshTransport {
         })
     }
 
-    fn check_binary(&self) -> Pin<Box<dyn Future<Output = Result<bool, Error>> + Send>> {
+    fn check_binary(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<BinaryCheckStatus, Error>> + Send>> {
         let socket_path = self.socket_path.clone();
         Box::pin(async move {
             let cmd = remote_server::setup::binary_check_command();
             log::info!("Running binary check: {cmd}");
-            let output = remote_server::ssh::run_ssh_command(
-                &socket_path,
-                &cmd,
-                remote_server::setup::CHECK_TIMEOUT,
-            )
-            .await?;
-            // `<binary> --version` exits 0 when present, executable, and
-            // functional. Exit 127 means the binary was not found, and 126
-            // means it exists but is not executable. Any other non-zero
-            // exit (e.g. SSH exit 255 for a dead connection, or signal
-            // termination) is treated as a transport-level failure.
-            let code = output.status.code();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            log::info!("Binary check result: exit={code:?} stdout={stdout}");
-            match code {
-                Some(0) => Ok(true),
-                Some(126) | Some(127) => Ok(false),
-                Some(code) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    Err(Error::Other(anyhow::anyhow!(
-                        "binary check exited with code {code}: {stderr}"
-                    )))
-                }
-                None => Err(Error::Other(anyhow::anyhow!(
-                    "binary check terminated by signal"
-                ))),
-            }
+            let status = check_installed_binary_status(&socket_path).await?;
+            log::info!("Binary check status: {status:?}");
+            Ok(status)
         })
     }
 
     fn check_has_old_binary(&self) -> Pin<Box<dyn Future<Output = anyhow::Result<bool>> + Send>> {
         let socket_path = self.socket_path.clone();
         Box::pin(async move {
-            // Treat the existence of the remote-server install directory
-            // itself as evidence of a prior install. If `~/.warp-XX/remote-server`
-            // exists, something was installed there before, so any mismatch
-            // with the client's expected binary path should be auto-updated
-            // rather than surfaced as a first-time install prompt.
-            let cmd = format!("test -d {}", remote_server::setup::remote_server_dir());
-            let output = remote_server::ssh::run_ssh_command(
-                &socket_path,
-                &cmd,
-                remote_server::setup::CHECK_TIMEOUT,
-            )
-            .await?;
+            // Treat any known remote-server install directory as evidence of
+            // a prior install. Slipstream/OSS can encounter stale binaries
+            // from another channel, so this intentionally scans every
+            // channel-specific install root instead of only the current one.
+            let cmd = old_binary_check_command();
+            let output =
+                run_ssh_command(&socket_path, &cmd, remote_server::setup::CHECK_TIMEOUT).await?;
             // `test -d` exits 0 when present, 1 when missing.
             // Anything else is treated as a check failure.
             match output.status.code() {
@@ -219,7 +411,15 @@ impl RemoteTransport for SshTransport {
 
     fn install_binary(&self) -> Pin<Box<dyn Future<Output = InstallOutcome> + Send>> {
         let socket_path = self.socket_path.clone();
-        Box::pin(async move { installation::install_binary(&socket_path).await })
+        let install_options = self.install_options.clone();
+        let identity_key = self.auth_context.remote_server_identity_key();
+        Box::pin(async move {
+            if let Err(e) = cleanup_remote_daemons(&socket_path, &identity_key).await {
+                log::warn!("Failed to clean up stale remote-server daemons before install: {e}");
+            }
+            let outcome = installation::install_binary(&socket_path, &install_options).await;
+            verify_install_outcome(&socket_path, outcome).await
+        })
     }
 
     fn connect(
@@ -281,6 +481,10 @@ impl RemoteTransport for SshTransport {
         })
     }
 
+    fn allow_tagged_server_with_untagged_client(&self) -> bool {
+        self.allow_tagged_server_with_untagged_client
+    }
+
     fn remove_remote_server_binary(
         &self,
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send>> {
@@ -288,12 +492,8 @@ impl RemoteTransport for SshTransport {
         Box::pin(async move {
             let cmd = remote_server::setup::remote_server_removal_command();
             log::info!("Removing stale remote server binary: {cmd}");
-            let output = remote_server::ssh::run_ssh_command(
-                &socket_path,
-                &cmd,
-                remote_server::setup::CHECK_TIMEOUT,
-            )
-            .await?;
+            let output =
+                run_ssh_command(&socket_path, &cmd, remote_server::setup::CHECK_TIMEOUT).await?;
             if output.status.success() {
                 Ok(())
             } else {

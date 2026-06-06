@@ -689,3 +689,83 @@ fn parse_preinstall_missing_status_falls_open() {
     assert_eq!(result.status, PreinstallStatus::Unknown);
     assert!(result.is_supported());
 }
+
+#[test]
+fn install_script_with_options_uses_configured_download_url_and_channel() {
+    let script = install_script_with_options(
+        &InstallScriptOptions::new(
+            "https://downloads.example.com/warp/cli/".to_string(),
+            DOWNLOAD_CHANNEL_PREVIEW.to_string(),
+        ),
+        None,
+    );
+
+    assert!(script.contains(
+        "https://downloads.example.com/warp/cli?package=tar&os=$os_name&arch=$arch_name&channel=preview"
+    ));
+}
+
+#[test]
+fn install_script_with_options_falls_back_for_invalid_channel() {
+    let script = install_script_with_options(
+        &InstallScriptOptions::new(
+            PRODUCTION_DOWNLOAD_BASE_URL.to_string(),
+            "nightly".to_string(),
+        ),
+        None,
+    );
+
+    assert!(script.contains(&format!("channel={}", default_download_channel())));
+}
+
+#[test]
+fn install_script_with_options_uses_slipstream_release_asset_url() {
+    let script = install_script_with_options(
+        &InstallScriptOptions::new(
+            SLIPSTREAM_RELEASES_BASE_URL.to_string(),
+            DOWNLOAD_CHANNEL_DEV.to_string(),
+        ),
+        None,
+    );
+
+    assert!(script.contains(
+        "https://github.com/pixelkaiser/slipstream/releases/download/remote-server-latest/slipstream-remote-server-$os_name-$arch_name.tar.gz"
+    ));
+}
+
+#[test]
+fn download_tarball_url_with_options_uses_slipstream_release_asset_url() {
+    let platform = RemotePlatform {
+        os: RemoteOs::Linux,
+        arch: RemoteArch::X86_64,
+    };
+    let url = download_tarball_url_with_options(
+        &platform,
+        &InstallScriptOptions::new(
+            SLIPSTREAM_RELEASES_BASE_URL.to_string(),
+            DOWNLOAD_CHANNEL_DEV.to_string(),
+        ),
+    );
+
+    assert_eq!(
+        url,
+        "https://github.com/pixelkaiser/slipstream/releases/download/remote-server-latest/slipstream-remote-server-linux-x86_64.tar.gz"
+    );
+}
+
+#[test]
+fn remote_server_artifact_version_uses_latest_release_for_untagged_oss() {
+    assert_eq!(
+        remote_server_artifact_version(),
+        SLIPSTREAM_LATEST_REMOTE_SERVER_RELEASE_TAG
+    );
+    assert!(remote_server_artifact_is_moving_latest());
+}
+
+#[test]
+fn slipstream_remote_server_asset_name_uses_platform() {
+    assert_eq!(
+        slipstream_remote_server_asset_name("linux", "aarch64"),
+        "slipstream-remote-server-linux-aarch64.tar.gz"
+    );
+}

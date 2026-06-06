@@ -4587,7 +4587,7 @@ impl TerminalView {
                             .unwrap_or((None, None));
                         send_telemetry_from_ctx!(
                             TelemetryEvent::RemoteServerBinaryCheck {
-                                found: matches!(result, Ok(true)),
+                                found: matches!(result, Ok(status) if status.is_found()),
                                 error: result.as_ref().err().map(|e| e.to_string()),
                                 remote_os,
                                 remote_arch,
@@ -12618,6 +12618,13 @@ impl TerminalView {
             ModelEvent::RemoteServerBlockRequested { session_id } => {
                 self.show_ssh_remote_server_choice_block(*session_id, ctx);
             }
+            ModelEvent::RemoteServerUpdateBlockRequested { session_id } => {
+                self.show_ssh_remote_server_choice_block_with_mode(
+                    *session_id,
+                    SshRemoteServerChoiceViewMode::UpdateRequired,
+                    ctx,
+                );
+            }
         }
     }
 
@@ -12639,17 +12646,55 @@ impl TerminalView {
             return;
         }
 
-        let choice_view =
-            ctx.add_typed_action_view(|ctx| SshRemoteServerChoiceView::new(session_id, ctx));
+        let choice_view = ctx.add_typed_action_view(|ctx| match mode {
+            SshRemoteServerChoiceViewMode::InitialInstall => {
+                SshRemoteServerChoiceView::new(session_id, ctx)
+            }
+            SshRemoteServerChoiceViewMode::UpdateRequired => {
+                SshRemoteServerChoiceView::new_with_mode(session_id, mode, ctx)
+            }
+            SshRemoteServerChoiceViewMode::RetryAfterControlMasterError
+            | SshRemoteServerChoiceViewMode::RetryAfterSetupFailure => {
+                SshRemoteServerChoiceView::new_with_mode(session_id, mode, ctx)
+            }
+        });
 
         ctx.subscribe_to_view(&choice_view, move |me, _, event, ctx| match event {
             SshRemoteServerChoiceViewEvent::Install => {
                 me.remove_ssh_remote_server_choice_block(session_id, ctx);
-                ctx.emit(Event::RemoteServerInstallRequested { session_id });
+                match mode {
+                    SshRemoteServerChoiceViewMode::InitialInstall
+                    | SshRemoteServerChoiceViewMode::UpdateRequired => {
+                        ctx.emit(Event::RemoteServerInstallRequested { session_id });
+                    }
+                    SshRemoteServerChoiceViewMode::RetryAfterControlMasterError
+                    | SshRemoteServerChoiceViewMode::RetryAfterSetupFailure => {
+                        if let Some(socket_path) = me
+                            .sessions
+                            .as_ref(ctx)
+                            .legacy_ssh_socket_path_for_session(session_id)
+                        {
+                            ctx.emit(Event::RemoteServerRetryInstallRequested {
+                                session_id,
+                                socket_path,
+                            });
+                        } else {
+                            log::warn!(
+                                "Remote server repair requested without SSH ControlMaster socket: session={session_id:?}"
+                            );
+                        }
+                    }
+                }
             }
             SshRemoteServerChoiceViewEvent::Skip => {
                 me.remove_ssh_remote_server_choice_block(session_id, ctx);
-                ctx.emit(Event::RemoteServerSkipRequested { session_id });
+                if matches!(
+                    mode,
+                    SshRemoteServerChoiceViewMode::InitialInstall
+                        | SshRemoteServerChoiceViewMode::UpdateRequired
+                ) {
+                    ctx.emit(Event::RemoteServerSkipRequested { session_id });
+                }
             }
             SshRemoteServerChoiceViewEvent::OpenWarpifySettings => {
                 ctx.emit(Event::OpenSettings(SettingsSection::Warpify));
