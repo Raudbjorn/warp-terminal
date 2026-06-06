@@ -151,3 +151,30 @@ fn ssh_extension_install_options_use_normalized_download_settings() {
         });
     });
 }
+
+#[cfg(not(windows))]
+#[test]
+fn ssh_extension_install_options_ignore_stale_production_default_for_oss() {
+    App::test((), |mut app| async move {
+        let settings = app.add_singleton_model(WarpifySettings::new_with_defaults);
+
+        settings.update(&mut app, |settings, ctx| {
+            settings
+                .ssh_extension_download_base_url
+                .load_value(
+                    format!("{}/", remote_server::setup::PRODUCTION_DOWNLOAD_BASE_URL),
+                    true,
+                    ctx,
+                )
+                .unwrap();
+        });
+
+        settings.read(&app, |settings, _ctx| {
+            let options = settings.ssh_extension_install_options();
+            assert_eq!(
+                options.download_base_url,
+                remote_server::setup::default_download_base_url()
+            );
+        });
+    });
+}
