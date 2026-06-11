@@ -548,6 +548,16 @@ pub enum WorkerCommand {
     #[cfg(unix)]
     TerminalServer(TerminalServerArgs),
 
+    /// oh-my-warp: attach to (or create) a durable warpkeep session for a shell.
+    #[clap(hide = true)]
+    #[cfg(unix)]
+    Warpkeep(WarpkeepArgs),
+
+    /// oh-my-warp: run the detached warpkeep session master. Not invoked directly.
+    #[clap(hide = true)]
+    #[cfg(unix)]
+    WarpkeepMaster(WarpkeepMasterArgs),
+
     /// Run this process as the plugin host rather than the main app.
     #[cfg(feature = "plugin_host")]
     #[clap(long_flag = "plugin-host")]
@@ -721,6 +731,32 @@ impl Command {
 pub struct TerminalServerArgs {
     #[clap(flatten)]
     pub parent: ParentOpts,
+}
+
+/// oh-my-warp: arguments for the `warpkeep` attach worker.
+#[cfg(unix)]
+#[derive(Debug, Clone, clap::Args)]
+pub struct WarpkeepArgs {
+    /// Directory holding warpkeep session sockets.
+    #[clap(long)]
+    pub dir: std::path::PathBuf,
+
+    /// The shell program and its arguments to run inside the session (after `--`).
+    #[clap(last = true, required = true)]
+    pub command: Vec<String>,
+}
+
+/// oh-my-warp: arguments for the detached `warpkeep-master` worker.
+#[cfg(unix)]
+#[derive(Debug, Clone, clap::Args)]
+pub struct WarpkeepMasterArgs {
+    /// Path to the Unix socket this master should bind.
+    #[clap(long)]
+    pub socket: std::path::PathBuf,
+
+    /// The shell program and its arguments to run (after `--`).
+    #[clap(last = true, required = true)]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]

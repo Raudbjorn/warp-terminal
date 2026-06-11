@@ -647,6 +647,24 @@ pub fn run() -> Result<()> {
                 crate::terminal::local_tty::server::run_terminal_server(args);
                 return Ok(());
             }
+            // oh-my-warp: durable terminal sessions (warpkeep). These run a
+            // transparent dtach-style session keeper bundled in this same binary
+            // (see `terminal::local_tty::warpkeep`); dispatch and return before
+            // any GUI initialization, like the terminal server above.
+            #[cfg(all(feature = "local_tty", unix))]
+            warp_cli::Command::Worker(warp_cli::WorkerCommand::Warpkeep(args)) => {
+                return crate::terminal::local_tty::warpkeep::run_attach(
+                    args.dir.clone(),
+                    args.command.clone(),
+                );
+            }
+            #[cfg(all(feature = "local_tty", unix))]
+            warp_cli::Command::Worker(warp_cli::WorkerCommand::WarpkeepMaster(args)) => {
+                return crate::terminal::local_tty::warpkeep::run_master(
+                    args.socket.clone(),
+                    args.command.clone(),
+                );
+            }
             #[cfg(feature = "plugin_host")]
             warp_cli::Command::Worker(warp_cli::WorkerCommand::PluginHost { .. }) => {
                 return crate::run_plugin_host();
