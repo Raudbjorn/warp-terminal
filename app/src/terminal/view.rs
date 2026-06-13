@@ -398,8 +398,8 @@ use crate::terminal::cli_agent_sessions::{
 use crate::terminal::color::List;
 use crate::terminal::command_corrections_denylist::COMMAND_CORRECTIONS_PREFERRED_DENYLIST;
 use crate::terminal::event::{
-    AfterBlockCompletedEvent, BlockLatencyData, BlockType, RemoteServerSetupState, TerminalMode,
-    UserBlockCompleted,
+    AfterBlockCompletedEvent, BlockLatencyData, BlockType, BootstrappedEvent,
+    RemoteServerSetupState, TerminalMode, UserBlockCompleted,
 };
 use crate::terminal::find::{BlockGridMatch, BlockListMatch, TerminalFindModel};
 use crate::terminal::general_settings::GeneralSettings;
@@ -2545,6 +2545,7 @@ pub struct TerminalView {
 
     bootstrap_start: Option<Instant>,
     is_login_shell_bootstrapped: bool,
+    degraded_bootstrap_session_ids: HashSet<SessionId>,
     /// Set when a pending command is submitted to the shell. Cleared on the
     /// next `AfterBlockCompleted`, at which point `Event::PendingCommandCompleted`
     /// is emitted so subscribers know the command has finished.
@@ -4264,6 +4265,7 @@ impl TerminalView {
             last_hover_fragment_boundary: None,
             bootstrap_start: None,
             is_login_shell_bootstrapped: false,
+            degraded_bootstrap_session_ids: HashSet::new(),
             awaiting_pending_command_completion: false,
             pending_command_queue: Default::default(),
             enter_agent_view_after_pending_commands: false,
@@ -13309,6 +13311,7 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) {
         let session_id = bootstrap_event.session_id;
+        let is_degraded_bootstrap = self.degraded_bootstrap_session_ids.remove(&session_id);
         let Some(session) = self.sessions.as_ref(ctx).get(session_id) else {
             log::error!(
                 "Could not find session {session_id:?} in sessions model after \
@@ -13398,11 +13401,7 @@ impl TerminalView {
         // If we were waiting for a successful warpification, it's come. Stop the timeout.
         self.warpify_state.abort_ssh_warpify_timeout();
 
-        let is_warpified_remote = matches!(
-            bootstrap_event.session_type,
-            BootstrapSessionType::WarpifiedRemote
-        );
-        if bootstrap_event.subshell_info.is_some() {
+        if bootstrap_event.subshell_info.is_some() && !is_degraded_bootstrap {
             self.add_bootstrap_success_block(bootstrap_event, ctx);
         }
 
@@ -15948,6 +15947,12 @@ impl TerminalView {
             block.unhide();
         });
 
+        let recovered_ssh_bootstrap = if is_ssh {
+            self.recover_failed_ssh_bootstrap(ctx)
+        } else {
+            false
+        };
+
         // Send the bootstrapping slow event synchronously to ensure that we don't drop
         // the event if the user quits the app before the event queue is flushed and then
         // never reopens the app.
@@ -15984,13 +15989,51 @@ impl TerminalView {
             ctx
         );
 
-        if !self.is_login_shell_bootstrapped {
+        if !self.is_login_shell_bootstrapped && !recovered_ssh_bootstrap {
             log::warn!("Showing bootstrap slow toast");
             self.is_slow_bootstrap_banner_open = true;
             ctx.notify();
         }
 
         ctx.emit(Event::SlowBootstrap);
+    }
+
+    fn recover_failed_ssh_bootstrap(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let Some(bootstrap_event) = self.model.lock().recover_failed_ssh_bootstrap() else {
+            return false;
+        };
+
+        let session_id = bootstrap_event.session_info.session_id;
+        log::warn!(
+            "Recovering failed SSH bootstrap by falling back to legacy session handling: session={session_id:?}"
+        );
+        self.degraded_bootstrap_session_ids.insert(session_id);
+
+        if WarpifySettings::is_ssh_remote_server_enabled(ctx) {
+            RemoteServerManager::handle(ctx).update(ctx, |mgr, ctx| {
+                mgr.mark_setup_skipped(session_id, ctx);
+                mgr.deregister_session(session_id, ctx);
+            });
+        }
+
+        let BootstrappedEvent {
+            spawning_command,
+            session_info,
+            restored_block_commands,
+            rcfiles_duration_seconds,
+        } = bootstrap_event;
+
+        self.sessions.update(ctx, |sessions, ctx| {
+            sessions.initialize_bootstrapped_session(
+                *session_info,
+                spawning_command,
+                restored_block_commands,
+                rcfiles_duration_seconds,
+                ctx,
+            );
+        });
+
+        true
     }
 
     pub fn size_info(&self) -> &SizeInfo {
