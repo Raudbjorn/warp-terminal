@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -37,6 +38,7 @@ use crate::{
     },
     menu::{Event as MenuEvent, Menu, MenuItemFields},
     pane_group::PaneGroup,
+    remote_server::manager::RemoteServerManager,
     terminal::model::session::{ExecuteCommandOptions, Session, SessionType},
     ui_components::icons::Icon,
     ui_components::menu_button::{icon_button_with_context_menu, MenuDirection},
@@ -118,6 +120,7 @@ enum DockerLogTarget {
     Local,
     RemoteSsh {
         spawning_command: Option<String>,
+        control_path: Option<PathBuf>,
         host: String,
         port: Option<String>,
     },
@@ -329,7 +332,7 @@ impl DockerContainersView {
                 .path()
                 .as_deref()
                 .map(|path| HashMap::from_iter([("PATH".to_string(), path.to_string())]));
-            let log_target = docker_log_target_for_session(&session);
+            let log_target = docker_log_target_for_session(&session, app);
 
             Ok(DockerCommandContext {
                 session,
@@ -835,36 +838,47 @@ fn docker_log_tail_command(container_id: &str, log_target: &DockerLogTarget) -> 
         DockerLogTarget::Local => docker_command,
         DockerLogTarget::RemoteSsh {
             spawning_command: Some(spawning_command),
+            control_path: None,
             ..
-        } if is_reusable_ssh_command(spawning_command) => {
-            format!(
-                "{} {}",
-                spawning_command.trim(),
-                shell_words::quote(&docker_command)
-            )
+        } if reusable_non_interactive_ssh_command(spawning_command).is_some() => {
+            let ssh_command = reusable_non_interactive_ssh_command(spawning_command)
+                .expect("guard ensures a reusable SSH command");
+            format!("{} {}", ssh_command, shell_words::quote(&docker_command))
         }
+        DockerLogTarget::RemoteSsh {
+            control_path: Some(control_path),
+            host,
+            ..
+        } => format!(
+            "ssh -T -S {} {} {}",
+            shell_words::quote(control_path.to_string_lossy().as_ref()),
+            shell_words::quote(host),
+            shell_words::quote(&docker_command)
+        ),
         DockerLogTarget::RemoteSsh {
             host,
             port: Some(port),
             ..
         } => format!(
-            "ssh -p {} {} {}",
+            "ssh -T -p {} {} {}",
             shell_words::quote(port),
             shell_words::quote(host),
             shell_words::quote(&docker_command)
         ),
         DockerLogTarget::RemoteSsh { host, .. } => format!(
-            "ssh {} {}",
+            "ssh -T {} {}",
             shell_words::quote(host),
             shell_words::quote(&docker_command)
         ),
     }
 }
 
-fn docker_log_target_for_session(session: &Session) -> DockerLogTarget {
+fn docker_log_target_for_session(session: &Session, app: &AppContext) -> DockerLogTarget {
     if !matches!(session.session_type(), SessionType::WarpifiedRemote { .. }) {
         return DockerLogTarget::Local;
     }
+
+    let control_path = RemoteServerManager::as_ref(app).control_path_for_session(session.id());
 
     let ssh_info = session
         .subshell_info()
@@ -884,6 +898,7 @@ fn docker_log_target_for_session(session: &Session) -> DockerLogTarget {
 
     DockerLogTarget::RemoteSsh {
         spawning_command,
+        control_path,
         host,
         port,
     }
@@ -903,9 +918,16 @@ fn fallback_ssh_host(session: &Session) -> Option<String> {
     }
 }
 
-fn is_reusable_ssh_command(command: &str) -> bool {
+fn reusable_non_interactive_ssh_command(command: &str) -> Option<String> {
     let command = command.trim_start();
-    command.starts_with("ssh ") || command.starts_with("command ssh ")
+    command
+        .strip_prefix("ssh ")
+        .map(|rest| format!("ssh -T {}", rest.trim_start()))
+        .or_else(|| {
+            command
+                .strip_prefix("command ssh ")
+                .map(|rest| format!("command ssh -T {}", rest.trim_start()))
+        })
 }
 
 async fn execute_docker_command(
@@ -1134,6 +1156,7 @@ mod tests {
             "69ac6863e73d",
             &DockerLogTarget::RemoteSsh {
                 spawning_command: Some("ssh root@adm19.nt.vc".to_string()),
+                control_path: None,
                 host: "root@adm19.nt.vc".to_string(),
                 port: None,
             },
@@ -1141,7 +1164,25 @@ mod tests {
 
         assert_eq!(
             command,
-            "ssh root@adm19.nt.vc 'docker logs --tail 200 -f 69ac6863e73d'"
+            "ssh -T root@adm19.nt.vc 'docker logs --tail 200 -f 69ac6863e73d'"
+        );
+    }
+
+    #[test]
+    fn docker_log_tail_command_prefers_control_path() {
+        let command = docker_log_tail_command(
+            "69ac6863e73d",
+            &DockerLogTarget::RemoteSsh {
+                spawning_command: Some("ssh root@adm19.nt.vc".to_string()),
+                control_path: Some(PathBuf::from("/tmp/warp ssh/control.sock")),
+                host: "root@adm19.nt.vc".to_string(),
+                port: None,
+            },
+        );
+
+        assert_eq!(
+            command,
+            "ssh -T -S '/tmp/warp ssh/control.sock' root@adm19.nt.vc 'docker logs --tail 200 -f 69ac6863e73d'"
         );
     }
 
@@ -1151,6 +1192,7 @@ mod tests {
             "69ac6863e73d",
             &DockerLogTarget::RemoteSsh {
                 spawning_command: None,
+                control_path: None,
                 host: "root@adm19.nt.vc".to_string(),
                 port: Some("2222".to_string()),
             },
@@ -1158,7 +1200,7 @@ mod tests {
 
         assert_eq!(
             command,
-            "ssh -p 2222 root@adm19.nt.vc 'docker logs --tail 200 -f 69ac6863e73d'"
+            "ssh -T -p 2222 root@adm19.nt.vc 'docker logs --tail 200 -f 69ac6863e73d'"
         );
     }
 }

@@ -2614,6 +2614,16 @@ impl RemoteServerManager {
         }
     }
 
+    /// Returns the SSH ControlMaster path for a connected session, if the
+    /// transport established one.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn control_path_for_session(&self, session_id: SessionId) -> Option<PathBuf> {
+        match self.sessions.get(&session_id) {
+            Some(RemoteSessionState::Connected { control_path, .. }) => control_path.clone(),
+            _ => None,
+        }
+    }
+
     /// Returns all session IDs connected to a given host. O(1) via the
     /// reverse index.
     pub fn sessions_for_host(&self, host_id: &HostId) -> Option<&HashSet<SessionId>> {
