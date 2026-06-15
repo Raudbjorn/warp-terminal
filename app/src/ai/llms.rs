@@ -856,12 +856,17 @@ impl LLMPreferences {
         &self,
         app: &AppContext,
     ) -> impl Iterator<Item = &LLMInfo> {
-        // Don't show admin-disabled models in the dropdown
+        // In fully-local mode the Warp-hosted (built-in) models can't be reached,
+        // so only custom-endpoint models are offered.
+        let hide_builtin = true;
         self.models_by_feature
             .agent_mode
             .choices
             .iter()
-            .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+            // Don't show admin-disabled models in the dropdown.
+            .filter(move |llm| {
+                !hide_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
             .chain(self.custom_llm_choices(app))
     }
 
@@ -880,13 +885,19 @@ impl LLMPreferences {
         app: &AppContext,
         profile_key: &str,
     ) -> Vec<&LLMInfo> {
+        // In fully-local mode the Warp-hosted (built-in) models can't be reached,
+        // so only custom-endpoint models are offered.
+        let hide_builtin = true;
         #[cfg(not(target_family = "wasm"))]
         if let Some(models) = self.local_models_for_profile_key(profile_key) {
             return models
                 .agent_mode
                 .choices
                 .iter()
-                .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+                .filter(move |llm| {
+                    !hide_builtin
+                        && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+                })
                 .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
                 .collect();
         }
@@ -895,19 +906,24 @@ impl LLMPreferences {
             .agent_mode
             .choices
             .iter()
-            .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+            .filter(move |llm| {
+                !hide_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
             .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
             .collect()
     }
 
     /// Returns the set of LLMs available for coding.
     pub fn get_coding_llm_choices(&self, app: &AppContext) -> impl Iterator<Item = &LLMInfo> {
-        // Don't show admin-disabled models in the dropdown
+        let hide_builtin = true;
         self.models_by_feature
             .coding
             .choices
             .iter()
-            .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+            // Don't show admin-disabled models in the dropdown.
+            .filter(move |llm| {
+                !hide_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
             .chain(self.custom_llm_choices(app))
     }
 
@@ -925,13 +941,19 @@ impl LLMPreferences {
         app: &AppContext,
         profile_key: &str,
     ) -> Vec<&LLMInfo> {
+        // In fully-local mode the Warp-hosted (built-in) models can't be reached,
+        // so only custom-endpoint models are offered.
+        let hide_builtin = true;
         #[cfg(not(target_family = "wasm"))]
         if let Some(models) = self.local_models_for_profile_key(profile_key) {
             return models
                 .coding
                 .choices
                 .iter()
-                .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+                .filter(move |llm| {
+                    !hide_builtin
+                        && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+                })
                 .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
                 .collect();
         }
@@ -940,7 +962,9 @@ impl LLMPreferences {
             .coding
             .choices
             .iter()
-            .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+            .filter(move |llm| {
+                !hide_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
             .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
             .collect()
     }
@@ -950,12 +974,16 @@ impl LLMPreferences {
         app: &AppContext,
         profile_key: &str,
     ) -> Vec<&LLMInfo> {
+        // In fully-local mode the Warp-hosted (built-in) models can't be reached,
+        // so only custom-endpoint models are offered.
+        let hide_builtin = true;
         #[cfg(not(target_family = "wasm"))]
         if let Some(models) = self.local_models_for_profile_key(profile_key) {
             let available = models.cli_agent.as_ref().unwrap_or(&models.agent_mode);
             return available
                 .choices
                 .iter()
+                .filter(move |_| !hide_builtin)
                 .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
                 .collect();
         }
@@ -963,6 +991,7 @@ impl LLMPreferences {
         self.get_cli_agent_available()
             .choices
             .iter()
+            .filter(move |_| !hide_builtin)
             .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
             .collect()
     }

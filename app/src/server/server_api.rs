@@ -443,6 +443,17 @@ cfg_if::cfg_if! {
     }
 }
 
+/// Whether all Warp API traffic must be suppressed. This is a fully-local
+/// build: the client never contacts the Warp server, so shared request helpers
+/// short-circuit here and no request is ever initiated.
+fn warp_api_disabled() -> bool {
+    true
+}
+
+fn warp_api_disabled_error() -> anyhow::Error {
+    anyhow!("Warp API is disabled in fully-local mode")
+}
+
 /// An API wrapper struct with methods to requests to warp-server.
 ///
 /// Prefer NOT adding new methods directly on this struct; instead, add to one of the existing
@@ -720,6 +731,9 @@ impl ServerApi {
     where
         QF: 'a,
     {
+        if warp_api_disabled() {
+            return Box::pin(async { Err(warp_api_disabled_error()) });
+        }
         warp_server_client::graphql_helpers::send_graphql_request(self, operation, timeout)
     }
 
@@ -745,7 +759,6 @@ impl ServerApi {
     /// response body, allowing the caller to decode it however they need.
     async fn get_public_api_response(&self, path: &str) -> Result<http_client::Response> {
         Self::ensure_public_api_enabled(path)?;
-
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -804,6 +817,9 @@ impl ServerApi {
         run_ids: &[String],
         since_sequence: i64,
     ) -> Result<http_client::EventSourceStream> {
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
+        }
         debug_assert!(!run_ids.is_empty(), "run_ids must not be empty");
         if ChannelState::is_local_only() {
             return Err(anyhow::anyhow!(
@@ -845,6 +861,9 @@ impl ServerApi {
         include_self: bool,
         since_sequence: i64,
     ) -> Result<http_client::EventSourceStream> {
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
+        }
         debug_assert!(
             !ancestor_run_id.is_empty(),
             "ancestor_run_id must not be empty"
@@ -883,6 +902,9 @@ impl ServerApi {
         run_ids: &[String],
         since_sequence: i64,
     ) -> Result<http_client::EventSourceStream> {
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
+        }
         debug_assert!(!run_ids.is_empty(), "run_ids must not be empty");
         let auth_token = self
             .get_or_refresh_access_token()
@@ -921,7 +943,6 @@ impl ServerApi {
         B: Serialize,
     {
         Self::ensure_public_api_enabled(path)?;
-
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -1178,6 +1199,9 @@ impl ServerApi {
         event: impl TelemetryEvent,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if warp_api_disabled() {
+            return Ok(());
+        }
         let user_id = self.user_id();
         let anonymous_id = self.anonymous_id();
         self.telemetry_api
@@ -1195,6 +1219,9 @@ impl ServerApi {
         &self,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<usize> {
+        if warp_api_disabled() {
+            return Ok(0);
+        }
         self.telemetry_api.flush_events(settings_snapshot).await
     }
 
@@ -1205,6 +1232,9 @@ impl ServerApi {
         path: &Path,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if warp_api_disabled() {
+            return Ok(());
+        }
         self.telemetry_api
             .flush_persisted_events_to_rudder(path, settings_snapshot)
             .await
@@ -1236,7 +1266,6 @@ impl ServerApi {
                 .await
                 .map_err(|err| AIApiError::Other(err.into()));
         }
-
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let request_builder = self.client.post(format!(
@@ -1262,6 +1291,9 @@ impl ServerApi {
         &self,
         request: &GetRelevantFiles,
     ) -> Result<GetRelevantFilesResponse, AIApiError> {
+        if warp_api_disabled() {
+            return Err(AIApiError::Other(warp_api_disabled_error()));
+        }
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let request_builder = self.client.post(format!(
@@ -1289,6 +1321,9 @@ impl ServerApi {
         &self,
         request: &GenerateAMQuerySuggestionsRequest,
     ) -> Result<generate_am_query_suggestions::GenerateAMQuerySuggestionsResponse, AIApiError> {
+        if warp_api_disabled() {
+            return Err(AIApiError::Other(warp_api_disabled_error()));
+        }
         let auth_token = self.get_or_refresh_access_token().await?;
 
         cfg_if::cfg_if! {
@@ -1332,7 +1367,6 @@ impl ServerApi {
                 .await
                 .map_err(|err| AIApiError::Other(err.into()));
         }
-
         let auth_token = self.get_or_refresh_access_token().await?;
         let request_builder = self.client.post(format!(
             "{}/ai/predict_am_queries",
@@ -1358,6 +1392,9 @@ impl ServerApi {
         &self,
         request: &TranscribeRequest,
     ) -> Result<TranscribeResponse, TranscribeError> {
+        if warp_api_disabled() {
+            return Err(TranscribeError::Transport);
+        }
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let request_builder = self
@@ -1572,6 +1609,9 @@ impl ServerApi {
         if let Some(cached) = self.cached_server_time() {
             return Ok(cached);
         }
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
+        }
 
         let time_endpoint = format!("{}/current_time", ChannelState::server_root_url());
         log::info!("Sending server time request to {}", &time_endpoint);
@@ -1614,6 +1654,9 @@ impl ServerApi {
         include_changelogs: bool,
         is_daily: bool,
     ) -> Result<ChannelVersions> {
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
+        }
         let mut url = Url::parse(&ChannelState::server_root_url())
             .expect("Should not fail to parse server root URL");
         if is_daily {
@@ -1834,3 +1877,55 @@ impl Entity for ServerApiProvider {
 }
 
 impl SingletonEntity for ServerApiProvider {}
+
+#[cfg(test)]
+mod fully_local_tests {
+    use super::*;
+    use crate::ai::predict::generate_ai_input_suggestions::GenerateAIInputSuggestionsRequest;
+
+    #[test]
+    fn warp_api_is_always_disabled() {
+        assert!(warp_api_disabled(), "this is a fully-local build");
+    }
+
+    // These construct `ServerApi` in a sync context (outside any Tokio runtime)
+    // because the test-util `server_root_url()` lazily spins up a mockito server,
+    // which panics if first initialized from within a runtime. The gated methods
+    // are then driven on a current-thread runtime.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn rest_call_is_blocked_without_touching_the_network() {
+        let api = ServerApi::new_for_test();
+
+        // fetch_channel_versions early-returns the disabled error rather than
+        // building a request to the Warp server.
+        let result = block_on(api.fetch_channel_versions(false, false));
+
+        let err = result.expect_err("fully-local mode must block the channel-version fetch");
+        assert!(
+            err.to_string().contains("fully-local"),
+            "should be the fully-local disabled error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ai_input_suggestions_are_blocked_in_fully_local() {
+        let api = ServerApi::new_for_test();
+
+        let result = block_on(
+            api.generate_ai_input_suggestions(&GenerateAIInputSuggestionsRequest::default()),
+        );
+
+        assert!(
+            matches!(result, Err(AIApiError::Other(_))),
+            "fully-local mode must block AI input suggestions at the server"
+        );
+    }
+}
