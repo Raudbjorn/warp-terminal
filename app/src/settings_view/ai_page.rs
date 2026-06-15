@@ -1,7 +1,4 @@
-use ::ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent, ApiKeys};
-#[cfg(not(target_family = "wasm"))]
-use ::ai::grok_subscription::oauth::{self, ManualCodeExchange};
-use chrono::{DateTime, Local};
+use ::ai::api_keys::ApiKeyManager;
 use enum_iterator::all;
 use itertools::Itertools;
 use pathfinder_geometry::vector::vec2f;
@@ -701,7 +698,10 @@ pub struct AISettingsPageView {
 }
 
 impl AISettingsPageView {
-    pub fn new(ctx: &mut ViewContext<Self>) -> Self {
+    pub fn new_with_subpage(
+        active_subpage: Option<AISubpage>,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
         let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
 
         let workspace = UserWorkspaces::handle(ctx);
@@ -1713,7 +1713,7 @@ impl AISettingsPageView {
         );
 
         let custom_endpoint_edit_buttons = Self::create_custom_endpoint_edit_buttons(
-            ApiKeyManager::as_ref(ctx).keys().custom_endpoints.len(),
+            ApiKeysWidget::active_profile_custom_endpoints_len(ctx),
             custom_inference_controls_enabled,
             ctx,
         );
@@ -1782,8 +1782,8 @@ impl AISettingsPageView {
             });
         }
         Self {
-            page: Self::build_page(None, ctx),
-            active_subpage: None,
+            page: Self::build_page(active_subpage, ctx),
+            active_subpage,
             voice_input_toggle_key_dropdown,
             autodetection_denylist_editor,
             local_only_icon_tooltip_states: Default::default(),
@@ -1875,7 +1875,7 @@ impl AISettingsPageView {
             button.set_disabled(!enabled, ctx);
         });
 
-        let endpoint_count = ApiKeyManager::as_ref(ctx).keys().custom_endpoints.len();
+        let endpoint_count = ApiKeysWidget::active_profile_custom_endpoints_len(ctx);
         if self.custom_endpoint_edit_buttons.len() != endpoint_count {
             self.custom_endpoint_edit_buttons =
                 Self::create_custom_endpoint_edit_buttons(endpoint_count, enabled, ctx);
@@ -1942,6 +1942,7 @@ impl AISettingsPageView {
         }
         let endpoint = ApiKeyManager::as_ref(ctx)
             .keys()
+            .profile_settings(&ApiKeysWidget::active_inference_profile_key(ctx))
             .custom_endpoints
             .get(index)
             .cloned();
@@ -2002,7 +2003,8 @@ impl AISettingsPageView {
                     return;
                 }
                 ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
-                    manager.add_custom_endpoint(
+                    manager.add_custom_endpoint_for_profile(
+                        &ApiKeysWidget::active_inference_profile_key(ctx),
                         name.clone(),
                         url.clone(),
                         api_key.clone(),
@@ -2011,6 +2013,7 @@ impl AISettingsPageView {
                     );
                 });
                 self.hide_custom_endpoint_modal(ctx);
+                self.sync_custom_endpoint_buttons(ctx);
 
                 let window_id = ctx.window_id();
                 crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
@@ -2033,7 +2036,8 @@ impl AISettingsPageView {
                     return;
                 }
                 ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
-                    manager.save_custom_endpoint(
+                    manager.save_custom_endpoint_for_profile(
+                        &ApiKeysWidget::active_inference_profile_key(ctx),
                         *index,
                         name.clone(),
                         url.clone(),
@@ -2043,6 +2047,7 @@ impl AISettingsPageView {
                     );
                 });
                 self.hide_custom_endpoint_modal(ctx);
+                self.sync_custom_endpoint_buttons(ctx);
 
                 let window_id = ctx.window_id();
                 crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
@@ -2074,6 +2079,7 @@ impl AISettingsPageView {
         }
         let endpoint = ApiKeyManager::as_ref(ctx)
             .keys()
+            .profile_settings(&ApiKeysWidget::active_inference_profile_key(ctx))
             .custom_endpoints
             .get(index)
             .cloned();
@@ -2121,7 +2127,11 @@ impl AISettingsPageView {
                     return;
                 }
                 ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
-                    manager.remove_custom_endpoint(*index, ctx);
+                    manager.remove_custom_endpoint_for_profile(
+                        &ApiKeysWidget::active_inference_profile_key(ctx),
+                        *index,
+                        ctx,
+                    );
                 });
                 self.pending_remove_custom_endpoint_index = None;
                 self.remove_custom_endpoint_confirmation_dialog
@@ -3570,6 +3580,82 @@ impl TypedActionView for AISettingsPageView {
                         .can_use_warp_credits_for_fallback
                         .toggle_and_save_value(ctx));
                 });
+                ctx.notify();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            AISettingsPageAction::RestartLocalMultiAgent => {
+                LocalMultiAgentManager::handle(ctx).update(ctx, |manager, ctx| {
+                    manager.restart_with_config(ctx);
+                });
+                ctx.notify();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            AISettingsPageAction::HealthCheckLocalMultiAgent => {
+                LocalMultiAgentManager::handle(ctx).update(ctx, |manager, ctx| {
+                    manager.test_backend(ctx);
+                });
+                ctx.notify();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            AISettingsPageAction::ToggleLocalMultiAgentTools => {
+                LocalMultiAgentManager::handle(ctx).update(ctx, |manager, ctx| {
+                    let mut config = manager.config().clone();
+                    config.local_enable_tools = !config.local_enable_tools;
+                    if let Err(error) = manager.set_config(config, ctx) {
+                        manager.record_config_error(error.to_string(), ctx);
+                    }
+                });
+                ctx.notify();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            AISettingsPageAction::ToggleLocalAIAutocomplete => {
+                ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                    let profile_key = ApiKeysWidget::active_inference_profile_key(ctx);
+                    let enabled = !manager.local_ai_autocomplete_enabled_for_profile(&profile_key);
+                    manager.set_local_ai_autocomplete_enabled_for_profile(
+                        &profile_key,
+                        enabled,
+                        ctx,
+                    );
+                });
+                ctx.notify();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            AISettingsPageAction::SetLocalMultiAgentDefaultModel(model) => {
+                LocalMultiAgentManager::handle(ctx).update(ctx, |manager, ctx| {
+                    let mut config = manager.config().clone();
+                    config.openai_model = Some(model.clone());
+                    if let Err(error) = manager.set_config(config, ctx) {
+                        manager.record_config_error(error.to_string(), ctx);
+                    }
+                });
+                ctx.notify();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            AISettingsPageAction::SetLocalMultiAgentAlias { alias, model } => {
+                let profile_key = ApiKeysWidget::active_inference_profile_key(ctx);
+                let current_aliases = ApiKeyManager::as_ref(ctx)
+                    .keys()
+                    .profile_settings(&profile_key)
+                    .local_model_aliases;
+                let mut config = LocalMultiAgentManager::as_ref(ctx).config().clone();
+                config.local_model_aliases = current_aliases;
+                match config.set_model_alias(alias, model) {
+                    Ok(()) => {
+                        ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                            manager.set_local_model_aliases_for_profile(
+                                &profile_key,
+                                config.local_model_aliases.clone(),
+                                ctx,
+                            );
+                        });
+                    }
+                    Err(error) => {
+                        LocalMultiAgentManager::handle(ctx).update(ctx, |manager, ctx| {
+                            manager.record_config_error(error.to_string(), ctx);
+                        })
+                    }
+                }
                 ctx.notify();
             }
             AISettingsPageAction::HyperlinkClick(hyperlink) => {
@@ -7596,18 +7682,87 @@ struct ApiKeysWidget {
 }
 
 impl ApiKeysWidget {
+    fn active_inference_profile_key(app: &AppContext) -> String {
+        AIExecutionProfilesModel::as_ref(app)
+            .active_profile(None, app)
+            .inference_profile_key()
+    }
+
+    fn active_profile_custom_endpoints_len(app: &AppContext) -> usize {
+        ApiKeyManager::as_ref(app)
+            .keys()
+            .profile_settings(&Self::active_inference_profile_key(app))
+            .custom_endpoints
+            .len()
+    }
+
+    fn sync_editor_text(
+        editor: &ViewHandle<EditorView>,
+        value: Option<String>,
+        ctx: &mut AppContext,
+    ) {
+        let value = value.unwrap_or_default();
+        editor.update(ctx, |editor, ctx| {
+            if editor.buffer_text(ctx) != value {
+                editor.set_buffer_text(&value, ctx);
+            }
+        });
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[allow(clippy::too_many_arguments)]
+    fn sync_profile_inference_editors(
+        openai_api_key_editor: &ViewHandle<EditorView>,
+        anthropic_api_key_editor: &ViewHandle<EditorView>,
+        google_api_key_editor: &ViewHandle<EditorView>,
+        openai_base_url_editor: &ViewHandle<EditorView>,
+        local_agent_model_aliases_editor: &ViewHandle<EditorView>,
+        ctx: &mut AppContext,
+    ) {
+        let profile_key = Self::active_inference_profile_key(ctx);
+        let settings = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&profile_key);
+        Self::sync_editor_text(openai_api_key_editor, settings.openai, ctx);
+        Self::sync_editor_text(anthropic_api_key_editor, settings.anthropic, ctx);
+        Self::sync_editor_text(google_api_key_editor, settings.google, ctx);
+        Self::sync_editor_text(openai_base_url_editor, settings.openai_base_url, ctx);
+        Self::sync_editor_text(
+            local_agent_model_aliases_editor,
+            Some(settings.local_model_aliases),
+            ctx,
+        );
+    }
+
+    #[cfg(target_family = "wasm")]
+    fn sync_profile_inference_editors(
+        openai_api_key_editor: &ViewHandle<EditorView>,
+        anthropic_api_key_editor: &ViewHandle<EditorView>,
+        google_api_key_editor: &ViewHandle<EditorView>,
+        ctx: &mut AppContext,
+    ) {
+        let profile_key = Self::active_inference_profile_key(ctx);
+        let settings = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&profile_key);
+        Self::sync_editor_text(openai_api_key_editor, settings.openai, ctx);
+        Self::sync_editor_text(anthropic_api_key_editor, settings.anthropic, ctx);
+        Self::sync_editor_text(google_api_key_editor, settings.google, ctx);
+    }
+
     fn new(ctx: &mut ViewContext<<Self as SettingsWidget>::View>) -> Self {
         let ai_settings = AISettings::as_ref(ctx);
         let workspace_handle = UserWorkspaces::handle(ctx);
         let is_any_ai_enabled = ai_settings.is_any_ai_enabled(ctx);
         let is_byo_enabled = workspace_handle.as_ref(ctx).is_byo_api_key_enabled(ctx);
 
-        let ApiKeys {
-            openai: openai_key,
-            anthropic: anthropic_key,
-            google: google_key,
-            ..
-        } = ApiKeyManager::as_ref(ctx).keys().clone();
+        let inference_profile_key = Self::active_inference_profile_key(ctx);
+        let inference_settings = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&inference_profile_key);
+        let openai_key = inference_settings.openai.clone();
+        let anthropic_key = inference_settings.anthropic.clone();
+        let google_key = inference_settings.google.clone();
 
         // A helper macro to create and configure an API key editor.  This avoids a lot
         // of code duplication and ensures consistency between the editors.
@@ -7646,7 +7801,8 @@ impl ApiKeysWidget {
                         let buffer_text = $editor.as_ref(ctx).buffer_text(ctx);
                         let key = buffer_text.is_empty().not().then_some(buffer_text);
                         ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
-                            model.$set_func(key, ctx);
+                            let profile_key = ApiKeysWidget::active_inference_profile_key(ctx);
+                            model.$set_func(&profile_key, key, ctx);
                         });
                     }
                 });
@@ -7665,7 +7821,8 @@ impl ApiKeysWidget {
                                 editor.set_buffer_text("", ctx);
                             });
                             ApiKeyManager::handle(ctx).update(ctx, |model, ctx| {
-                                model.$set_func(None, ctx);
+                                let profile_key = ApiKeysWidget::active_inference_profile_key(ctx);
+                                model.$set_func(&profile_key, None, ctx);
                             });
                         }
 
@@ -7680,37 +7837,347 @@ impl ApiKeysWidget {
             };
         }
 
-        create_api_key_editor!(openai_api_key_editor, openai_key, set_openai_key, "sk-...");
+        create_api_key_editor!(
+            openai_api_key_editor,
+            openai_key,
+            set_openai_key_for_profile,
+            "sk-...",
+            true
+        );
         create_api_key_editor!(
             anthropic_api_key_editor,
             anthropic_key,
-            set_anthropic_key,
-            "sk-ant-..."
+            set_anthropic_key_for_profile,
+            "sk-ant-...",
+            true
         );
         create_api_key_editor!(
             google_api_key_editor,
             google_key,
-            set_google_key,
-            "AIzaSy..."
+            set_google_key_for_profile,
+            "AIzaSy...",
+            true
         );
 
-        // Editor text colors are snapshotted at construction via
-        // `text_colors_override`, so refresh them whenever the theme changes.
-        let api_key_editors = [
-            openai_api_key_editor.clone(),
-            anthropic_api_key_editor.clone(),
-            google_api_key_editor.clone(),
-        ];
-        ctx.subscribe_to_model(&Appearance::handle(ctx), move |_, _, event, ctx| {
-            if let AppearanceEvent::ThemeChanged = event {
-                let text_colors = editor_text_colors(Appearance::as_ref(ctx));
-                for editor in &api_key_editors {
-                    let colors = text_colors.clone();
-                    editor.update(ctx, move |editor, ctx| {
-                        editor.set_text_colors(colors, ctx);
-                    });
-                }
+        #[cfg(not(target_family = "wasm"))]
+        let local_config = LocalMultiAgentManager::as_ref(ctx).config().clone();
+        #[cfg(not(target_family = "wasm"))]
+        macro_rules! create_profile_inference_editor {
+            ($editor:ident, $initial:expr, $placeholder:literal, |$manager:ident, $profile_key:ident, $buffer_text:ident, $ctx:ident| $apply:block) => {
+                let initial_value = $initial;
+                let $editor = ctx.add_typed_action_view(move |ctx| {
+                    let appearance = Appearance::handle(ctx).as_ref(ctx);
+                    let options = SingleLineEditorOptions {
+                        is_password: false,
+                        text: TextOptions {
+                            font_size_override: Some(appearance.ui_font_size()),
+                            font_family_override: Some(appearance.monospace_font_family()),
+                            text_colors_override: Some(TextColors {
+                                default_color: appearance.theme().active_ui_text_color(),
+                                disabled_color: appearance.theme().disabled_ui_text_color(),
+                                hint_color: appearance.theme().disabled_ui_text_color(),
+                            }),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut editor = EditorView::single_line(options, ctx);
+                    editor.set_placeholder_text($placeholder, ctx);
+                    if !initial_value.is_empty() {
+                        editor.set_buffer_text(&initial_value, ctx);
+                    }
+                    editor
+                });
+                AISettingsPageView::update_editor_interaction_state(
+                    $editor.clone(),
+                    is_any_ai_enabled && is_byo_enabled,
+                    ctx,
+                );
+                ctx.subscribe_to_view(&$editor, |_, $editor, event, ctx| {
+                    if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                        let $buffer_text = $editor.as_ref(ctx).buffer_text(ctx);
+                        let $profile_key = ApiKeysWidget::active_inference_profile_key(ctx);
+                        ApiKeyManager::handle(ctx).update(ctx, |$manager, $ctx| $apply);
+                    }
+                });
+                let editor_clone = $editor.clone();
+                ctx.subscribe_to_model(&workspace_handle, move |_, workspace, event, ctx| {
+                    if let UserWorkspacesEvent::TeamsChanged = event {
+                        let is_any_ai_enabled =
+                            AISettings::handle(ctx).as_ref(ctx).is_any_ai_enabled(ctx);
+                        let is_byo_enabled = workspace.as_ref(ctx).is_byo_api_key_enabled(ctx);
+                        AISettingsPageView::update_editor_interaction_state(
+                            editor_clone.clone(),
+                            is_any_ai_enabled && is_byo_enabled,
+                            ctx,
+                        );
+                        ctx.notify();
+                    }
+                });
+                let editor_clone = $editor.clone();
+                ctx.subscribe_to_model(&AISettings::handle(ctx), move |_, _, event, ctx| {
+                    if let AISettingsChangedEvent::IsAnyAIEnabled { .. } = event {
+                        let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
+                        let is_byo_enabled =
+                            UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
+                        AISettingsPageView::update_editor_interaction_state(
+                            editor_clone.clone(),
+                            is_any_ai_enabled && is_byo_enabled,
+                            ctx,
+                        );
+                        ctx.notify();
+                    }
+                })
+            };
+        }
+        #[cfg(not(target_family = "wasm"))]
+        macro_rules! create_local_agent_editor {
+            ($editor:ident, $initial:expr, $placeholder:literal, |$config:ident, $buffer_text:ident| $apply:block) => {
+                let initial_value = $initial;
+                let $editor = ctx.add_typed_action_view(move |ctx| {
+                    let appearance = Appearance::handle(ctx).as_ref(ctx);
+                    let options = SingleLineEditorOptions {
+                        is_password: false,
+                        text: TextOptions {
+                            font_size_override: Some(appearance.ui_font_size()),
+                            font_family_override: Some(appearance.monospace_font_family()),
+                            text_colors_override: Some(TextColors {
+                                default_color: appearance.theme().active_ui_text_color(),
+                                disabled_color: appearance.theme().disabled_ui_text_color(),
+                                hint_color: appearance.theme().disabled_ui_text_color(),
+                            }),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut editor = EditorView::single_line(options, ctx);
+                    editor.set_placeholder_text($placeholder, ctx);
+                    if !initial_value.is_empty() {
+                        editor.set_buffer_text(&initial_value, ctx);
+                    }
+                    editor
+                });
+                AISettingsPageView::update_editor_interaction_state(
+                    $editor.clone(),
+                    is_any_ai_enabled && is_byo_enabled,
+                    ctx,
+                );
+                ctx.subscribe_to_view(&$editor, |_, $editor, event, ctx| {
+                    if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                        let $buffer_text = $editor.as_ref(ctx).buffer_text(ctx);
+                        LocalMultiAgentManager::handle(ctx).update(ctx, |manager, ctx| {
+                            let mut $config = manager.config().clone();
+                            let update_result: Result<(), String> = (|| $apply)();
+                            match update_result.and_then(|_| {
+                                manager
+                                    .set_config($config, ctx)
+                                    .map_err(|error| error.to_string())
+                            }) {
+                                Ok(()) => {}
+                                Err(message) => manager.record_config_error(message, ctx),
+                            }
+                        });
+                    }
+                });
+                let editor_clone = $editor.clone();
+                ctx.subscribe_to_model(&workspace_handle, move |_, workspace, event, ctx| {
+                    if let UserWorkspacesEvent::TeamsChanged = event {
+                        let is_any_ai_enabled =
+                            AISettings::handle(ctx).as_ref(ctx).is_any_ai_enabled(ctx);
+                        let is_byo_enabled = workspace.as_ref(ctx).is_byo_api_key_enabled(ctx);
+                        AISettingsPageView::update_editor_interaction_state(
+                            editor_clone.clone(),
+                            is_any_ai_enabled && is_byo_enabled,
+                            ctx,
+                        );
+                        ctx.notify();
+                    }
+                });
+                let editor_clone = $editor.clone();
+                ctx.subscribe_to_model(&AISettings::handle(ctx), move |_, _, event, ctx| {
+                    if let AISettingsChangedEvent::IsAnyAIEnabled { .. } = event {
+                        let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
+                        let is_byo_enabled =
+                            UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
+                        AISettingsPageView::update_editor_interaction_state(
+                            editor_clone.clone(),
+                            is_any_ai_enabled && is_byo_enabled,
+                            ctx,
+                        );
+                        ctx.notify();
+                    }
+                })
+            };
+        }
+        #[cfg(not(target_family = "wasm"))]
+        create_profile_inference_editor!(
+            openai_base_url_editor,
+            inference_settings
+                .openai_base_url
+                .clone()
+                .unwrap_or_default(),
+            "https://api.openai.com/v1",
+            |manager, profile_key, buffer_text, ctx| {
+                manager.set_openai_base_url_for_profile(
+                    &profile_key,
+                    buffer_text
+                        .trim()
+                        .is_empty()
+                        .not()
+                        .then_some(buffer_text.trim().trim_end_matches('/').to_string()),
+                    ctx,
+                );
             }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_host_editor,
+            local_config.host.clone(),
+            "127.0.0.1",
+            |config, buffer_text| {
+                config.host = buffer_text.trim().to_string();
+                Ok(())
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_port_editor,
+            local_config.port.to_string(),
+            "8787",
+            |config, buffer_text| {
+                config.port = buffer_text
+                    .trim()
+                    .parse::<u16>()
+                    .map_err(|_| "Port must be between 1 and 65535.".to_string())?;
+                Ok(())
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_profile_inference_editor!(
+            local_agent_model_aliases_editor,
+            inference_settings.local_model_aliases.clone(),
+            r#"{"auto-efficient":"model-id"}"#,
+            |manager, profile_key, buffer_text, ctx| {
+                manager.set_local_model_aliases_for_profile(
+                    &profile_key,
+                    buffer_text.trim().to_string(),
+                    ctx,
+                );
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_model_list_editor,
+            local_config.local_model_list.clone(),
+            "model-a,model-b",
+            |config, buffer_text| {
+                config.local_model_list = buffer_text.trim().to_string();
+                Ok(())
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_max_history_editor,
+            local_config.local_max_history_messages.to_string(),
+            "80",
+            |config, buffer_text| {
+                config.local_max_history_messages =
+                    buffer_text.trim().parse::<u16>().map_err(|_| {
+                        "Maximum history messages must be a positive number.".to_string()
+                    })?;
+                Ok(())
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_max_completion_tokens_editor,
+            local_config.local_max_completion_tokens.to_string(),
+            "2048",
+            |config, buffer_text| {
+                config.local_max_completion_tokens =
+                    buffer_text.trim().parse::<u32>().map_err(|_| {
+                        "Maximum completion tokens must be a positive number.".to_string()
+                    })?;
+                Ok(())
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_context_tokens_editor,
+            local_config
+                .local_model_context_tokens
+                .clone()
+                .unwrap_or_default(),
+            r#"{"model-id":131072}"#,
+            |config, buffer_text| {
+                config.local_model_context_tokens = buffer_text
+                    .trim()
+                    .is_empty()
+                    .not()
+                    .then_some(buffer_text.trim().to_string());
+                Ok(())
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_graphql_db_path_editor,
+            local_config
+                .local_graphql_db_path
+                .clone()
+                .unwrap_or_default(),
+            "Default Warp data path",
+            |config, buffer_text| {
+                config.local_graphql_db_path = buffer_text
+                    .trim()
+                    .is_empty()
+                    .not()
+                    .then_some(buffer_text.trim().to_string());
+                Ok(())
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_log_level_editor,
+            local_config.log_level.clone(),
+            "info",
+            |config, buffer_text| {
+                config.log_level = buffer_text.trim().to_string();
+                Ok(())
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_log_path_editor,
+            local_config
+                .local_service_log_path
+                .clone()
+                .unwrap_or_default(),
+            "Default Warp log path",
+            |config, buffer_text| {
+                config.local_service_log_path = buffer_text
+                    .trim()
+                    .is_empty()
+                    .not()
+                    .then_some(buffer_text.trim().to_string());
+                Ok(())
+            }
+        );
+        #[cfg(not(target_family = "wasm"))]
+        create_local_agent_editor!(
+            local_agent_system_prompt_editor,
+            local_config.local_multi_agent_system_prompt.clone(),
+            "System prompt",
+            |config, buffer_text| {
+                config.local_multi_agent_system_prompt = buffer_text;
+                Ok(())
+            }
+        );
+
+        #[cfg(not(target_family = "wasm"))]
+        let local_agent_default_model_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = FilterableDropdown::new(ctx);
+            dropdown.set_menu_width(AI_SETTINGS_DROPDOWN_WIDTH, ctx);
+            dropdown
         });
 
         let grok_connect_button = ctx.add_typed_action_view(|_| {
@@ -7752,16 +8219,87 @@ impl ApiKeysWidget {
                     });
                 }
                 ctx.notify();
-            }
-        });
-
-        // Re-render the SuperGrok row whenever the stored tokens change (the
-        // connect flow completes, a disconnect, or a background refresh).
-        ctx.subscribe_to_model(&ApiKeyManager::handle(ctx), |_, _, event, ctx| {
-            if matches!(event, ApiKeyManagerEvent::KeysUpdated) {
+            });
+        }
+        {
+            let openai_editor = openai_api_key_editor.clone();
+            let anthropic_editor = anthropic_api_key_editor.clone();
+            let google_editor = google_api_key_editor.clone();
+            #[cfg(not(target_family = "wasm"))]
+            let openai_base_url_editor_clone = openai_base_url_editor.clone();
+            #[cfg(not(target_family = "wasm"))]
+            let local_agent_model_aliases_editor_clone = local_agent_model_aliases_editor.clone();
+            #[cfg(not(target_family = "wasm"))]
+            let default_model_dropdown = local_agent_default_model_dropdown.clone();
+            #[cfg(not(target_family = "wasm"))]
+            let alias_dropdowns = local_agent_alias_dropdowns.clone();
+            ctx.subscribe_to_model(&ApiKeyManager::handle(ctx), move |_, _, _, ctx| {
+                #[cfg(not(target_family = "wasm"))]
+                Self::sync_profile_inference_editors(
+                    &openai_editor,
+                    &anthropic_editor,
+                    &google_editor,
+                    &openai_base_url_editor_clone,
+                    &local_agent_model_aliases_editor_clone,
+                    ctx,
+                );
+                #[cfg(target_family = "wasm")]
+                Self::sync_profile_inference_editors(
+                    &openai_editor,
+                    &anthropic_editor,
+                    &google_editor,
+                    ctx,
+                );
+                #[cfg(not(target_family = "wasm"))]
+                Self::refresh_local_agent_model_dropdowns(
+                    &default_model_dropdown,
+                    &alias_dropdowns,
+                    ctx,
+                );
                 ctx.notify();
-            }
-        });
+            });
+        }
+        {
+            let openai_editor = openai_api_key_editor.clone();
+            let anthropic_editor = anthropic_api_key_editor.clone();
+            let google_editor = google_api_key_editor.clone();
+            #[cfg(not(target_family = "wasm"))]
+            let openai_base_url_editor_clone = openai_base_url_editor.clone();
+            #[cfg(not(target_family = "wasm"))]
+            let local_agent_model_aliases_editor_clone = local_agent_model_aliases_editor.clone();
+            #[cfg(not(target_family = "wasm"))]
+            let default_model_dropdown = local_agent_default_model_dropdown.clone();
+            #[cfg(not(target_family = "wasm"))]
+            let alias_dropdowns = local_agent_alias_dropdowns.clone();
+            ctx.subscribe_to_model(
+                &AIExecutionProfilesModel::handle(ctx),
+                move |_, _, _, ctx| {
+                    #[cfg(not(target_family = "wasm"))]
+                    Self::sync_profile_inference_editors(
+                        &openai_editor,
+                        &anthropic_editor,
+                        &google_editor,
+                        &openai_base_url_editor_clone,
+                        &local_agent_model_aliases_editor_clone,
+                        ctx,
+                    );
+                    #[cfg(target_family = "wasm")]
+                    Self::sync_profile_inference_editors(
+                        &openai_editor,
+                        &anthropic_editor,
+                        &google_editor,
+                        ctx,
+                    );
+                    #[cfg(not(target_family = "wasm"))]
+                    Self::refresh_local_agent_model_dropdowns(
+                        &default_model_dropdown,
+                        &alias_dropdowns,
+                        ctx,
+                    );
+                    ctx.notify();
+                },
+            );
+        }
 
         Self {
             openai_api_key_editor,
@@ -7778,6 +8316,143 @@ impl ApiKeysWidget {
             custom_inference_info_tooltip: Default::default(),
             custom_inference_terms_index: Default::default(),
             description_learn_more_index: Default::default(),
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn local_agent_settings_enabled(app: &AppContext) -> bool {
+        AISettings::as_ref(app).is_any_ai_enabled(app)
+            && UserWorkspaces::as_ref(app).is_byo_api_key_enabled(app)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn update_local_agent_buttons(
+        restart_button: &ViewHandle<ActionButton>,
+        health_button: &ViewHandle<ActionButton>,
+        app: &mut AppContext,
+    ) {
+        let is_enabled = Self::local_agent_settings_enabled(app);
+        let test_status = LocalMultiAgentManager::as_ref(app).test_status().clone();
+        restart_button.update(app, |button, ctx| {
+            button.set_disabled(!is_enabled, ctx);
+        });
+        health_button.update(app, |button, ctx| match test_status {
+            LocalMultiAgentTestStatus::NotRun => {
+                button.set_label("Test", ctx);
+                button.set_icon(Some(Icon::Check), ctx);
+                button.set_disabled(!is_enabled, ctx);
+            }
+            LocalMultiAgentTestStatus::Testing => {
+                button.set_label("Testing...", ctx);
+                button.set_icon(Some(Icon::RefreshCw04), ctx);
+                button.set_disabled(true, ctx);
+            }
+            LocalMultiAgentTestStatus::Passed { .. } => {
+                button.set_label("Passed", ctx);
+                button.set_icon(Some(Icon::Check), ctx);
+                button.set_disabled(!is_enabled, ctx);
+            }
+            LocalMultiAgentTestStatus::Failed { .. } => {
+                button.set_label("Failed", ctx);
+                button.set_icon(Some(Icon::AlertTriangle), ctx);
+                button.set_disabled(!is_enabled, ctx);
+            }
+        });
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn refresh_local_agent_model_dropdowns(
+        default_model_dropdown: &ViewHandle<FilterableDropdown<AISettingsPageAction>>,
+        alias_dropdowns: &HashMap<
+            &'static str,
+            ViewHandle<FilterableDropdown<AISettingsPageAction>>,
+        >,
+        ctx: &mut AppContext,
+    ) {
+        let is_enabled = Self::local_agent_settings_enabled(ctx);
+        let manager = LocalMultiAgentManager::as_ref(ctx);
+        let config = manager.config().clone();
+        let discovered_models = manager.discovered_models().to_vec();
+        let choices = config.model_choices(&discovered_models);
+        let profile_key = Self::active_inference_profile_key(ctx);
+        let profile_settings = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&profile_key);
+        let autocomplete_enabled = profile_settings.local_ai_autocomplete_enabled;
+
+        default_model_dropdown.update(ctx, |dropdown, ctx| {
+            if is_enabled && !choices.is_empty() {
+                dropdown.set_enabled(ctx);
+            } else {
+                dropdown.set_disabled(ctx);
+            }
+            let items = choices
+                .iter()
+                .map(|model| {
+                    DropdownItem::new(
+                        model.clone(),
+                        AISettingsPageAction::SetLocalMultiAgentDefaultModel(model.clone()),
+                    )
+                })
+                .collect();
+            dropdown.set_items(items, ctx);
+            if let Some(selected) = config
+                .openai_model
+                .as_ref()
+                .filter(|model| choices.iter().any(|choice| choice == *model))
+                .or_else(|| choices.first())
+            {
+                dropdown.set_selected_by_action(
+                    AISettingsPageAction::SetLocalMultiAgentDefaultModel(selected.clone()),
+                    ctx,
+                );
+            }
+        });
+
+        let mut profile_alias_config = config.clone();
+        profile_alias_config.local_model_aliases = profile_settings.local_model_aliases.clone();
+        let aliases = profile_alias_config.model_aliases().unwrap_or_default();
+        for alias in LOCAL_MODEL_ALIAS_IDS {
+            let Some(dropdown_handle) = alias_dropdowns.get(alias) else {
+                continue;
+            };
+            let selected = aliases
+                .get(alias)
+                .filter(|model| choices.iter().any(|choice| choice == *model))
+                .or_else(|| choices.first())
+                .cloned();
+            dropdown_handle.update(ctx, |dropdown, ctx| {
+                let alias_enabled = is_enabled
+                    && !choices.is_empty()
+                    && (alias != "auto-autocomplete" || autocomplete_enabled);
+                if alias_enabled {
+                    dropdown.set_enabled(ctx);
+                } else {
+                    dropdown.set_disabled(ctx);
+                }
+                let items = choices
+                    .iter()
+                    .map(|model| {
+                        DropdownItem::new(
+                            model.clone(),
+                            AISettingsPageAction::SetLocalMultiAgentAlias {
+                                alias: alias.to_string(),
+                                model: model.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                dropdown.set_items(items, ctx);
+                if let Some(selected) = selected.clone() {
+                    dropdown.set_selected_by_action(
+                        AISettingsPageAction::SetLocalMultiAgentAlias {
+                            alias: alias.to_string(),
+                            model: selected,
+                        },
+                        ctx,
+                    );
+                }
+            });
         }
     }
 
@@ -7969,7 +8644,11 @@ impl ApiKeysWidget {
     ) -> Box<dyn Element> {
         let theme = appearance.theme();
         let text_color = styles::header_font_color(is_enabled, app);
-        let endpoints = &ApiKeyManager::as_ref(app).keys().custom_endpoints;
+        let profile_key = Self::active_inference_profile_key(app);
+        let endpoints = ApiKeyManager::as_ref(app)
+            .keys()
+            .profile_settings(&profile_key)
+            .custom_endpoints;
         let chip_border = internal_colors::fg_overlay_3(theme);
 
         let mut list = Flex::column().with_spacing(12.);
@@ -8095,38 +8774,51 @@ impl ApiKeysWidget {
             .with_child(header_row)
             .with_child(description);
 
-        if let Some(tokens) = grok_tokens {
-            let connected_text = match tokens.connected_at.map(DateTime::<Local>::from) {
-                Some(connected_at) => format!(
-                    "Connected on {}.",
-                    connected_at.format("%m/%d/%Y at %-I:%M%P")
-                ),
-                // Tokens stored before the connection time was tracked.
-                None => "Connected.".to_string(),
-            };
-            let check = ConstrainedBox::new(
-                Icon::Check
-                    .to_warpui_icon(appearance.theme().ansi_fg_green().into())
-                    .finish(),
-            )
-            .with_width(12.)
-            .with_height(12.)
-            .finish();
-            let status_text = Text::new_inline(
-                connected_text,
-                appearance.ui_font_family(),
-                CONTENT_FONT_SIZE,
-            )
-            .with_color(styles::description_font_color(is_enabled, app).into())
-            .finish();
-            column.add_child(
-                Flex::row()
-                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
-                    .with_spacing(4.)
-                    .with_child(check)
-                    .with_child(status_text)
-                    .finish(),
-            );
+        let profile_key = Self::active_inference_profile_key(app);
+        let autocomplete_enabled =
+            ApiKeyManager::as_ref(app).local_ai_autocomplete_enabled_for_profile(&profile_key);
+        let mut autocomplete_toggle = Some(if is_enabled {
+            appearance
+                .ui_builder()
+                .switch(self.local_agent_autocomplete_toggle.clone())
+                .check(autocomplete_enabled)
+                .build()
+                .on_click(|ctx, _, _| {
+                    ctx.dispatch_typed_action(AISettingsPageAction::ToggleLocalAIAutocomplete);
+                })
+                .finish()
+        } else {
+            appearance
+                .ui_builder()
+                .switch(self.local_agent_autocomplete_toggle.clone())
+                .check(autocomplete_enabled)
+                .with_disabled(true)
+                .build()
+                .finish()
+        });
+        for alias in LOCAL_MODEL_ALIAS_IDS {
+            if alias == "auto-autocomplete" {
+                column.add_child(build_toggle_element(
+                    render_body_item_label::<AISettingsPageAction>(
+                        "Autocomplete".to_string(),
+                        Some(styles::header_font_color(is_enabled, app)),
+                        None,
+                        LocalOnlyIconState::Hidden,
+                        ToggleState::Enabled,
+                        appearance,
+                    ),
+                    autocomplete_toggle
+                        .take()
+                        .expect("auto-autocomplete alias is rendered only once"),
+                    appearance,
+                    None,
+                ));
+            }
+            if let Some(dropdown) = self.local_agent_alias_dropdowns.get(alias) {
+                column.add_child(render_dropdown_input(
+                    appearance, alias, dropdown, is_enabled, app,
+                ));
+            }
         }
 
         column.finish()
@@ -8280,7 +8972,11 @@ impl SettingsWidget for ApiKeysWidget {
 
         // Custom endpoints sub-label + list (only when flag on and endpoints non-empty)
         if show_custom_inference {
-            let endpoints = &ApiKeyManager::as_ref(app).keys().custom_endpoints;
+            let profile_key = Self::active_inference_profile_key(app);
+            let endpoints = ApiKeyManager::as_ref(app)
+                .keys()
+                .profile_settings(&profile_key)
+                .custom_endpoints;
             if !endpoints.is_empty() {
                 column.add_child(
                     Container::new(

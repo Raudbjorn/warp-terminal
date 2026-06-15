@@ -65,6 +65,30 @@ use crate::ai::local_openai::LocalOpenAIClient;
 use crate::settings::{AISettings, LocalOpenAISettingsSnapshot, PrivacySettingsSnapshot};
 use crate::{settings_view, ChannelState};
 
+const OPENAI_BASE_URL_HEADER: &str = "X-Warp-OpenAI-Base-URL";
+const LOCAL_MODEL_ALIASES_HEADER: &str = "X-Warp-Local-Model-Aliases";
+
+fn multi_agent_output_url(
+    is_passive: bool,
+    is_evals: bool,
+    server_root_url_override: Option<&str>,
+) -> String {
+    let server_root_url = server_root_url_override
+        .map(str::to_string)
+        .unwrap_or_else(|| ChannelState::server_root_url().into_owned());
+
+    format!(
+        "{}/{}/{}",
+        server_root_url.trim_end_matches('/'),
+        if is_evals { "agent-mode-evals" } else { "ai" },
+        if is_passive {
+            "passive-suggestions"
+        } else {
+            "multi-agent"
+        }
+    )
+}
+
 pub const FETCH_CHANNEL_VERSIONS_TIMEOUT: std::time::Duration = Duration::from_secs(60);
 
 /// We use a special error code header `X-Warp-Error-Code` to allow the server to send
@@ -1381,6 +1405,9 @@ impl ServerApi {
     pub async fn generate_multi_agent_output(
         &self,
         request: &warp_multi_agent_api::Request,
+        server_root_url_override: Option<&str>,
+        openai_base_url: Option<&str>,
+        local_model_aliases: Option<&str>,
     ) -> std::result::Result<AIOutputStream<warp_multi_agent_api::ResponseEvent>, Arc<AIApiError>>
     {
         if ChannelState::is_local_only() {
@@ -1436,6 +1463,16 @@ impl ServerApi {
 
         if let Some(token) = ambient_workload_token {
             request_builder = request_builder.header(AMBIENT_WORKLOAD_TOKEN_HEADER, token);
+        }
+
+        if server_root_url_override.is_some() {
+            if let Some(openai_base_url) = openai_base_url {
+                request_builder = request_builder.header(OPENAI_BASE_URL_HEADER, openai_base_url);
+            }
+            if let Some(local_model_aliases) = local_model_aliases {
+                request_builder =
+                    request_builder.header(LOCAL_MODEL_ALIASES_HEADER, local_model_aliases);
+            }
         }
 
         cfg_if::cfg_if! {

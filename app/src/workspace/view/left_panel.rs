@@ -29,10 +29,6 @@ use crate::drive::panel::{
     DrivePanel, DrivePanelEvent, MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH,
 };
 #[cfg(not(target_family = "wasm"))]
-use crate::workspace::view::docker_containers::{
-    DockerContainersEvent, DockerContainersView,
-};
-#[cfg(not(target_family = "wasm"))]
 use crate::opencode_server::OpenCodeServerModel;
 use crate::pane_group::pane::view::header::components::HEADER_EDGE_PADDING;
 use crate::pane_group::pane::view::header::PANE_HEADER_HEIGHT;
@@ -56,6 +52,8 @@ use crate::util::openable_file_type::FileTarget;
 use crate::workspace::view::conversation_list::view::{
     ConversationListView, Event as ConversationListViewEvent,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::workspace::view::docker_containers::{DockerContainersEvent, DockerContainersView};
 use crate::workspace::view::global_search::view::{
     Event as GlobalSearchViewEvent, GlobalSearchEntryFocus, GlobalSearchView,
 };
@@ -1383,11 +1381,9 @@ impl View for LeftPanelView {
             )
             .finish(),
             #[cfg(not(target_family = "wasm"))]
-            ToolPanelView::DockerContainers => Shrinkable::new(
-                1.0,
-                ChildView::new(&self.docker_containers_view).finish(),
-            )
-            .finish(),
+            ToolPanelView::DockerContainers => {
+                Shrinkable::new(1.0, ChildView::new(&self.docker_containers_view).finish()).finish()
+            }
         };
 
         let panel_content = Container::new({

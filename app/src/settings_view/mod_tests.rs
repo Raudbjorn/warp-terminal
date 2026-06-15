@@ -2,6 +2,30 @@ use settings_page::MatchData;
 
 use super::*;
 
+#[test]
+fn initial_ai_page_mode_matches_requested_settings_section() {
+    let initial_page = SettingsView::initial_page(Some(SettingsSection::AgentProfiles));
+    assert_eq!(initial_page, SettingsSection::AgentProfiles);
+    assert_eq!(
+        SettingsView::initial_ai_subpage(initial_page),
+        AISubpage::Profiles
+    );
+
+    let initial_page = SettingsView::initial_page(Some(SettingsSection::WarpAgent));
+    assert_eq!(initial_page, SettingsSection::WarpAgent);
+    assert_eq!(
+        SettingsView::initial_ai_subpage(initial_page),
+        AISubpage::WarpAgent
+    );
+
+    let initial_page = SettingsView::initial_page(Some(SettingsSection::Appearance));
+    assert_eq!(initial_page, SettingsSection::Appearance);
+    assert_eq!(
+        SettingsView::initial_ai_subpage(initial_page),
+        AISubpage::Profiles
+    );
+}
+
 // ── SettingsSection classification ──────────────────────────────────────────
 
 #[test]
