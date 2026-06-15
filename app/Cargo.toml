@@ -691,6 +691,11 @@ default = [
     "billing_and_usage_page_v2",
     "remote_code_review",
     "git_operations_in_code_review",
+    # Fully-local build: no Warp API traffic and no auth required (synthetic
+    # local user via skip_login), with passive prompt suggestions routed through
+    # the local multi-agent path instead of the gated-off server endpoint.
+    "skip_login",
+    "prompt_suggestions_via_maa",
 ]
 # Enable this feature to automatically perform heap profiling.  NOTE: This will
 # substantially slow down program execution.
