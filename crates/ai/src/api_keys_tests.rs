@@ -130,6 +130,7 @@ fn serde_round_trip_with_provider_keys() {
         google: Some("AIzaSy123".into()),
         open_router: Some("sk-or-xxx".into()),
         custom_endpoints: vec![],
+        ..Default::default()
     };
     let json = serde_json::to_string(&keys).unwrap();
     let deser: ApiKeys = serde_json::from_str(&json).unwrap();
@@ -152,6 +153,7 @@ fn serde_round_trip_with_custom_endpoints() {
                 &[("llama-70b", None), ("mixtral", Some("mix"))],
             ),
         ],
+        ..Default::default()
     };
     let json = serde_json::to_string(&keys).unwrap();
     let deser: ApiKeys = serde_json::from_str(&json).unwrap();
@@ -164,6 +166,68 @@ fn serde_ignores_unknown_fields() {
     let keys: ApiKeys = serde_json::from_str(json).unwrap();
     assert_eq!(keys.openai, Some("sk-x".into()));
     assert!(keys.custom_endpoints.is_empty());
+}
+
+#[test]
+fn default_profile_settings_fall_back_to_legacy_fields_before_migration() {
+    let keys = ApiKeys {
+        openai: Some("sk-openai".into()),
+        anthropic: Some("sk-anthropic".into()),
+        openai_base_url: Some("http://127.0.0.1:1234/v1".into()),
+        custom_endpoints: vec![endpoint("ep", "https://a.io", "key", &[("m", None)])],
+        ..Default::default()
+    };
+
+    let settings = keys.profile_settings(DEFAULT_PROFILE_INFERENCE_KEY);
+    assert_eq!(settings.openai.as_deref(), Some("sk-openai"));
+    assert_eq!(settings.anthropic.as_deref(), Some("sk-anthropic"));
+    assert_eq!(
+        settings.openai_base_url.as_deref(),
+        Some("http://127.0.0.1:1234/v1")
+    );
+    assert_eq!(settings.custom_endpoints.len(), 1);
+}
+
+#[test]
+fn local_settings_migration_populates_default_profile_once() {
+    let mut keys = ApiKeys {
+        openai: Some("sk-openai".into()),
+        ..Default::default()
+    };
+
+    assert!(keys.migrate_default_profile_if_needed());
+    assert!(keys.migrate_default_profile_local_settings_if_needed(
+        Some(" http://127.0.0.1:1234/v1/ ".into()),
+        r#"{"auto-autocomplete":"local/model"}"#.into(),
+        "local/model,local/other".into(),
+        true,
+    ));
+
+    let settings = keys.profile_settings(DEFAULT_PROFILE_INFERENCE_KEY);
+    assert_eq!(settings.openai.as_deref(), Some("sk-openai"));
+    assert_eq!(
+        settings.openai_base_url.as_deref(),
+        Some("http://127.0.0.1:1234/v1")
+    );
+    assert_eq!(
+        settings.local_model_aliases,
+        r#"{"auto-autocomplete":"local/model"}"#
+    );
+    assert_eq!(settings.local_model_list, "local/model,local/other");
+    assert!(settings.local_ai_autocomplete_enabled);
+
+    assert!(!keys.migrate_default_profile_local_settings_if_needed(
+        Some("http://different.test/v1".into()),
+        r#"{"auto":"different"}"#.into(),
+        "different".into(),
+        false,
+    ));
+    let settings = keys.profile_settings(DEFAULT_PROFILE_INFERENCE_KEY);
+    assert_eq!(
+        settings.openai_base_url.as_deref(),
+        Some("http://127.0.0.1:1234/v1")
+    );
+    assert!(settings.local_ai_autocomplete_enabled);
 }
 
 // ── has_any_key ─────────────────────────────────────────────────
@@ -221,7 +285,9 @@ fn has_custom_endpoints_true_when_present() {
 #[test]
 fn custom_model_providers_none_when_empty() {
     let mgr = make_manager(ApiKeys::default());
-    assert!(mgr.custom_model_providers_for_request(true).is_none());
+    assert!(mgr
+        .custom_model_providers_for_request(DEFAULT_PROFILE_INFERENCE_KEY, true)
+        .is_none());
 }
 
 #[test]
@@ -230,7 +296,9 @@ fn custom_model_providers_none_when_byo_disabled() {
         custom_endpoints: vec![endpoint("ep", "https://a.io", "k", &[("m", None)])],
         ..Default::default()
     });
-    assert!(mgr.custom_model_providers_for_request(false).is_none());
+    assert!(mgr
+        .custom_model_providers_for_request(DEFAULT_PROFILE_INFERENCE_KEY, false)
+        .is_none());
 }
 
 #[test]
@@ -244,7 +312,9 @@ fn custom_model_providers_populates_single_endpoint() {
         )],
         ..Default::default()
     });
-    let result = mgr.custom_model_providers_for_request(true).unwrap();
+    let result = mgr
+        .custom_model_providers_for_request(DEFAULT_PROFILE_INFERENCE_KEY, true)
+        .unwrap();
     assert_eq!(result.providers.len(), 1);
     let p = &result.providers[0];
     assert_eq!(p.base_url, "https://custom.io/v1");
@@ -276,7 +346,9 @@ fn multiple_endpoints_all_serialize() {
         ],
         ..Default::default()
     });
-    let result = mgr.custom_model_providers_for_request(true).unwrap();
+    let result = mgr
+        .custom_model_providers_for_request(DEFAULT_PROFILE_INFERENCE_KEY, true)
+        .unwrap();
     assert_eq!(result.providers.len(), 2);
     assert_eq!(result.providers[0].base_url, "https://a.io");
     assert_eq!(result.providers[0].models[0].config_key, "uuid-a");
@@ -293,7 +365,9 @@ fn byok_disabled_returns_none_even_with_endpoints() {
         custom_endpoints: vec![endpoint("ep", "https://a.io", "k", &[("m", None)])],
         ..Default::default()
     });
-    assert!(mgr.custom_model_providers_for_request(false).is_none());
+    assert!(mgr
+        .custom_model_providers_for_request(DEFAULT_PROFILE_INFERENCE_KEY, false)
+        .is_none());
 }
 
 #[test]
@@ -305,7 +379,9 @@ fn empty_api_key_endpoints_are_skipped() {
         ],
         ..Default::default()
     });
-    let result = mgr.custom_model_providers_for_request(true).unwrap();
+    let result = mgr
+        .custom_model_providers_for_request(DEFAULT_PROFILE_INFERENCE_KEY, true)
+        .unwrap();
     assert_eq!(result.providers.len(), 1);
     assert_eq!(result.providers[0].base_url, "https://b.io");
 }
@@ -321,7 +397,9 @@ fn endpoints_with_only_empty_models_are_skipped() {
         )],
         ..Default::default()
     });
-    assert!(mgr.custom_model_providers_for_request(true).is_none());
+    assert!(mgr
+        .custom_model_providers_for_request(DEFAULT_PROFILE_INFERENCE_KEY, true)
+        .is_none());
 }
 
 // ── display_label fallback ─────────────────────────────────────
@@ -361,7 +439,9 @@ fn display_label_falls_back_to_name_when_alias_is_whitespace() {
 #[test]
 fn api_keys_for_request_none_when_empty() {
     let mgr = make_manager(ApiKeys::default());
-    assert!(mgr.api_keys_for_request(true, false, None).is_none());
+    assert!(mgr
+        .api_keys_for_request(DEFAULT_PROFILE_INFERENCE_KEY, true, false)
+        .is_none());
 }
 
 #[test]
@@ -371,7 +451,9 @@ fn api_keys_for_request_populates_provider_keys() {
         anthropic: Some("sk-a".into()),
         ..Default::default()
     });
-    let result = mgr.api_keys_for_request(true, false, None).unwrap();
+    let result = mgr
+        .api_keys_for_request(DEFAULT_PROFILE_INFERENCE_KEY, true, false)
+        .unwrap();
     assert_eq!(result.openai, "sk-o");
     assert_eq!(result.anthropic, "sk-a");
     assert!(result.google.is_empty());
@@ -384,7 +466,9 @@ fn api_keys_for_request_omits_keys_when_byo_disabled() {
         ..Default::default()
     });
     // With BYO disabled and no other credentials, returns None.
-    assert!(mgr.api_keys_for_request(false, false, None).is_none());
+    assert!(mgr
+        .api_keys_for_request(DEFAULT_PROFILE_INFERENCE_KEY, false, false)
+        .is_none());
 }
 
 #[test]
@@ -393,223 +477,73 @@ fn api_keys_for_request_none_for_custom_endpoints_only() {
         custom_endpoints: vec![endpoint("ep", "https://a.io", "k", &[("m", None)])],
         ..Default::default()
     });
-    assert!(mgr.api_keys_for_request(true, false, None).is_none());
-}
-
-// ── grok oauth token ────────────────────────────────────────────
-
-#[test]
-fn grok_access_token_present_without_expiry() {
-    let t = GrokTokens {
-        access_token: "tok".into(),
-        ..Default::default()
-    };
-    assert_eq!(t.access_token_for_request(), Some("tok"));
-}
-
-#[test]
-fn grok_access_token_blank_is_none() {
-    let t = GrokTokens {
-        access_token: "   ".into(),
-        ..Default::default()
-    };
-    assert_eq!(t.access_token_for_request(), None);
-}
-
-#[test]
-fn grok_access_token_near_expiry_still_sent() {
-    // Expired tokens are still sent; the server is the authority on validity.
-    let t = grok_tokens("tok", Some(0));
-    assert_eq!(t.access_token_for_request(), Some("tok"));
-}
-
-#[test]
-fn grok_access_token_far_future_is_some() {
-    let t = grok_tokens("tok", Some(3600));
-    assert_eq!(t.access_token_for_request(), Some("tok"));
-}
-
-#[test]
-fn grok_needs_refresh_within_lead_time() {
-    assert!(grok_tokens("tok", Some(30)).needs_refresh(Duration::from_secs(300)));
-    assert!(!grok_tokens("tok", Some(3600)).needs_refresh(Duration::from_secs(300)));
-    // Expired tokens still need a refresh.
-    assert!(grok_tokens("tok", Some(0)).needs_refresh(Duration::from_secs(300)));
-    // Unknown expiry never reports as needing refresh.
-    assert!(!grok_tokens("tok", None).needs_refresh(Duration::from_secs(300)));
-}
-
-#[test]
-fn api_keys_for_request_includes_grok_token() {
-    let mgr = make_manager_with_grok(
-        ApiKeys::default(),
-        Some(grok_tokens("grok-abc", Some(3600))),
-    );
-    let result = mgr.api_keys_for_request(true, false, None).unwrap();
-    assert_eq!(result.grok_oauth_access_token, "grok-abc");
-    assert!(result.anthropic.is_empty());
-}
-
-#[test]
-fn api_keys_for_request_omits_grok_token_when_byo_disabled() {
-    // The Grok subscription is user-provided auth, so it follows the BYO
-    // policy gate: with BYO disabled and no other credentials, returns None.
-    let mgr = make_manager_with_grok(
-        ApiKeys::default(),
-        Some(grok_tokens("grok-abc", Some(3600))),
-    );
-    assert!(mgr.api_keys_for_request(false, false, None).is_none());
-}
-
-#[test]
-fn api_keys_for_request_includes_expired_grok_token() {
-    // Expired tokens are still sent in requests; the server rejects truly
-    // invalid ones and the background refresh replaces them.
-    let mgr = make_manager_with_grok(ApiKeys::default(), Some(grok_tokens("grok-abc", Some(0))));
-    let result = mgr.api_keys_for_request(true, false, None).unwrap();
-    assert_eq!(result.grok_oauth_access_token, "grok-abc");
-}
-
-// ── geap credentials ────────────────────────────────────────────
-
-#[test]
-fn geap_access_token_present_without_expiry() {
-    let credentials = GeapCredentials::new("tok".into(), None);
-    assert_eq!(credentials.access_token_for_request(), Some("tok"));
-}
-
-#[test]
-fn geap_access_token_blank_is_none() {
-    let credentials = GeapCredentials::new("   ".into(), None);
-    assert_eq!(credentials.access_token_for_request(), None);
-}
-
-#[test]
-fn geap_access_token_near_expiry_still_sent() {
-    // Expired tokens are still sent; Google is the authority on validity.
-    let credentials = geap_credentials("tok", Some(0));
-    assert_eq!(credentials.access_token_for_request(), Some("tok"));
-}
-
-#[test]
-fn geap_needs_refresh_lead_time_boundaries() {
-    // Within the 5-minute lead window.
-    assert!(geap_credentials("tok", Some(30)).needs_refresh());
-    // Comfortably fresh.
-    assert!(!geap_credentials("tok", Some(3600)).needs_refresh());
-    // Already expired -> still needs a refresh.
-    assert!(geap_credentials("tok", Some(0)).needs_refresh());
-    // Unknown expiry never reports as needing a refresh.
-    assert!(!geap_credentials("tok", None).needs_refresh());
-}
-
-#[test]
-fn api_keys_for_request_includes_geap_token_when_gate_and_binding_match() {
-    let mgr = make_manager_with_geap(geap_loaded("geap-abc", Some(3600)));
-    let result = mgr
-        .api_keys_for_request(false, false, Some(geap_gate()))
-        .unwrap();
-    let credentials = result.google_cloud_credentials.unwrap();
-    assert_eq!(credentials.access_token, "geap-abc");
-    // The GEAP token is independent of the BYO key gate.
-    assert!(result.anthropic.is_empty());
-}
-
-#[test]
-fn api_keys_for_request_includes_expired_geap_token() {
-    // Expired tokens are still attached — never silently dropped. Google
-    // rejects truly invalid ones, which surfaces a recoverable error instead
-    // of a silent fallback to another route.
-    let mgr = make_manager_with_geap(geap_loaded("geap-abc", Some(0)));
-    let result = mgr
-        .api_keys_for_request(false, false, Some(geap_gate()))
-        .unwrap();
-    assert_eq!(
-        result.google_cloud_credentials.unwrap().access_token,
-        "geap-abc"
-    );
-}
-
-#[test]
-fn api_keys_for_request_omits_geap_token_without_gate() {
-    // No gate (policy off at the call site) ⇒ no GEAP credentials, even when
-    // a token is loaded.
-    let mgr = make_manager_with_geap(geap_loaded("geap-abc", Some(3600)));
-    assert!(mgr.api_keys_for_request(false, false, None).is_none());
-}
-
-#[test]
-fn api_keys_for_request_omits_geap_token_on_binding_mismatch() {
-    let mgr = make_manager_with_geap(geap_loaded("geap-abc", Some(3600)));
-
-    // A different user (sign-out/account switch).
-    let mut gate = geap_gate();
-    gate.user_uid = "someone-else".into();
-    assert!(mgr.api_keys_for_request(false, false, Some(gate)).is_none());
-
-    // A different audience (admin changed the pool/provider).
-    let mut gate = geap_gate();
-    gate.audience = "//iam.googleapis.com/projects/2/locations/global/workloadIdentityPools/other/providers/other".into();
-    assert!(mgr.api_keys_for_request(false, false, Some(gate)).is_none());
-
-    // A different service account (admin changed impersonation target).
-    let mut gate = geap_gate();
-    gate.federation = GeapFederation::ServiceAccount {
-        email: "other@proj.iam.gserviceaccount.com".into(),
-    };
-    assert!(mgr.api_keys_for_request(false, false, Some(gate)).is_none());
-}
-
-#[test]
-fn api_keys_for_request_serves_previous_geap_token_while_refreshing() {
-    // A re-mint in flight keeps serving the previous token — tokens stay
-    // until replaced.
-    let mgr = make_manager_with_geap(GeapCredentialsState::Refreshing {
-        previous: Some((geap_credentials("geap-old", Some(10)), geap_binding())),
-    });
-    let result = mgr
-        .api_keys_for_request(false, false, Some(geap_gate()))
-        .unwrap();
-    assert_eq!(
-        result.google_cloud_credentials.unwrap().access_token,
-        "geap-old"
-    );
-}
-
-#[test]
-fn api_keys_for_request_omits_geap_token_during_first_mint() {
-    // The very first mint has nothing to serve yet.
-    let mgr = make_manager_with_geap(GeapCredentialsState::Refreshing { previous: None });
     assert!(mgr
-        .api_keys_for_request(false, false, Some(geap_gate()))
+        .api_keys_for_request(DEFAULT_PROFILE_INFERENCE_KEY, true, false)
         .is_none());
 }
 
 #[test]
-fn api_keys_for_request_omits_geap_token_for_non_loaded_states() {
-    for state in [
-        GeapCredentialsState::Missing,
-        GeapCredentialsState::Disabled,
-        GeapCredentialsState::Failed {
-            error: LoadGeapCredentialsError::ExchangeToken {
-                status: None,
-                detail: "boom".into(),
-            },
+fn api_keys_for_request_uses_requested_profile() {
+    let mut keys = ApiKeys::default();
+    keys.profile_inference_settings.insert(
+        DEFAULT_PROFILE_INFERENCE_KEY.to_string(),
+        ProfileInferenceSettings {
+            openai: Some("sk-default".into()),
+            ..Default::default()
         },
-    ] {
-        let mgr = make_manager_with_geap(state);
-        assert!(mgr
-            .api_keys_for_request(false, false, Some(geap_gate()))
-            .is_none());
-    }
+    );
+    keys.profile_inference_settings.insert(
+        "profile-2".to_string(),
+        ProfileInferenceSettings {
+            openai: Some("sk-profile-2".into()),
+            anthropic: Some("sk-anthropic-2".into()),
+            ..Default::default()
+        },
+    );
+    let mgr = make_manager(keys);
+
+    let result = mgr
+        .api_keys_for_request("profile-2", true, false)
+        .expect("profile scoped keys should be present");
+    assert_eq!(result.openai, "sk-profile-2");
+    assert_eq!(result.anthropic, "sk-anthropic-2");
 }
 
 #[test]
-fn api_keys_for_request_omits_geap_token_when_previous_binding_mismatches() {
-    let mgr = make_manager_with_geap(GeapCredentialsState::Refreshing {
-        previous: Some((geap_credentials("geap-old", Some(10)), geap_binding())),
-    });
-    let mut gate = geap_gate();
-    gate.user_uid = "someone-else".into();
-    assert!(mgr.api_keys_for_request(false, false, Some(gate)).is_none());
+fn custom_model_providers_for_request_uses_requested_profile() {
+    let mut keys = ApiKeys::default();
+    keys.profile_inference_settings.insert(
+        DEFAULT_PROFILE_INFERENCE_KEY.to_string(),
+        ProfileInferenceSettings {
+            custom_endpoints: vec![endpoint_with_keys(
+                "default",
+                "https://default.test/v1",
+                "default-key",
+                &[("default-model", None, "default-cfg")],
+            )],
+            ..Default::default()
+        },
+    );
+    keys.profile_inference_settings.insert(
+        "profile-2".to_string(),
+        ProfileInferenceSettings {
+            custom_endpoints: vec![endpoint_with_keys(
+                "profile",
+                "https://profile.test/v1",
+                "profile-key",
+                &[("profile-model", None, "profile-cfg")],
+            )],
+            ..Default::default()
+        },
+    );
+    let mgr = make_manager(keys);
+
+    let result = mgr
+        .custom_model_providers_for_request("profile-2", true)
+        .expect("profile custom endpoint should be present");
+    assert_eq!(result.providers.len(), 1);
+    assert_eq!(result.providers[0].base_url, "https://profile.test/v1");
+    assert_eq!(result.providers[0].api_key, "profile-key");
+    assert_eq!(result.providers[0].models[0].slug, "profile-model");
+    assert_eq!(result.providers[0].models[0].config_key, "profile-cfg");
 }

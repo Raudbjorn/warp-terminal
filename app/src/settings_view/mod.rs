@@ -81,7 +81,7 @@ mod billing_and_usage_dispatch;
 mod billing_and_usage_page;
 mod billing_and_usage_page_v2;
 mod code_page;
-mod custom_inference_modal;
+pub(crate) mod custom_inference_modal;
 mod delete_environment_confirmation_dialog;
 mod directory_color_add_picker;
 pub(crate) mod environments_page;
@@ -100,8 +100,7 @@ mod platform_page;
 mod privacy;
 mod privacy_page;
 mod referrals_page;
-mod remove_custom_endpoint_confirmation_dialog;
-mod scripting_page;
+pub(crate) mod remove_custom_endpoint_confirmation_dialog;
 mod settings_file_footer;
 pub(crate) mod settings_page;
 mod show_blocks_view;
@@ -183,7 +182,7 @@ pub(super) fn render_beta_chip(appearance: &Appearance) -> Box<dyn Element> {
 
 /// Renders a horizontal row of pill-shaped chips for model labels.
 /// Used by custom inference endpoint cards and the remove confirmation dialog.
-pub(super) fn render_model_chips(
+pub(crate) fn render_model_chips(
     labels: impl IntoIterator<Item = String>,
     appearance: &Appearance,
     text_color: warp_core::ui::theme::Fill,
@@ -1106,8 +1105,22 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
+    fn initial_page(page: Option<SettingsSection>) -> SettingsSection {
+        match page {
+            Some(SettingsSection::AI) => SettingsSection::WarpAgent,
+            Some(SettingsSection::Code) => SettingsSection::CodeIndexing,
+            Some(section) if section.is_subpage() => section.visible_or_default(),
+            other => other.unwrap_or_default().visible_or_default(),
+        }
+    }
+
+    fn initial_ai_subpage(initial_page: SettingsSection) -> AISubpage {
+        AISubpage::from_section(initial_page).unwrap_or(AISubpage::Profiles)
+    }
+
     pub fn new(page: Option<SettingsSection>, ctx: &mut ViewContext<Self>) -> Self {
         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new("Settings"));
+        let initial_page = Self::initial_page(page);
 
         let global_resource_handles = GlobalResourceHandlesProvider::as_ref(ctx).get().clone();
         // Appearance & themes page
@@ -1146,7 +1159,10 @@ impl SettingsView {
         let local_ai_page_handle = ctx.add_typed_action_view(LocalAISettingsPageView::new);
 
         // AI page
-        let ai_page_handle = ctx.add_typed_action_view(AISettingsPageView::new);
+        let initial_ai_subpage = Self::initial_ai_subpage(initial_page);
+        let ai_page_handle = ctx.add_typed_action_view(move |ctx| {
+            AISettingsPageView::new_with_subpage(Some(initial_ai_subpage), ctx)
+        });
         let ai_page_handle_for_nav = ai_page_handle.clone();
         ctx.subscribe_to_view(&ai_page_handle, |me, _, event, ctx| {
             me.handle_ai_page_event(event, ctx);

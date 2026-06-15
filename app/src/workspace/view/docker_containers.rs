@@ -829,7 +829,10 @@ fn docker_stop_command(container_id: &str) -> String {
 }
 
 fn docker_logs_command(container_id: &str) -> String {
-    format!("docker logs --tail 200 -f {}", shell_words::quote(container_id))
+    format!(
+        "docker logs --tail 200 -f {}",
+        shell_words::quote(container_id)
+    )
 }
 
 fn docker_log_tail_command(container_id: &str, log_target: &DockerLogTarget) -> String {

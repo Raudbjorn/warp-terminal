@@ -5691,6 +5691,15 @@ impl Workspace {
         }
     }
 
+    fn pane_locator_exists(&self, pane_view_locator: PaneViewLocator, ctx: &AppContext) -> bool {
+        self.tabs.iter().any(|tab| {
+            tab.pane_group.id() == pane_view_locator.pane_group_id
+                && tab.pane_group.read(ctx, |pane_group, _| {
+                    pane_group.has_pane_id(pane_view_locator.pane_id)
+                })
+        })
+    }
+
     /// Searches this workspace's tabs for the given terminal view and focuses it.
     /// Returns true if the terminal view was found and focused.
     fn focus_terminal_view_locally(
@@ -8220,18 +8229,26 @@ impl Workspace {
         // Ensure there is only one settings pane per window
         let settings_pane_manager = SettingsPaneManager::handle(ctx);
         if let Some(locator) = settings_pane_manager.as_ref(ctx).find_pane(ctx.window_id()) {
-            // Update to new page if specified
-            if let Some(page) = page {
-                self.settings_pane.update(ctx, |settings_pane, ctx| {
-                    settings_pane.set_and_refresh_current_page(page, ctx);
-                    if let Some(search_query) = search_query {
-                        settings_pane.set_search_query(search_query, ctx);
-                    }
-                });
+            if self.pane_locator_exists(locator, ctx) {
+                // Update to new page if specified
+                if let Some(page) = page {
+                    self.settings_pane.update(ctx, |settings_pane, ctx| {
+                        settings_pane.set_and_refresh_current_page(page, ctx);
+                        if let Some(search_query) = search_query {
+                            settings_pane.set_search_query(search_query, ctx);
+                        }
+                    });
+                }
+                // Navigate to and focus existing pane
+                self.focus_pane(locator, ctx);
+                return;
             }
-            // Navigate to and focus existing pane
-            self.focus_pane(locator, ctx);
-            return;
+
+            log::warn!("Dropping stale settings pane locator: {locator:?}");
+            let window_id = ctx.window_id();
+            settings_pane_manager.update(ctx, |manager, ctx| {
+                manager.deregister_pane(&window_id, locator.pane_group_id, locator.pane_id, ctx);
+            });
         }
 
         let ps1_grid_info = self.active_session_ps1_grid_info(ctx);

@@ -24,6 +24,10 @@ use warpui::{
 const SIDECAR_HORIZONTAL_GAP: f32 = 8.;
 const SIDECAR_POSITION_ID: &str = "model_sidecar_panel";
 
+#[cfg(not(target_family = "wasm"))]
+use crate::codex_app_server::{CodexAppServerModel, CodexModelInfo};
+#[cfg(not(target_family = "wasm"))]
+use crate::opencode_server::{OpenCodeModelInfo, OpenCodeServerModel};
 use warp_cli::agent::Harness;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::color::{coloru_with_opacity, Opacity};
@@ -966,16 +970,22 @@ impl ProfileModelSelector {
             .clone()
             .and_then(|id| {
                 llm_preferences
-                    .get_llm_info(&id)
+                    .get_agent_mode_llm_info_for_terminal(&id, ctx, Some(self.terminal_view_id))
                     .map(|info| info.id.clone())
             })
-            .unwrap_or_else(|| llm_preferences.get_default_base_model().id.clone());
+            .unwrap_or_else(|| {
+                llm_preferences
+                    .get_profile_default_base_model(ctx, Some(self.terminal_view_id))
+                    .id
+                    .clone()
+            });
 
         let model_id_to_add_profile_default_label_to = Some(&profile_base_model_id);
 
         // Store all model choices for reasoning variant lookups
         self.all_model_choices = llm_preferences
-            .get_base_llm_choices_for_agent_mode(ctx)
+            .get_base_llm_choices_for_agent_mode_for_terminal(ctx, Some(self.terminal_view_id))
+            .into_iter()
             .cloned()
             .collect();
 
@@ -983,7 +993,8 @@ impl ProfileModelSelector {
         // custom-endpoint choices (rendered separately under a `Custom models` sub-header so
         // the server-curated list stays visually distinct).
         let custom_ids: std::collections::HashSet<LLMId> = llm_preferences
-            .custom_llm_choices(ctx)
+            .custom_llm_choices_for_terminal(ctx, Some(self.terminal_view_id))
+            .into_iter()
             .map(|info| info.id.clone())
             .collect();
         let server_choices: Vec<&LLMInfo> = self
@@ -1108,6 +1119,211 @@ impl ProfileModelSelector {
         self.set_hovered_llm_info(Some(selected_index), ctx);
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn refresh_codex_model_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        self.all_model_choices.clear();
+        self.hovered_llm_info = None;
+        self.model_spec_sidecar.hovered_info = None;
+        self.model_spec_sidecar.active_kind = None;
+
+        let codex_model = CodexAppServerModel::as_ref(ctx);
+        let models = codex_model.models().to_vec();
+        let selected_model_id = codex_model.selected_model_id().map(ToOwned::to_owned);
+
+        let mut items: Vec<MenuItem<ProfileModelSelectorAction>> = vec![
+            MenuItem::Header {
+                fields: MenuItemFields::new("Codex models"),
+                clickable: false,
+                right_side_fields: None,
+            },
+            MenuItem::Separator,
+        ];
+        items.push(Self::codex_default_model_menu_item(
+            selected_model_id.is_none(),
+        ));
+        items.push(MenuItem::Separator);
+        items.extend(models.iter().map(|model| {
+            let is_selected = selected_model_id.as_deref() == Some(model.id.as_str());
+            Self::codex_model_menu_item(model, is_selected)
+        }));
+
+        let selected_index = Self::find_selected_codex_index(&items, selected_model_id.as_deref());
+        self.model_dropdown.update(ctx, |menu, ctx| {
+            menu.set_width(MENU_WIDTH);
+            menu.set_items(items, ctx);
+            menu.set_selected_by_index(selected_index, ctx);
+            menu.set_safe_zone_target(None);
+            menu.set_submenu_being_shown_for_item_index(None);
+            ctx.notify();
+        });
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn codex_default_model_menu_item(is_selected: bool) -> MenuItem<ProfileModelSelectorAction> {
+        let mut fields = MenuItemFields::new("codex")
+            .with_on_select_action(ProfileModelSelectorAction::UseCodexDefault);
+        if is_selected {
+            fields = fields.with_icon(Icon::Check);
+        } else {
+            fields = fields.with_indent();
+        }
+        fields.into_item()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn codex_model_menu_item(
+        model: &CodexModelInfo,
+        is_selected: bool,
+    ) -> MenuItem<ProfileModelSelectorAction> {
+        let mut label = model.display_name.clone();
+        if model.is_default {
+            label = format!("{label} (default)");
+        }
+        let mut fields = MenuItemFields::new(label).with_on_select_action(
+            ProfileModelSelectorAction::SelectCodexModel(model.id.clone()),
+        );
+        if is_selected {
+            fields = fields.with_icon(Icon::Check);
+        } else {
+            fields = fields.with_indent();
+        }
+        fields.into_item()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn find_selected_codex_index(
+        items: &[MenuItem<ProfileModelSelectorAction>],
+        selected_model_id: Option<&str>,
+    ) -> usize {
+        items
+            .iter()
+            .position(|item| {
+                if let MenuItem::Item(fields) = item {
+                    let is_selected = matches!(
+                        item.item_on_select_action(),
+                        Some(ProfileModelSelectorAction::SelectCodexModel(model_id))
+                            if Some(model_id.as_str()) == selected_model_id
+                    ) || (selected_model_id.is_none()
+                        && matches!(
+                            item.item_on_select_action(),
+                            Some(ProfileModelSelectorAction::UseCodexDefault)
+                        ));
+                    !fields.is_disabled() && is_selected
+                } else {
+                    false
+                }
+            })
+            .or_else(|| {
+                items.iter().position(
+                    |item| matches!(item, MenuItem::Item(fields) if !fields.is_disabled()),
+                )
+            })
+            .unwrap_or(0)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn refresh_opencode_model_menu(&mut self, ctx: &mut ViewContext<Self>) {
+        self.all_model_choices.clear();
+        self.hovered_llm_info = None;
+        self.model_spec_sidecar.hovered_info = None;
+        self.model_spec_sidecar.active_kind = None;
+
+        let opencode_model = OpenCodeServerModel::as_ref(ctx);
+        let models = opencode_model.models().to_vec();
+        let selected_model_id = opencode_model.selected_model_id().map(ToOwned::to_owned);
+
+        let mut items: Vec<MenuItem<ProfileModelSelectorAction>> = vec![
+            MenuItem::Header {
+                fields: MenuItemFields::new("OpenCode models"),
+                clickable: false,
+                right_side_fields: None,
+            },
+            MenuItem::Separator,
+        ];
+        items.push(Self::opencode_default_model_menu_item(
+            selected_model_id.is_none(),
+        ));
+        items.push(MenuItem::Separator);
+        items.extend(models.iter().map(|model| {
+            let is_selected = selected_model_id.as_deref() == Some(model.id.as_str());
+            Self::opencode_model_menu_item(model, is_selected)
+        }));
+
+        let selected_index =
+            Self::find_selected_opencode_index(&items, selected_model_id.as_deref());
+        self.model_dropdown.update(ctx, |menu, ctx| {
+            menu.set_width(MENU_WIDTH);
+            menu.set_items(items, ctx);
+            menu.set_selected_by_index(selected_index, ctx);
+            menu.set_safe_zone_target(None);
+            menu.set_submenu_being_shown_for_item_index(None);
+            ctx.notify();
+        });
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn opencode_default_model_menu_item(is_selected: bool) -> MenuItem<ProfileModelSelectorAction> {
+        let mut fields = MenuItemFields::new("opencode")
+            .with_on_select_action(ProfileModelSelectorAction::UseOpenCodeDefault);
+        if is_selected {
+            fields = fields.with_icon(Icon::Check);
+        } else {
+            fields = fields.with_indent();
+        }
+        fields.into_item()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn opencode_model_menu_item(
+        model: &OpenCodeModelInfo,
+        is_selected: bool,
+    ) -> MenuItem<ProfileModelSelectorAction> {
+        let mut label = model.display_name.clone();
+        if model.is_default {
+            label = format!("{label} (default)");
+        }
+        let mut fields = MenuItemFields::new(label).with_on_select_action(
+            ProfileModelSelectorAction::SelectOpenCodeModel(model.id.clone()),
+        );
+        if is_selected {
+            fields = fields.with_icon(Icon::Check);
+        } else {
+            fields = fields.with_indent();
+        }
+        fields.into_item()
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn find_selected_opencode_index(
+        items: &[MenuItem<ProfileModelSelectorAction>],
+        selected_model_id: Option<&str>,
+    ) -> usize {
+        items
+            .iter()
+            .position(|item| {
+                if let MenuItem::Item(fields) = item {
+                    let is_selected = matches!(
+                        item.item_on_select_action(),
+                        Some(ProfileModelSelectorAction::SelectOpenCodeModel(model_id))
+                            if Some(model_id.as_str()) == selected_model_id
+                    ) || (selected_model_id.is_none()
+                        && matches!(
+                            item.item_on_select_action(),
+                            Some(ProfileModelSelectorAction::UseOpenCodeDefault)
+                        ));
+                    !fields.is_disabled() && is_selected
+                } else {
+                    false
+                }
+            })
+            .or_else(|| {
+                items.iter().position(
+                    |item| matches!(item, MenuItem::Item(fields) if !fields.is_disabled()),
+                )
+            })
+            .unwrap_or(0)
+    }
+
     fn refresh_model_spec_sidecar(
         &mut self,
         kind: &ModelSpecSidecarKind,
@@ -1119,7 +1335,8 @@ impl ProfileModelSelector {
 
         let items: Vec<MenuItem<ProfileModelSelectorAction>> = match kind {
             ModelSpecSidecarKind::Auto => llm_preferences
-                .get_base_llm_choices_for_agent_mode(ctx)
+                .get_base_llm_choices_for_agent_mode_for_terminal(ctx, Some(self.terminal_view_id))
+                .into_iter()
                 .filter(|llm| is_auto(llm))
                 .map(|llm| {
                     let is_selected = llm.id == active_llm_id;
@@ -1310,13 +1527,23 @@ impl ProfileModelSelector {
                 .and_then(|action| {
                     match action {
                         ProfileModelSelectorAction::SelectModel(llm_id) => {
-                            LLMPreferences::as_ref(ctx).get_llm_info(llm_id).cloned()
+                            LLMPreferences::as_ref(ctx)
+                                .get_agent_mode_llm_info_for_terminal(
+                                    llm_id,
+                                    ctx,
+                                    Some(self.terminal_view_id),
+                                )
+                                .cloned()
                         }
                         ProfileModelSelectorAction::SelectAutoModel => {
                             // Get the first "auto" variant as the generic auto model
                             let llm_prefs = LLMPreferences::as_ref(ctx);
                             llm_prefs
-                                .get_base_llm_choices_for_agent_mode(ctx)
+                                .get_base_llm_choices_for_agent_mode_for_terminal(
+                                    ctx,
+                                    Some(self.terminal_view_id),
+                                )
+                                .into_iter()
                                 .find(|llm| is_auto(llm))
                                 .cloned()
                         }

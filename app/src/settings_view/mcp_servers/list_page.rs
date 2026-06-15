@@ -1592,6 +1592,55 @@ impl MCPServersListPageView {
         title_chips
     }
 
+    fn file_based_config_path_description(
+        uuid: Uuid,
+        provider_filter: Option<MCPProvider>,
+        ctx: &AppContext,
+    ) -> Option<String> {
+        let providers = match provider_filter {
+            Some(provider) => vec![provider],
+            None => MCPProvider::iter().collect(),
+        };
+
+        let mut paths: Vec<String> = providers
+            .into_iter()
+            .flat_map(|provider| {
+                FileBasedMCPManager::as_ref(ctx)
+                    .config_file_paths_for_installation_and_provider(uuid, provider)
+            })
+            .map(|path| path.display().to_string())
+            .collect();
+        paths.sort();
+        paths.dedup();
+
+        match paths.as_slice() {
+            [] => None,
+            [path] => Some(format!("Detected from config file: {path}")),
+            _ => Some(format!("Detected from config files: {}", paths.join(", "))),
+        }
+    }
+
+    fn file_based_card_description(
+        installation: &TemplatableMCPServerInstallation,
+        provider_filter: Option<MCPProvider>,
+        ctx: &AppContext,
+    ) -> Option<String> {
+        let source_description =
+            Self::file_based_config_path_description(installation.uuid(), provider_filter, ctx);
+
+        match (
+            installation.templatable_mcp_server().description.clone(),
+            source_description,
+        ) {
+            (Some(description), Some(source)) if !description.trim().is_empty() => {
+                Some(format!("{description} {source}"))
+            }
+            (Some(description), _) if !description.trim().is_empty() => Some(description),
+            (_, Some(source)) => Some(source),
+            _ => Some("Detected from config file".to_string()),
+        }
+    }
+
     fn register_file_based_template_card(
         &mut self,
         provider: MCPProvider,
@@ -1731,24 +1780,15 @@ impl MCPServersListPageView {
         switch_state: bool,
         ctx: &mut ViewContext<Self>,
     ) {
-        match switch_state {
-            true => {
-                let installation = FileBasedMCPManager::as_ref(ctx)
-                    .get_installation_by_uuid(uuid)
-                    .cloned();
-                if let Some(installation) = installation {
-                    TemplatableMCPServerManager::handle(ctx).update(ctx, |mgr, ctx| {
-                        mgr.spawn_ephemeral_server(installation, ctx);
-                    });
-                } else {
-                    log::warn!("Cannot start file-based server {uuid}: installation not found");
-                }
-            }
-            false => TemplatableMCPServerManager::handle(ctx).update(ctx, |mgr, ctx| {
-                // Shuts down the file-based server without purging credentials.
-                mgr.shutdown_server(uuid, ctx);
-            }),
-        }
+        FileBasedMCPManager::handle(ctx).update(ctx, |mgr, ctx| {
+            mgr.set_server_activation(uuid, switch_state, ctx);
+        });
+    }
+
+    fn remove_file_based_server_from_my_mcps(&self, uuid: Uuid, ctx: &mut ViewContext<Self>) {
+        FileBasedMCPManager::handle(ctx).update(ctx, |mgr, ctx| {
+            mgr.set_server_activation(uuid, false, ctx);
+        });
     }
 
     fn get_title_chip_text(

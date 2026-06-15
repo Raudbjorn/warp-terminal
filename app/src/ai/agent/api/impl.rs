@@ -135,7 +135,14 @@ pub async fn generate_multi_agent_output(
         mcp_context: params.mcp_context.map(Into::into),
     };
 
-    let response_stream = server_api.generate_multi_agent_output(&request).await;
+    let response_stream = server_api
+        .generate_multi_agent_output(
+            &request,
+            params.local_multi_agent_server_root_url.as_deref(),
+            params.openai_base_url.as_deref(),
+            params.local_model_aliases.as_deref(),
+        )
+        .await;
     match response_stream {
         Ok(stream) => {
             let output_stream = stream.take_until(cancellation_rx);

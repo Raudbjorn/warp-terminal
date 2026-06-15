@@ -433,8 +433,10 @@ impl UpdateManager {
                                     }
                                 });
                         } else if cloud_model.get_ai_execution_profile(&server_id).is_some() {
-                            AIExecutionProfilesModel::handle(ctx).update(ctx, |model, _| {
-                                model.replace_client_id_with_server_id(server_id, client_id);
+                            AIExecutionProfilesModel::handle(ctx).update(ctx, |model, ctx| {
+                                model.replace_client_id_with_server_id(
+                                    server_id, client_id, ctx,
+                                );
                             });
                         }
                     }
