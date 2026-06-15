@@ -129,7 +129,10 @@ impl CustomEndpointModal {
                 ..Default::default()
             };
             let mut editor = EditorView::single_line(options, ctx);
-            editor.set_placeholder_text("Please include 'https://'", ctx);
+            editor.set_placeholder_text(
+                "e.g. https://api.example.com/v1 or http://localhost:11434/v1",
+                ctx,
+            );
             if let Some(ep) = endpoint {
                 editor.set_buffer_text(&ep.url, ctx);
             }
@@ -895,14 +898,21 @@ fn validate_url(url: &str) -> Result<(), &'static str> {
         return Ok(());
     }
     let parsed = Url::parse(url).map_err(|_| "Invalid URL")?;
-    if parsed.scheme() != "https" {
-        return Err("URL must use HTTPS");
-    }
     let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+        if parsed.scheme() != "https" {
+            return Err("URL must use HTTPS");
+        }
         return Err("URL must include a host");
     };
     if is_restricted_host(host) {
-        return Err("URL must not use a local or private host");
+        // This client connects to the endpoint directly, so loopback/LAN
+        // endpoints (Ollama, LM Studio, vLLM) are the primary use case and
+        // plain HTTP to them is fine.
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("URL must use HTTP or HTTPS");
+        }
+    } else if parsed.scheme() != "https" {
+        return Err("URL must use HTTPS");
     }
     Ok(())
 }
