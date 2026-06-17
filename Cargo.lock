@@ -14672,6 +14672,7 @@ dependencies = [
  "mockall",
  "mockito",
  "natural_language_detection",
+ "network_policy",
  "nix 0.26.4",
  "notify-debouncer-full",
  "num-traits",
