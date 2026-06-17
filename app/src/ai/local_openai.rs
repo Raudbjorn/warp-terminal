@@ -340,26 +340,40 @@ impl LocalOpenAIClient {
         let (base_url, api_key) = match config.provider_kind {
             LocalProviderKind::OpenAICompatible => (config.base_url.clone(), config.api_key.clone()),
             LocalProviderKind::OpenCode => {
-                let working_dir = self
-                    .opencode_working_dir
-                    .read()
-                    .clone()
-                    .or_else(|| std::env::current_dir().ok())
-                    .ok_or(OpenCodeError::NoWorkingDirectory)?;
-                let sidecar = self
-                    .opencode_pool
-                    .get_or_spawn(
-                        &config.opencode_command,
-                        &config.opencode_args,
-                        &working_dir,
-                    )
-                    .await?;
-                // OpenCode ships an OpenAI-compatible /v1/chat/completions
-                // endpoint without an API key by default. We still pass
-                // the user-configured key through if one is set, since
-                // some self-hosted OpenCode builds gate `/v1` behind a
-                // bearer token.
-                (sidecar.base_url().to_string(), config.api_key.clone())
+                // Spawning a local process is unavailable on wasm; short-circuit
+                // with the stub's `Unsupported` error before touching
+                // `current_dir()`. This also keeps the non-wasm-only
+                // `OpenCodeError::NoWorkingDirectory` variant out of the wasm
+                // build (the wasm stub does not define it). Tail-expression
+                // `return` keeps the arm typed as the `(String, String)` tuple
+                // via the `!` coercion.
+                #[cfg(target_family = "wasm")]
+                {
+                    return Err(OpenCodeError::Unsupported.into())
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let working_dir = self
+                        .opencode_working_dir
+                        .read()
+                        .clone()
+                        .or_else(|| std::env::current_dir().ok())
+                        .ok_or(OpenCodeError::NoWorkingDirectory)?;
+                    let sidecar = self
+                        .opencode_pool
+                        .get_or_spawn(
+                            &config.opencode_command,
+                            &config.opencode_args,
+                            &working_dir,
+                        )
+                        .await?;
+                    // OpenCode ships an OpenAI-compatible /v1/chat/completions
+                    // endpoint without an API key by default. We still pass
+                    // the user-configured key through if one is set, since
+                    // some self-hosted OpenCode builds gate `/v1` behind a
+                    // bearer token.
+                    (sidecar.base_url().to_string(), config.api_key.clone())
+                }
             }
         };
 
