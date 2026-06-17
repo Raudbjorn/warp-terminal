@@ -584,6 +584,19 @@ fn apply_scroll_multiplier(event: &mut Event, app: &AppContext) {
 /// Runs the app. If a subcommand was requested, it'll be run instead of the main application.
 #[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
 pub fn run() -> Result<()> {
+    // POSIX locale fallback: When LANG/LC_* are all unset, provide C/Rust libraries
+    // (chrono number formatting, libc strftime, etc.) with a reasonable UTF-8 default.
+    // Intentionally skipped on Windows — Windows API (`GetUserPreferredUILanguages`) is
+    // the true source of UI locale; forcing `LANG=en_US.UTF-8` here makes
+    // `DesktopLanguageRequester` return en regardless of user's UI language choice,
+    // which biases CJK Han glyph fallback incorrectly (Japanese UI gets Simplified Chinese shapes).
+    #[cfg(not(windows))]
+    if std::env::var_os("LANG").is_none()
+        && std::env::var_os("LC_ALL").is_none()
+        && std::env::var_os("LC_CTYPE").is_none()
+    {
+        std::env::set_var("LANG", "en_US.UTF-8");
+    }
     // Perform any necessary platform-specific initialization.
     platform::init();
 
