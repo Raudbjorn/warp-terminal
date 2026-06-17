@@ -19,7 +19,9 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct LocalOpenAIClient {
     config: Arc<RwLock<LocalOpenAISettingsSnapshot>>,
-    opencode_pool: Arc<tokio::sync::Mutex<OpenCodeSidecarPool>>,
+    // `OpenCodeSidecarPool` is already `Clone` + internally synchronized, so no
+    // outer mutex is needed (it would just serialize concurrent requests).
+    opencode_pool: OpenCodeSidecarPool,
     /// Per-client override for the working directory the OpenCode
     /// sidecar pool keys on. `None` means "use the process CWD at
     /// request time". A future refactor can wire this through to a
@@ -132,7 +134,7 @@ impl LocalOpenAIClient {
     pub(crate) fn new(config: LocalOpenAISettingsSnapshot) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
-            opencode_pool: Arc::new(tokio::sync::Mutex::new(OpenCodeSidecarPool::new())),
+            opencode_pool: OpenCodeSidecarPool::new(),
             opencode_working_dir: Arc::new(RwLock::new(None)),
         }
     }
@@ -140,17 +142,13 @@ impl LocalOpenAIClient {
     pub(crate) fn set_config(&self, config: LocalOpenAISettingsSnapshot) {
         let provider_kind = config.provider_kind;
         *self.config.write() = config;
-        // Provider switched away from OpenCode: drop cached sidecars
-        // so we do not leak a child that no caller will use.
-        // The clear is queued as a `tokio::task` because
-        // `tokio::sync::Mutex` requires an async context to lock.
+        // Provider switched away from OpenCode: drop cached sidecars so we do
+        // not leak a child that no caller will use. `clear()` is synchronous
+        // (parking_lot lock) so this runs directly on the UI thread — no
+        // Tokio runtime required, and no fire-and-forget task that could be
+        // dropped before it runs.
         if provider_kind != LocalProviderKind::OpenCode {
-            let pool = self.opencode_pool.clone();
-            // The spawned future is fire-and-forget; the `let _ =`
-            // suppresses the `must_use` warning.
-            let _ = tokio::spawn(async move {
-                let _ = pool.lock().await.clear();
-            });
+            self.opencode_pool.clear();
         }
     }
 
@@ -346,15 +344,14 @@ impl LocalOpenAIClient {
                             "no working directory available for OpenCode sidecar".to_string(),
                         )
                     })?;
-                let sidecar = {
-                    let pool = self.opencode_pool.lock().await;
-                    pool.get_or_spawn(
+                let sidecar = self
+                    .opencode_pool
+                    .get_or_spawn(
                         &config.opencode_command,
                         &config.opencode_args,
                         &working_dir,
                     )
-                    .await?
-                };
+                    .await?;
                 // OpenCode ships an OpenAI-compatible /v1/chat/completions
                 // endpoint without an API key by default. We still pass
                 // the user-configured key through if one is set, since
