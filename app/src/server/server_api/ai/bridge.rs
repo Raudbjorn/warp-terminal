@@ -117,6 +117,14 @@ impl AIClient for GrpcBridgeAIClient {
         self.inner.get_request_limit_info().await
     }
 
+    async fn rename_conversation(
+        &self,
+        conversation_id: String,
+        title: String,
+    ) -> anyhow::Result<RenameConversationResponse, anyhow::Error> {
+        self.inner.rename_conversation(conversation_id, title).await
+    }
+
     async fn get_feature_model_choices(&self) -> Result<ModelsByFeature, anyhow::Error> {
         self.inner.get_feature_model_choices().await
     }
@@ -210,7 +218,7 @@ impl AIClient for GrpcBridgeAIClient {
             UserQueryMode::Orchestrate => pb::AgentMode::Orchestrate,
         } as i32;
         let pb_req = pb::SpawnAgentRequest {
-            prompt: request.prompt,
+            prompt: request.prompt.unwrap_or_default(),
             mode,
             title: request.title.unwrap_or_default(),
             conversation_id: request.conversation_id.unwrap_or_default(),
@@ -297,6 +305,8 @@ impl AIClient for GrpcBridgeAIClient {
             artifacts: vec![],
             last_event_sequence: None,
             children: vec![],
+            // oh-my-warp: synthesized in-progress task; no run-time duration yet.
+            run_time: None,
         })
     }
 
@@ -367,11 +377,82 @@ impl AIClient for GrpcBridgeAIClient {
             .await
     }
 
-    async fn list_agents(
+    async fn list_agents(&self) -> anyhow::Result<Vec<AgentResponse>, anyhow::Error> {
+        self.inner.list_agents().await
+    }
+
+    async fn list_agents_raw(&self) -> anyhow::Result<serde_json::Value, anyhow::Error> {
+        self.inner.list_agents_raw().await
+    }
+
+    async fn get_agent(&self, uid: &str) -> anyhow::Result<AgentResponse, anyhow::Error> {
+        self.inner.get_agent(uid).await
+    }
+
+    async fn get_agent_raw(&self, uid: &str) -> anyhow::Result<serde_json::Value, anyhow::Error> {
+        self.inner.get_agent_raw(uid).await
+    }
+
+    async fn create_agent(
+        &self,
+        request: CreateAgentRequest,
+    ) -> anyhow::Result<AgentResponse, anyhow::Error> {
+        self.inner.create_agent(request).await
+    }
+
+    async fn create_agent_raw(
+        &self,
+        request: CreateAgentRequest,
+    ) -> anyhow::Result<serde_json::Value, anyhow::Error> {
+        self.inner.create_agent_raw(request).await
+    }
+
+    async fn update_agent(
+        &self,
+        uid: &str,
+        request: UpdateAgentRequest,
+    ) -> anyhow::Result<AgentResponse, anyhow::Error> {
+        self.inner.update_agent(uid, request).await
+    }
+
+    async fn update_agent_raw(
+        &self,
+        uid: &str,
+        request: UpdateAgentRequest,
+    ) -> anyhow::Result<serde_json::Value, anyhow::Error> {
+        self.inner.update_agent_raw(uid, request).await
+    }
+
+    async fn delete_agent(&self, uid: &str) -> anyhow::Result<(), anyhow::Error> {
+        self.inner.delete_agent(uid).await
+    }
+
+    async fn list_skills(
         &self,
         repo: Option<String>,
-    ) -> anyhow::Result<Vec<AgentListItem>, anyhow::Error> {
-        self.inner.list_agents(repo).await
+    ) -> anyhow::Result<Vec<AgentSkillItem>, anyhow::Error> {
+        self.inner.list_skills(repo).await
+    }
+
+    async fn get_conversation_usage_history(
+        &self,
+        days: Option<i32>,
+        limit: Option<i32>,
+        last_updated_end_timestamp: Option<warp_graphql::scalars::Time>,
+    ) -> Result<Vec<ConversationUsage>, anyhow::Error> {
+        self.inner
+            .get_conversation_usage_history(days, limit, last_updated_end_timestamp)
+            .await
+    }
+
+    async fn post_agent_run_client_event(
+        &self,
+        run_id: &AmbientAgentTaskId,
+        request: AgentRunClientEventRequest,
+    ) -> anyhow::Result<(), anyhow::Error> {
+        self.inner
+            .post_agent_run_client_event(run_id, request)
+            .await
     }
 
     async fn cancel_ambient_agent_task(

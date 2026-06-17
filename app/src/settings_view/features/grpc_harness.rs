@@ -19,7 +19,7 @@ pub struct GrpcHarnessSelectorView {
     dropdown: ViewHandle<Dropdown<GrpcHarnessAction>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum GrpcHarnessAction {
     /// Select this harness (empty string = nothing selectable / no gRPC backend).
     Select(String),

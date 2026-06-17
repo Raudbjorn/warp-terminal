@@ -18,7 +18,7 @@ pub struct BackendSelectorView {
     dropdown: ViewHandle<Dropdown<BackendAction>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum BackendAction {
     /// Select the backend with this id ([`DEFAULT_BACKEND_ID`] = built-in Warp).
     Select(String),
