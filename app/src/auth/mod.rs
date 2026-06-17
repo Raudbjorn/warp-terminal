@@ -14,6 +14,7 @@ pub use warp_server_auth::{auth_state, credentials, user, user_uid};
 #[cfg(target_family = "wasm")]
 pub mod web_handoff;
 
+use crate::ChannelState;
 use ::settings::{Setting, SettingsManager, ToggleableSetting};
 use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
 pub use auth_manager::AuthManager;
@@ -64,8 +65,16 @@ pub fn init(app: &mut AppContext) {
 /// If the app has running processes or dirty objects, we'll show a confirmation modal before logging out.
 /// If the user aborts, the user will not be logged out.
 pub fn maybe_log_out(app: &mut AppContext) {
-    send_telemetry_sync_from_app_ctx!(TelemetryEvent::UserInitiatedLogOut, app);
-
+    // Defense-in-depth: the app menu hides the "Log out" item in
+    // local-only mode (see `app_menus.rs`), but keyboard shortcuts or
+    // future callers might still reach this path. Skip the entire
+    // logout flow when there is no Warp account to log out of: the
+    // user is anonymous by definition in local-only mode, and the
+    // telemetry and state-clearing actions are a no-op for them.
+    if ChannelState::is_local_only() {
+        return;
+    }
+     send_telemetry_sync_from_app_ctx!(TelemetryEvent::UserInitiatedLogOut, app);
     let sessions = SessionNavigationData::all_sessions(app).collect_vec();
     let num_long_running_commands = RunningSessionSummary::new(&sessions)
         .long_running_cmds
