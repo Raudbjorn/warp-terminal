@@ -73,6 +73,7 @@ pub fn is_shared_cjk_han(ch: char) -> bool {
         0x3400..=0x4DBF       // CJK Unified Ideographs Extension A
             | 0x4E00..=0x9FFF // CJK Unified Ideographs
             | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0xFF00..=0xFFEF // Halfwidth and Fullwidth Forms
             | 0x20000..=0x2A6DF // Extension B
             | 0x2A700..=0x2B73F // Extension C
             | 0x2B740..=0x2B81F // Extension D
