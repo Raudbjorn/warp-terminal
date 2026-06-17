@@ -197,8 +197,7 @@ pub enum AIApiError {
     #[error("Response stream ended unexpectedly before completion.")]
     UnexpectedEof,
 
-    #[error("Network policy denied: {0}")]
-    NetworkPolicyDenied(#[source] network_policy::NetworkPolicyDenied),
+
 }
 
 impl From<http_client::ResponseError> for AIApiError {
