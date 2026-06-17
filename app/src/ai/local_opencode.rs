@@ -55,10 +55,11 @@ pub enum OpenCodeError {
 /// We accept the minimum subset; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
 struct OpenCodeAnnouncement {
-    /// Listening port. Newer versions of OpenCode print a bare number;
-    /// older alphas used a full `address` URL. We support both via
-    /// `#[serde(alias)]`, and a final fallback in `from_line` for the
-    /// plain-text form (e.g. `ready:43123`).
+    /// Listening port. Newer OpenCode versions print a bare JSON number
+    /// (`{"port": 43123}`); the `#[serde(alias)]`s also accept a *numeric*
+    /// `address`/`url` field. String forms (`{"url":"http://127.0.0.1:43123"}`
+    /// or the plain-text `ready:43123`) cannot deserialize into `u16`, so they
+    /// fall through to the URL/heuristic parsing in `from_line`.
     #[serde(alias = "address", alias = "url")]
     port: u16,
 }
@@ -93,7 +94,9 @@ impl OpenCodeAnnouncement {
         if line.contains("://") {
             if let Some(scheme_end) = line.find("://") {
                 let after_scheme = &line[scheme_end + 3..];
-                if let Some(host_end) = after_scheme.find(':') {
+                // Use `rfind` so the port separator is found after the host,
+                // including IPv6 hosts like `[::1]:43123` whose host contains `:`.
+                if let Some(host_end) = after_scheme.rfind(':') {
                     let port_str: String = after_scheme[host_end + 1..]
                         .chars()
                         .take_while(|c| c.is_ascii_digit())
@@ -196,8 +199,8 @@ pub async fn spawn(
     // Read the announcement with a timeout; on timeout, kill the child
     // and surface a structured error.
     let announcement = tokio::time::timeout(READY_TIMEOUT, read_announcement(stdout)).await;
-    let port = match announcement {
-        Ok(Ok(ann)) => ann.port,
+    let (port, stdout) = match announcement {
+        Ok(Ok((ann, stdout))) => (ann.port, stdout),
         Ok(Err(err)) => {
             let _ = process.kill();
             return Err(err);
@@ -216,7 +219,7 @@ pub async fn spawn(
 
     // Spawn the background drain that owns the kill path.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(drain_sidecar(process, stderr, shutdown_rx));
+    tokio::spawn(drain_sidecar(process, stderr, Some(stdout), shutdown_rx));
 
     Ok(OpenCodeSidecar {
         inner: Arc::new(SidecarInner {
@@ -232,7 +235,7 @@ pub async fn spawn(
 /// emits it on a fresh line or appended to the first line of output.
 async fn read_announcement(
     mut stdout: async_process::ChildStdout,
-) -> Result<OpenCodeAnnouncement, OpenCodeError> {
+) -> Result<(OpenCodeAnnouncement, async_process::ChildStdout), OpenCodeError> {
     let mut buffer = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
     loop {
@@ -244,8 +247,15 @@ async fn read_announcement(
                 // recognizer from buffering arbitrarily long log lines.
                 if byte[0] == b'\n' {
                     if let Ok(ann) = try_parse_buffer(&buffer) {
-                        return Ok(ann);
+                        // Hand stdout back so the caller can keep draining it;
+                        // dropping it here would close the pipe and risk
+                        // EPIPE/blocking if the sidecar logs more to stdout.
+                        return Ok((ann, stdout));
                     }
+                    // Drop the non-matching line so we only ever parse the
+                    // current line (avoids O(N^2) re-parsing and prevents a
+                    // preceding log line from poisoning the JSON parse).
+                    buffer.clear();
                 }
             }
             Err(err) => return Err(OpenCodeError::Io(err)),
@@ -271,6 +281,7 @@ fn try_parse_buffer(buffer: &[u8]) -> Result<OpenCodeAnnouncement, OpenCodeError
 async fn drain_sidecar(
     mut child: async_process::Child,
     stderr: Option<async_process::ChildStderr>,
+    stdout: Option<async_process::ChildStdout>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     // Drain stderr in a sibling task so a noisy OpenCode log cannot wedge
@@ -280,6 +291,22 @@ async fn drain_sidecar(
             let mut buffer = [0u8; 4096];
             loop {
                 match stderr.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_n) => {
+                        // Discarded; reserved for future log capture.
+                    }
+                }
+            }
+        });
+    }
+
+    // Keep draining stdout after the announcement so the pipe stays open and
+    // the sidecar never blocks (or gets EPIPE) writing further stdout.
+    if let Some(mut stdout) = stdout {
+        tokio::spawn(async move {
+            let mut buffer = [0u8; 4096];
+            loop {
+                match stdout.read(&mut buffer).await {
                     Ok(0) | Err(_) => break,
                     Ok(_n) => {
                         // Discarded; reserved for future log capture.
@@ -319,16 +346,13 @@ async fn drain_sidecar(
 }
 
 /// Pool of `OpenCodeSidecar`s keyed by working directory. Cheap to clone;
-/// clones share the same backing map. The internal `std::sync::Mutex`
-/// is used (not `parking_lot::Mutex`) so the guard can be held across
-/// Pool of `OpenCodeSidecar`s keyed by working directory. Cheap to clone;
-/// clones share the same backing map. The internal `tokio::sync::Mutex`
-/// is used (not `parking_lot::Mutex` nor `std::sync::Mutex`) so the
-/// guard is `Send + !Sync` and can be held across `.await` points in
-/// async callers.
+/// clones share the same backing map. The internal `parking_lot::Mutex` is
+/// only ever held for synchronous map lookups/inserts (never across an
+/// `.await`), so an async mutex is unnecessary — and a sync lock lets
+/// `clear()` run on the (non-Tokio) UI thread without spawning a task.
 #[derive(Clone, Default)]
 pub struct OpenCodeSidecarPool {
-    inner: Arc<tokio::sync::Mutex<HashMap<PathBuf, OpenCodeSidecar>>>,
+    inner: Arc<parking_lot::Mutex<HashMap<PathBuf, OpenCodeSidecar>>>,
 }
 
 impl OpenCodeSidecarPool {
@@ -347,15 +371,12 @@ impl OpenCodeSidecarPool {
     ) -> Result<OpenCodeSidecar, OpenCodeError> {
         let canonical = canonicalize_for_pool(working_dir);
 
-        {
-            let guard = self.inner.lock().await;
-            if let Some(existing) = guard.get(&canonical).cloned() {
-                return Ok(existing);
-            }
+        if let Some(existing) = self.inner.lock().get(&canonical).cloned() {
+            return Ok(existing);
         }
 
         let sidecar = spawn(command, args, &canonical).await?;
-        let mut guard = self.inner.lock().await;
+        let mut guard = self.inner.lock();
         // Another caller may have raced us to insert; prefer the
         // existing sidecar so we do not leak a duplicate child.
         if let Some(existing) = guard.get(&canonical).cloned() {
@@ -367,8 +388,8 @@ impl OpenCodeSidecarPool {
 
     /// Forget every cached sidecar. Existing clones continue to live;
     /// the next `get_or_spawn` for any key spawns a fresh sidecar.
-    pub async fn clear(&self) {
-        self.inner.lock().await.clear();
+    pub fn clear(&self) {
+        self.inner.lock().clear();
     }
 }
 
