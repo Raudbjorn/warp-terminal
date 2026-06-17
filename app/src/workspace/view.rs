@@ -2213,10 +2213,10 @@ impl Workspace {
                 me.show_plugin_palette(title.clone(), items.clone(), ctx);
             }
             crate::plugin::PluginHostEvent::OpenWebTab { url } => {
-                // Set the one-shot initial-URL override, then open a browser tab;
-                // `BrowserView::new` consumes it synchronously during construction.
-                crate::browser::view::set_next_browser_url(url.clone());
-                me.open_web_tab(ctx);
+                // URL flows through `LeafContents::Browser { url }` so it's also
+                // persisted across restart; the restore arm propagates it into
+                // `BrowserView::new` via the one-shot URL override.
+                me.open_web_tab(Some(url.clone()), ctx);
             }
         });
     }
@@ -14797,12 +14797,17 @@ impl Workspace {
         });
     }
 
-    /// Opens an embedded browser pane (oh-my-warp) as its own new tab.
-    pub(crate) fn open_web_tab(&mut self, ctx: &mut ViewContext<Self>) {
+    /// Opens an embedded browser pane (oh-my-warp) as its own new tab. `url` is
+    /// the initial page to navigate to; pass `None` (or an empty string) to use
+    /// the configured home page. The URL is plumbed through `LeafContents::Browser`
+    /// so it's also persisted across restarts.
+    pub(crate) fn open_web_tab(&mut self, url: Option<String>, ctx: &mut ViewContext<Self>) {
         let panes_layout = PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
             is_focused: true,
             custom_vertical_tabs_title: None,
-            contents: LeafContents::Browser,
+            contents: LeafContents::Browser {
+                url: url.unwrap_or_default(),
+            },
         })));
         self.add_tab_with_pane_layout(
             panes_layout,
@@ -23608,7 +23613,7 @@ impl TypedActionView for Workspace {
                 self.open_browser_pane(ctx);
             }
             NewWebTab => {
-                self.open_web_tab(ctx);
+                self.open_web_tab(None, ctx);
             }
             FixSettingsWithOz { error_description } => {
                 use crate::ai::skills::SkillManager;

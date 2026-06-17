@@ -73,9 +73,19 @@ thread_local! {
 /// Sets the initial URL for the *next* browser pane created (consumed once by
 /// [`BrowserView::new`]). Backs the `warp.ui.openWebTab` plugin bridge; the input
 /// is normalized like an address-bar entry (bare hosts gain `https://`, non-URLs
-/// become a web search) via [`normalize_url`].
+/// become a web search) via [`normalize_url`]. Also used by the persistence
+/// restore path (`pane_group::mod`) to navigate restored panes to the URL
+/// they were last viewing.
 pub fn set_next_browser_url(url: String) {
     NEXT_BROWSER_URL.with(|cell| cell.set(Some(normalize_url(&url))));
+}
+
+impl BrowserView {
+    /// The current page URL — read by `BrowserPane::snapshot` when persisting
+    /// the pane so it can be restored to the same page across app restarts.
+    pub fn current_url(&self) -> &str {
+        &self.url
+    }
 }
 
 /// The CSS viewport size the current frame represents (shared with input

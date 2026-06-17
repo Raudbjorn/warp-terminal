@@ -1948,12 +1948,16 @@ impl PaneGroup {
                     "Network log pane should not have been persisted, as it cannot be restored"
                 ))
             }
-            LeafContents::Browser => {
+            LeafContents::Browser { url } => {
                 // Browser panes (oh-my-warp) construct a fresh Chrome + CDP
-                // session here. This arm is reached for newly-opened panes/tabs
-                // (e.g. "New Web Tab"); it is never reached during session
-                // restore because `is_persisted()` is false (so `save_pane_state`
-                // never writes a browser leaf to restore).
+                // session here. Reached for newly-opened panes/tabs ("New Web
+                // Tab", `warp.ui.openWebTab`) AND on session restore: the URL
+                // captured at save time (or `""` for a default "New Web Tab")
+                // is propagated into `BrowserView::new` via the one-shot URL
+                // override; an empty URL falls back to the configured home.
+                if !url.is_empty() {
+                    crate::browser::view::set_next_browser_url(url.clone());
+                }
                 let pane: Box<dyn AnyPaneContent + 'static> = Box::new(BrowserPane::new(ctx));
                 let pane_id = pane.as_pane().id();
                 pane_contents.insert(pane_id, pane);

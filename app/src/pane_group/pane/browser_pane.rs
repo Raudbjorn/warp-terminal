@@ -80,8 +80,11 @@ impl PaneContent for BrowserPane {
         ctx.unsubscribe_to_view(&self.view);
     }
 
-    fn snapshot(&self, _app: &AppContext) -> LeafContents {
-        LeafContents::Browser
+    fn snapshot(&self, app: &AppContext) -> LeafContents {
+        // Persist the current URL so the pane restores to the same page on next
+        // launch (the CDP/Chrome session itself is ephemeral and rebuilt).
+        let url = self.browser_view(app).as_ref(app).current_url().to_owned();
+        LeafContents::Browser { url }
     }
 
     fn has_application_focus(&self, ctx: &mut ViewContext<PaneGroup>) -> bool {

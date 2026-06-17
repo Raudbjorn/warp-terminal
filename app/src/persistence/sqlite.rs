@@ -40,7 +40,7 @@ use lsp::supported_servers::LSPServerType;
 use num_traits::FromPrimitive;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
-use persistence::model::AMBIENT_AGENT_PANE_KIND;
+use persistence::model::{AMBIENT_AGENT_PANE_KIND, BROWSER_PANE_KIND};
 use uuid::Uuid;
 use warpui::platform::FullscreenState;
 use warpui::windowing::{MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH};
@@ -1132,11 +1132,9 @@ fn save_pane_state(
         LeafContents::CodeReview(_) => CODE_REVIEW_PANE_KIND,
         LeafContents::AmbientAgent(_) => AMBIENT_AGENT_PANE_KIND,
         LeafContents::ExecutionProfileEditor => EXECUTION_PROFILE_EDITOR_PANE_KIND,
-        LeafContents::GetStarted => GET_STARTED_PANE_KIND,
         LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
-        LeafContents::EnvironmentManagement(_)
-        | LeafContents::NetworkLog
-        | LeafContents::Browser => {
+        LeafContents::Browser { .. } => BROWSER_PANE_KIND,
+        LeafContents::EnvironmentManagement(_) | LeafContents::NetworkLog => {
             // These pane types are filtered out before this function is
             // called; see `LeafContents::is_persisted` and the skip in
             // `save_app_state`. Reaching this arm would mean a `pane_nodes`
@@ -1367,8 +1365,14 @@ fn save_pane_state(
         LeafContents::NetworkLog => {
             // Unreachable: filtered by `is_persisted` in `save_app_state`.
         }
-        LeafContents::Browser => {
-            // Unreachable: filtered by `is_persisted` in `save_app_state`.
+        LeafContents::Browser { url } => {
+            let browser_pane = model::NewBrowserPane {
+                id,
+                url: url.clone(),
+            };
+            diesel::insert_into(schema::browser_panes::dsl::browser_panes)
+                .values(browser_pane)
+                .execute(conn)?;
         }
     }
 
@@ -2344,6 +2348,13 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                         uuid: pane.uuid,
                         task_id,
                     })
+                }
+                BROWSER_PANE_KIND => {
+                    let pane = schema::browser_panes::dsl::browser_panes
+                        .find(node.id)
+                        .select(model::BrowserPane::as_select())
+                        .first(conn)?;
+                    LeafContents::Browser { url: pane.url }
                 }
                 other => bail!("Unrecognized pane kind: {other}"),
             };

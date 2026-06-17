@@ -10,9 +10,9 @@ use warp_multi_agent_api::{self as api};
 
 use super::schema::{
     active_mcp_servers, agent_conversations, agent_tasks, ai_document_panes, ai_memory_panes,
-    ambient_agent_panes, app, blocks, cloud_objects_refreshes, code_pane_tabs, code_panes,
-    code_review_panes, commands, current_user_information, env_var_collection_panes, folders,
-    generic_string_objects, ignored_suggestions, mcp_environment_variables,
+    ambient_agent_panes, app, blocks, browser_panes, cloud_objects_refreshes, code_pane_tabs,
+    code_panes, code_review_panes, commands, current_user_information, env_var_collection_panes,
+    folders, generic_string_objects, ignored_suggestions, mcp_environment_variables,
     mcp_server_installations, mcp_server_panes, notebook_panes, notebooks, object_actions,
     object_metadata, object_permissions, pane_branches, pane_leaves, pane_nodes, panels,
     project_rules, projects, server_experiments, settings_panes, tab_groups, tabs, team_members,
@@ -586,6 +586,9 @@ pub const AI_DOCUMENT_PANE_KIND: &str = "ai_document";
 /// The [`pane_leaves::kind`] value for ambient agent (cloud mode) panes.
 pub const AMBIENT_AGENT_PANE_KIND: &str = "ambient_agent";
 
+/// The [`pane_leaves::kind`] value for oh-my-warp embedded browser panes.
+pub const BROWSER_PANE_KIND: &str = "browser";
+
 #[derive(Insertable)]
 #[diesel(table_name = terminal_panes)]
 pub struct NewTerminalPane {
@@ -686,6 +689,24 @@ pub struct NewAmbientAgentPane {
     pub id: i32,
     pub uuid: Vec<u8>,
     pub task_id: Option<String>,
+}
+
+/// oh-my-warp: persisted state for an embedded browser pane — just the current
+/// URL (the CDP session itself is ephemeral and recreated on restore).
+#[derive(Identifiable, Queryable, Selectable)]
+#[diesel(table_name = browser_panes)]
+#[diesel(primary_key(id))]
+pub struct BrowserPane {
+    pub id: i32,
+    pub kind: String,
+    pub url: String,
+}
+
+#[derive(Insertable)]
+#[diesel(table_name = browser_panes)]
+pub struct NewBrowserPane {
+    pub id: i32,
+    pub url: String,
 }
 
 #[derive(Insertable)]
