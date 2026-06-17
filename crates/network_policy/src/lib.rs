@@ -1,7 +1,6 @@
-use std::net::IpAddr;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use serde::{Deserialize, Serialize};
 use url::Url;
 
 static SERVICES_MODE: AtomicU8 = AtomicU8::new(ServicesMode::Online as u8);
@@ -87,17 +86,12 @@ fn is_guarded_scheme(scheme: &str) -> bool {
 }
 
 fn is_loopback_url(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
     }
-
-    host.trim_matches(['[', ']'])
-        .parse::<IpAddr>()
-        .is_ok_and(|addr| addr.is_loopback())
 }
 
 #[cfg(test)]

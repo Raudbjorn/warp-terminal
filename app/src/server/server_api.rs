@@ -179,6 +179,9 @@ pub enum AIApiError {
     ErrorStatus(http::StatusCode, String),
 
     #[error(transparent)]
+    NetworkPolicyDenied(#[from] network_policy::NetworkPolicyDenied),
+
+    #[error(transparent)]
     Other(#[from] anyhow::Error),
 
     #[error("Got error when streaming {stream_type}: {source:#}")]
@@ -216,7 +219,7 @@ impl From<http_client::Error> for AIApiError {
     fn from(err: http_client::Error) -> Self {
         match err {
             http_client::Error::Reqwest(err) => Self::from_transport_error(err),
-            http_client::Error::NetworkPolicyDenied(err) => AIApiError::Other(anyhow::anyhow!(err)),
+            http_client::Error::NetworkPolicyDenied(err) => AIApiError::NetworkPolicyDenied(err),
         }
     }
 }
@@ -340,6 +343,8 @@ impl AIApiError {
                 }
                 true
             }
+            // Deterministic denials (LocalOnly policy) won't be fixed by retry/resume.
+            AIApiError::NetworkPolicyDenied(_) => false,
             // By default, attempt recovery on error.
             _ => true,
         }
@@ -357,7 +362,8 @@ impl ErrorExt for AIApiError {
             AIApiError::UnexpectedEof => true,
             AIApiError::QuotaLimit { .. }
             | AIApiError::ServerOverloaded
-            | AIApiError::NoContextFound => false,
+            | AIApiError::NoContextFound
+            | AIApiError::NetworkPolicyDenied(_) => false,
         }
     }
 }

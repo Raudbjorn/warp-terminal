@@ -448,6 +448,7 @@ const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
     "agent",
     "environment",
     "run",
+    "task",
     "model",
     "login",
     "logout",
@@ -482,7 +483,12 @@ fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) ->
             return None;
         }
 
-        if arg.starts_with("--") {
+        if arg.starts_with('-') {
+            // Skip both long (`--foo`, `--foo=bar`) and short (`-v`, `-o value`,
+            // `-obar`, `-abc`) options. The previous implementation only
+            // skipped long options, which let invocations like
+            // `warp -v agent` misidentify `-v` as the subcommand and bypass
+            // local-only gating entirely.
             let option_name = arg.split_once('=').map_or(arg, |(name, _)| name);
             index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name) && !arg.contains('=') {
                 2
@@ -494,7 +500,8 @@ fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) ->
 
         if arg == "help" {
             // Find the help target, skipping option values the same way the main loop does
-            // (e.g. `help --output-format json agent` should target `agent`, not `json`).
+            // (e.g. `help --output-format json agent` should target `agent`, not `json`; `help -v agent`
+            // should likewise target `agent`, not get blocked by `-v`).
             let mut help_index = index + 1;
             while help_index < args.len() {
                 let candidate = args[help_index].as_str();

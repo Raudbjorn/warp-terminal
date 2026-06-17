@@ -773,7 +773,8 @@ impl From<&Arc<AIApiError>> for RenderableAIError {
             | AIApiError::NoContextFound
             | AIApiError::ErrorStatus(_, _)
             | AIApiError::Other(_)
-            | AIApiError::Stream { .. } => Self::Other {
+            | AIApiError::Stream { .. }
+            | AIApiError::NetworkPolicyDenied(_) => Self::Other {
                 error_message: format!("Request failed with error: {value:?}"),
                 will_attempt_resume: false,
                 waiting_for_network: false,
