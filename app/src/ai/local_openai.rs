@@ -248,6 +248,16 @@ enum PredictionJson {
     String(String),
 }
 
+/// Upper bound for the local-provider request timeout (1 hour). Values loaded from
+/// `settings.toml` or set programmatically bypass the UI validation, so every call
+/// path clamps here to keep `reqwest`/`tokio` timer math from overflowing.
+const MAX_LOCAL_OPENAI_TIMEOUT_MS: u64 = 3_600_000;
+
+fn clamp_timeout(mut config: LocalOpenAISettingsSnapshot) -> LocalOpenAISettingsSnapshot {
+    config.timeout_ms = config.timeout_ms.clamp(1, MAX_LOCAL_OPENAI_TIMEOUT_MS);
+    config
+}
+
 impl LocalOpenAIClient {
     pub(crate) fn new(config: LocalOpenAISettingsSnapshot) -> Self {
         Self {
@@ -677,20 +687,21 @@ impl LocalOpenAIClient {
     /// may be empty — only `command_model` is required here so the command path
     /// doesn't get blocked by an unset prediction model.
     fn configured_for_command(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
-        let config = self.config.read().clone();
+        let config = self.config.read();
         if !config.enabled
             || config.command_model.trim().is_empty()
         {
             return Err(LocalOpenAIError::NotConfigured);
         }
-        Ok(config)
+        // Clone only once validated, and clamp the timeout for settings-file values.
+        Ok(clamp_timeout(config.clone()))
     }
 
     /// Returns the current snapshot if it is runnable for the **prediction** path
     /// (agent-mode query prediction, AI input suggestions). Requires the
     /// `prediction_model` to be set.
     fn configured_for_prediction(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
-        let config = self.config.read().clone();
+        let config = self.config.read();
         if !config.enabled
             || config.base_url.trim().is_empty()
             || config.prediction_model.trim().is_empty()
@@ -709,7 +720,8 @@ impl LocalOpenAIClient {
                 }
             }
         }
-        Ok(config)
+        // Clone only once validated, and clamp the timeout for settings-file values.
+        Ok(clamp_timeout(config.clone()))
     }
 }
 
