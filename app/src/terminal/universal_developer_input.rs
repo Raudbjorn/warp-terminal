@@ -809,10 +809,10 @@ impl View for UniversalDeveloperInputButtonBar {
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn warpui::Element> {
-        if ChannelState::is_local_only() {
-            return warpui::elements::Empty::new().finish();
-        }
-
+        // We still render in local-only mode so the user keeps the offline-compatible
+        // controls (segmented mode switcher, slash-command button). Online-only
+        // controls (mic, @, file, model selector) are gated below on
+        // `online_agent_controls_allowed_by_channel()`.
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
         #[cfg(feature = "voice_input")]
