@@ -16,6 +16,34 @@ use itertools::Itertools;
 use markdown_parser::{FormattedText, FormattedTextInline, TableAlignment};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
+use std::sync::Arc;
+use warp_core::{
+    features::FeatureFlag,
+    ui::{appearance::Appearance, color::blend::Blend, theme::color::internal_colors},
+};
+use warpui::{
+    assets::asset_cache::{AssetCache, AssetSource, AssetState},
+    elements::{
+        new_scrollable::{ScrollableAppearance, SingleAxisConfig},
+        Align, Axis, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle,
+        ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty,
+        EventHandler, Expanded, Fill, Flex, FormattedTextElement, HeadingFontSizeMultipliers,
+        Hoverable, Image as WarpImage, MainAxisAlignment, MainAxisSize, MouseStateHandle,
+        NewScrollable, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius,
+        SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth, Shrinkable, Stack, Table,
+        TableColumnWidth, TableConfig, TableHeader, TableVerticalSizing, Text, Wrap,
+    },
+    fonts::{Properties, Weight},
+    image_cache::{CacheOption, ImageType},
+    keymap::Keystroke,
+    platform::Cursor,
+    text_layout::{ClipConfig, TextAlignment, TextStyle},
+    ui_components::{
+        button::Button,
+        components::{Coords, UiComponent, UiComponentStyles},
+    },
+    Action, AppContext, Element, EventContext, SingletonEntity, View, ViewHandle,
+};
 use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
@@ -2416,6 +2444,25 @@ fn blocklist_base_line_height(app: &AppContext) -> f32 {
 }
 
 const TABLE_BLOCK_CORNER_RADIUS: f32 = 8.0;
+
+fn ai_table_appearance(appearance: &Appearance) -> MarkdownTableAppearance {
+    let theme = appearance.theme();
+    MarkdownTableAppearance {
+        border_color: internal_colors::neutral_4(theme),
+        header_background: theme.surface_2().into_solid(),
+        cell_background: ColorU::transparent_black(),
+        alternate_row_background: Some(theme.surface_1().with_opacity(50).into_solid()),
+        text_color: internal_colors::text_sub(theme, theme.background()),
+        header_text_color: internal_colors::text_main(theme, theme.background()),
+        scrollbar_nonactive_thumb_color: theme.nonactive_ui_detail().into_solid(),
+        scrollbar_active_thumb_color: theme.active_ui_detail().into_solid(),
+        cell_padding: 8.,
+        outer_border: true,
+        column_dividers: true,
+        row_dividers: true,
+    }
+}
+
 fn render_table_section(
     table: &AgentOutputTable,
     table_handles: TableSectionHandles,
@@ -2435,7 +2482,7 @@ fn render_table_section(
     }
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
-    let table_appearance = markdown_table_appearance(appearance);
+    let table_appearance = ai_table_appearance(appearance);
     let notebook_styles = rich_text_styles(appearance, FontSettings::as_ref(app));
     let table_font_family = appearance.ai_font_family();
     let table_font_size = appearance.monospace_font_size();

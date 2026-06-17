@@ -961,6 +961,8 @@ pub const PREVIEW_FLAGS: &[FeatureFlag] = &[
     #[cfg(target_os = "macos")]
     FeatureFlag::DragTabsToWindows,
     FeatureFlag::GroupedTabs,
+    FeatureFlag::MarkdownTables,
+    FeatureFlag::GitOperationsInCodeReview,
 ];
 
 /// Features enabled for all release builds (i.e.: everything but WarpLocal).
@@ -973,6 +975,7 @@ pub const RELEASE_FLAGS: &[FeatureFlag] = &[
     // Marked text is currently only supported on MacOS.
     #[cfg(target_os = "macos")]
     FeatureFlag::ImeMarkedText,
+    FeatureFlag::BlocklistMarkdownTableRendering,
     // Remote server binary is not yet supported on Windows.
     #[cfg(not(windows))]
     FeatureFlag::SshRemoteServer,
