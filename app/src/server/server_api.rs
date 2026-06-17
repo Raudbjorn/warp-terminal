@@ -62,7 +62,7 @@ use crate::server::iap::{IapManager, IapState};
 use crate::server::server_api::presigned_upload::HttpStatusError;
 use crate::server::telemetry::TelemetryApi;
 use crate::ai::local_openai::LocalOpenAIClient;
-use crate::settings::{LocalOpenAISettingsSnapshot, PrivacySettingsSnapshot};
+use crate::settings::{AISettings, LocalOpenAISettingsSnapshot, PrivacySettingsSnapshot};
 use crate::{settings_view, ChannelState};
 
 pub const FETCH_CHANNEL_VERSIONS_TIMEOUT: std::time::Duration = Duration::from_secs(60);
@@ -1659,10 +1659,24 @@ impl ServerApiProvider {
             server_api.clone(),
             server_api.auth_session.clone(),
         ));
-        Self {
+        let provider = Self {
             server_api,
             auth_client,
-        }
+        };
+
+        // Propagate the user-configured local OpenAI provider settings to the client now and
+        // whenever AI settings change. Without this, local-only mode would never see the
+        // configured endpoint and the client would stay on disabled defaults.
+        provider
+            .server_api
+            .set_local_openai_config(AISettings::as_ref(ctx).local_openai_settings());
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |provider, _, ctx| {
+            provider
+                .server_api
+                .set_local_openai_config(AISettings::as_ref(ctx).local_openai_settings());
+        });
+
+        provider
     }
 
     /// Handles fetching server-side experiments by updating the appropriate app state.
@@ -1674,8 +1688,6 @@ impl ServerApiProvider {
         ServerExperiments::handle(ctx).update(ctx, |state, ctx| {
             state.apply_latest_state(experiments, ctx);
         });
-
-        settings_view::handle_experiment_change();
     }
 
     /// Constructs a new SeverApiProvider for tests.

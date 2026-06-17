@@ -1630,7 +1630,11 @@ impl AISettings {
 
     pub(crate) fn is_ai_command_search_enabled(&self, app: &AppContext) -> bool {
         if ChannelState::is_local_only() {
+            // Only expose command search when the local provider is actually runnable —
+            // an enabled-but-unconfigured provider would fail every request.
             self.is_local_ai_enabled()
+                && !self.local_openai_base_url.value().trim().is_empty()
+                && !self.local_openai_command_model.value().trim().is_empty()
         } else {
             self.is_any_ai_enabled(app)
         }

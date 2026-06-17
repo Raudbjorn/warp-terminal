@@ -76,7 +76,11 @@ pub fn menu_bar(ctx: &mut AppContext) -> MenuBar {
         menus.push(make_new_ai_menu(ctx));
     }
 
-    menus.extend([make_new_drive_menu(ctx), make_new_window_menu()]);
+    // Warp Drive is a cloud surface; hide its top-level menu in local-only mode.
+    if online_services_menu_enabled() {
+        menus.push(make_new_drive_menu(ctx));
+    }
+    menus.push(make_new_window_menu());
 
     if online_services_menu_enabled() {
         menus.push(make_new_help_menu());

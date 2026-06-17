@@ -1286,6 +1286,12 @@ impl UpdateManager {
     /// after signup/login) to prevent stale cloud data from a previous session
     /// being used.
     pub fn reset_initial_load(&self) {
+        if ChannelState::is_local_only() {
+            // Local-only mode never starts the cloud load path and marks the condition
+            // satisfied at construction; resetting it would hang callers awaiting
+            // `initial_load_complete()`.
+            return;
+        }
         log::info!("Resetting initial_load_complete condition for fresh cloud object fetch");
         self.has_initial_load.reset();
     }

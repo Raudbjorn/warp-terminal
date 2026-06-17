@@ -104,10 +104,9 @@ define_settings_group!(SafeModeSettings, settings: [
 
 /// Returns whether the rendering should obfuscate secrets given the current safe mode settings.
 pub fn get_secret_obfuscation_mode(app: &AppContext) -> ObfuscateSecrets {
-    if ChannelState::is_local_only() {
-        return ObfuscateSecrets::No;
-    }
-
+    // NOTE: do not short-circuit to `ObfuscateSecrets::No` in local-only mode — secret
+    // obfuscation is a local, settings-driven safety feature and must keep honouring the
+    // user's redaction preferences regardless of services mode.
     let safe_mode_settings = SafeModeSettings::as_ref(app);
     let is_enterprise_secret_redaction_enabled =
         UserWorkspaces::as_ref(app).is_enterprise_secret_redaction_enabled();

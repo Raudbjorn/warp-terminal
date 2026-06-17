@@ -926,11 +926,12 @@ impl DriveIndex {
                 .with_width(MENU_WIDTH)
         });
 
-        if !local_only {
-            ctx.subscribe_to_view(&menu, |me, _, event, ctx| {
-                me.handle_menu_event(event, ctx);
-            });
-        }
+        // The sorting menu is rendered in local-only mode too, so always wire its events;
+        // otherwise `Event::Close` never reaches `handle_menu_event` and the open/focus
+        // state gets stuck.
+        ctx.subscribe_to_view(&menu, |me, _, event, ctx| {
+            me.handle_menu_event(event, ctx);
+        });
 
         let title_editor = ctx.add_typed_action_view(|ctx| {
             let options = SingleLineEditorOptions {

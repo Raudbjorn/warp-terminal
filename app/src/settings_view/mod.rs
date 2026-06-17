@@ -685,8 +685,6 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
     ]);
 }
 
-pub fn handle_experiment_change() {}
-
 /// The string the user will see when the action is enabled or disabled.
 #[derive(Clone)]
 pub struct SettingActionPairDescriptions {

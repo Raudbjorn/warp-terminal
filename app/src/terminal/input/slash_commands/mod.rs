@@ -3,7 +3,6 @@ mod data_source;
 mod search_item;
 pub(super) mod view;
 
-#[cfg(feature = "local_fs")]
 use warp_core::channel::ChannelState;
 use std::path::PathBuf;
 

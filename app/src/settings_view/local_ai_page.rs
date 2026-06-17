@@ -175,10 +175,15 @@ impl LocalAIProviderWidget {
         ctx.subscribe_to_view(&timeout_ms_editor, |_, editor, event, ctx| {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
+                // Reject non-positive timeouts (`0ms` would make every request fail
+                // immediately) as well as unparseable input, resetting to the saved value.
                 let value = match buffer_text.trim().parse::<u64>() {
-                    Ok(value) => value,
-                    Err(e) => {
-                        log::warn!("Failed to parse local OpenAI timeout: {e:?}");
+                    Ok(value) if value > 0 => value,
+                    _ => {
+                        log::warn!(
+                            "Invalid local OpenAI timeout: {:?}",
+                            buffer_text.trim()
+                        );
                         let current = AISettings::as_ref(ctx)
                             .local_openai_timeout_ms
                             .value()
