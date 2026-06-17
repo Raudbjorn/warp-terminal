@@ -114,11 +114,21 @@ struct LocalAIProviderWidget {
     command_model_editor: ViewHandle<EditorView>,
     prediction_model_editor: ViewHandle<EditorView>,
     timeout_ms_editor: ViewHandle<EditorView>,
+    opencode_command_editor: ViewHandle<EditorView>,
+    opencode_args_editor: ViewHandle<EditorView>,
 }
 
 impl LocalAIProviderWidget {
     fn new(ctx: &mut ViewContext<LocalAISettingsPageView>) -> Self {
-        let (base_url, api_key, command_model, prediction_model, timeout_ms) = {
+        let (
+            base_url,
+            api_key,
+            command_model,
+            prediction_model,
+            timeout_ms,
+            opencode_command,
+            opencode_args,
+        ) = {
             let ai_settings = AISettings::as_ref(ctx);
             (
                 ai_settings.local_openai_base_url.value().clone(),
@@ -126,9 +136,13 @@ impl LocalAIProviderWidget {
                 ai_settings.local_openai_command_model.value().clone(),
                 ai_settings.local_openai_prediction_model.value().clone(),
                 ai_settings.local_openai_timeout_ms.value().to_string(),
+                ai_settings.local_openai_opencode_command.value().clone(),
+                ai_settings
+                    .local_openai_opencode_args
+                    .value()
+                    .join(" "),
             )
         };
-
         let base_url_editor = Self::create_editor(ctx, base_url, "http://127.0.0.1:1234/v1", false);
         ctx.subscribe_to_view(&base_url_editor, |_, editor, event, ctx| {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
@@ -199,6 +213,35 @@ impl LocalAIProviderWidget {
                 });
             }
         });
+        let opencode_command_editor =
+            Self::create_editor(ctx, opencode_command, "opencode", false);
+        ctx.subscribe_to_view(&opencode_command_editor, |_, editor, event, ctx| {
+            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                let value = editor.as_ref(ctx).buffer_text(ctx).trim().to_string();
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.local_openai_opencode_command.set_value(value, ctx));
+                });
+            }
+        });
+
+        let opencode_args_editor =
+            Self::create_editor(ctx, opencode_args, "serve --port 0", false);
+        ctx.subscribe_to_view(&opencode_args_editor, |_, editor, event, ctx| {
+            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
+                // Split on whitespace; preserve tokens that contain
+                // `=` since the sidecar may receive flag arguments.
+                let value: Vec<String> = buffer_text
+                    .split_whitespace()
+                    .map(|s| s.to_string())
+                    .collect();
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(
+                        settings.local_openai_opencode_args.set_value(value, ctx)
+                    );
+                });
+            }
+        });
 
         Self {
             enabled_toggle: Default::default(),
@@ -207,6 +250,8 @@ impl LocalAIProviderWidget {
             command_model_editor,
             prediction_model_editor,
             timeout_ms_editor,
+            opencode_command_editor,
+            opencode_args_editor,
         }
     }
 
@@ -331,7 +376,7 @@ impl SettingsWidget for LocalAIProviderWidget {
     type View = LocalAISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "local ai local openai openai compatible endpoint base url api key model command prediction timeout ollama lm studio"
+        "local ai local openai openai compatible endpoint base url api key model command prediction timeout ollama lm studio opencode sidecar"
     }
 
     fn render(
@@ -374,9 +419,23 @@ impl SettingsWidget for LocalAIProviderWidget {
                     "Timeout (ms)",
                     self.timeout_ms_editor.clone(),
                 ))
+                .with_child(Self::render_description(
+                    appearance,
+                    "OpenCode sidecar: route requests through a locally-spawned OpenCode process bound to the working directory. The sidecar exposes an OpenAI-compatible endpoint on a random loopback port; we read the port from its startup announcement. Set `Local OpenAI Command` to the binary name or absolute path; the default `opencode` resolves from `$PATH`.",
+                ))
+                .with_child(Self::render_input(
+                    appearance,
+                    "OpenCode Command",
+                    self.opencode_command_editor.clone(),
+                ))
+                .with_child(Self::render_input(
+                    appearance,
+                    "OpenCode Args",
+                    self.opencode_args_editor.clone(),
+                ))
                 .finish(),
         )
         .with_margin_bottom(HEADER_PADDING)
         .finish()
-    }
+}
 }

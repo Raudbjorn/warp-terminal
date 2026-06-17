@@ -594,14 +594,40 @@ pub struct AIRequestQuotaInfo {
     pub cycle_history: Vec<CycleInfo>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalProviderKind {
+    /// A user-supplied OpenAI-compatible HTTP endpoint (Ollama, LM Studio,
+    /// vLLM, llama.cpp, etc.). This is the default.
+    #[default]
+    OpenAICompatible,
+    /// A locally-spawned OpenCode sidecar. The sidecar lifecycle is
+    /// managed by `crate::ai::local_opencode`; this kind is what
+    /// switches the chat-completion path from `base_url` to a per-CWD
+    /// sidecar pool.
+    OpenCode,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LocalOpenAISettingsSnapshot {
-    pub enabled: bool,
-    pub base_url: String,
-    pub api_key: String,
-    pub command_model: String,
-    pub prediction_model: String,
-    pub timeout_ms: u64,
+     pub enabled: bool,
+     pub base_url: String,
+     pub api_key: String,
+     pub command_model: String,
+     pub prediction_model: String,
+     pub timeout_ms: u64,
+    pub provider_kind: LocalProviderKind,
+    pub opencode_command: String,
+    pub opencode_args: Vec<String>,
+ }
+
+fn parse_provider_kind(raw: &str) -> LocalProviderKind {
+    match raw {
+        "open_code" | "opencode" | "open-code" => LocalProviderKind::OpenCode,
+        // Default to the OpenAI-compatible provider when the stored
+        // value is empty or unrecognized; matches the macro default.
+        _ => LocalProviderKind::OpenAICompatible,
+    }
 }
 
 #[derive(
@@ -835,9 +861,40 @@ define_settings_group!(AISettings, settings: [
         toml_path: "agents.local_openai.timeout_ms",
         description: "Timeout for local OpenAI-compatible AI requests in milliseconds.",
     }
+    local_openai_provider_kind: LocalOpenAIProviderKind {
+        type: String,
+        // `LocalProviderKind` is serialized as snake_case strings; the
+        // custom getter parses to the enum.
+        default: "open_ai_compatible".to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.provider_kind",
+        description: "Which local AI provider to route Chat Completions through. `open_ai_compatible` talks to a user-configured base URL; `open_code` spawns a per-working-directory sidecar.",
+    }
+    local_openai_opencode_command: LocalOpenAIOpenCodeCommand {
+        type: String,
+        default: crate::ai::local_opencode::DEFAULT_OPENCODE_BINARY.to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.opencode_command",
+        description: "Path or name of the OpenCode binary to spawn when `provider_kind = open_code`.",
+    }
+    local_openai_opencode_args: LocalOpenAIOpenCodeArgs {
+        type: Vec<String>,
+        default: crate::ai::local_opencode::DEFAULT_OPENCODE_ARGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.opencode_args",
+        description: "Arguments to pass to the OpenCode binary when spawning a sidecar.",
+    }
     // This field should not be referenced directly to lookup Prompt Suggestions
     // enablement -- use the `is_prompt_suggestions_enabled()` getter.
-    // Note that AgentModeQuerySuggestionsEnabled is a legacy name (the feature was initially named Agent
     // Mode Query Suggestions), however, we do not want to change the name of the setting key to avoid
     // breaking existing user settings.
     prompt_suggestions_enabled_internal: AgentModeQuerySuggestionsEnabled {
@@ -1611,6 +1668,11 @@ impl AISettings {
             command_model: self.local_openai_command_model.value().clone(),
             prediction_model: self.local_openai_prediction_model.value().clone(),
             timeout_ms: *self.local_openai_timeout_ms.value(),
+            provider_kind: parse_provider_kind(
+                self.local_openai_provider_kind.value().as_str(),
+            ),
+            opencode_command: self.local_openai_opencode_command.value().clone(),
+            opencode_args: self.local_openai_opencode_args.value().clone(),
         }
     }
 

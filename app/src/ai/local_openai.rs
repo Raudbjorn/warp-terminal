@@ -1,9 +1,10 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use parking_lot::RwLock;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
+    ai::local_opencode::{OpenCodeError, OpenCodeSidecarPool},
     ai::predict::{
         generate_ai_input_suggestions::{
             GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2,
@@ -12,12 +13,18 @@ use crate::{
     },
     ai_assistant::{execution_context::WarpAiExecutionContext, AIGeneratedCommand},
     drive::workflows::ai_assist::{GeneratedArgument, GeneratedCommandMetadata},
-    settings::LocalOpenAISettingsSnapshot,
+    settings::{LocalOpenAISettingsSnapshot, LocalProviderKind},
 };
 
 #[derive(Clone)]
 pub(crate) struct LocalOpenAIClient {
     config: Arc<RwLock<LocalOpenAISettingsSnapshot>>,
+    opencode_pool: Arc<tokio::sync::Mutex<OpenCodeSidecarPool>>,
+    /// Per-client override for the working directory the OpenCode
+    /// sidecar pool keys on. `None` means "use the process CWD at
+    /// request time". A future refactor can wire this through to a
+    /// per-tab working directory.
+    opencode_working_dir: Arc<RwLock<Option<PathBuf>>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +41,8 @@ pub(crate) enum LocalOpenAIError {
     Status(#[from] http_client::ResponseError),
     #[error("local OpenAI-compatible provider response could not be decoded")]
     Decode(#[from] reqwest::Error),
+    #[error("local OpenAI-compatible provider's OpenCode sidecar could not be started: {0}")]
+    OpenCode(#[from] OpenCodeError),
 }
 
 #[derive(Serialize)]
@@ -123,11 +132,34 @@ impl LocalOpenAIClient {
     pub(crate) fn new(config: LocalOpenAISettingsSnapshot) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
+            opencode_pool: Arc::new(tokio::sync::Mutex::new(OpenCodeSidecarPool::new())),
+            opencode_working_dir: Arc::new(RwLock::new(None)),
         }
     }
 
     pub(crate) fn set_config(&self, config: LocalOpenAISettingsSnapshot) {
+        let provider_kind = config.provider_kind;
         *self.config.write() = config;
+        // Provider switched away from OpenCode: drop cached sidecars
+        // so we do not leak a child that no caller will use.
+        // The clear is queued as a `tokio::task` because
+        // `tokio::sync::Mutex` requires an async context to lock.
+        if provider_kind != LocalProviderKind::OpenCode {
+            let pool = self.opencode_pool.clone();
+            // The spawned future is fire-and-forget; the `let _ =`
+            // suppresses the `must_use` warning.
+            let _ = tokio::spawn(async move {
+                let _ = pool.lock().await.clear();
+            });
+        }
+    }
+
+    /// Override the working directory the OpenCode sidecar pool keys on.
+    /// Pass `None` to use the process current working directory at
+    /// request time.
+    #[allow(dead_code)]
+    pub(crate) fn set_opencode_working_dir(&self, cwd: Option<PathBuf>) {
+        *self.opencode_working_dir.write() = cwd;
     }
 
     pub(crate) async fn generate_commands_from_natural_language(
@@ -301,8 +333,39 @@ impl LocalOpenAIClient {
         model: String,
         messages: Vec<ChatMessage>,
     ) -> Result<String, LocalOpenAIError> {
+        let (base_url, api_key) = match config.provider_kind {
+            LocalProviderKind::OpenAICompatible => (config.base_url.clone(), config.api_key.clone()),
+            LocalProviderKind::OpenCode => {
+                let working_dir = self
+                    .opencode_working_dir
+                    .read()
+                    .clone()
+                    .or_else(|| std::env::current_dir().ok())
+                    .ok_or_else(|| {
+                        OpenCodeError::BadAnnouncement(
+                            "no working directory available for OpenCode sidecar".to_string(),
+                        )
+                    })?;
+                let sidecar = {
+                    let pool = self.opencode_pool.lock().await;
+                    pool.get_or_spawn(
+                        &config.opencode_command,
+                        &config.opencode_args,
+                        &working_dir,
+                    )
+                    .await?
+                };
+                // OpenCode ships an OpenAI-compatible /v1/chat/completions
+                // endpoint without an API key by default. We still pass
+                // the user-configured key through if one is set, since
+                // some self-hosted OpenCode builds gate `/v1` behind a
+                // bearer token.
+                (sidecar.base_url().to_string(), config.api_key.clone())
+            }
+        };
+
         let mut request_builder = http_client
-            .post(chat_completions_url(&config.base_url))
+            .post(chat_completions_url(&base_url))
             .timeout(Duration::from_millis(config.timeout_ms))
             .json(&ChatCompletionRequest {
                 model,
@@ -311,8 +374,8 @@ impl LocalOpenAIClient {
                 stream: false,
             });
 
-        if !config.api_key.trim().is_empty() {
-            request_builder = request_builder.bearer_auth(config.api_key.trim());
+        if !api_key.trim().is_empty() {
+            request_builder = request_builder.bearer_auth(api_key.trim());
         }
 
         let response: ChatCompletionResponse = request_builder
@@ -333,11 +396,22 @@ impl LocalOpenAIClient {
     fn configured(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
         let config = self.config.read().clone();
         if !config.enabled
-            || config.base_url.trim().is_empty()
             || config.command_model.trim().is_empty()
             || config.prediction_model.trim().is_empty()
         {
             return Err(LocalOpenAIError::NotConfigured);
+        }
+        match config.provider_kind {
+            LocalProviderKind::OpenAICompatible => {
+                if config.base_url.trim().is_empty() {
+                    return Err(LocalOpenAIError::NotConfigured);
+                }
+            }
+            LocalProviderKind::OpenCode => {
+                if config.opencode_command.trim().is_empty() {
+                    return Err(LocalOpenAIError::NotConfigured);
+                }
+            }
         }
         Ok(config)
     }
@@ -403,7 +477,8 @@ impl From<LocalOpenAIError> for crate::ai_assistant::GenerateCommandsFromNatural
             }
             LocalOpenAIError::Request(_)
             | LocalOpenAIError::Status(_)
-            | LocalOpenAIError::Decode(_) => Self::LocalProviderError,
+            | LocalOpenAIError::Decode(_)
+            | LocalOpenAIError::OpenCode(_) => Self::LocalProviderError,
         }
     }
 }
@@ -417,7 +492,8 @@ impl From<LocalOpenAIError> for crate::drive::workflows::ai_assist::GeneratedCom
             }
             LocalOpenAIError::Request(_)
             | LocalOpenAIError::Status(_)
-            | LocalOpenAIError::Decode(_) => Self::LocalProviderError,
+            | LocalOpenAIError::Decode(_)
+            | LocalOpenAIError::OpenCode(_) => Self::LocalProviderError,
         }
     }
 }
