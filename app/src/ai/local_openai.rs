@@ -687,21 +687,22 @@ impl LocalOpenAIClient {
     /// may be empty — only `command_model` is required here so the command path
     /// doesn't get blocked by an unset prediction model.
     fn configured_for_command(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
-        let config = self.config.read().clone();
+        let config = self.config.read();
         if !config.enabled
             || config.base_url.trim().is_empty()
             || config.command_model.trim().is_empty()
         {
             return Err(LocalOpenAIError::NotConfigured);
         }
-        Ok(config)
+        // Clone only once validated, and clamp the timeout for settings-file values.
+        Ok(clamp_timeout(config.clone()))
     }
 
     /// Returns the current snapshot if it is runnable for the **prediction** path
     /// (agent-mode query prediction, AI input suggestions). Requires the
     /// `prediction_model` to be set.
     fn configured_for_prediction(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
-        let config = self.config.read().clone();
+        let config = self.config.read();
         if !config.enabled
             || config.base_url.trim().is_empty()
             || config.prediction_model.trim().is_empty()
