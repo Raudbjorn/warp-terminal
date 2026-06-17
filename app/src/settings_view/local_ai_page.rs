@@ -197,7 +197,7 @@ impl LocalAIProviderWidget {
                 let value = match buffer_text.trim().parse::<u64>() {
                     // Clamp overly-large (but otherwise valid) inputs to the 1-hour
                     // cap rather than reverting them; reject non-positive/invalid input.
-                    Ok(value) if value > 0 => value.min(3_600_000),
+                    Ok(value) if value > 0 => value.min(crate::ai::local_openai::MAX_LOCAL_OPENAI_TIMEOUT_MS),
                     _ => {
                         log::warn!(
                             "Invalid local OpenAI timeout: {:?}",

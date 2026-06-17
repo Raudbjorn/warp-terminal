@@ -677,7 +677,7 @@ fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
         if network_policy::check_url(attempt.url(), "redirect target").is_ok() {
             attempt.follow()
         } else {
-            attempt.stop()
+            attempt.error("network policy denied redirect")
         }
     })
 }
@@ -826,7 +826,6 @@ impl<'c> oauth2::AsyncHttpClient<'c> for Client {
                 .builder(builder, include_warp_headers, iap_token, None)
                 .send()
                 .await
-                .map_err(Error::from)
                 .map_err(Box::new)?;
 
             let mut builder = ::http::Response::builder().status(response.status());
