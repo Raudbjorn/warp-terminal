@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::collections::HashSet;
 use std::future::Future;
 use std::sync::mpsc::SyncSender;
@@ -202,11 +203,38 @@ pub struct UpdateManager {
 }
 
 impl UpdateManager {
+    fn local_only_cloud_request_blocked(operation: &'static str) -> bool {
+        if ChannelState::is_local_only() {
+            log::debug!("Ignoring cloud object {operation} in local-only mode");
+            true
+        } else {
+            false
+        }
+    }
+
+    fn local_only_mutation_blocked() -> bool {
+        Self::local_only_cloud_request_blocked("mutation")
+    }
+
     pub fn new(
         model_event_sender: Option<SyncSender<ModelEvent>>,
         object_client: Arc<dyn ObjectClient>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
+        if ChannelState::is_local_only() {
+            let has_initial_load = Condition::new();
+            has_initial_load.set();
+            return Self {
+                model_event_sender,
+                object_client,
+                next_poll_abort_handle: None,
+                in_flight_request_abort_handle: None,
+                should_poll_for_updated_objects: false,
+                spawned_futures: Default::default(),
+                has_initial_load,
+            };
+        }
+
         let network_status = NetworkStatus::handle(ctx);
         ctx.subscribe_to_model(&network_status, |me, event, ctx| {
             me.handle_network_status_changed(event, ctx);
@@ -602,6 +630,10 @@ impl UpdateManager {
         cloud_object_type_and_id: &CloudObjectTypeAndId,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         CloudModel::handle(ctx).update(ctx, |cloud_model, ctx| {
             if let Some(object) = cloud_model.get_mut_by_uid(&cloud_object_type_and_id.uid()) {
                 let queue_item = object
@@ -623,6 +655,10 @@ impl UpdateManager {
     }
 
     pub fn start_polling_for_updated_objects(&mut self, ctx: &mut ModelContext<Self>) {
+        if Self::local_only_cloud_request_blocked("poll") {
+            return;
+        }
+
         let is_online = NetworkStatus::as_ref(ctx).is_online();
 
         if !self.should_poll_for_updated_objects && is_online {
@@ -633,6 +669,10 @@ impl UpdateManager {
 
     /// Out-of-band (from the regular poll) refresh of updated objects.
     pub fn refresh_updated_objects(&mut self, ctx: &mut ModelContext<Self>) {
+        if Self::local_only_cloud_request_blocked("refresh") {
+            return;
+        }
+
         let object_client = self.object_client.clone();
         let cloud_model = CloudModel::as_ref(ctx);
         let versions_for_all_objects = cloud_model.get_versions_for_all_objects(ctx);
@@ -676,6 +716,10 @@ impl UpdateManager {
     }
 
     fn poll_for_updated_objects(&mut self, ctx: &mut ModelContext<Self>) {
+        if Self::local_only_cloud_request_blocked("poll") {
+            return;
+        }
+
         self.abort_existing_poll();
 
         if !self.should_poll_for_updated_objects {
@@ -1127,6 +1171,10 @@ impl UpdateManager {
     /// Fetches environment "last used" timestamps from the server and merges them
     /// into the in-memory environment objects.
     fn fetch_and_merge_environment_timestamps(&mut self, ctx: &mut ModelContext<UpdateManager>) {
+        if Self::local_only_cloud_request_blocked("environment timestamp fetch") {
+            return;
+        }
+
         let object_client = self.object_client.clone();
         let future = ctx.spawn(
             async move {
@@ -1476,9 +1524,15 @@ impl UpdateManager {
         fetch_single_object_option: FetchSingleObjectOption,
         ctx: &mut ModelContext<Self>,
     ) -> Receiver<()> {
+        let (fetch_cloud_object_tx, fetch_cloud_object_rx) = oneshot::channel::<()>();
+
+        if Self::local_only_cloud_request_blocked("single object fetch") {
+            let _ = fetch_cloud_object_tx.send(());
+            return fetch_cloud_object_rx;
+        }
+
         let object_client = self.object_client.clone();
         let server_id_copy = *server_id;
-        let (fetch_cloud_object_tx, fetch_cloud_object_rx) = oneshot::channel::<()>();
         let future = ctx.spawn(
             async move {
                 object_client
@@ -2039,6 +2093,10 @@ impl UpdateManager {
         current_metadata_last_updated_ts: Option<ServerTimestamp>,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         let object_client = self.object_client.clone();
 
         CloudModel::handle(ctx).update(ctx, |model, _| {
@@ -2204,6 +2262,10 @@ impl UpdateManager {
         current_permissions_last_updated_ts: Option<ServerTimestamp>,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         let object_client = self.object_client.clone();
 
         // If the moved object is a workflow, we also have to move its the workflow enums to the new space.
@@ -2354,6 +2416,10 @@ impl UpdateManager {
 
     /// Leaves a shared object, removing all of the current user's ACLs on it.
     pub fn leave_object(&mut self, server_id: ServerId, ctx: &mut ModelContext<Self>) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         let uid = server_id.uid();
 
         // If there's a pending online-only operation for this object, don't leave it.
@@ -2711,6 +2777,10 @@ impl UpdateManager {
         <S as Future>::Output: warpui::r#async::SpawnableOutput,
         F: 'static + FnMut(R, &mut AppContext) -> Option<ServerPermissions>,
     {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         let object_client = self.object_client.clone();
 
         ctx.spawn_with_retry_on_error(
@@ -2772,6 +2842,10 @@ impl UpdateManager {
         S: warpui::r#async::Spawnable + Future<Output = anyhow::Result<M>>,
         <S as Future>::Output: warpui::r#async::SpawnableOutput,
     {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         let cloud_model = CloudModel::handle(ctx);
         let uid = server_id.uid();
 
@@ -2943,6 +3017,10 @@ impl UpdateManager {
         new_location: CloudObjectLocation,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         // If we are moving into the trash, we really mean to trash the object
         if let CloudObjectLocation::Trash = new_location {
             return self.trash_object(object_id, ctx);
@@ -3546,6 +3624,10 @@ impl UpdateManager {
             > + 'static,
         S: Serializer<T> + 'static,
     {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         let mut objects = Vec::new();
         let mut sync_queue_objects = Vec::new();
         for input in inputs {
@@ -3630,6 +3712,10 @@ impl UpdateManager {
             + 'static,
         M: CloudModelType<IdType = K, CloudObjectType = GenericCloudObject<K, M>> + 'static,
     {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         let object_id = SyncId::ClientId(client_id);
         let auth_state = AuthStateProvider::as_ref(ctx).get();
         let initial_editor = auth_state.user_id();
@@ -3701,6 +3787,13 @@ impl UpdateManager {
     {
         let (tx, rx) = oneshot::channel();
         let completion = async move { rx.await? };
+
+        if ChannelState::is_local_only() {
+            let _ = tx.send(Err(anyhow::anyhow!(
+                "Cloud object creation is disabled in local-only mode"
+            )));
+            return completion;
+        }
 
         let initial_server_folder_id = match initial_folder_id {
             Some(SyncId::ServerId(id)) => Some(FolderId::from(id)),
@@ -3827,6 +3920,13 @@ impl UpdateManager {
         let (tx, rx) = oneshot::channel();
         let completion = async move { rx.await? };
 
+        if ChannelState::is_local_only() {
+            let _ = tx.send(Err(anyhow::anyhow!(
+                "Cloud object updates are disabled in local-only mode"
+            )));
+            return completion;
+        }
+
         let server_id = match object_id {
             SyncId::ServerId(id) => id,
             SyncId::ClientId(_) => {
@@ -3936,6 +4036,10 @@ impl UpdateManager {
             + 'static,
         M: CloudModelType<IdType = K, CloudObjectType = GenericCloudObject<K, M>> + 'static,
     {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         // Update in-memory model.
         CloudModel::handle(ctx).update(ctx, |cloud_model, ctx| {
             cloud_model.update_object_from_edit(model.clone(), object_id, ctx);
@@ -3968,6 +4072,10 @@ impl UpdateManager {
         data: Option<String>,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         // Take the action timestamp from the client.
         let action_timestamp = Utc::now();
 
@@ -4074,6 +4182,10 @@ impl UpdateManager {
         optimistically_grant_access: bool,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         // If the object isn't known to the server yet, we should not proceed
         let SyncId::ServerId(server_id) = notebook_id else {
             return;
@@ -4152,6 +4264,10 @@ impl UpdateManager {
         notebook_id: SyncId,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         // If the object isn't known to the server yet, we should not proceed
         let SyncId::ServerId(server_id) = notebook_id else {
             return;
@@ -4231,6 +4347,10 @@ impl UpdateManager {
     }
 
     pub fn trash_object(&mut self, id: CloudObjectTypeAndId, ctx: &mut ModelContext<Self>) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         // // If the object isn't known to the server yet, we can't trash it.
         let Some(server_id) = id.server_id() else {
             return;
@@ -4344,6 +4464,10 @@ impl UpdateManager {
     }
 
     pub fn untrash_object(&mut self, id: CloudObjectTypeAndId, ctx: &mut ModelContext<Self>) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         // If the object isn't known to the server yet, we can't untrash it.
         let Some(server_id) = id.server_id() else {
             return;
@@ -4495,6 +4619,10 @@ impl UpdateManager {
         initiated_by: InitiatedBy,
         ctx: &mut ModelContext<Self>,
     ) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         // If the object isn't known to the server yet, we can't delete it.
         let Some(server_id) = id.server_id() else {
             return;
@@ -4605,6 +4733,10 @@ impl UpdateManager {
     }
 
     pub fn empty_trash(&mut self, space: Space, ctx: &mut ModelContext<Self>) {
+        if Self::local_only_mutation_blocked() {
+            return;
+        }
+
         let object_client = self.object_client.clone();
 
         let owner = match UserWorkspaces::as_ref(ctx).space_to_owner(space, ctx) {

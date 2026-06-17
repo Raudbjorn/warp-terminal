@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +84,10 @@ impl Listener {
             last_disconnected_at: None,
             pending_refresh_abort_handle: None,
         };
+
+        if ChannelState::is_local_only() {
+            return listener;
+        }
 
         // When the websocket signals readiness, decide whether to refresh cloud objects
         // based on how long the connection was down.
@@ -376,3 +381,62 @@ impl Entity for Listener {
 }
 
 impl SingletonEntity for Listener {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::server_api::object::MockObjectClient;
+    use serial_test::serial;
+    use std::sync::Arc;
+    use warp_core::{
+        channel::{Channel, ChannelConfig, OzConfig, ServicesMode, WarpServerConfig},
+        AppId,
+    };
+    use warpui::App;
+
+    struct ChannelStateGuard;
+
+    impl Drop for ChannelStateGuard {
+        fn drop(&mut self) {
+            ChannelState::set(ChannelState::init());
+        }
+    }
+
+    fn set_local_only_channel_state() -> ChannelStateGuard {
+        ChannelState::set(ChannelState::new(
+            Channel::Oss,
+            ChannelConfig {
+                app_id: AppId::new("dev", "warp", "WarpOssTest"),
+                logfile_name: "warp-oss-test.log".into(),
+                server_config: WarpServerConfig::local_only(),
+                oz_config: OzConfig::local_only(),
+                services_mode: ServicesMode::LocalOnly,
+                telemetry_config: None,
+                autoupdate_config: None,
+                crash_reporting_config: None,
+                mcp_static_config: None,
+            },
+        ));
+        ChannelStateGuard
+    }
+
+    #[test]
+    #[serial]
+    fn test_local_only_listener_does_not_start_websocket() {
+        let _channel_state = set_local_only_channel_state();
+
+        App::test((), |app| async move {
+            let mut object_client = MockObjectClient::new();
+            object_client.expect_get_warp_drive_updates().times(0);
+
+            let listener =
+                app.add_singleton_model(|ctx| Listener::new(Arc::new(object_client), ctx));
+
+            listener.read(&app, |listener, _| {
+                assert!(!listener.should_subscribe_to_updates);
+                assert!(!listener.has_current_subscription_abort_handle());
+                assert!(listener.pending_refresh_abort_handle.is_none());
+            });
+        });
+    }
+}

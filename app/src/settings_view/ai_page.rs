@@ -2386,25 +2386,28 @@ impl AISettingsPageView {
                 if !FeatureFlag::UsageBasedPricing.is_enabled() {
                     widgets.push(Box::new(UsageWidget::default()));
                 }
-                if ai_settings
-                    .intelligent_autosuggestions_enabled_internal
-                    .is_supported_on_current_platform()
-                    || ai_settings
-                        .prompt_suggestions_enabled_internal
+                let should_show_active_ai = {
+                    let ai_settings = AISettings::as_ref(ctx);
+                    ai_settings
+                        .intelligent_autosuggestions_enabled_internal
                         .is_supported_on_current_platform()
-                    || (FeatureFlag::PredictAMQueries.is_enabled()
-                        && ai_settings
-                            .natural_language_autosuggestions_enabled_internal
-                            .is_supported_on_current_platform())
-                    || (FeatureFlag::SharedBlockTitleGeneration.is_enabled()
-                        && ai_settings
-                            .shared_block_title_generation_enabled_internal
-                            .is_supported_on_current_platform())
-                    || (FeatureFlag::GitOperationsInCodeReview.is_enabled()
-                        && ai_settings
-                            .git_operations_autogen_enabled_internal
-                            .is_supported_on_current_platform())
-                {
+                        || ai_settings
+                            .prompt_suggestions_enabled_internal
+                            .is_supported_on_current_platform()
+                        || (FeatureFlag::PredictAMQueries.is_enabled()
+                            && ai_settings
+                                .natural_language_autosuggestions_enabled_internal
+                                .is_supported_on_current_platform())
+                        || (FeatureFlag::SharedBlockTitleGeneration.is_enabled()
+                            && ai_settings
+                                .shared_block_title_generation_enabled_internal
+                                .is_supported_on_current_platform())
+                        || (FeatureFlag::GitOperationsInCodeReview.is_enabled()
+                            && ai_settings
+                                .git_operations_autogen_enabled_internal
+                                .is_supported_on_current_platform())
+                };
+                if should_show_active_ai {
                     widgets.push(Box::new(ActiveAIWidget::default()));
                 }
                 widgets.push(Box::new(AgentsWidget::default()));
@@ -2415,11 +2418,14 @@ impl AISettingsPageView {
                 if FeatureFlag::AIRules.is_enabled() {
                     widgets.push(Box::new(AIFactWidget::default()));
                 }
-                if cfg!(feature = "voice_input")
-                    && ai_settings
-                        .voice_input_enabled_internal
-                        .is_supported_on_current_platform()
-                {
+                let voice_supported = {
+                    let ai_settings = AISettings::as_ref(ctx);
+                    cfg!(feature = "voice_input")
+                        && ai_settings
+                            .voice_input_enabled_internal
+                            .is_supported_on_current_platform()
+                };
+                if voice_supported {
                     widgets.push(Box::new(VoiceWidget::default()));
                 }
                 widgets.push(Box::new(CloudHandoffWidget::default()));
@@ -2435,30 +2441,33 @@ impl AISettingsPageView {
             Some(AISubpage::WarpAgent) => {
                 // Oz page: global toggle + Active AI + Input + Other
                 widgets.push(Box::new(GlobalAIWidget::default()));
-                if ai_settings
-                    .intelligent_autosuggestions_enabled_internal
-                    .is_supported_on_current_platform()
-                    || ai_settings
-                        .prompt_suggestions_enabled_internal
+                let should_show_active_ai = {
+                    let ai_settings = AISettings::as_ref(ctx);
+                    ai_settings
+                        .intelligent_autosuggestions_enabled_internal
                         .is_supported_on_current_platform()
-                    || (FeatureFlag::PredictAMQueries.is_enabled()
-                        && ai_settings
-                            .natural_language_autosuggestions_enabled_internal
-                            .is_supported_on_current_platform())
-                    || (FeatureFlag::SharedBlockTitleGeneration.is_enabled()
-                        && ai_settings
-                            .shared_block_title_generation_enabled_internal
-                            .is_supported_on_current_platform())
-                    || (FeatureFlag::GitOperationsInCodeReview.is_enabled()
-                        && ai_settings
-                            .git_operations_autogen_enabled_internal
-                            .is_supported_on_current_platform())
-                {
+                        || ai_settings
+                            .prompt_suggestions_enabled_internal
+                            .is_supported_on_current_platform()
+                        || (FeatureFlag::PredictAMQueries.is_enabled()
+                            && ai_settings
+                                .natural_language_autosuggestions_enabled_internal
+                                .is_supported_on_current_platform())
+                        || (FeatureFlag::SharedBlockTitleGeneration.is_enabled()
+                            && ai_settings
+                                .shared_block_title_generation_enabled_internal
+                                .is_supported_on_current_platform())
+                        || (FeatureFlag::GitOperationsInCodeReview.is_enabled()
+                            && ai_settings
+                                .git_operations_autogen_enabled_internal
+                                .is_supported_on_current_platform())
+                };
+                if should_show_active_ai {
                     widgets.push(Box::new(ActiveAIWidget::default()));
                 }
                 widgets.push(Box::new(AIInputWidget::default()));
                 let voice_supported = cfg!(feature = "voice_input")
-                    && ai_settings
+                    && AISettings::as_ref(ctx)
                         .voice_input_enabled_internal
                         .is_supported_on_current_platform();
                 if voice_supported {
@@ -4049,10 +4058,13 @@ impl SettingsPageMeta for AISettingsPageView {
     }
 
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        FeatureFlag::AgentMode.is_enabled()
+        !ChannelState::is_local_only() && FeatureFlag::AgentMode.is_enabled()
     }
 
     fn on_page_selected(&mut self, _: bool, ctx: &mut ViewContext<Self>) {
+        if ChannelState::is_local_only() {
+            return;
+        }
         AIRequestUsageModel::handle(ctx).update(ctx, |ai_request_usage_model, ctx| {
             ai_request_usage_model.refresh_request_usage_async(ctx)
         });

@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -883,28 +884,40 @@ impl DriveIndex {
     }
 
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
+        let local_only = ChannelState::is_local_only();
+
         let cloud_model = CloudModel::handle(ctx);
-        ctx.observe(&cloud_model, Self::on_cloud_model_changed);
+        if !local_only {
+            ctx.observe(&cloud_model, Self::on_cloud_model_changed);
+        }
 
         let object_actions = ObjectActions::handle(ctx);
-        ctx.observe(&object_actions, Self::on_object_actions_changed);
+        if !local_only {
+            ctx.observe(&object_actions, Self::on_object_actions_changed);
+        }
 
-        ctx.subscribe_to_model(&cloud_model, |index, _, event, ctx| {
-            index.handle_cloud_model_event(event, ctx);
-        });
+        if !local_only {
+            ctx.subscribe_to_model(&cloud_model, |index, _, event, ctx| {
+                index.handle_cloud_model_event(event, ctx);
+            });
 
-        ctx.subscribe_to_model(
-            &CloudViewModel::handle(ctx),
-            Self::handle_cloud_view_model_event,
-        );
+            ctx.subscribe_to_model(
+                &CloudViewModel::handle(ctx),
+                Self::handle_cloud_view_model_event,
+            );
+        }
 
         let user_workspaces = UserWorkspaces::handle(ctx);
-        ctx.observe(&user_workspaces, Self::on_user_workspaces_changed);
+        if !local_only {
+            ctx.observe(&user_workspaces, Self::on_user_workspaces_changed);
+        }
 
         let network_status = NetworkStatus::handle(ctx);
-        ctx.subscribe_to_model(&network_status, |_me, _, _event, ctx| {
-            ctx.notify();
-        });
+        if !local_only {
+            ctx.subscribe_to_model(&network_status, |_me, _, _event, ctx| {
+                ctx.notify();
+            });
+        }
 
         let menu = ctx.add_typed_action_view(|_ctx| {
             Menu::new()
@@ -913,9 +926,11 @@ impl DriveIndex {
                 .with_width(MENU_WIDTH)
         });
 
-        ctx.subscribe_to_view(&menu, |me, _, event, ctx| {
-            me.handle_menu_event(event, ctx);
-        });
+        if !local_only {
+            ctx.subscribe_to_view(&menu, |me, _, event, ctx| {
+                me.handle_menu_event(event, ctx);
+            });
+        }
 
         let title_editor = ctx.add_typed_action_view(|ctx| {
             let options = SingleLineEditorOptions {
@@ -928,31 +943,39 @@ impl DriveIndex {
             editor
         });
 
-        ctx.subscribe_to_view(&title_editor, |me, _, event, ctx| {
-            me.handle_title_editor_event(event, ctx);
-        });
+        if !local_only {
+            ctx.subscribe_to_view(&title_editor, |me, _, event, ctx| {
+                me.handle_title_editor_event(event, ctx);
+            });
+        }
 
         let empty_trash_confirmation_dialog =
             ctx.add_typed_action_view(|_| EmptyTrashConfirmationDialog::new());
-        ctx.subscribe_to_view(&empty_trash_confirmation_dialog, |me, _, event, ctx| {
-            me.handle_empty_trash_confirmation_dialog_event(event, ctx);
-        });
+        if !local_only {
+            ctx.subscribe_to_view(&empty_trash_confirmation_dialog, |me, _, event, ctx| {
+                me.handle_empty_trash_confirmation_dialog_event(event, ctx);
+            });
+        }
 
         let sorting_choice = *WarpDriveSettings::as_ref(ctx).sorting_choice.value();
 
         // Hide Warp Drive loading icon once initial load is complete
-        let initial_load_complete = UpdateManager::as_ref(ctx).initial_load_complete();
-        ctx.spawn(initial_load_complete, |me, _, ctx| {
-            me.show_warp_drive_loading_icon = false;
-            me.initialize_section_states(ctx);
-            me.has_initialized_sections.set();
-            ctx.notify();
-        });
+        if !local_only {
+            let initial_load_complete = UpdateManager::as_ref(ctx).initial_load_complete();
+            ctx.spawn(initial_load_complete, |me, _, ctx| {
+                me.show_warp_drive_loading_icon = false;
+                me.initialize_section_states(ctx);
+                me.has_initialized_sections.set();
+                ctx.notify();
+            });
+        }
 
         let sharing_dialog = ctx.add_typed_action_view(|ctx| SharingDialog::new(None, ctx));
-        ctx.subscribe_to_view(&sharing_dialog, |me, _, event, ctx| {
-            me.handle_sharing_dialog_event(event, ctx);
-        });
+        if !local_only {
+            ctx.subscribe_to_view(&sharing_dialog, |me, _, event, ctx| {
+                me.handle_sharing_dialog_event(event, ctx);
+            });
+        }
 
         let workspace_dropdown = ctx.add_typed_action_view(|ctx| {
             let mut dropdown = Dropdown::new(ctx);
@@ -994,6 +1017,11 @@ impl DriveIndex {
         let ai_fact_collection = WarpDriveAIFactCollection::new(ClientId::default());
         let mcp_server_collection = WarpDriveMCPServerCollection::new(ClientId::default());
 
+        let has_initialized_sections = Condition::new();
+        if local_only {
+            has_initialized_sections.set();
+        }
+
         Self {
             window_id: ctx.window_id(),
             menu,
@@ -1015,10 +1043,10 @@ impl DriveIndex {
             sorting_choice,
             auth_state: AuthStateProvider::as_ref(ctx).get().clone(),
             space_menu_open_for_space: None,
-            show_warp_drive_loading_icon: true,
+            show_warp_drive_loading_icon: !local_only,
             sorted_orders_by_location: Default::default(),
             ordered_items: Default::default(),
-            has_initialized_sections: Default::default(),
+            has_initialized_sections,
             num_errored_objects: Default::default(),
             share_dialog_open_for_object: None,
             should_show_personal_object_limit_status: true,

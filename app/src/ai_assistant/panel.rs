@@ -1,3 +1,5 @@
+use crate::util::bindings;
+use warp_core::channel::ChannelState;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -154,6 +156,8 @@ pub fn init(app: &mut AppContext) {
             "Focus Terminal Input From Warp AI",
             AIAssistantAction::FocusTerminalInput,
         )
+        .with_enabled(|| !ChannelState::is_local_only())
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(id!("AIAssistantPanel"))
         .with_key_binding(cmd_or_ctrl_shift("l")),
         EditableBinding::new(
@@ -161,6 +165,8 @@ pub fn init(app: &mut AppContext) {
             "Restart Warp AI",
             AIAssistantAction::ResetContext,
         )
+        .with_enabled(|| !ChannelState::is_local_only())
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(id!("AIAssistantPanel"))
         .with_key_binding("ctrl-l"),
         EditableBinding::new(
@@ -168,6 +174,8 @@ pub fn init(app: &mut AppContext) {
             "Restart Warp AI",
             AIAssistantAction::ResetContext,
         )
+        .with_enabled(|| !ChannelState::is_local_only())
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(id!("AIAssistantPanel"))
         .with_key_binding(cmd_or_ctrl_shift("k")),
     ]);

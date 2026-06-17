@@ -1,5 +1,6 @@
 //! This module contains the implementation of `BackingView` for `TerminalView`, as well as
 //! business logic for integrating the terminal view with the pane infra (`crate::pane_group`).
+use warp_core::channel::ChannelState;
 use settings::Setting as _;
 use warp_core::context_flag::ContextFlag;
 use warpui::elements::{
@@ -679,7 +680,8 @@ impl BackingView for TerminalView {
                         .into_item(),
                 );
             }
-        } else if FeatureFlag::CreatingSharedSessions.is_enabled()
+        } else if !ChannelState::is_local_only()
+            && FeatureFlag::CreatingSharedSessions.is_enabled()
             && ContextFlag::CreateSharedSession.is_enabled()
         {
             items.push(

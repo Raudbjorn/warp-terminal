@@ -20,6 +20,7 @@ use warpui::{AppContext, SingletonEntity};
 
 use crate::ai::persisted_workspace::PersistedWorkspace;
 use crate::auth::AuthStateProvider;
+use crate::channel::ChannelState;
 use crate::default_terminal::DefaultTerminal;
 use crate::features::{runtime_flags_menu_items, FeatureFlag};
 use crate::root_view::OpenLaunchConfigArg;
@@ -62,18 +63,30 @@ const MAX_RECENT_REPOS_IN_MENU: usize = 10;
 
 /// Creates the root app menu bar
 pub fn menu_bar(ctx: &mut AppContext) -> MenuBar {
-    MenuBar::new(vec![
+    let mut menus = vec![
         make_new_app_menu(ctx),
         make_new_file_menu(ctx),
         make_new_edit_menu(ctx),
         make_new_view_menu(ctx),
         make_new_tab_menu(ctx),
         make_new_blocks_menu(ctx),
-        make_new_ai_menu(ctx),
-        make_new_drive_menu(ctx),
-        make_new_window_menu(),
-        make_new_help_menu(),
-    ])
+    ];
+
+    if online_services_menu_enabled() {
+        menus.push(make_new_ai_menu(ctx));
+    }
+
+    menus.extend([make_new_drive_menu(ctx), make_new_window_menu()]);
+
+    if online_services_menu_enabled() {
+        menus.push(make_new_help_menu());
+    }
+
+    MenuBar::new(menus)
+}
+
+fn online_services_menu_enabled() -> bool {
+    !ChannelState::is_local_only()
 }
 
 // Creates the app dock menu
@@ -143,18 +156,22 @@ fn make_new_app_menu(ctx: &AppContext) -> Menu {
         ctx,
     )];
 
-    if !FeatureFlag::AvatarInTabBar.is_enabled() {
+    if online_services_menu_enabled() && !FeatureFlag::AvatarInTabBar.is_enabled() {
         menu_items.push(updateable_custom_item_without_checkmark(
             CustomAction::ToggleResourceCenter,
             ctx,
         ))
     }
 
-    menu_items.extend([
-        MenuItem::Separator,
-        updateable_custom_item_without_checkmark(CustomAction::ReferAFriend, ctx),
-        MenuItem::Separator,
-    ]);
+    if online_services_menu_enabled() {
+        menu_items.extend([
+            MenuItem::Separator,
+            updateable_custom_item_without_checkmark(CustomAction::ReferAFriend, ctx),
+            MenuItem::Separator,
+        ]);
+    } else {
+        menu_items.push(MenuItem::Separator);
+    }
 
     let preferences_menu_items = vec![
         updateable_custom_item_without_checkmark(CustomAction::ShowSettings, ctx),
@@ -174,7 +191,7 @@ fn make_new_app_menu(ctx: &AppContext) -> Menu {
         preferences_menu_items,
     )));
 
-    if FeatureFlag::Changelog.is_enabled() {
+    if online_services_menu_enabled() && FeatureFlag::Changelog.is_enabled() {
         menu_items.push(updateable_custom_item_without_checkmark(
             CustomAction::ViewChangelog,
             ctx,
@@ -186,11 +203,13 @@ fn make_new_app_menu(ctx: &AppContext) -> Menu {
         menu_items.push(MenuItem::Services);
     }
 
-    menu_items.push(MenuItem::Separator);
-    menu_items.push(link_menu_item(
-        "Privacy Policy...",
-        links::PRIVACY_POLICY_URL.into(),
-    ));
+    if online_services_menu_enabled() {
+        menu_items.push(MenuItem::Separator);
+        menu_items.push(link_menu_item(
+            "Privacy Policy...",
+            links::PRIVACY_POLICY_URL.into(),
+        ));
+    }
 
     let debug_menu_items = debug_menu_items();
     if !debug_menu_items.is_empty() {
@@ -375,9 +394,14 @@ fn make_new_edit_menu(ctx: &AppContext) -> Menu {
 }
 
 fn make_new_view_menu(ctx: &AppContext) -> Menu {
-    let mut items = vec![
-        updateable_custom_item_without_checkmark(CustomAction::ToggleWarpDrive, ctx),
-        MenuItem::Separator,
+    let mut items = Vec::new();
+    if online_services_menu_enabled() {
+        items.extend([
+            updateable_custom_item_without_checkmark(CustomAction::ToggleWarpDrive, ctx),
+            MenuItem::Separator,
+        ]);
+    }
+    items.extend([
         updateable_custom_item_without_checkmark(CustomAction::CommandPalette, ctx),
         updateable_custom_item_without_checkmark(CustomAction::NavigationPalette, ctx),
         updateable_custom_item_without_checkmark(CustomAction::LaunchConfigPalette, ctx),
@@ -436,7 +460,7 @@ fn make_new_view_menu(ctx: &AppContext) -> Menu {
             },
             None,
         )),
-    ];
+    ]);
 
     let is_compact_mode = matches!(
         TerminalSettings::handle(ctx)
@@ -588,37 +612,51 @@ fn make_new_drive_menu(ctx: &AppContext) -> Menu {
     let mut items = vec![
         updateable_custom_item_without_checkmark(CustomAction::NewPersonalWorkflow, ctx),
         updateable_custom_item_without_checkmark(CustomAction::NewPersonalNotebook, ctx),
-        updateable_custom_item_without_checkmark(CustomAction::NewPersonalAIPrompt, ctx),
     ];
+
+    if online_services_menu_enabled() {
+        items.push(updateable_custom_item_without_checkmark(
+            CustomAction::NewPersonalAIPrompt,
+            ctx,
+        ));
+    }
+
     items.push(updateable_custom_item_without_checkmark(
         CustomAction::NewPersonalEnvVars,
         ctx,
     ));
-    items.extend([
-        MenuItem::Separator,
-        updateable_custom_item_without_checkmark(CustomAction::NewTeamWorkflow, ctx),
-        updateable_custom_item_without_checkmark(CustomAction::NewTeamNotebook, ctx),
-        updateable_custom_item_without_checkmark(CustomAction::NewTeamAIPrompt, ctx),
-    ]);
-    items.push(updateable_custom_item_without_checkmark(
-        CustomAction::NewTeamEnvVars,
-        ctx,
-    ));
-    items.extend([
-        MenuItem::Separator,
-        updateable_custom_item_without_checkmark(CustomAction::ToggleWarpDrive, ctx),
-        updateable_custom_item_without_checkmark(CustomAction::SearchDrive, ctx),
-        updateable_custom_item_without_checkmark(CustomAction::OpenTeamSettings, ctx),
-        updateable_custom_item_without_checkmark(CustomAction::OpenAIFactCollection, ctx),
-        updateable_custom_item_without_checkmark(CustomAction::OpenMCPServerCollection, ctx),
-    ]);
 
-    items.push(updateable_custom_item_without_checkmark(
-        CustomAction::SharePaneContents,
-        ctx,
-    ));
+    if online_services_menu_enabled() {
+        items.extend([
+            MenuItem::Separator,
+            updateable_custom_item_without_checkmark(CustomAction::NewTeamWorkflow, ctx),
+            updateable_custom_item_without_checkmark(CustomAction::NewTeamNotebook, ctx),
+            updateable_custom_item_without_checkmark(CustomAction::NewTeamAIPrompt, ctx),
+        ]);
+        items.push(updateable_custom_item_without_checkmark(
+            CustomAction::NewTeamEnvVars,
+            ctx,
+        ));
+    }
 
-    if FeatureFlag::CreatingSharedSessions.is_enabled() {
+    if online_services_menu_enabled() {
+        items.extend([
+            MenuItem::Separator,
+            updateable_custom_item_without_checkmark(CustomAction::ToggleWarpDrive, ctx),
+            updateable_custom_item_without_checkmark(CustomAction::SearchDrive, ctx),
+        ]);
+    }
+
+    if online_services_menu_enabled() {
+        items.extend([
+            updateable_custom_item_without_checkmark(CustomAction::OpenTeamSettings, ctx),
+            updateable_custom_item_without_checkmark(CustomAction::OpenAIFactCollection, ctx),
+            updateable_custom_item_without_checkmark(CustomAction::OpenMCPServerCollection, ctx),
+            updateable_custom_item_without_checkmark(CustomAction::SharePaneContents, ctx),
+        ]);
+    }
+
+    if online_services_menu_enabled() && FeatureFlag::CreatingSharedSessions.is_enabled() {
         items.extend([
             MenuItem::Separator,
             updateable_custom_item_without_checkmark(CustomAction::ShareCurrentSession, ctx),
@@ -1006,7 +1044,10 @@ fn make_new_elements_menu_items(ctx: &AppContext) -> Vec<MenuItem> {
             },
             Some(Keystroke::parse("cmd-t").expect("Valid keystroke")),
         )),
-        MenuItem::Custom(CustomMenuItem::new(
+    ];
+
+    if online_services_menu_enabled() {
+        new_elements_menu.push(MenuItem::Custom(CustomMenuItem::new(
             "New Agent Tab",
             open_new_agent_tab_or_window,
             move |_props: &MenuItemProperties, ctx: &mut AppContext| {
@@ -1036,9 +1077,10 @@ fn make_new_elements_menu_items(ctx: &AppContext) -> Vec<MenuItem> {
                 changes
             },
             None,
-        )),
-        non_updateable_custom_item(CustomAction::NewFile, ctx),
-    ];
+        )));
+    }
+
+    new_elements_menu.push(non_updateable_custom_item(CustomAction::NewFile, ctx));
 
     let reopen_session_action_updater =
         custom_action_updater(CustomAction::ReopenClosedSession, Box::new(|_| false));

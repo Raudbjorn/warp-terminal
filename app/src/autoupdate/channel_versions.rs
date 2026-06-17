@@ -26,6 +26,12 @@ pub async fn fetch_channel_versions(
             .context("Failed to parse channel versions JSON");
     }
 
+    if ChannelState::is_local_only() {
+        return Err(anyhow::anyhow!(
+            "Online channel version fetching is disabled in local-only services mode"
+        ));
+    }
+
     let channel_versions = server_api
         .fetch_channel_versions(include_changelogs, is_daily)
         .await

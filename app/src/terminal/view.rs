@@ -14919,7 +14919,8 @@ impl TerminalView {
             let rule = correction.rule_applied;
 
             if AISettings::as_ref(ctx).is_intelligent_autosuggestions_enabled(ctx)
-                && UserWorkspaces::as_ref(ctx).is_next_command_enabled()
+                && (ChannelState::is_local_only()
+                    || UserWorkspaces::as_ref(ctx).is_next_command_enabled())
                 && COMMAND_CORRECTIONS_PREFERRED_DENYLIST.contains(rule.to_str())
             {
                 // Defer to Next Command if the rule is in the denylist.
@@ -16504,7 +16505,8 @@ impl TerminalView {
                         ))
                         .into_item(),
                 ];
-                if AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+                if !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+                {
                     fields.extend([
                         MenuItem::Separator,
                         MenuItemFields::new(if FeatureFlag::AgentMode.is_enabled() {
@@ -16659,7 +16661,8 @@ impl TerminalView {
                     );
                 }
 
-                if AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+                if !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+                {
                     if FeatureFlag::AgentMode.is_enabled() {
                         // We can only attach selected blocks if the input box is visible.
                         if self.is_input_box_visible(&model, ctx) {
@@ -17330,7 +17333,8 @@ impl TerminalView {
                 .into_item(),
         ]);
 
-        if AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+        let ai_settings = AISettings::as_ref(ctx);
+        if ai_settings.is_ai_command_search_enabled(ctx) {
             items.push(
                 MenuItemFields::new("AI command search")
                     .with_on_select_action(TerminalAction::InputContextMenuItem(
@@ -17343,7 +17347,9 @@ impl TerminalView {
                     .with_disabled(is_editor_disabled)
                     .into_item(),
             );
+        }
 
+        if !ChannelState::is_local_only() && ai_settings.is_any_ai_enabled(ctx) {
             if !selected_input_text.is_empty() && !FeatureFlag::AgentMode.is_enabled() {
                 items.push(
                     MenuItemFields::new("Ask Warp AI")
@@ -17530,7 +17536,7 @@ impl TerminalView {
                     .with_key_shortcut_label(Some("⌘-C"))
                     .into_item(),
             );
-            if AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+            if !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
                 menu_items.extend([
                     MenuItem::Separator,
                     MenuItemFields::new(if FeatureFlag::AgentMode.is_enabled() {
@@ -24359,7 +24365,9 @@ impl TerminalView {
                     );
                 }
 
-                self.ask_ai(ask_source, ctx);
+                if !ChannelState::is_local_only() {
+                    self.ask_ai(ask_source, ctx);
+                }
             }
             OpenWorkflowModal => self.open_workflow_modal(ctx),
             OpenShareSessionModal => self.open_share_session_modal(source, ctx),
@@ -24685,7 +24693,11 @@ impl TerminalView {
             SelectAll => self.select_all_text_from_input(ctx),
             Paste => self.paste_in_input(ctx),
             ShowCommandSearch => self.command_search_from_input(ctx),
-            AskWarpAI => self.ask_ai(&AskAISource::SelectedInputText, ctx),
+            AskWarpAI => {
+                if !ChannelState::is_local_only() {
+                    self.ask_ai(&AskAISource::SelectedInputText, ctx);
+                }
+            }
             ShowAICommandSearch => self.ai_command_search_from_input(ctx),
             SaveAsWorkflow => self.save_as_workflow_from_input(ctx),
             ToggleInputHintText => self.toggle_input_hint_text(ctx),
@@ -26272,7 +26284,9 @@ impl TypedActionView for TerminalView {
                     );
                 }
 
-                self.ask_ai(&AskAISource::Block(*block_index), ctx)
+                if !ChannelState::is_local_only() {
+                    self.ask_ai(&AskAISource::Block(*block_index), ctx)
+                }
             }
             TriggerSubshellBootstrap => self.trigger_subshell_bootstrap(None, false, ctx),
             ShowSubshellBanner(command) => {
@@ -27780,6 +27794,10 @@ impl View for TerminalView {
 
         if AISettings::as_ref(app).is_any_ai_enabled(app) {
             context.set.insert(flags::IS_ANY_AI_ENABLED);
+        }
+
+        if AISettings::as_ref(app).is_ai_command_search_enabled(app) {
+            context.set.insert(flags::AI_COMMAND_SEARCH_ENABLED);
         }
 
         if self

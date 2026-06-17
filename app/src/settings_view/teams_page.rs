@@ -1822,6 +1822,9 @@ impl SettingsPageMeta for TeamsPageView {
     }
 
     fn on_page_selected(&mut self, allow_steal_focus: bool, ctx: &mut ViewContext<Self>) {
+        if ChannelState::is_local_only() {
+            return;
+        }
         if allow_steal_focus {
             self.focus_on_next_input(ctx);
         }
@@ -1844,7 +1847,7 @@ impl SettingsPageMeta for TeamsPageView {
     }
 
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        true
+        !ChannelState::is_local_only()
     }
 
     fn on_tab_pressed(&mut self, ctx: &mut ViewContext<Self>) {

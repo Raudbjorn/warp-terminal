@@ -1014,6 +1014,27 @@ pub(crate) const CONNECTED_SELF_HOSTED_WORKERS_PATH: &str = "agent/connected-sel
 #[cfg_attr(test, automock)]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
+pub trait CommandGenerationClient: 'static + Send + Sync {
+    async fn generate_commands_from_natural_language(
+        &self,
+        prompt: String,
+        ai_execution_context: Option<WarpAiExecutionContext>,
+    ) -> Result<Vec<AIGeneratedCommand>, GenerateCommandsFromNaturalLanguageError>;
+}
+
+#[cfg_attr(test, automock)]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+pub trait WorkflowMetadataAIClient: 'static + Send + Sync {
+    async fn generate_metadata_for_command(
+        &self,
+        command: String,
+    ) -> Result<GeneratedCommandMetadata, GeneratedCommandMetadataError>;
+}
+
+#[cfg_attr(test, automock)]
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
 pub trait AIClient: 'static + Send + Sync {
     async fn generate_commands_from_natural_language(
         &self,
@@ -1445,8 +1466,16 @@ impl AIClient for ServerApi {
         &self,
         prompt: String,
         // TODO: use relevant context from RequestContext and deprecate usage of ai_execution_context
-        _ai_execution_context: Option<WarpAiExecutionContext>,
+        ai_execution_context: Option<WarpAiExecutionContext>,
     ) -> Result<Vec<AIGeneratedCommand>, GenerateCommandsFromNaturalLanguageError> {
+        if ChannelState::is_local_only() {
+            return self
+                .local_openai_client
+                .generate_commands_from_natural_language(&self.client, prompt, ai_execution_context)
+                .await
+                .map_err(Into::into);
+        }
+
         let default_err = GenerateCommandsFromNaturalLanguageError::Other;
 
         let variables = GenerateCommandsVariables {
@@ -1538,6 +1567,14 @@ impl AIClient for ServerApi {
         &self,
         command: String,
     ) -> Result<GeneratedCommandMetadata, GeneratedCommandMetadataError> {
+        if ChannelState::is_local_only() {
+            return self
+                .local_openai_client
+                .generate_metadata_for_command(&self.client, command)
+                .await
+                .map_err(Into::into);
+        }
+
         let default_err = GeneratedCommandMetadataError::Other;
         let variables = GenerateMetadataForCommandVariables {
             input: GenerateMetadataForCommandInput { command },
@@ -1581,6 +1618,29 @@ impl AIClient for ServerApi {
 
     #[cfg(not(feature = "agent_mode_evals"))]
     async fn get_request_limit_info(&self) -> Result<RequestUsageInfo, anyhow::Error> {
+        if ChannelState::is_local_only() {
+            return Ok(RequestUsageInfo {
+                request_limit_info: crate::ai::request_usage_model::RequestLimitInfo {
+                    limit: usize::MAX,
+                    num_requests_used_since_refresh: 0,
+                    next_refresh_time: warp_graphql::scalars::time::ServerTimestamp::new(
+                        Utc::now() + chrono::Duration::days(365),
+                    ),
+                    is_unlimited: true,
+                    request_limit_refresh_duration:
+                        crate::ai::request_usage_model::RequestLimitRefreshDuration::Monthly,
+                    is_unlimited_voice: true,
+                    voice_request_limit: usize::MAX,
+                    voice_requests_used_since_last_refresh: 0,
+                    is_unlimited_codebase_indices: true,
+                    max_codebase_indices: usize::MAX,
+                    max_files_per_repo: usize::MAX,
+                    embedding_generation_batch_size: 100,
+                },
+                bonus_grants: vec![],
+            });
+        }
+
         let variables = GetRequestLimitInfoVariables {
             request_context: get_request_context(),
         };
@@ -2640,6 +2700,12 @@ impl AIClient for ServerApi {
         &self,
         request: GenerateCodeReviewContentRequest,
     ) -> Result<GenerateCodeReviewContentResponse, anyhow::Error> {
+        if ChannelState::is_local_only() {
+            return Err(anyhow!(
+                "Code review content generation is disabled in local-only services mode"
+            ));
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
         let request_builder = self.client.post(format!(
             "{}/ai/generate_code_review_content",
@@ -2657,6 +2723,29 @@ impl AIClient for ServerApi {
         .json()
         .await?;
         Ok(response)
+    }
+}
+
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+impl CommandGenerationClient for ServerApi {
+    async fn generate_commands_from_natural_language(
+        &self,
+        prompt: String,
+        ai_execution_context: Option<WarpAiExecutionContext>,
+    ) -> Result<Vec<AIGeneratedCommand>, GenerateCommandsFromNaturalLanguageError> {
+        AIClient::generate_commands_from_natural_language(self, prompt, ai_execution_context).await
+    }
+}
+
+#[cfg_attr(not(target_family = "wasm"), async_trait)]
+#[cfg_attr(target_family = "wasm", async_trait(?Send))]
+impl WorkflowMetadataAIClient for ServerApi {
+    async fn generate_metadata_for_command(
+        &self,
+        command: String,
+    ) -> Result<GeneratedCommandMetadata, GeneratedCommandMetadataError> {
+        AIClient::generate_metadata_for_command(self, command).await
     }
 }
 

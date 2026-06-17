@@ -64,6 +64,10 @@ pub use one_time_modal_model::OneTimeModalModel;
 pub use registry::WorkspaceRegistry;
 pub use toast_stack::ToastStack;
 
+fn online_services_bindings_enabled() -> bool {
+    !ChannelState::is_local_only()
+}
+
 use crate::workspace::view::{
     LEFT_PANEL_AGENT_CONVERSATIONS_BINDING_NAME, LEFT_PANEL_GLOBAL_SEARCH_BINDING_NAME,
     LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME, LEFT_PANEL_WARP_DRIVE_BINDING_NAME,
@@ -610,6 +614,7 @@ pub fn init(app: &mut AppContext) {
                 .with_custom_description(bindings::MAC_MENUS_CONTEXT, "New Team Notebook"),
             WorkspaceAction::CreateTeamNotebook,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_custom_action(CustomAction::NewTeamNotebook)
         .with_context_predicate(
             id!("Workspace")
@@ -633,6 +638,7 @@ pub fn init(app: &mut AppContext) {
                 .with_custom_description(bindings::MAC_MENUS_CONTEXT, "New Team Workflow"),
             WorkspaceAction::CreateTeamWorkflow,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_custom_action(CustomAction::NewTeamWorkflow)
         .with_context_predicate(
             id!("Workspace")
@@ -662,6 +668,7 @@ pub fn init(app: &mut AppContext) {
                 & id!("IsOnline")
                 & id!("WarpDrive_BelongsToTeam"),
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::Folders.as_str()),
         EditableBinding::new(
             "workspace:create_personal_folder",
@@ -694,6 +701,7 @@ pub fn init(app: &mut AppContext) {
             BindingDescription::new("New Agent Tab"),
             WorkspaceAction::AddAgentTab,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_custom_action(CustomAction::NewAgentTab)
         .with_context_predicate(
@@ -709,7 +717,9 @@ pub fn init(app: &mut AppContext) {
             id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED) & !id!("Workspace_PaneDragging"),
         )
         .with_enabled(|| {
-            FeatureFlag::AgentView.is_enabled() && FeatureFlag::CloudMode.is_enabled()
+            online_services_bindings_enabled()
+                && FeatureFlag::AgentView.is_enabled()
+                && FeatureFlag::CloudMode.is_enabled()
         }),
         EditableBinding::new(
             "workspace:toggle_left_panel",
@@ -717,6 +727,7 @@ pub fn init(app: &mut AppContext) {
             WorkspaceAction::ToggleLeftPanel,
         )
         .with_context_predicate(id!("Workspace"))
+        .with_enabled(online_services_bindings_enabled)
         .with_custom_action(CustomAction::ToggleWarpDrive),
         EditableBinding::new(
             TOGGLE_RIGHT_PANEL_BINDING_NAME,
@@ -753,7 +764,10 @@ pub fn init(app: &mut AppContext) {
         )
         .with_group(bindings::BindingGroup::Navigation.as_str())
         .with_context_predicate(id!("Workspace") & id!(flags::SHOW_CONVERSATION_HISTORY))
-        .with_enabled(|| FeatureFlag::AgentViewConversationListView.is_enabled())
+        .with_enabled(|| {
+            FeatureFlag::AgentViewConversationListView.is_enabled()
+                && online_services_bindings_enabled()
+        })
         .with_custom_action(CustomAction::ToggleConversationListView),
         EditableBinding::new(
             LEFT_PANEL_GLOBAL_SEARCH_BINDING_NAME,
@@ -780,6 +794,7 @@ pub fn init(app: &mut AppContext) {
         )
         .with_group(bindings::BindingGroup::Navigation.as_str())
         .with_context_predicate(id!("Workspace") & id!(flags::ENABLE_WARP_DRIVE))
+        .with_enabled(online_services_bindings_enabled)
         .with_mac_key_binding("ctrl-4")
         .with_linux_or_windows_key_binding("alt-4"),
         EditableBinding::new(
@@ -805,7 +820,8 @@ pub fn init(app: &mut AppContext) {
                 .with_custom_description(bindings::MAC_MENUS_CONTEXT, "Warp Drive"),
             WorkspaceAction::ToggleWarpDrive,
         )
-        .with_context_predicate(id!("Workspace") & id!(flags::ENABLE_WARP_DRIVE)),
+        .with_context_predicate(id!("Workspace") & id!(flags::ENABLE_WARP_DRIVE))
+        .with_enabled(online_services_bindings_enabled),
         EditableBinding::new(
             TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME,
             BindingDescription::new("Toggle Agent conversation list view").with_custom_description(
@@ -814,7 +830,10 @@ pub fn init(app: &mut AppContext) {
             ),
             WorkspaceAction::ToggleConversationListView,
         )
-        .with_enabled(|| FeatureFlag::AgentViewConversationListView.is_enabled())
+        .with_enabled(|| {
+            FeatureFlag::AgentViewConversationListView.is_enabled()
+                && online_services_bindings_enabled()
+        })
         .with_context_predicate(id!("Workspace") & id!(flags::SHOW_CONVERSATION_HISTORY))
         .with_mac_key_binding("cmd-shift-A")
         .with_linux_or_windows_key_binding("ctrl-shift-A")
@@ -1053,10 +1072,11 @@ pub fn init(app: &mut AppContext) {
             },
         )
         .with_context_predicate(id!("Workspace"))
+        .with_enabled(online_services_bindings_enabled)
         .with_custom_action(CustomAction::SearchDrive),
     ]);
 
-    if FeatureFlag::Autoupdate.is_enabled() {
+    if online_services_bindings_enabled() && FeatureFlag::Autoupdate.is_enabled() {
         app.register_editable_bindings([
             EditableBinding::new(
                 "workspace:update_and_relaunch",
@@ -1086,7 +1106,7 @@ pub fn init(app: &mut AppContext) {
     .with_group(bindings::BindingGroup::Settings.as_str())
     .with_context_predicate(id!("Workspace") & !id!("IsAnonymousUser"))]);
 
-    if !FeatureFlag::AvatarInTabBar.is_enabled() {
+    if online_services_bindings_enabled() && !FeatureFlag::AvatarInTabBar.is_enabled() {
         app.register_editable_bindings([EditableBinding::new(
             "workspace:toggle_resource_center",
             "Toggle resource center",
@@ -1128,7 +1148,7 @@ pub fn init(app: &mut AppContext) {
         ]);
     }
 
-    if FeatureFlag::Changelog.is_enabled() {
+    if online_services_bindings_enabled() && FeatureFlag::Changelog.is_enabled() {
         app.register_editable_bindings([
             // Always show the "View latest changelog" action in the command palette,
             // but without a keybinding when the update toast is not visible.
@@ -1167,7 +1187,7 @@ pub fn init(app: &mut AppContext) {
                 zero_state_prompt_suggestion_type: None,
             },
         )
-        .with_enabled(|| FeatureFlag::AgentMode.is_enabled())
+        .with_enabled(|| FeatureFlag::AgentMode.is_enabled() && online_services_bindings_enabled())
         .with_context_predicate(id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED))
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_custom_action(CustomAction::NewAgentModePane),
@@ -1176,7 +1196,7 @@ pub fn init(app: &mut AppContext) {
             "Toggle Warp AI",
             WorkspaceAction::ToggleAIAssistant,
         )
-        .with_enabled(|| !FeatureFlag::AgentMode.is_enabled())
+        .with_enabled(|| !FeatureFlag::AgentMode.is_enabled() && online_services_bindings_enabled())
         .with_context_predicate(id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED))
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         // We use the same custom action as AM so that we don't have
@@ -1194,6 +1214,7 @@ pub fn init(app: &mut AppContext) {
                 ),
             WorkspaceAction::CreateTeamEnvVarCollection,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_custom_action(CustomAction::NewTeamEnvVars)
         .with_context_predicate(
             id!("Workspace")
@@ -1220,6 +1241,7 @@ pub fn init(app: &mut AppContext) {
                 .with_custom_description(bindings::MAC_MENUS_CONTEXT, "New Personal Prompt"),
             WorkspaceAction::CreatePersonalAIPrompt,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_custom_action(CustomAction::NewPersonalAIPrompt)
         .with_context_predicate(
@@ -1231,6 +1253,7 @@ pub fn init(app: &mut AppContext) {
                 .with_custom_description(bindings::MAC_MENUS_CONTEXT, "New Team Prompt"),
             WorkspaceAction::CreateTeamAIPrompt,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_custom_action(CustomAction::NewTeamAIPrompt)
         .with_context_predicate(
@@ -1304,7 +1327,7 @@ pub fn init(app: &mut AppContext) {
                 .with_custom_description(bindings::MAC_MENUS_CONTEXT, "Open AI Rules"),
             WorkspaceAction::OpenAIFactCollection,
         )
-        .with_enabled(|| FeatureFlag::AIRules.is_enabled())
+        .with_enabled(|| FeatureFlag::AIRules.is_enabled() && online_services_bindings_enabled())
         .with_custom_action(CustomAction::OpenAIFactCollection)
         .with_context_predicate(id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED))
         .with_group(bindings::BindingGroup::WarpAi.as_str()),
@@ -1317,7 +1340,9 @@ pub fn init(app: &mut AppContext) {
         WorkspaceAction::OpenMCPServerCollection,
     )
     .with_enabled(|| {
-        FeatureFlag::McpServer.is_enabled() && ContextFlag::ShowMCPServers.is_enabled()
+        FeatureFlag::McpServer.is_enabled()
+            && ContextFlag::ShowMCPServers.is_enabled()
+            && online_services_bindings_enabled()
     })
     .with_custom_action(CustomAction::OpenMCPServerCollection)
     .with_context_predicate(id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED))
@@ -1328,7 +1353,7 @@ pub fn init(app: &mut AppContext) {
         "Jump to latest agent task",
         WorkspaceAction::JumpToLatestToast,
     )
-    .with_enabled(|| FeatureFlag::AgentMode.is_enabled())
+    .with_enabled(|| FeatureFlag::AgentMode.is_enabled() && online_services_bindings_enabled())
     .with_context_predicate(id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED))
     .with_mac_key_binding("cmd-shift-G")
     .with_linux_or_windows_key_binding("ctrl-shift-G")
@@ -1339,7 +1364,9 @@ pub fn init(app: &mut AppContext) {
         "Toggle notification mailbox",
         WorkspaceAction::ToggleNotificationMailbox { select_first: true },
     )
-    .with_enabled(|| FeatureFlag::HOANotifications.is_enabled())
+    .with_enabled(|| {
+        FeatureFlag::HOANotifications.is_enabled() && online_services_bindings_enabled()
+    })
     .with_context_predicate(id!("Workspace"))
     .with_mac_key_binding("cmd-shift-U")
     .with_linux_or_windows_key_binding("ctrl-shift-U")
@@ -1353,7 +1380,9 @@ pub fn init(app: &mut AppContext) {
         "Toggle the agent management view",
         WorkspaceAction::ToggleAgentManagementView,
     )
-    .with_enabled(|| FeatureFlag::AgentManagementView.is_enabled())
+    .with_enabled(|| {
+        FeatureFlag::AgentManagementView.is_enabled() && online_services_bindings_enabled()
+    })
     .with_context_predicate(id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED))
     .with_mac_key_binding("cmd-shift-M")
     .with_linux_or_windows_key_binding("ctrl-shift-M")
@@ -1374,14 +1403,6 @@ fn add_open_setting_pages_as_editable_binding(app: &mut AppContext) {
         .with_context_predicate(id!("Workspace"))
         .with_group(bindings::BindingGroup::Settings.as_str())
         .with_custom_action(CustomAction::ShowSettings),
-        EditableBinding::new(
-            "workspace:show_settings_account_page",
-            "Open Settings: Account",
-            WorkspaceAction::ShowSettingsPage(SettingsSection::Account),
-        )
-        .with_context_predicate(id!("Workspace"))
-        .with_group(bindings::BindingGroup::Settings.as_str())
-        .with_custom_action(CustomAction::ShowAccount),
         EditableBinding::new(
             "workspace:show_settings_appearance_page",
             BindingDescription::new("Open Settings: Appearance")
@@ -1433,6 +1454,7 @@ fn add_open_setting_pages_as_editable_binding(app: &mut AppContext) {
                 .with_custom_description(bindings::MAC_MENUS_CONTEXT, "Open Team Settings"),
             WorkspaceAction::ShowSettingsPage(SettingsSection::Teams),
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::Settings.as_str())
         .with_custom_action(CustomAction::OpenTeamSettings)
         .with_context_predicate(id!("Workspace")),
@@ -1441,6 +1463,7 @@ fn add_open_setting_pages_as_editable_binding(app: &mut AppContext) {
             BindingDescription::new("Open Settings: Privacy"),
             WorkspaceAction::ShowSettingsPage(SettingsSection::Privacy),
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::Settings.as_str())
         .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
@@ -1456,7 +1479,7 @@ fn add_open_setting_pages_as_editable_binding(app: &mut AppContext) {
             BindingDescription::new("Open Settings: AI"),
             WorkspaceAction::ShowSettingsPage(SettingsSection::WarpAgent),
         )
-        .with_enabled(|| FeatureFlag::AgentMode.is_enabled())
+        .with_enabled(|| FeatureFlag::AgentMode.is_enabled() && online_services_bindings_enabled())
         .with_group(bindings::BindingGroup::Settings.as_str())
         .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
@@ -1464,6 +1487,7 @@ fn add_open_setting_pages_as_editable_binding(app: &mut AppContext) {
             BindingDescription::new("Open Settings: Billing and usage"),
             WorkspaceAction::ShowSettingsPage(SettingsSection::BillingAndUsage),
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::Settings.as_str())
         .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
@@ -1478,6 +1502,7 @@ fn add_open_setting_pages_as_editable_binding(app: &mut AppContext) {
             BindingDescription::new("Open Settings: Referrals"),
             WorkspaceAction::ShowSettingsPage(SettingsSection::Referrals),
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::Settings.as_str())
         .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
@@ -1485,6 +1510,7 @@ fn add_open_setting_pages_as_editable_binding(app: &mut AppContext) {
             BindingDescription::new("Open Settings: Environments"),
             WorkspaceAction::ShowSettingsPage(SettingsSection::CloudEnvironments),
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::Settings.as_str())
         .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
@@ -1492,6 +1518,7 @@ fn add_open_setting_pages_as_editable_binding(app: &mut AppContext) {
             BindingDescription::new("Open Settings: MCP Servers"),
             WorkspaceAction::ShowSettingsPage(SettingsSection::MCPServers),
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_group(bindings::BindingGroup::Settings.as_str())
         .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
@@ -1515,6 +1542,7 @@ fn add_overflow_menu_items_as_editable_binding(app: &mut AppContext) {
             "Invite People...",
             WorkspaceAction::ShowReferralSettingsPage,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_context_predicate(id!("Workspace"))
         .with_custom_action(CustomAction::ReferAFriend),
         EditableBinding::new(
@@ -1522,18 +1550,21 @@ fn add_overflow_menu_items_as_editable_binding(app: &mut AppContext) {
             "Join our Slack community (opens external link)",
             WorkspaceAction::JoinSlack,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
             "workspace:link_to_user_docs",
             "View user docs (opens external link)",
             WorkspaceAction::ViewUserDocs,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_context_predicate(id!("Workspace")),
         EditableBinding::new(
             "workspace:send_feedback",
             BindingDescription::new("Send feedback (opens external link)"),
             WorkspaceAction::SendFeedback,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_context_predicate(id!("Workspace")),
         #[cfg(not(target_family = "wasm"))]
         EditableBinding::new(
@@ -1547,6 +1578,7 @@ fn add_overflow_menu_items_as_editable_binding(app: &mut AppContext) {
             "View privacy policy (opens external link)",
             WorkspaceAction::ViewPrivacyPolicy,
         )
+        .with_enabled(online_services_bindings_enabled)
         .with_context_predicate(id!("Workspace")),
     ]);
 }

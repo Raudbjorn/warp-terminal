@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::sync::Arc;
 
 use ai::api_keys::ApiKeyManager;
@@ -225,6 +226,10 @@ impl AIRequestUsageModel {
 
     /// Spawns a task to refresh the latest AI request usage and bonus grants, fetching from the server.
     pub fn refresh_request_usage_async(&mut self, ctx: &mut ModelContext<Self>) {
+        if ChannelState::is_local_only() {
+            return;
+        }
+
         if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             return;
         }
@@ -381,6 +386,10 @@ impl AIRequestUsageModel {
     /// 7. user has BYOK enabled and has provided at least one API key
     /// Use this method as the starting point for AI availability checking.
     pub fn has_any_ai_remaining(&self, ctx: &AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            return true;
+        }
+
         let current_workspace = UserWorkspaces::as_ref(ctx).current_workspace();
 
         let has_base_plan_ai_requests = self.has_requests_remaining();

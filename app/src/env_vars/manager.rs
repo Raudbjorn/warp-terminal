@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
@@ -30,6 +31,12 @@ pub enum EnvVarCollectionSource {
 /// Manages EnvVarCollection panes
 impl EnvVarCollectionManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        if ChannelState::is_local_only() {
+            return EnvVarCollectionManager {
+                panes_by_hashed_id: HashMap::new(),
+            };
+        }
+
         ctx.subscribe_to_model(
             &UpdateManager::handle(ctx),
             Self::handle_update_manager_event,

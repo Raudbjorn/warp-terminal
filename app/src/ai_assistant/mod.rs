@@ -108,6 +108,23 @@ impl From<AIGeneratedCommand> for Workflow {
     }
 }
 
+impl AIGeneratedCommand {
+    pub(crate) fn new(
+        command: String,
+        description: String,
+        parameters: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            command,
+            description,
+            parameters: parameters
+                .into_iter()
+                .map(|(id, description)| AIGeneratedCommandParameter { id, description })
+                .collect_vec(),
+        }
+    }
+}
+
 impl From<GeneratedCommand> for AIGeneratedCommand {
     fn from(value: GeneratedCommand) -> Self {
         AIGeneratedCommand {
@@ -130,6 +147,9 @@ pub enum GenerateCommandsFromNaturalLanguageError {
     BadPrompt,
     AiProviderError,
     RateLimited,
+    LocalProviderNotConfigured,
+    LocalProviderError,
+    LocalProviderInvalidResponse,
     Other,
 }
 

@@ -11,6 +11,7 @@ pub mod referral;
 pub mod team;
 pub mod workspace;
 
+use self::ai::{CommandGenerationClient, WorkflowMetadataAIClient};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -60,7 +61,8 @@ use crate::auth::UserUid;
 use crate::server::iap::{IapManager, IapState};
 use crate::server::server_api::presigned_upload::HttpStatusError;
 use crate::server::telemetry::TelemetryApi;
-use crate::settings::PrivacySettingsSnapshot;
+use crate::ai::local_openai::LocalOpenAIClient;
+use crate::settings::{LocalOpenAISettingsSnapshot, PrivacySettingsSnapshot};
 use crate::{settings_view, ChannelState};
 
 pub const FETCH_CHANNEL_VERSIONS_TIMEOUT: std::time::Duration = Duration::from_secs(60);
@@ -410,6 +412,8 @@ pub struct ServerApi {
     ambient_agent_task_id: Arc<RwLock<Option<AmbientAgentTaskId>>>,
     /// The source of agent runs (e.g. CLI, GitHub Action). Set once at startup and immutable.
     agent_source: Option<ai::AgentSource>,
+    /// Client for a user-configured local OpenAI-compatible provider (local-only mode).
+    local_openai_client: LocalOpenAIClient,
     /// IAP credential cache for staging server access. [`None`] on production builds.
     iap_state: Option<Arc<super::iap::IapState>>,
 
@@ -474,6 +478,7 @@ impl ServerApi {
             ambient_workload_token: Arc::new(Mutex::new(None)),
             ambient_agent_task_id: Arc::new(RwLock::new(None)),
             agent_source,
+            local_openai_client: LocalOpenAIClient::new(LocalOpenAISettingsSnapshot::default()),
             iap_state,
             #[cfg(feature = "agent_mode_evals")]
             eval_user_id,
@@ -526,6 +531,17 @@ impl ServerApi {
 
     fn user_id(&self) -> Option<UserUid> {
         self.auth_state.user_id()
+    }
+
+    fn set_local_openai_config(&self, config: LocalOpenAISettingsSnapshot) {
+        self.local_openai_client.set_config(config);
+    }
+
+    fn ensure_public_api_enabled(path: &str) -> Result<()> {
+        if ChannelState::is_local_only() {
+            anyhow::bail!("Public API request {path} is disabled in local-only services mode");
+        }
+        Ok(())
     }
 
     /// Sets the ambient agent task ID to be sent with all subsequent requests.
@@ -678,6 +694,8 @@ impl ServerApi {
     /// Unlike [`get_public_api`], this does not attempt JSON deserialization on the
     /// response body, allowing the caller to decode it however they need.
     async fn get_public_api_response(&self, path: &str) -> Result<http_client::Response> {
+        Self::ensure_public_api_enabled(path)?;
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -737,6 +755,12 @@ impl ServerApi {
         since_sequence: i64,
     ) -> Result<http_client::EventSourceStream> {
         debug_assert!(!run_ids.is_empty(), "run_ids must not be empty");
+        if ChannelState::is_local_only() {
+            return Err(anyhow::anyhow!(
+                "Agent event streams are disabled in local-only services mode"
+            ));
+        }
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -846,6 +870,8 @@ impl ServerApi {
     where
         B: Serialize,
     {
+        Self::ensure_public_api_enabled(path)?;
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -1030,6 +1056,8 @@ impl ServerApi {
     where
         B: Serialize,
     {
+        Self::ensure_public_api_enabled(path)?;
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -1061,6 +1089,11 @@ impl ServerApi {
     /// Sends an authenticated empty POST request to /client/login, which signals to the server
     /// that the user is logged in.
     pub async fn notify_login(&self) {
+        if ChannelState::is_local_only() {
+            log::debug!("Skipping login notification in local-only services mode");
+            return;
+        }
+
         match self.get_or_refresh_access_token().await {
             Ok(auth_token) => {
                 let url = format!("{}/client/login", ChannelState::server_root_url());
@@ -1146,6 +1179,14 @@ impl ServerApi {
         request: &GenerateAIInputSuggestionsRequest,
     ) -> Result<generate_ai_input_suggestions::GenerateAIInputSuggestionsResponseV2, AIApiError>
     {
+        if ChannelState::is_local_only() {
+            return self
+                .local_openai_client
+                .generate_ai_input_suggestions(&self.client, request)
+                .await
+                .map_err(|err| AIApiError::Other(err.into()));
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let request_builder = self.client.post(format!(
@@ -1234,6 +1275,14 @@ impl ServerApi {
         &self,
         request: &PredictAMQueriesRequest,
     ) -> Result<PredictAMQueriesResponse, AIApiError> {
+        if ChannelState::is_local_only() {
+            return self
+                .local_openai_client
+                .predict_am_queries(&self.client, request)
+                .await
+                .map_err(|err| AIApiError::Other(err.into()));
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
         let request_builder = self.client.post(format!(
             "{}/ai/predict_am_queries",
@@ -1311,6 +1360,13 @@ impl ServerApi {
         request: &warp_multi_agent_api::Request,
     ) -> std::result::Result<AIOutputStream<warp_multi_agent_api::ResponseEvent>, Arc<AIApiError>>
     {
+        if ChannelState::is_local_only() {
+            return Err(Arc::new(AIApiError::Other(
+                anyhow::anyhow!("Multi-agent output is disabled in local-only services mode")
+                    .into(),
+            )));
+        }
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -1619,7 +1675,7 @@ impl ServerApiProvider {
             state.apply_latest_state(experiments, ctx);
         });
 
-        settings_view::handle_experiment_change(ctx);
+        settings_view::handle_experiment_change();
     }
 
     /// Constructs a new SeverApiProvider for tests.
@@ -1663,6 +1719,14 @@ impl ServerApiProvider {
     }
 
     pub fn get_ai_client(&self) -> Arc<dyn AIClient> {
+        self.server_api.clone()
+    }
+
+    pub fn get_command_generation_client(&self) -> Arc<dyn CommandGenerationClient> {
+        self.server_api.clone()
+    }
+
+    pub fn get_workflow_metadata_ai_client(&self) -> Arc<dyn WorkflowMetadataAIClient> {
         self.server_api.clone()
     }
 

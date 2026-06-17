@@ -225,6 +225,10 @@ impl AutoupdateState {
 
     /// User-initiated check for updates.
     pub fn manually_check_for_update(&mut self, ctx: &mut ModelContext<Self>) {
+        if ChannelState::is_local_only() {
+            log::debug!("Ignoring manual autoupdate check in local-only services mode");
+            return;
+        }
         self.enqueue_request(RequestType::ManualCheck, ctx);
     }
 
@@ -240,6 +244,10 @@ impl AutoupdateState {
     /// Trigger the update check to /client_version/daily, but only go through with sending the
     /// request if we haven't done that today.
     pub fn maybe_daily_check_for_update(&mut self, ctx: &mut ModelContext<Self>) {
+        if ChannelState::is_local_only() {
+            log::debug!("Ignoring daily autoupdate check in local-only services mode");
+            return;
+        }
         self.enqueue_request(RequestType::DailyCheck, ctx)
     }
 

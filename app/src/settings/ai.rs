@@ -3,6 +3,7 @@
 //! These settings are currently used to configure the underlying model/API used to power the AI
 //! UX, as well as small UX configurations.
 
+use warp_core::channel::ChannelState;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -593,6 +594,16 @@ pub struct AIRequestQuotaInfo {
     pub cycle_history: Vec<CycleInfo>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LocalOpenAISettingsSnapshot {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: String,
+    pub command_model: String,
+    pub prediction_model: String,
+    pub timeout_ms: u64,
+}
+
 #[derive(
     Debug,
     Serialize,
@@ -769,6 +780,60 @@ define_settings_group!(AISettings, settings: [
         private: false,
         toml_path: "agents.warp_agent.active_ai.intelligent_autosuggestions_enabled",
         description: "Controls whether AI-powered intelligent autosuggestions are enabled.",
+    }
+    local_openai_enabled: LocalOpenAIEnabled {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.enabled",
+        description: "Controls whether local OpenAI-compatible AI requests are enabled.",
+    }
+    local_openai_base_url: LocalOpenAIBaseUrl {
+        type: String,
+        default: "http://127.0.0.1:1234/v1".to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.base_url",
+        description: "Base URL for a local OpenAI-compatible API endpoint.",
+    }
+    local_openai_api_key: LocalOpenAIApiKey {
+        type: String,
+        default: String::new(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.api_key",
+        description: "Optional API key for the local OpenAI-compatible endpoint.",
+    }
+    local_openai_command_model: LocalOpenAICommandModel {
+        type: String,
+        default: "google/gemma-4-e4b".to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.command_model",
+        description: "Model used for local command generation and workflow metadata.",
+    }
+    local_openai_prediction_model: LocalOpenAIPredictionModel {
+        type: String,
+        default: "google/gemma-4-e4b".to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.prediction_model",
+        description: "Model used for local command prediction.",
+    }
+    local_openai_timeout_ms: LocalOpenAITimeoutMs {
+        type: u64,
+        default: 8000,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.timeout_ms",
+        description: "Timeout for local OpenAI-compatible AI requests in milliseconds.",
     }
     // This field should not be referenced directly to lookup Prompt Suggestions
     // enablement -- use the `is_prompt_suggestions_enabled()` getter.
@@ -1538,6 +1603,39 @@ define_settings_group!(AISettings, settings: [
 ]);
 
 impl AISettings {
+    pub(crate) fn local_openai_settings(&self) -> LocalOpenAISettingsSnapshot {
+        LocalOpenAISettingsSnapshot {
+            enabled: *self.local_openai_enabled.value(),
+            base_url: self.local_openai_base_url.value().clone(),
+            api_key: self.local_openai_api_key.value().clone(),
+            command_model: self.local_openai_command_model.value().clone(),
+            prediction_model: self.local_openai_prediction_model.value().clone(),
+            timeout_ms: *self.local_openai_timeout_ms.value(),
+        }
+    }
+
+    fn is_local_openai_provider_configured(&self) -> bool {
+        *self.local_openai_enabled.value() && !self.local_openai_base_url.value().trim().is_empty()
+    }
+
+    pub(crate) fn is_local_openai_prediction_enabled(&self) -> bool {
+        ChannelState::is_local_only()
+            && self.is_local_openai_provider_configured()
+            && !self.local_openai_prediction_model.value().trim().is_empty()
+    }
+
+    pub(crate) fn is_local_ai_enabled(&self) -> bool {
+        ChannelState::is_local_only() && *self.local_openai_enabled.value()
+    }
+
+    pub(crate) fn is_ai_command_search_enabled(&self, app: &AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            self.is_local_ai_enabled()
+        } else {
+            self.is_any_ai_enabled(app)
+        }
+    }
+
     pub fn register_and_subscribe_to_events(app: &mut AppContext) {
         Self::register(app);
         app.add_singleton_model(FocusedTerminalInfo::new);
@@ -1572,6 +1670,10 @@ impl AISettings {
     }
 
     pub fn is_any_ai_enabled(&self, app: &AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            return *self.is_any_ai_enabled;
+        }
+
         // Disable AI for anonymous and logged-out users.
         let is_anonymous_or_logged_out = AuthStateProvider::as_ref(app)
             .get()
@@ -1589,7 +1691,7 @@ impl AISettings {
             DefaultSessionMode::Terminal | DefaultSessionMode::TabConfig => mode,
             // Agent and CloudAgent require AI to be enabled.
             DefaultSessionMode::Agent | DefaultSessionMode::CloudAgent => {
-                if self.is_any_ai_enabled(app) {
+                if !ChannelState::is_local_only() && self.is_any_ai_enabled(app) {
                     mode
                 } else {
                     DefaultSessionMode::Terminal
@@ -1649,6 +1751,12 @@ impl AISettings {
     }
 
     pub fn is_natural_language_autosuggestions_enabled(&self, app: &warpui::AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            return self.is_local_openai_prediction_enabled()
+                && *self.natural_language_autosuggestions_enabled_internal
+                && AppExecutionMode::as_ref(app).allows_active_ai();
+        }
+
         self.is_active_ai_enabled(app) && *self.natural_language_autosuggestions_enabled_internal
     }
 
@@ -1661,6 +1769,12 @@ impl AISettings {
     }
 
     pub fn is_intelligent_autosuggestions_enabled(&self, app: &warpui::AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            return self.is_local_openai_prediction_enabled()
+                && *self.intelligent_autosuggestions_enabled_internal
+                && AppExecutionMode::as_ref(app).allows_active_ai();
+        }
+
         self.is_active_ai_enabled(app) && *self.intelligent_autosuggestions_enabled_internal
     }
 

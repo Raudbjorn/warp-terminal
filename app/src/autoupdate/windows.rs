@@ -123,6 +123,11 @@ fn parse_minidump_cleanup_exit_code(contents_lowercase: &[u8]) -> Option<i32> {
 /// Sends telemetry for specific known issues, and sends a Sentry event if errors are found.
 /// The log file is renamed after processing to avoid duplicate reports on subsequent launches.
 pub(super) fn check_and_report_update_errors(ctx: &mut AppContext) {
+    if ChannelState::is_local_only() {
+        log::debug!("Skipping autoupdate log reporting in local-only services mode");
+        return;
+    }
+
     let log_path = match autoupdate_log_file() {
         Ok(path) => path,
         Err(e) => {

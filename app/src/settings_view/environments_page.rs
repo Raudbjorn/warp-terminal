@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::collections::HashMap;
 
 use instant::Instant;
@@ -2011,6 +2012,9 @@ impl SettingsPageMeta for EnvironmentsPageView {
         SettingsSection::CloudEnvironments
     }
     fn on_page_selected(&mut self, _allow_steal_focus: bool, ctx: &mut ViewContext<Self>) {
+        if ChannelState::is_local_only() {
+            return;
+        }
         self.environment_form.update(ctx, |form, ctx| {
             form.fetch_github_repos(ctx);
         });
@@ -2023,7 +2027,7 @@ impl SettingsPageMeta for EnvironmentsPageView {
     }
 
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        true
+        !ChannelState::is_local_only()
     }
 
     fn update_filter(&mut self, query: &str, ctx: &mut ViewContext<Self>) -> MatchData {

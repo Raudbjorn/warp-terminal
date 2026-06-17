@@ -12,6 +12,11 @@ use crate::channel::{Channel, ChannelState};
 use crate::server::server_api::ServerApi;
 
 pub async fn get_current_changelog(server_api: Arc<ServerApi>) -> Result<Option<Changelog>> {
+    if ChannelState::is_local_only() {
+        log::debug!("Skipping changelog fetch in local-only services mode");
+        return Ok(None);
+    }
+
     let rand: String = {
         let mut rng = thread_rng();
         iter::repeat(())

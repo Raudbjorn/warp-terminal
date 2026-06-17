@@ -1,3 +1,4 @@
+use crate::server::server_api::ai::WorkflowMetadataAIClient;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -147,7 +148,7 @@ pub struct WorkflowModal {
     pub(super) arguments_rows: Vec<ArgumentEditorRow>,
     show_unsaved_changes_dialog: bool,
     revision_ts: Option<Revision>,
-    pub(super) ai_client: Arc<dyn AIClient>,
+    pub(super) ai_client: Arc<dyn WorkflowMetadataAIClient>,
     pub(super) ai_metadata_assist_state: AiAssistState,
     breadcrumbs: Option<Vec<BreadcrumbState<ContainingObject>>>,
     /// ID of the breadcrumb space/folder a user clicked on before the unsaved dialog popped up
@@ -208,7 +209,7 @@ impl WorkflowEditorErrorState {
 }
 
 impl WorkflowModal {
-    pub fn new(ai_client: Arc<dyn AIClient>, ctx: &mut ViewContext<Self>) -> Self {
+    pub fn new(ai_client: Arc<dyn WorkflowMetadataAIClient>, ctx: &mut ViewContext<Self>) -> Self {
         let appearance = Appearance::as_ref(ctx);
         let header_font_size = appearance.header_font_size();
         let ui_font_family = appearance.ui_font_family();

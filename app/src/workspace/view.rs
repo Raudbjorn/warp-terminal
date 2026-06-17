@@ -22,6 +22,7 @@ mod vertical_tabs;
 #[cfg(target_family = "wasm")]
 mod wasm_view;
 
+use crate::server::server_api::ai::WorkflowMetadataAIClient;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -546,6 +547,31 @@ const PILL_FONT_SIZE: f32 = 12.;
 // We use the word "Warp" in the Update Ready button to make it obvious that the terminal is Warp.
 // This can lead to free advertising when users screen-share Warp when an update is available.
 const UPDATE_READY_TEXT: &str = "Update Warp";
+
+fn section_is_online_services_only(section: SettingsSection) -> bool {
+    matches!(
+        section,
+        SettingsSection::AI
+            | SettingsSection::MCPServers
+            | SettingsSection::WarpAgent
+            | SettingsSection::AgentProfiles
+            | SettingsSection::AgentMCPServers
+            | SettingsSection::Knowledge
+            | SettingsSection::ThirdPartyCLIAgents
+            | SettingsSection::BillingAndUsage
+            | SettingsSection::Teams
+            | SettingsSection::Referrals
+            | SettingsSection::SharedBlocks
+            | SettingsSection::CloudEnvironments
+            | SettingsSection::OzCloudAPIKeys
+            | SettingsSection::WarpDrive
+            | SettingsSection::Privacy
+    )
+}
+
+fn can_open_settings_section(section: Option<SettingsSection>) -> bool {
+    !ChannelState::is_local_only() || !section.is_some_and(section_is_online_services_only)
+}
 
 const TAB_BAR_OVERFLOW_MENU_WIDTH: f32 = 300.;
 
@@ -1773,7 +1799,7 @@ impl Workspace {
     }
 
     fn build_workflow_modal(
-        ai_client: Arc<dyn AIClient>,
+        ai_client: Arc<dyn WorkflowMetadataAIClient>,
         ctx: &mut ViewContext<Self>,
     ) -> ViewHandle<WorkflowModal> {
         let workflow_modal =
@@ -2389,7 +2415,8 @@ impl Workspace {
 
     pub(crate) fn show_session_config_modal(&mut self, ctx: &mut ViewContext<Self>) {
         // Configure the modal to hide Oz when AI is disabled.
-        let show_oz = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
+        let show_oz =
+            !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         self.session_config_modal.view.update(ctx, |modal, ctx| {
             modal.body().update(ctx, |body, ctx| {
                 body.configure(show_oz);
@@ -2731,6 +2758,8 @@ impl Workspace {
         let server_api_provider = ServerApiProvider::as_ref(ctx);
         let server_api = server_api_provider.get();
         let ai_client = server_api_provider.get_ai_client();
+        let command_generation_client = server_api_provider.get_command_generation_client();
+        let workflow_metadata_ai_client = server_api_provider.get_workflow_metadata_ai_client();
 
         // Inserting a (window, ModalSizes) pair to the ResizableData singleton. A restored window
         // reads the sizes from the window snapshot. A new window initializes with all default sizes.
@@ -2858,7 +2887,7 @@ impl Workspace {
 
         let auth_override_warning_modal = Self::build_auth_override_warning_modal(ctx);
 
-        let workflow_modal = Self::build_workflow_modal(ai_client.clone(), ctx);
+        let workflow_modal = Self::build_workflow_modal(workflow_metadata_ai_client, ctx);
 
         let theme_creator_modal = Self::build_theme_creator_modal(ctx);
 
@@ -2902,8 +2931,9 @@ impl Workspace {
         let rewind_confirmation_dialog = Self::build_rewind_confirmation_dialog(ctx);
         let delete_conversation_confirmation_dialog =
             Self::build_delete_conversation_confirmation_dialog(ctx);
-        let command_search_view =
-            ctx.add_typed_action_view(|ctx| CommandSearchView::new(ai_client.clone(), ctx));
+        let command_search_view = ctx.add_typed_action_view(|ctx| {
+            CommandSearchView::new(command_generation_client.clone(), ctx)
+        });
         ctx.subscribe_to_view(&command_search_view, |me, _, event, ctx| {
             me.handle_command_search_event(event, ctx);
         });
@@ -3034,6 +3064,7 @@ impl Workspace {
         // Show the Warp AI warm welcome iff the user hasn't dismissed it nor interacted with Warp AI before.
         // Also, avoid showing it in integration tests to prevent interaction with other tests.
         let mut should_show_ai_assistant_warm_welcome: bool = !FeatureFlag::AgentMode.is_enabled()
+            && !ChannelState::is_local_only()
             && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
             && !matches!(ChannelState::channel(), Channel::Integration)
             && ctx
@@ -5156,7 +5187,7 @@ impl Workspace {
             }
 
             // If the agent management view is open, we want to close it when we activate a new tab.
-            if FeatureFlag::AgentManagementView.is_enabled() {
+            if !ChannelState::is_local_only() && FeatureFlag::AgentManagementView.is_enabled() {
                 self.set_is_agent_management_view_open(false, ctx);
             }
 
@@ -5322,7 +5353,7 @@ impl Workspace {
 
         // If the agent management view is open, we want to close it when we change focus to rename a tab.
         // This function doesn't call `activate_tab_internal`, which is why we need the extra check here.
-        if FeatureFlag::AgentManagementView.is_enabled() {
+        if !ChannelState::is_local_only() && FeatureFlag::AgentManagementView.is_enabled() {
             self.set_is_agent_management_view_open(false, ctx);
         }
 
@@ -6378,7 +6409,8 @@ impl Workspace {
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let mut menu_items = vec![];
 
-        let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
+        let online_agent_ui_enabled =
+            !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         let ai_settings = AISettings::as_ref(ctx);
         let effective_default = ai_settings.default_session_mode(ctx);
         let default_tab_config_path = ai_settings.default_tab_config_path().to_string();
@@ -6387,7 +6419,7 @@ impl Workspace {
             keybinding_name_to_display_string("app:reopen_closed_session", ctx);
 
         // 1. Agent (if AI enabled)
-        if is_any_ai_enabled {
+        if online_agent_ui_enabled {
             let mut agent_item = MenuItemFields::new("Agent")
                 .with_on_select_action(WorkspaceAction::AddAgentTab)
                 .with_icon(icons::Icon::LayoutAlt01);
@@ -6454,7 +6486,7 @@ impl Workspace {
         }
 
         // 3. Cloud Agent (if flags enabled)
-        if is_any_ai_enabled
+        if online_agent_ui_enabled
             && FeatureFlag::AgentView.is_enabled()
             && FeatureFlag::CloudMode.is_enabled()
         {
@@ -16997,7 +17029,9 @@ impl Workspace {
                 );
             }
             DrivePanelEvent::OpenTeamSettingsPage => {
-                self.show_settings_with_section(Some(SettingsSection::Teams), ctx);
+                if !ChannelState::is_local_only() {
+                    self.show_settings_with_section(Some(SettingsSection::Teams), ctx);
+                }
             }
             DrivePanelEvent::OpenImportModal {
                 owner,
@@ -17489,7 +17523,9 @@ impl Workspace {
                         );
                     }
                     OpenWarpAI => {
-                        if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+                        if ChannelState::is_local_only()
+                            || !AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+                        {
                             return;
                         }
 
@@ -18019,9 +18055,14 @@ impl Workspace {
         &mut self,
         section: Option<SettingsSection>,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
+        if !can_open_settings_section(section) {
+            return false;
+        }
+
         self.close_all_overlays(ctx);
         self.open_settings_pane(section, None, ctx);
+        true
     }
 
     fn show_settings_with_search(
@@ -18029,9 +18070,14 @@ impl Workspace {
         search_query: &str,
         section: Option<SettingsSection>,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
+        if !can_open_settings_section(section) {
+            return false;
+        }
+
         self.close_all_overlays(ctx);
         self.open_settings_pane(section, Some(search_query), ctx);
+        true
     }
 
     /// Opens the team settings page and fills the invite field with the given email. This is used when linking directing to
@@ -18041,7 +18087,9 @@ impl Workspace {
         email_invite: Option<&String>,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.show_settings_with_section(Some(SettingsSection::Teams), ctx);
+        if !self.show_settings_with_section(Some(SettingsSection::Teams), ctx) {
+            return;
+        }
 
         self.settings_pane.update(ctx, |view, ctx| {
             view.open_teams_page_email_invite(email_invite, ctx);
@@ -18055,7 +18103,9 @@ impl Workspace {
         autoinstall_gallery_title: Option<&str>,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.show_settings_with_section(Some(SettingsSection::MCPServers), ctx);
+        if !self.show_settings_with_section(Some(SettingsSection::MCPServers), ctx) {
+            return;
+        }
 
         self.settings_pane.update(ctx, |view, ctx| {
             view.open_mcp_servers_page(page, autoinstall_gallery_title, ctx);
@@ -20434,6 +20484,7 @@ impl Workspace {
 
         // Legacy AI assistant button (non-agent-mode only)
         if is_online
+            && !ChannelState::is_local_only()
             && !FeatureFlag::AgentMode.is_enabled()
             && !is_web_anonymous_user
             && !self.current_workspace_state.is_ai_assistant_panel_open
@@ -20520,9 +20571,8 @@ impl Workspace {
             traffic_light_data
                 .as_ref()
                 .filter(|data| data.side == TrafficLightSide::Left)
-                .map(|data| data.width(zoom_factor))
+                .map(|data| data.width(zoom_factor) + 16.)
                 .unwrap_or(0.)
-                + 16.
         }
     }
 
@@ -20760,17 +20810,35 @@ impl Workspace {
             .username_for_display()
             .unwrap_or(DEFAULT_USER_DISPLAY_NAME.to_owned());
 
-        let avatar_content = if self.auth_state.is_anonymous_or_logged_out() {
-            AvatarContent::Icon(icons::Icon::Gear)
-        } else {
-            self.auth_state
-                .user_photo_url()
-                .map(|url| AvatarContent::Image {
-                    url,
-                    display_name: display_name.clone(),
-                })
-                .unwrap_or(AvatarContent::DisplayName(display_name.clone()))
-        };
+        if is_anonymous {
+            return SavePosition::new(
+                Align::new(
+                    self.render_tab_bar_icon_button(
+                        appearance,
+                        icons::Icon::Gear,
+                        &self.mouse_states.settings_icon,
+                        WorkspaceAction::ToggleUserMenu,
+                        "Settings".to_string(),
+                        None,
+                        false,
+                        false,
+                    )
+                    .finish(),
+                )
+                .finish(),
+                USER_AVATAR_BUTTON_POSITION_ID,
+            )
+            .finish();
+        }
+
+        let avatar_content = self
+            .auth_state
+            .user_photo_url()
+            .map(|url| AvatarContent::Image {
+                url,
+                display_name: display_name.clone(),
+            })
+            .unwrap_or(AvatarContent::DisplayName(display_name.clone()));
 
         let mut avatar = Avatar::new(
             avatar_content,
@@ -20815,7 +20883,7 @@ impl Workspace {
                     container = container.with_background(appearance.theme().surface_2());
                 }
                 // On hover, show tooltip of user's display name (if it exists)
-                if !self.is_user_menu_open && !is_anonymous {
+                if !self.is_user_menu_open {
                     stack.add_positioned_overlay_child(
                         appearance
                             .ui_builder()
@@ -21215,7 +21283,8 @@ impl Workspace {
     ) -> Box<dyn Element> {
         let active_tab_data = &self.tabs[self.active_tab_index];
 
-        let active_content = if FeatureFlag::AgentManagementView.is_enabled()
+        let active_content = if !ChannelState::is_local_only()
+            && FeatureFlag::AgentManagementView.is_enabled()
             && self.current_workspace_state.is_agent_management_view_open
         {
             ChildView::new(&self.agent_management_view).finish()
@@ -22870,6 +22939,7 @@ impl Workspace {
             views.push(ToolPanelView::ProjectExplorer);
         }
         if FeatureFlag::AgentViewConversationListView.is_enabled()
+            && !ChannelState::is_local_only()
             && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
             && *AISettings::as_ref(ctx).show_conversation_history
         {
@@ -23110,8 +23180,16 @@ impl TypedActionView for Workspace {
                 self.add_tab_with_shell(shell.clone(), *source, ctx)
             }
             AddGetStartedTab => self.add_get_started_tab(ctx),
-            AddAmbientAgentTab => self.add_ambient_agent_tab(ctx),
-            AddAgentTab => self.add_terminal_tab_with_new_agent_view(ctx),
+            AddAmbientAgentTab => {
+                if !ChannelState::is_local_only() {
+                    self.add_ambient_agent_tab(ctx);
+                }
+            }
+            AddAgentTab => {
+                if !ChannelState::is_local_only() {
+                    self.add_terminal_tab_with_new_agent_view(ctx);
+                }
+            }
             AddDockerSandboxTab => self.add_docker_sandbox_tab(ctx),
             StartAgentOnboardingTutorial(tutorial) => {
                 self.start_agent_onboarding_tutorial(tutorial.clone(), ctx)
@@ -23382,11 +23460,15 @@ impl TypedActionView for Workspace {
                 self.show_keyboard_settings(keybinding_name.as_deref(), ctx)
             }
             ShowSettings => self.show_settings(ctx),
-            ShowSettingsPage(section) => self.show_settings_with_section(Some(*section), ctx),
+            ShowSettingsPage(section) => {
+                self.show_settings_with_section(Some(*section), ctx);
+            }
             ShowSettingsPageWithSearch {
                 search_query,
                 section,
-            } => self.show_settings_with_search(search_query, *section, ctx),
+            } => {
+                self.show_settings_with_search(search_query, *section, ctx);
+            }
             ShowThemeChooser(mode) => self.show_theme_chooser(Some(*mode), ctx),
             ShowThemeChooserForActiveTheme => self.show_theme_chooser_for_active_theme(ctx),
             IncreaseFontSize => self.increase_font_size(ctx),

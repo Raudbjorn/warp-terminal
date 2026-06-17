@@ -58,6 +58,12 @@ pub enum GeneratedCommandMetadataError {
     AiProviderError,
     /// User is over rate limit.
     RateLimited,
+    /// The local OpenAI-compatible provider is not configured.
+    LocalProviderNotConfigured,
+    /// The local OpenAI-compatible provider request failed.
+    LocalProviderError,
+    /// The local OpenAI-compatible provider returned an unparsable response.
+    LocalProviderInvalidResponse,
     Other,
 }
 
@@ -69,6 +75,15 @@ impl GeneratedCommandMetadataError {
             }
             Self::AiProviderError => "Something went wrong. Please try again.",
             Self::RateLimited => "Looks like you're out of AI credits. Please try again later.",
+            Self::LocalProviderNotConfigured => {
+                "Configure a local OpenAI-compatible model to use AI autofill."
+            }
+            Self::LocalProviderError => {
+                "Could not reach the configured local AI provider. Check the endpoint and model."
+            }
+            Self::LocalProviderInvalidResponse => {
+                "The local AI provider returned a response Warp could not parse."
+            }
             Self::Other => "Something went wrong. Please try again.",
         }
         .to_string()

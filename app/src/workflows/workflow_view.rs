@@ -1,3 +1,4 @@
+use crate::server::server_api::ai::WorkflowMetadataAIClient;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -310,7 +311,7 @@ pub struct WorkflowView {
     pub(super) ai_metadata_assist_state: AiAssistState,
     revision_ts: Option<Revision>,
     pub(super) auth_state: Arc<AuthState>,
-    pub(super) ai_client: Arc<dyn AIClient>,
+    pub(super) ai_client: Arc<dyn WorkflowMetadataAIClient>,
     owner: Option<Owner>,
     initial_folder_id: Option<SyncId>,
 
@@ -405,7 +406,7 @@ impl WorkflowView {
             me.handle_content_editor_event(event, ctx);
         });
 
-        let ai_client = ServerApiProvider::as_ref(ctx).get_ai_client();
+        let ai_client = ServerApiProvider::as_ref(ctx).get_workflow_metadata_ai_client();
 
         let enum_creation_dialog = ctx.add_typed_action_view(EnumCreationDialog::new);
         ctx.subscribe_to_view(&enum_creation_dialog, |me, _, event, ctx| {

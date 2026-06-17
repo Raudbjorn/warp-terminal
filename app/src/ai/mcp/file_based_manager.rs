@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -32,6 +33,10 @@ pub struct FileBasedMCPManager {
 
 impl FileBasedMCPManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        if ChannelState::is_local_only() {
+            return Self::default();
+        }
+
         if FeatureFlag::FileBasedMcp.is_enabled() {
             ctx.subscribe_to_model(&FileMCPWatcher::handle(ctx), |me, event, ctx| {
                 me.handle_watcher_event(event, ctx);
