@@ -7767,11 +7767,11 @@ impl ApiKeysWidget {
         // A helper macro to create and configure an API key editor.  This avoids a lot
         // of code duplication and ensures consistency between the editors.
         macro_rules! create_api_key_editor {
-            ($editor:ident, $key:ident, $set_func:ident, $placeholder:literal) => {
+            ($editor:ident, $key:ident, $set_func:ident, $placeholder:literal, $is_password:literal) => {
                 let $editor = ctx.add_typed_action_view(move |ctx| {
                     let appearance = Appearance::handle(ctx).as_ref(ctx);
                     let options = SingleLineEditorOptions {
-                        is_password: true,
+                        is_password: $is_password,
                         text: TextOptions {
                             font_size_override: Some(appearance.ui_font_size()),
                             font_family_override: Some(appearance.monospace_font_family()),
@@ -8219,8 +8219,9 @@ impl ApiKeysWidget {
                     });
                 }
                 ctx.notify();
-            });
-        }
+            }
+        });
+
         {
             let openai_editor = openai_api_key_editor.clone();
             let anthropic_editor = anthropic_api_key_editor.clone();

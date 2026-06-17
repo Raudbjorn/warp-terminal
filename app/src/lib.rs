@@ -1393,7 +1393,7 @@ pub(crate) fn initialize_app(
             );
         });
         let openai_key = ::ai::api_keys::ApiKeyManager::as_ref(ctx)
-            .openai_key_for_profile(::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY);
+        .openai_key_for_profile(::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY);
         manager.update_provider_config(openai_key, ctx);
         ctx.subscribe_to_model(
             &::ai::api_keys::ApiKeyManager::handle(ctx),
@@ -1403,10 +1403,8 @@ pub(crate) fn initialize_app(
                         .openai_key_for_profile(::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY);
                     manager.update_provider_config(openai_key, ctx);
                 }
-            });
-            let allowed = UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
-            manager.set_grok_refresh_allowed(allowed, ctx);
-        }
+            },
+        );
         manager
     });
 

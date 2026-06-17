@@ -14,6 +14,11 @@ pub const SLIPSTREAM_REMOTE_SERVER_ASSET_PREFIX: &str = "slipstream-remote-serve
 pub const DOWNLOAD_CHANNEL_STABLE: &str = "stable";
 pub const DOWNLOAD_CHANNEL_PREVIEW: &str = "preview";
 pub const DOWNLOAD_CHANNEL_DEV: &str = "dev";
+/// Global, version-independent directory name where the remote server's
+/// `resources/` tree (bundled skills, settings schema) is installed.
+/// Substituted into [`install_script_with_options`] for the
+/// `{bundled_resources_dir_name}` placeholder.
+pub const BUNDLED_RESOURCES_DIR_NAME: &str = "bundled_resources";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InstallScriptOptions {

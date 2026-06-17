@@ -369,6 +369,7 @@ dependencies = [
  "tokio",
  "typed-path 0.10.0",
  "unicode-width 0.1.14",
+ "url",
  "uuid",
  "virtual-fs",
  "warp_core",
@@ -7586,6 +7587,34 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.17",
  "uuid",
+]
+
+[[package]]
+name = "local_multi_agent_service"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "diesel",
+ "futures",
+ "futures-util",
+ "http 1.4.0",
+ "log",
+ "prost",
+ "prost-types",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "tokio",
+ "tower",
+ "uuid",
+ "warp_multi_agent_api",
 ]
 
 [[package]]
@@ -15197,7 +15226,7 @@ dependencies = [
 [[package]]
 name = "warp_multi_agent_api"
 version = "0.0.0"
-source = "git+https://github.com/warpdotdev/warp-proto-apis.git?rev=97d1b367b955c562812e0a1315a6ec7ee6a5389e#97d1b367b955c562812e0a1315a6ec7ee6a5389e"
+source = "git+https://github.com/warpdotdev/warp-proto-apis.git?rev=c67de64fc4949f693a679552dc88cebc9f7d0180#c67de64fc4949f693a679552dc88cebc9f7d0180"
 dependencies = [
  "prost",
  "prost-reflect",

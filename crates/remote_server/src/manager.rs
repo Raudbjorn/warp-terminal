@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(not(target_family = "wasm"))]
 use std::time::Duration;
@@ -9,6 +10,7 @@ use repo_metadata::RepoMetadataUpdate;
 use serde::Serialize;
 #[cfg(not(target_family = "wasm"))]
 use warp_core::channel::ChannelState;
+use warp_core::channel::Channel;
 use warp_core::SessionId;
 use warp_util::remote_path::{RemoteNavigationResult, RemotePath};
 use warp_util::standardized_path::StandardizedPath;
@@ -39,7 +41,7 @@ use crate::setup::UnsupportedReason;
 use crate::setup::{PreinstallCheckResult, RemotePlatform, RemoteServerSetupState};
 #[cfg(not(target_family = "wasm"))]
 use crate::transport::Connection;
-use crate::transport::{BinaryCheckStatus, Error, InstallSource, RemoteTransport};
+use crate::transport::{BinaryCheckStatus, ControlPath, Error, InstallSource, RemoteTransport};
 use crate::HostId;
 
 /// Maximum number of reconnection attempts after a spontaneous disconnect.
@@ -2619,7 +2621,7 @@ impl RemoteServerManager {
     #[cfg(not(target_family = "wasm"))]
     pub fn control_path_for_session(&self, session_id: SessionId) -> Option<PathBuf> {
         match self.sessions.get(&session_id) {
-            Some(RemoteSessionState::Connected { control_path, .. }) => control_path.clone(),
+            Some(RemoteSessionState::Connected { control_path, .. }) => control_path.as_path(),
             _ => None,
         }
     }
