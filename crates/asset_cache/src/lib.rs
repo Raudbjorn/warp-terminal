@@ -138,6 +138,7 @@ mod tests {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 async fn persist_bytes(bytes: &Bytes, file: &Path) {
     use async_fs::{OpenOptions, create_dir_all};
     use futures::AsyncWriteExt;
