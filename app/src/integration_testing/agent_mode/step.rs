@@ -26,8 +26,16 @@ use super::hydrate_ai_conversation_assertion;
 
 /// Assumes that the terminal input is currently not in AI input mode.
 pub fn enter_agent_view() -> TestStep {
+    // The fixed binding that opens the fullscreen Agent View is `cmd-enter` on
+    // macOS and `ctrl-shift-enter` on Linux/Windows (see `CMD_ENTER_KEYBINDING`
+    // and the `StartNewAgentConversation` binding in `terminal/view/init.rs`).
+    let enter_agent_view_keystroke = if cfg!(target_os = "macos") {
+        "cmd-enter"
+    } else {
+        "ctrl-shift-enter"
+    };
     new_step_with_default_assertions("Enter Agent View")
-        .with_keystrokes(&["ctrl-shift-enter"])
+        .with_keystrokes(&[enter_agent_view_keystroke])
         .add_named_assertion(
             "Assert that we are in Agent View and AI input mode",
             move |app, window_id| {
