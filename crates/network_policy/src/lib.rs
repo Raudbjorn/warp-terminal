@@ -86,6 +86,12 @@ fn is_guarded_scheme(scheme: &str) -> bool {
 }
 
 fn is_loopback_url(url: &Url) -> bool {
+    // Use the url crate's Host enum rather than manual string parsing
+    // of the host. The url crate already parses IPv4 and IPv6 into
+    // standard library types with proper is_loopback() semantics,
+    // including the bracketed IPv6 form (e.g. [::1]) which the
+    // previous string-strip code happened to handle but only by
+    // accident.
     match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
