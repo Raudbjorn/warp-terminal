@@ -100,6 +100,10 @@ fn leaked_stub_server() -> &'static mut mockito::ServerGuard {
 /// passive flow has its own dedicated test.
 fn builder_routing_to(server_url: &str) -> Builder {
     FeatureFlag::CustomInferenceEndpoints.set_enabled(true);
+    // The fullscreen Agent View entered by `enter_agent_view()` is gated behind
+    // this flag; without it the `StartNewAgentConversation` binding (cmd-enter /
+    // ctrl-shift-enter) isn't registered and the view never opens.
+    FeatureFlag::AgentView.set_enabled(true);
 
     new_builder()
         .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
