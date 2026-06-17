@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, Setting, SupportedPlatforms, SyncToCloud};
 use warpui::{AppContext, SingletonEntity};
@@ -103,6 +104,10 @@ define_settings_group!(SafeModeSettings, settings: [
 
 /// Returns whether the rendering should obfuscate secrets given the current safe mode settings.
 pub fn get_secret_obfuscation_mode(app: &AppContext) -> ObfuscateSecrets {
+    if ChannelState::is_local_only() {
+        return ObfuscateSecrets::No;
+    }
+
     let safe_mode_settings = SafeModeSettings::as_ref(app);
     let is_enterprise_secret_redaction_enabled =
         UserWorkspaces::as_ref(app).is_enterprise_secret_redaction_enabled();

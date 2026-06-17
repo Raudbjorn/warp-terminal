@@ -104,6 +104,10 @@ lazy_static! {
 }
 
 pub fn fallback_font_fn(ch: char) -> Option<ExternalFontFamily> {
+    if ChannelState::is_local_only() {
+        return None;
+    }
+
     match ch {
         '\u{007F}'..='\u{007F}'
         | '\u{21EA}'..='\u{21EA}'

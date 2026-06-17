@@ -4,6 +4,7 @@ mod search_item;
 pub(super) mod view;
 
 #[cfg(feature = "local_fs")]
+use warp_core::channel::ChannelState;
 use std::path::PathBuf;
 
 use ai::skills::SkillReference;
@@ -403,6 +404,9 @@ impl Input {
             agent_or_new
                 if command.name == commands::NEW.name || command.name == commands::AGENT.name =>
             {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 if !self
                     .ai_context_model
                     .as_ref(ctx)
@@ -456,6 +460,9 @@ impl Input {
                 });
             }
             cloud_agent if command.name == commands::CLOUD_AGENT.name => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 let prompt = argument.and_then(|argument| {
                     let trimmed = argument.trim();
                     if trimmed.is_empty() {
@@ -568,6 +575,9 @@ impl Input {
                 ctx.dispatch_typed_action(&WorkspaceAction::SetActiveTabColor(color));
             }
             create_env if command.name == commands::CREATE_ENVIRONMENT.name => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 // If the user included args after the slash command, treat them as repo paths/URLs.
                 let repos = argument
                     .map(|arg| {
@@ -581,6 +591,9 @@ impl Input {
                 ctx.emit(Event::TriggerEnvironmentSetup { repos });
             }
             create_project if command.name == commands::CREATE_NEW_PROJECT.name => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 if argument.is_none_or(|args| args.is_empty()) {
                     show_error_toast(
                         "Please describe the project you want to create after /create-new-project"
@@ -726,12 +739,15 @@ impl Input {
                 ctx.dispatch_typed_action(&TerminalAction::InitProject);
             }
             changelog if command.name == commands::CHANGELOG.name => {
-                if !FeatureFlag::Changelog.is_enabled() {
+                if ChannelState::is_local_only() || !FeatureFlag::Changelog.is_enabled() {
                     return false;
                 }
                 ctx.dispatch_typed_action(&WorkspaceAction::ViewLatestChangelog);
             }
             feedback if command.name == commands::FEEDBACK.name => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 ctx.dispatch_typed_action(&WorkspaceAction::SendFeedback);
             }
             open_code_review if command.name == commands::OPEN_CODE_REVIEW.name => {

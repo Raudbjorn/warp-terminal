@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
@@ -910,6 +911,10 @@ impl SettingsPageMeta for PlatformPageView {
     }
 
     fn should_render(&self, ctx: &AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            return false;
+        }
+
         let is_anonymous = AuthStateProvider::as_ref(ctx)
             .get()
             .is_anonymous_or_logged_out();
@@ -918,6 +923,9 @@ impl SettingsPageMeta for PlatformPageView {
     }
 
     fn on_page_selected(&mut self, _allow_steal_focus: bool, ctx: &mut ViewContext<Self>) {
+        if ChannelState::is_local_only() {
+            return;
+        }
         // Always fetch/refresh API keys when page is selected to keep data fresh
         self.fetch_api_keys(ctx);
     }

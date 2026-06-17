@@ -1404,8 +1404,10 @@ pub(crate) fn initialize_app(
     }
     // Send buffered pre-init errors to Sentry now that the client is ready.
     #[cfg(feature = "crash_reporting")]
-    for err in _pre_sentry_errors {
-        sentry::integrations::anyhow::capture_anyhow(&err);
+    if is_crash_reporting_enabled {
+        for err in _pre_sentry_errors {
+            sentry::integrations::anyhow::capture_anyhow(&err);
+        }
     }
     timer.mark_interval_end("INIT_CRASH_REPORTING");
 
@@ -1413,7 +1415,9 @@ pub(crate) fn initialize_app(
         autoupdate::check_and_report_update_errors(ctx);
     }
 
-    ctx.set_fallback_font_source_provider(|url| ::asset_cache::url_source(url));
+    if !ChannelState::is_local_only() {
+        ctx.set_fallback_font_source_provider(|url| ::asset_cache::url_source(url));
+    }
 
     ctx.set_default_binding_validator(is_binding_cross_platform);
 
@@ -2583,7 +2587,9 @@ fn launch(ctx: &mut warpui::AppContext, app_state: Option<AppState>, launch_mode
 
     // For now, we only specify application-level fallback fonts on web.
     #[cfg(target_family = "wasm")]
-    ctx.set_fallback_font_fn(font_fallback::fallback_font_fn);
+    if !ChannelState::is_local_only() {
+        ctx.set_fallback_font_fn(font_fallback::fallback_font_fn);
+    }
 
     match launch_mode {
         LaunchMode::App { .. } | LaunchMode::Test { .. } => {

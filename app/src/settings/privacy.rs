@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::fmt::Display;
 use std::sync::Arc;
 
@@ -501,7 +502,7 @@ impl PrivacySettings {
                     .set_value(new_value, ctx);
             });
 
-            if self.auth_state.is_logged_in() {
+            if self.auth_state.is_logged_in() && !ChannelState::is_local_only() {
                 let auth_client = self.auth_client.clone();
                 let _ = ctx.spawn(
                     async move { auth_client.set_is_crash_reporting_enabled(new_value).await },
@@ -535,7 +536,7 @@ impl PrivacySettings {
                 let _ = settings.is_telemetry_enabled.set_value(new_value, ctx);
             });
 
-            if self.auth_state.is_logged_in() {
+            if self.auth_state.is_logged_in() && !ChannelState::is_local_only() {
                 let auth_client = self.auth_client.clone();
                 let _ = ctx.spawn(
                     async move { auth_client.set_is_telemetry_enabled(new_value).await },

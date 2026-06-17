@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 use warp_core::report_if_error;
 use warp_core::settings::ToggleableSetting as _;
@@ -117,7 +118,7 @@ impl SettingsPageMeta for WarpDriveSettingsPageView {
     }
 
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
+        !ChannelState::is_local_only() && FeatureFlag::OpenWarpNewSettingsModes.is_enabled()
     }
 
     fn update_filter(&mut self, query: &str, ctx: &mut ViewContext<Self>) -> MatchData {

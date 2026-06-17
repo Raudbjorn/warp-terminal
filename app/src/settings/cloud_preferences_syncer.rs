@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,6 +67,10 @@ pub fn initialize_cloud_preferences_syncer(
     startup_toml_parse_error: Option<&str>,
     ctx: &mut ModelContext<CloudPreferencesSyncer>,
 ) -> CloudPreferencesSyncer {
+    if ChannelState::is_local_only() {
+        return CloudPreferencesSyncer::new_local_only(toml_file_path);
+    }
+
     let current_hash = TomlBackedUserPreferences::file_content_hash(&toml_file_path);
     let stored_hash = ctx
         .private_user_preferences()
@@ -187,10 +192,26 @@ impl CloudPreferencesSyncer {
         toml_file_path: PathBuf,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
+        if ChannelState::is_local_only() {
+            return Self::new_local_only(toml_file_path);
+        }
+
         let mut me = Self::new_internal(ctx, Arc::new(DefaultClientIdProvider), toml_file_path);
         me.force_local_wins_on_startup = force_local_wins_on_startup;
         me.retry_failed_settings(ctx);
         me
+    }
+
+    fn new_local_only(toml_file_path: PathBuf) -> Self {
+        let (update_tx, _) = async_channel::unbounded();
+        Self {
+            update_tx,
+            dirty_local_prefs: HashSet::new(),
+            client_id_provider: Arc::new(DefaultClientIdProvider),
+            has_completed_initial_load: true,
+            force_local_wins_on_startup: false,
+            toml_file_path,
+        }
     }
 
     fn new_internal(
@@ -393,6 +414,10 @@ impl CloudPreferencesSyncer {
         auth_state: Arc<AuthState>,
         ctx: &mut ModelContext<Self>,
     ) {
+        if ChannelState::is_local_only() {
+            return;
+        }
+
         let is_onboarded = auth_state.is_onboarded();
 
         // Reset the initial load flag so that we re-evaluate sync direction
@@ -440,6 +465,10 @@ impl CloudPreferencesSyncer {
         force_cloud_to_match_local: ForceCloudToMatchLocal,
         ctx: &mut ModelContext<Self>,
     ) {
+        if ChannelState::is_local_only() {
+            return;
+        }
+
         let update_manager = UpdateManager::as_ref(ctx);
 
         // We wait for the cloud objects to load because we need to know if there are any cloud preferences
@@ -633,6 +662,10 @@ impl CloudPreferencesSyncer {
         keys_to_sync: Vec<String>,
         ctx: &mut ModelContext<Self>,
     ) {
+        if ChannelState::is_local_only() {
+            return;
+        }
+
         if !AppExecutionMode::as_ref(ctx).can_sync_preferences() {
             // Early exit if the app can't sync preferences.
             return;

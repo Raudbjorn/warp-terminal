@@ -1,3 +1,4 @@
+use crate::server::server_api::ai::CommandGenerationClient;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
@@ -120,7 +121,7 @@ pub struct CommandSearchView {
     handle: WeakViewHandle<Self>,
     menu_positioning: MenuPositioning,
     auth_state: Arc<AuthState>,
-    ai_client: Arc<dyn AIClient>,
+    ai_client: Arc<dyn CommandGenerationClient>,
     state: CommandSearchViewState,
     visible_results_range_sender: Sender<Range<usize>>,
     resizable_state_handle: ResizableStateHandle,
@@ -131,7 +132,7 @@ pub struct CommandSearchView {
 }
 
 impl CommandSearchView {
-    pub fn new(ai_client: Arc<dyn AIClient>, ctx: &mut ViewContext<Self>) -> Self {
+    pub fn new(ai_client: Arc<dyn CommandGenerationClient>, ctx: &mut ViewContext<Self>) -> Self {
         let search_bar_state =
             ctx.add_model(|_| SearchBarState::new(SearchResultOrdering::BottomUp));
 
@@ -227,7 +228,7 @@ impl CommandSearchView {
             // Add data sources in lowest->highest priority order.  If results from two
             // data sources produce the same ranking score, the data source added first
             // will show up higher in the list (i.e.: further away from the input).
-            if AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+            if AISettings::as_ref(ctx).is_ai_command_search_enabled(ctx) {
                 mixer.add_sync_source(
                     WarpAIDataSource::new(self.ai_client.clone(), None),
                     HashSet::from([QueryFilter::NaturalLanguage]),

@@ -611,6 +611,10 @@ impl SettingsPageMeta for ShowBlocksView {
     }
 
     fn should_render(&self, ctx: &AppContext) -> bool {
+        if crate::channel::ChannelState::is_local_only() {
+            return false;
+        }
+
         let is_anonymous = AuthStateProvider::as_ref(ctx)
             .get()
             .is_anonymous_or_logged_out();
@@ -619,6 +623,9 @@ impl SettingsPageMeta for ShowBlocksView {
     }
 
     fn on_page_selected(&mut self, _: bool, ctx: &mut ViewContext<Self>) {
+        if crate::channel::ChannelState::is_local_only() {
+            return;
+        }
         self.load_blocks(ctx);
     }
 

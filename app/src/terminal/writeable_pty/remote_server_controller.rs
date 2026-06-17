@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -310,6 +311,15 @@ impl<T: EventLoopSender> RemoteServerController<T> {
                 });
             }
             Ok(false) => {
+                if ChannelState::is_local_only() {
+                    log::info!(
+                        "Remote server binary is not installed for {session_id:?}; \
+                         skipping Warp-managed install in local-only services mode"
+                    );
+                    self.flush_stashed_bootstrap(session_info, ctx);
+                    return;
+                }
+
                 let install_mode = *WarpifySettings::as_ref(ctx)
                     .ssh_extension_install_mode
                     .value();
@@ -354,6 +364,15 @@ impl<T: EventLoopSender> RemoteServerController<T> {
         session_id: SessionId,
         ctx: &mut ModelContext<Self>,
     ) {
+        if ChannelState::is_local_only() {
+            log::info!(
+                "Ignoring remote server install request for {session_id:?} \
+                 in local-only services mode"
+            );
+            self.handle_ssh_remote_server_skip(session_id, ctx);
+            return;
+        }
+
         let SshInitState::AwaitingUserChoice { .. } = self.state else {
             log::warn!(
                 "Remote server install requested in unexpected state: session={session_id:?}"

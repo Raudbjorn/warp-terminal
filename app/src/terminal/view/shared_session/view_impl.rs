@@ -1,5 +1,6 @@
 //! [`TerminalView`]-specific implementation for shared sessions.
 
+use warp_core::channel::ChannelState;
 use chrono::{DateTime, Local};
 use itertools::Itertools;
 use session_sharing_protocol::common::{
@@ -68,6 +69,10 @@ use crate::terminal::view::{
 use crate::terminal::TerminalModel;
 use crate::view_components::{DismissibleToast, ToastFlavor};
 use crate::{send_telemetry_from_ctx, TelemetryEvent};
+
+fn shared_sessions_allowed_by_channel() -> bool {
+    !ChannelState::is_local_only()
+}
 
 impl TerminalView {
     pub fn sharer_session_kind(&self) -> Option<&Kind> {
@@ -322,6 +327,9 @@ impl TerminalView {
         role: Option<Role>,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !shared_sessions_allowed_by_channel() {
+            return;
+        }
         ctx.emit(Event::UpdateSessionLinkPermissions { role });
     }
 
@@ -331,6 +339,9 @@ impl TerminalView {
         team_uid: String,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !shared_sessions_allowed_by_channel() {
+            return;
+        }
         ctx.emit(Event::UpdateSessionTeamPermissions { role, team_uid });
     }
 
@@ -487,6 +498,10 @@ impl TerminalView {
         open_source: SharedSessionActionSource,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !shared_sessions_allowed_by_channel() {
+            return;
+        }
+
         if !matches!(
             open_source,
             SharedSessionActionSource::BlocklistContextMenu { .. }
@@ -539,6 +554,11 @@ impl TerminalView {
         bypass_conversation_guard: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !shared_sessions_allowed_by_channel() {
+            log::debug!("Ignoring shared session start in local-only services mode");
+            return;
+        }
+
         // We should only be attempting to share a session
         // if it is bootstrapped.
         //
@@ -1406,6 +1426,10 @@ impl TerminalView {
     }
 
     pub fn request_shared_session_role(&mut self, role: Role, ctx: &mut ViewContext<Self>) {
+        if !shared_sessions_allowed_by_channel() {
+            return;
+        }
+
         if let Some(old_role) = self
             .shared_session_presence_manager()
             .as_ref()
@@ -1430,6 +1454,10 @@ impl TerminalView {
         source: SharedSessionActionSource,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !shared_sessions_allowed_by_channel() {
+            return;
+        }
+
         #[cfg(target_family = "wasm")]
         {
             let manager = Manager::as_ref(ctx);
@@ -1463,6 +1491,10 @@ impl TerminalView {
         role_request_id: RoleRequestId,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !shared_sessions_allowed_by_channel() {
+            return;
+        }
+
         ctx.emit(Event::CancelRoleRequest(role_request_id));
         if let Some(viewer) = self.shared_session_viewer_mut() {
             viewer.pending_role_request = false;
@@ -1476,6 +1508,10 @@ impl TerminalView {
         response: RoleRequestResponse,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !shared_sessions_allowed_by_channel() {
+            return;
+        }
+
         let Some(presence_manager) = &self.shared_session_presence_manager() else {
             return;
         };
@@ -1546,6 +1582,10 @@ impl TerminalView {
         source: SharedSessionActionSource,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !shared_sessions_allowed_by_channel() {
+            return;
+        }
+
         let manager = Manager::as_ref(ctx);
         let Some(session_id) = manager
             .session_id(&ctx.view_id())

@@ -1,3 +1,5 @@
+use crate::server::server_api::ai::CommandGenerationClient;
+use warp_core::channel::ChannelState;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -31,11 +33,15 @@ use crate::workflows::{AIWorkflowOrigin, WorkflowSource, WorkflowType};
 
 const OPEN_WARP_AI_ITEM_BODY_TEXT: &str = "Ask Warp AI for command suggestions";
 const TRANSLATE_WITH_WARP_AI_ITEM_BODY_TEXT: &str = "Translate into shell command using Warp AI";
+const TRANSLATE_WITH_LOCAL_AI_ITEM_BODY_TEXT: &str = "Generate command suggestions with Local AI";
 
 #[derive(Clone, Debug)]
 pub enum WarpAISearchItem {
     /// Translates the query within command search.
     Translate,
+
+    /// Translates the query within command search using the local AI provider.
+    TranslateLocal,
 
     /// Opens WarpAI with the query.
     Open,
@@ -45,6 +51,7 @@ impl WarpAISearchItem {
     fn item_body_text(&self) -> &'static str {
         match self {
             WarpAISearchItem::Translate => TRANSLATE_WITH_WARP_AI_ITEM_BODY_TEXT,
+            WarpAISearchItem::TranslateLocal => TRANSLATE_WITH_LOCAL_AI_ITEM_BODY_TEXT,
             WarpAISearchItem::Open => OPEN_WARP_AI_ITEM_BODY_TEXT,
         }
     }
@@ -120,20 +127,24 @@ impl SearchItem for WarpAISearchItem {
 
     fn accept_result(&self) -> CommandSearchItemAction {
         match self {
-            WarpAISearchItem::Translate => CommandSearchItemAction::TranslateUsingWarpAI,
+            WarpAISearchItem::Translate | WarpAISearchItem::TranslateLocal => {
+                CommandSearchItemAction::TranslateUsingWarpAI
+            }
             WarpAISearchItem::Open => CommandSearchItemAction::OpenWarpAI,
         }
     }
 
     fn execute_result(&self) -> CommandSearchItemAction {
         match self {
-            WarpAISearchItem::Translate => CommandSearchItemAction::TranslateUsingWarpAI,
+            WarpAISearchItem::Translate | WarpAISearchItem::TranslateLocal => {
+                CommandSearchItemAction::TranslateUsingWarpAI
+            }
             WarpAISearchItem::Open => CommandSearchItemAction::OpenWarpAI,
         }
     }
 
     fn accessibility_label(&self) -> String {
-        format!("Warp AI: {}", self.item_body_text())
+        format!("AI command search: {}", self.item_body_text())
     }
 }
 
@@ -145,13 +156,13 @@ impl SearchItem for WarpAISearchItem {
 /// and once as an async source. That way, the mixer will treat these as two separate
 /// data sources.
 pub struct WarpAIDataSource {
-    ai_client: Arc<dyn AIClient>,
+    ai_client: Arc<dyn CommandGenerationClient>,
     ai_execution_context: Option<WarpAiExecutionContext>,
 }
 
 impl WarpAIDataSource {
     pub fn new(
-        ai_client: Arc<dyn AIClient>,
+        ai_client: Arc<dyn CommandGenerationClient>,
         ai_execution_context: Option<WarpAiExecutionContext>,
     ) -> Self {
         Self {
@@ -169,6 +180,13 @@ impl SyncDataSource for WarpAIDataSource {
         query: &Query,
         _app: &AppContext,
     ) -> Result<Vec<QueryResult<Self::Action>>, DataSourceRunErrorWrapper> {
+        if ChannelState::is_local_only() {
+            if query.filters.is_empty() {
+                return Ok(vec![WarpAISearchItem::TranslateLocal.into()]);
+            }
+            return Ok(Vec::new());
+        }
+
         if query.filters.is_empty() {
             Ok(vec![WarpAISearchItem::Translate.into()])
         } else {
@@ -238,6 +256,15 @@ impl DataSourceRunError for GenerateCommandsFromNaturalLanguageError {
             Self::BadPrompt => "No results found. Please try again with a more specific query.",
             Self::AiProviderError => "Something went wrong. Please try again.",
             Self::RateLimited => "Looks like you're out of AI credits. Please try again later.",
+            Self::LocalProviderNotConfigured => {
+                "Configure a local OpenAI-compatible model to generate commands."
+            }
+            Self::LocalProviderError => {
+                "Could not reach the configured local AI provider. Check the endpoint and model."
+            }
+            Self::LocalProviderInvalidResponse => {
+                "The local AI provider returned a response Warp could not parse."
+            }
             Self::Other => "Something went wrong. Please try again.",
         }
         .to_string()
