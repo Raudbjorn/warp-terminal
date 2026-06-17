@@ -130,7 +130,11 @@ fn main() -> Result<()> {
         let cargo_full_profile = env::var("CARGO_FULL_PROFILE").unwrap_or(String::from("debug"));
         let target_dir =
             app_target_dir(&cargo_full_profile).expect("Could not get app target directory");
-        copy_windows_assets(&target_dir);
+        // Windows console assets (OpenConsole/dxcompiler/conpty) only apply to Windows
+        // targets; skip on other targets so the bundled binaries aren't required.
+        if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+            copy_windows_assets(&target_dir);
+        }
 
         #[cfg(windows)]
         embed_resource_file(&target_dir);
