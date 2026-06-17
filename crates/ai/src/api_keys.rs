@@ -179,6 +179,8 @@ impl ApiKeyManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
         let is_local_only = ChannelState::is_local_only();
         let keys = if is_local_only {
+            // Local-only mode starts with empty keys for BYOK (Bring Your Own Key).
+            // Users configure their own API keys via the UI as needed.
             ApiKeys::default()
         } else {
             Self::load_keys_from_secure_storage(ctx)
