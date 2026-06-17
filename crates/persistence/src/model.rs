@@ -589,6 +589,8 @@ pub const AMBIENT_AGENT_PANE_KIND: &str = "ambient_agent";
 /// The [`pane_leaves::kind`] value for oh-my-warp embedded browser panes.
 pub const BROWSER_PANE_KIND: &str = "browser";
 
+/// The [`pane_leaves::kind`] value for welcome panes (oh-my-warp).
+pub const WELCOME_PANE_KIND: &str = "welcome";
 #[derive(Insertable)]
 #[diesel(table_name = terminal_panes)]
 pub struct NewTerminalPane {

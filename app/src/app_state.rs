@@ -197,8 +197,9 @@ impl LeafContents {
             | LeafContents::AIFact(_)
             | LeafContents::ExecutionProfileEditor
             | LeafContents::CodeReview(_)
-            | LeafContents::AmbientAgent(_)
-            | LeafContents::GetStarted => true,
+            | LeafContents::GetStarted
+            | LeafContents::Welcome { .. }
+            | LeafContents::AmbientAgent(_) => true,
         }
     }
 }

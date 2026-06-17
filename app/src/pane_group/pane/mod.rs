@@ -495,9 +495,7 @@ impl PaneId {
             IPaneType::Browser => {
                 ChildView::<PaneView<BrowserView>>::with_id(self.0.pane_view_id).finish()
             }
-            IPaneType::Welcome => {
-                ChildView::<PaneView<WelcomeView>>::with_id(self.0.pane_view_id).finish()
-            }
+            IPaneType::Welcome => warpui::elements::Empty::new().finish(),
             IPaneType::DeferredPlaceholder => warpui::elements::Empty::new().finish(),
             #[cfg(test)]
             IPaneType::Dummy => warpui::elements::Empty::new().finish(),

@@ -178,8 +178,8 @@ pub enum AIApiError {
     #[error("Failed with status code {0}: {1}")]
     ErrorStatus(http::StatusCode, String),
 
-    #[error(transparent)]
-    NetworkPolicyDenied(#[from] network_policy::NetworkPolicyDenied),
+    #[error("Network policy denied: {0}")]
+    NetworkPolicyDenied(#[source] network_policy::NetworkPolicyDenied),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -197,8 +197,6 @@ pub enum AIApiError {
     #[error("Response stream ended unexpectedly before completion.")]
     UnexpectedEof,
 
-    #[error("Network policy denied: {0}")]
-    NetworkPolicyDenied(#[source] network_policy::NetworkPolicyDenied),
 }
 
 impl From<http_client::ResponseError> for AIApiError {
@@ -379,8 +377,7 @@ impl ErrorExt for AIApiError {
             AIApiError::UnexpectedEof => true,
             AIApiError::QuotaLimit { .. }
             | AIApiError::ServerOverloaded
-            | AIApiError::NoContextFound
-            | AIApiError::NetworkPolicyDenied(_) => false,
+            | AIApiError::NoContextFound => false,
         }
     }
 }

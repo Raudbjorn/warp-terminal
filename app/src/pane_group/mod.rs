@@ -1989,6 +1989,13 @@ impl PaneGroup {
                     "Environment management panes are not restored"
                 ))
             }
+            LeafContents::Welcome { .. } => {
+                // Welcome panes are not restored from persistence.
+                // They are opened on-demand via workspace actions.
+                Err(anyhow::anyhow!(
+                    "Welcome panes are not restored"
+                ))
+            }
         };
 
         if let (Ok((pane_data, _)), Some(title)) = (&result, custom_vertical_tabs_title.as_deref())

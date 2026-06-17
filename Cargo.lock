@@ -6364,7 +6364,7 @@ dependencies = [
  "network_policy",
  "oauth2",
  "prevent_sleep",
- "prost",
+ "prost 0.14.3",
  "reqwest",
  "rustls",
  "serde",
@@ -9434,7 +9434,7 @@ dependencies = [
  "opentelemetry-http",
  "opentelemetry-proto",
  "opentelemetry_sdk",
- "prost",
+ "prost 0.14.3",
  "thiserror 2.0.17",
  "zstd",
 ]

@@ -91,7 +91,7 @@ use crate::persistence::agent::read_agent_conversations;
 use crate::persistence::block_list::{get_all_restored_blocks, read_ai_queries};
 use crate::persistence::model::{
     NewPersistedObjectAction, NewTeamSettings, ProjectRules, UserProfile, CODE_REVIEW_PANE_KIND,
-    GET_STARTED_PANE_KIND,
+    GET_STARTED_PANE_KIND, WELCOME_PANE_KIND,
 };
 use crate::server::experiments::ServerExperiment;
 use crate::server::ids::{ClientId, HashableId, ServerId, SyncId};
@@ -1123,8 +1123,9 @@ fn save_pane_state(
     // kind-specific tables.
     let kind = match &snapshot.contents {
         LeafContents::Terminal(_) => TERMINAL_PANE_KIND,
-        LeafContents::Notebook(_) => NOTEBOOK_PANE_KIND,
+        LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
         LeafContents::EnvVarCollection(_) => ENV_VAR_COLLECTION_PANE_KIND,
+        LeafContents::Notebook(_) => NOTEBOOK_PANE_KIND,
         LeafContents::Code(_) => CODE_PANE_KIND,
         LeafContents::Workflow(_) => WORKFLOW_PANE_KIND,
         LeafContents::Settings(_) => SETTINGS_PANE_KIND,
@@ -1132,7 +1133,8 @@ fn save_pane_state(
         LeafContents::CodeReview(_) => CODE_REVIEW_PANE_KIND,
         LeafContents::AmbientAgent(_) => AMBIENT_AGENT_PANE_KIND,
         LeafContents::ExecutionProfileEditor => EXECUTION_PROFILE_EDITOR_PANE_KIND,
-        LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
+        LeafContents::GetStarted => GET_STARTED_PANE_KIND,
+        LeafContents::Welcome { .. } => WELCOME_PANE_KIND,
         LeafContents::Browser { .. } => BROWSER_PANE_KIND,
         LeafContents::EnvironmentManagement(_) | LeafContents::NetworkLog => {
             // These pane types are filtered out before this function is
@@ -1364,6 +1366,9 @@ fn save_pane_state(
         }
         LeafContents::NetworkLog => {
             // Unreachable: filtered by `is_persisted` in `save_app_state`.
+        }
+        LeafContents::Welcome { .. } => {
+            // Stateless (oh-my-warp)
         }
         LeafContents::Browser { url } => {
             let browser_pane = model::NewBrowserPane {

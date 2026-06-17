@@ -662,8 +662,8 @@ impl LocalOpenAIClient {
                             "no working directory available for OpenCode sidecar".to_string(),
                         )
                     })?;
-                let pool = self.opencode_pool.lock().await;
-                let sidecar = pool
+                let sidecar = self
+                    .opencode_pool
                     .get_or_spawn(&config.opencode_command, &config.opencode_args, &working_dir)
                     .await?;
                 Ok((sidecar.base_url().to_string(), config.api_key.clone()))
