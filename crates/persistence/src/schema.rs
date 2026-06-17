@@ -363,6 +363,9 @@ diesel::table! {
         collapsed -> Bool,
         pinned -> Bool,
     }
+}
+
+diesel::table! {
     ssh_nodes (id) {
         id -> Text,
         parent_id -> Nullable<Text>,
