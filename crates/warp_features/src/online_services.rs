@@ -45,6 +45,9 @@ pub(super) fn is_online_services_only(feature: FeatureFlag) -> bool {
             | FeatureFlag::AgentViewBlockContext
             | FeatureFlag::CloudMode
             | FeatureFlag::CloudModeFromLocalSession
+            | FeatureFlag::CloudModeImageContext
+            | FeatureFlag::HandoffCloudCloud
+            | FeatureFlag::HandoffLocalCloud
             | FeatureFlag::CloudModeHostSelector
             | FeatureFlag::WarpManagedSecrets
             | FeatureFlag::TeamApiKeys

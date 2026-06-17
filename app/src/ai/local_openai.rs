@@ -385,7 +385,13 @@ fn parse_json_content<T: DeserializeOwned>(content: &str) -> Result<T, serde_jso
         .rfind(['}', ']'])
         .map(|index| index + 1)
         .unwrap_or(unfenced.len());
-    serde_json::from_str(&unfenced[json_start..json_end])
+    // Guard against malformed output where a closing bracket precedes the opening one
+    // (`json_start > json_end`), which would panic on the slice.
+    if json_start < json_end {
+        serde_json::from_str(&unfenced[json_start..json_end])
+    } else {
+        serde_json::from_str(unfenced)
+    }
 }
 
 impl From<LocalOpenAIError> for crate::ai_assistant::GenerateCommandsFromNaturalLanguageError {

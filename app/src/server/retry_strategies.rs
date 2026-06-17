@@ -71,6 +71,9 @@ pub(crate) fn is_transient_graphql_or_http_error(e: &anyhow::Error) -> bool {
     for cause in e.chain() {
         if let Some(graphql_err) = cause.downcast_ref::<GraphQLError>() {
             return match graphql_err {
+                // Network-policy denials in local-only mode are permanent, not transient —
+                // retrying just hits the same loopback-only policy again.
+                GraphQLError::RequestError(http_client::Error::NetworkPolicyDenied(_)) => false,
                 GraphQLError::RequestError(_) => true,
                 GraphQLError::HttpError { status, .. } => is_transient_status(status.as_u16()),
                 GraphQLError::StagingAccessBlocked
