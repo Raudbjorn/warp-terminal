@@ -1,0 +1,154 @@
+From 9c19dd9ca176dedf18a26bc42079be308830e292 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Mon, 25 May 2026 14:07:04 -0400
+Subject: [PATCH 39/48] Add warp.ui.openProject(path): switch to an existing
+ tab rooted at the dir, else open a new terminal tab there (oh-my-warp)
+
+---
+ app/src/plugin/app/mod.rs                |  5 +++
+ app/src/plugin/app_requests.rs           |  2 +
+ app/src/plugin/host/native/js_api/mod.rs | 11 ++++-
+ app/src/workspace/view.rs                | 51 +++++++++++++++++++++++-
+ 4 files changed, 67 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/plugin/app/mod.rs b/app/src/plugin/app/mod.rs
+index f6e22d7e..0e8d2279 100644
+--- a/app/src/plugin/app/mod.rs
++++ b/app/src/plugin/app/mod.rs
+@@ -179,6 +179,9 @@ impl PluginHost {
+             PluginAppRequest::OpenWebTab { url } => {
+                 ctx.emit(PluginHostEvent::OpenWebTab { url });
+             }
++            PluginAppRequest::OpenProject { path } => {
++                ctx.emit(PluginHostEvent::OpenProject { path });
++            }
+         }
+     }
+ }
+@@ -196,6 +199,8 @@ pub enum PluginHostEvent {
+     },
+     /// Open an embedded browser pane navigated to `url` (`warp.ui.openWebTab`).
+     OpenWebTab { url: String },
++    /// Open a new tab with a terminal rooted at `path` (`warp.ui.openProject`).
++    OpenProject { path: String },
+ }
+ 
+ impl Drop for PluginHost {
+diff --git a/app/src/plugin/app_requests.rs b/app/src/plugin/app_requests.rs
+index 01a6446d..03dfb816 100644
+--- a/app/src/plugin/app_requests.rs
++++ b/app/src/plugin/app_requests.rs
+@@ -50,6 +50,8 @@ pub enum PluginAppRequest {
+     },
+     /// Open an embedded browser pane navigated to `url` (`warp.ui.openWebTab`).
+     OpenWebTab { url: String },
++    /// Open a new tab with a terminal rooted at `path` (`warp.ui.openProject`).
++    OpenProject { path: String },
+ }
+ 
+ static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index 2401a85a..da6181b7 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -254,7 +254,8 @@ fn network_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+ /// Returns a JS object representing the UI namespace for the Warp Plugin API.
+ ///
+ /// `toast(message, kind?)` — transient toast; `showMarkdown(title, markdown)` — markdown panel;
+-/// `showPalette(title, items)` — command picker; `openWebTab(url)` — open an embedded browser pane.
++/// `showPalette(title, items)` — command picker; `openWebTab(url)` — open an embedded browser pane;
++/// `openProject(path)` — open a new tab with a terminal rooted at `path`.
+ ///
+ /// Each request is enqueued (non-blocking) and relayed to the app on a background task; we must not
+ /// do the blocking IPC inline on the plugin runner thread (see `super::app_request`).
+@@ -309,6 +310,14 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+             super::app_request::send_app_request(PluginAppRequest::OpenWebTab { url });
+         }),
+     )?;
++    // `openProject(path)` — opens a new tab with a terminal rooted at `path` (the tmux-sessionizer
++    // workflow). Fire-and-forget.
++    ui.set(
++        "openProject",
++        Function::new(ctx, |path: String| {
++            super::app_request::send_app_request(PluginAppRequest::OpenProject { path });
++        }),
++    )?;
+     Ok(ui)
+ }
+ 
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index 61858b31..3fbb8bf5 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -2187,6 +2187,12 @@ impl Workspace {
+                 // `BrowserView::new` via the one-shot URL override.
+                 me.open_web_tab(Some(url.clone()), ctx);
+             }
++            crate::plugin::PluginHostEvent::OpenProject { path } => {
++                // Backs the sessionizer plugin: focus an existing tab rooted at
++                // `path` if one is open, else open a new one (tmux-sessionizer's
++                // switch-or-create).
++                me.open_or_focus_project(path, ctx);
++            }
+         });
+     }
+ 
+@@ -12605,6 +12611,36 @@ impl Workspace {
+         }
+     }
+ 
++    /// Switch-or-create for a project directory (backs `warp.ui.openProject`): if
++    /// any tab already has a terminal whose cwd is `path` (or a subdirectory of
++    /// it), activate that tab; otherwise open a fresh tab rooted at `path`. This
++    /// gives the sessionizer tmux-style "jump to the session if it exists" behavior
++    /// rather than piling up duplicate tabs.
++    fn open_or_focus_project(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
++        let target = PathBuf::from(path);
++        let mut existing_tab: Option<usize> = None;
++        for index in 0..self.tabs.len() {
++            let Some(pane_group) = self.get_pane_group_view(index).cloned() else {
++                continue;
++            };
++            let rooted_here = pane_group
++                .as_ref(ctx)
++                .terminal_view_working_directories(ctx)
++                .any(|(_, cwd)| match cwd {
++                    Some(LocalOrRemotePath::Local(p)) => p == target || p.starts_with(&target),
++                    _ => false,
++                });
++            if rooted_here {
++                existing_tab = Some(index);
++                break;
++            }
++        }
++        match existing_tab {
++            Some(index) => self.activate_tab(index, ctx),
++            None => self.handle_open_repository(path, ctx),
++        }
++    }
++
+     fn handle_open_repository(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
+         let path_buf = PathBuf::from(path);
+         ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
+@@ -23003,7 +23039,20 @@ impl TypedActionView for Workspace {
+         match action {
+             RunPluginCommand(command_id) => {
+                 #[cfg(feature = "plugin_host")]
+-                crate::plugin::commands::run_plugin_command(command_id, ctx);
++                {
++                    // oh-my-warp: a palette item whose command id is
++                    // `warp:openProject:<path>` opens that project (switch-or-create)
++                    // instead of running a registered plugin command. This lets
++                    // plugins (e.g. sessionizer) build fully-dynamic project pickers
++                    // via `showPalette` without registering a command per project —
++                    // which would re-enter `plugin.get_mut()` from inside the command
++                    // callback and crash the host.
++                    if let Some(path) = command_id.strip_prefix("warp:openProject:") {
++                        self.open_or_focus_project(path, ctx);
++                    } else {
++                        crate::plugin::commands::run_plugin_command(command_id, ctx);
++                    }
++                }
+                 #[cfg(not(feature = "plugin_host"))]
+                 let _ = command_id;
+             }

@@ -1,0 +1,530 @@
+From be54859d33b02b04c880a8ea868538823aa90399 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Thu, 21 May 2026 13:31:39 -0400
+Subject: [PATCH 20/48] Add warp.ui.toast + warp.keymap.bind (oh-my-warp)
+
+Two host->app plugin APIs that need an AppContext: warp.ui.toast(message, kind?)
+and warp.keymap.bind(commandId, keys). The IPC handler enqueues a PluginAppRequest
+onto a channel that the PluginHost model drains via spawn_stream_local on the
+foreground executor (app/src/plugin/app_requests.rs), where it shows a toast
+(ToastStack) or registers an editable binding. Keybindings dispatch a new
+WorkspaceAction::RunPluginCommand(id) handled by the Workspace, which runs the
+plugin command (shared commands::run_plugin_command). See PLUGIN_SPEC.md (M3).
+---
+ app/src/plugin/app/mod.rs                     | 58 ++++++++++++++++++-
+ .../plugin/app/service_impl/app_requests.rs   | 35 +++++++++++
+ app/src/plugin/app/service_impl/mod.rs        |  2 +
+ app/src/plugin/app_requests.rs                | 51 ++++++++++++++++
+ app/src/plugin/commands.rs                    | 58 +++++++++++++++++++
+ app/src/plugin/host/native/js_api/mod.rs      | 47 +++++++++++++++
+ app/src/plugin/host/native/plugin.rs          | 19 +++++-
+ app/src/plugin/mod.rs                         |  1 +
+ app/src/plugin/service/app_requests.rs        | 25 ++++++++
+ app/src/plugin/service/mod.rs                 |  2 +
+ app/src/workspace/action.rs                   |  6 ++
+ app/src/workspace/view.rs                     |  6 ++
+ 12 files changed, 305 insertions(+), 5 deletions(-)
+ create mode 100644 app/src/plugin/app/service_impl/app_requests.rs
+ create mode 100644 app/src/plugin/app_requests.rs
+ create mode 100644 app/src/plugin/service/app_requests.rs
+
+diff --git a/app/src/plugin/app/mod.rs b/app/src/plugin/app/mod.rs
+index eb46f0dd..19ca06ad 100644
+--- a/app/src/plugin/app/mod.rs
++++ b/app/src/plugin/app/mod.rs
+@@ -2,12 +2,16 @@ mod service_impl;
+ 
+ use std::sync::Arc;
+ 
++use crate::plugin::app_requests::{PluginAppRequest, ToastKind};
++use crate::view_components::{DismissibleToast, ToastFlavor};
++use crate::workspace::{ToastStack, WorkspaceAction};
+ use anyhow::{Context, Result};
+ use command::blocking::Command;
+ use service_impl::{
+-    LogServiceImpl, PluginHostBootstrapServiceImpl, RegisterCommandServiceImpl,
+-    RegisterEventHandlerServiceImpl,
++    LogServiceImpl, PluginAppRequestServiceImpl, PluginHostBootstrapServiceImpl,
++    RegisterCommandServiceImpl, RegisterEventHandlerServiceImpl,
+ };
++use warpui::keymap::EditableBinding;
+ use warpui::{Entity, ModelContext, SingletonEntity};
+ 
+ use super::{PLUGIN_HOST_ADDRESS_ENV_VAR, PLUGIN_HOST_FLAG};
+@@ -39,6 +43,15 @@ impl PluginHost {
+         let plugin_host_bootstrap_service = PluginHostBootstrapServiceImpl::new();
+         let connection_address_rx = plugin_host_bootstrap_service.connection_address_rx();
+ 
++        // Drain host→app requests (warp.ui.toast / warp.keymap.bind) on the foreground executor,
++        // where we have the `ModelContext` needed to touch app state. See `super::app_requests`.
++        let app_request_rx = crate::plugin::app_requests::init_channel();
++        ctx.spawn_stream_local(
++            app_request_rx,
++            |me, request, ctx| me.handle_app_request(request, ctx),
++            |_, _| {},
++        );
++
+         // Schedule a task that awaits a request containing the connection address for the plugin
+         // host process and uses it to instantiate a Client when it's received.
+         let background_executor = ctx.background_executor();
+@@ -71,7 +84,8 @@ impl PluginHost {
+             .with_service(plugin_host_bootstrap_service)
+             .with_service(LogServiceImpl::new())
+             .with_service(RegisterCommandServiceImpl::new())
+-            .with_service(RegisterEventHandlerServiceImpl::new());
++            .with_service(RegisterEventHandlerServiceImpl::new())
++            .with_service(PluginAppRequestServiceImpl::new());
+ 
+         #[cfg(feature = "completions_v2")]
+         let server_builder =
+@@ -117,6 +131,44 @@ impl PluginHost {
+     pub fn plugin_service_caller<S: ipc::Service>(&self) -> Option<Box<dyn ipc::ServiceCaller<S>>> {
+         self.host_client.clone().map(ipc::service_caller::<S>)
+     }
++
++    /// Handles a host→app request on the foreground executor (see [`super::app_requests`]).
++    fn handle_app_request(&mut self, request: PluginAppRequest, ctx: &mut ModelContext<Self>) {
++        match request {
++            PluginAppRequest::ShowToast { message, kind } => {
++                let Some(window_id) = ctx.windows().active_window() else {
++                    return;
++                };
++                let flavor = match kind {
++                    ToastKind::Error => ToastFlavor::Error,
++                    ToastKind::Info | ToastKind::Warn => ToastFlavor::Default,
++                };
++                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
++                    toast_stack.add_ephemeral_toast(
++                        DismissibleToast::new(message, flavor),
++                        window_id,
++                        ctx,
++                    );
++                });
++            }
++            PluginAppRequest::BindKey { keys, command_id } => {
++                let title = crate::plugin::commands::title(&command_id)
++                    .unwrap_or_else(|| command_id.clone());
++                // `EditableBinding::new` takes a `&'static str` name; plugin command ids are
++                // dynamic, so leak the (small, session-lived) binding name.
++                let name: &'static str =
++                    Box::leak(format!("plugin-keymap:{command_id}").into_boxed_str());
++                let binding = EditableBinding::new(
++                    name,
++                    title,
++                    WorkspaceAction::RunPluginCommand(command_id),
++                )
++                .with_context_predicate(warpui::id!("Workspace"))
++                .with_key_binding(keys);
++                ctx.register_editable_bindings([binding]);
++            }
++        }
++    }
+ }
+ 
+ impl Drop for PluginHost {
+diff --git a/app/src/plugin/app/service_impl/app_requests.rs b/app/src/plugin/app/service_impl/app_requests.rs
+new file mode 100644
+index 00000000..91593789
+--- /dev/null
++++ b/app/src/plugin/app/service_impl/app_requests.rs
+@@ -0,0 +1,35 @@
++//! Implementation of `PluginAppRequestService`: enqueues the request onto the foreground-drained
++//! [`crate::plugin::app_requests`] channel.
++
++use std::fmt;
++
++use async_trait::async_trait;
++
++use crate::plugin::service::{
++    PluginAppRequestEnvelope, PluginAppRequestResponse, PluginAppRequestService,
++};
++
++#[derive(Clone, Default)]
++pub struct PluginAppRequestServiceImpl {}
++
++impl PluginAppRequestServiceImpl {
++    pub fn new() -> Self {
++        Self {}
++    }
++}
++
++impl fmt::Debug for PluginAppRequestServiceImpl {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("PluginAppRequestService").finish()
++    }
++}
++
++#[async_trait]
++impl ipc::ServiceImpl for PluginAppRequestServiceImpl {
++    type Service = PluginAppRequestService;
++
++    async fn handle_request(&self, request: PluginAppRequestEnvelope) -> PluginAppRequestResponse {
++        crate::plugin::app_requests::send(request.request);
++        PluginAppRequestResponse { success: true }
++    }
++}
+diff --git a/app/src/plugin/app/service_impl/mod.rs b/app/src/plugin/app/service_impl/mod.rs
+index 4d0f328e..d889de8d 100644
+--- a/app/src/plugin/app/service_impl/mod.rs
++++ b/app/src/plugin/app/service_impl/mod.rs
+@@ -4,11 +4,13 @@ cfg_if::cfg_if! {
+         pub use completions::*;
+     }
+ }
++mod app_requests;
+ mod commands;
+ mod events;
+ mod logging;
+ mod plugin_host_bootstrap;
+ 
++pub(super) use app_requests::*;
+ pub(super) use commands::*;
+ pub(super) use events::*;
+ pub(super) use logging::*;
+diff --git a/app/src/plugin/app_requests.rs b/app/src/plugin/app_requests.rs
+new file mode 100644
+index 00000000..96e51bb2
+--- /dev/null
++++ b/app/src/plugin/app_requests.rs
+@@ -0,0 +1,51 @@
++//! oh-my-warp: host→app requests that must run with an `AppContext` (Milestone 3).
++//!
++//! Some plugin APIs (`warp.ui.toast`, `warp.keymap.bind`) need to touch app state that requires a
++//! foreground `AppContext` — but the IPC service handler that receives them runs on a background
++//! thread without one. So the handler enqueues a [`PluginAppRequest`] onto this channel, and the
++//! [`crate::plugin::PluginHost`] model drains it on the foreground executor (via
++//! `spawn_stream_local`), where it has the `ModelContext` needed to show a toast or register a
++//! keybinding. See PLUGIN_SPEC.md (M3).
++
++use std::sync::OnceLock;
++
++use async_channel::{Receiver, Sender};
++use serde::{Deserialize, Serialize};
++
++/// Severity of a toast requested via `warp.ui.toast`.
++#[derive(Clone, Debug, Serialize, Deserialize, Default)]
++pub enum ToastKind {
++    #[default]
++    Info,
++    Warn,
++    Error,
++}
++
++/// A request from the plugin host that must be handled on the app's foreground executor.
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub enum PluginAppRequest {
++    /// Show a transient toast (`warp.ui.toast`).
++    ShowToast { message: String, kind: ToastKind },
++    /// Bind a key sequence to a registered plugin command (`warp.keymap.bind`).
++    BindKey { keys: String, command_id: String },
++}
++
++static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();
++
++/// Creates the request channel and returns the receiver. Called once by `PluginHost::new`; the
++/// sender is stored globally so IPC handlers can enqueue requests without a context.
++pub fn init_channel() -> Receiver<PluginAppRequest> {
++    let (sender, receiver) = async_channel::unbounded();
++    let _ = SENDER.set(sender);
++    receiver
++}
++
++/// Enqueues a request to be handled on the app's foreground executor. No-op if the channel hasn't
++/// been initialized (e.g. plugin host failed to start).
++pub fn send(request: PluginAppRequest) {
++    if let Some(sender) = SENDER.get() {
++        if let Err(e) = sender.try_send(request) {
++            log::warn!("Failed to enqueue plugin app request: {e:?}");
++        }
++    }
++}
+diff --git a/app/src/plugin/commands.rs b/app/src/plugin/commands.rs
+index ef252b85..187790c6 100644
+--- a/app/src/plugin/commands.rs
++++ b/app/src/plugin/commands.rs
+@@ -47,3 +47,61 @@ pub fn all() -> Vec<PluginCommand> {
+ pub fn function_id(id: &str) -> Option<JsFunctionId> {
+     REGISTRY.lock().unwrap().get(id).map(|c| c.function_id)
+ }
++
++/// Returns the display title for the command with the given id, if registered.
++pub fn title(id: &str) -> Option<String> {
++    REGISTRY.lock().unwrap().get(id).map(|c| c.title.clone())
++}
++
++/// Runs the registered plugin command with the given id by invoking its JS callback in the plugin
++/// host; a non-empty returned string is shown as a toast. Generic over the view so it can be
++/// invoked both from the command palette and from keybinding handlers.
++pub fn run_plugin_command<V: warpui::View>(command_id: &str, ctx: &mut warpui::ViewContext<V>) {
++    use crate::plugin::service::{
++        CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
++    };
++    use crate::plugin::PluginHost;
++    use crate::view_components::{DismissibleToast, ToastFlavor};
++    use crate::workspace::ToastStack;
++    use warp_js::SerializedJsValue;
++    use warpui::SingletonEntity;
++
++    let Some(function_id) = function_id(command_id) else {
++        return;
++    };
++    let window_id = ctx.window_id();
++    let Some(caller) = PluginHost::handle(ctx)
++        .as_ref(ctx)
++        .plugin_service_caller::<CallJsFunctionService>()
++    else {
++        return;
++    };
++    let Ok(input) = SerializedJsValue::from_value(String::new()) else {
++        return;
++    };
++    ctx.spawn(
++        async move {
++            caller
++                .call(CallJsFunctionRequest {
++                    id: function_id,
++                    serialized_input: input,
++                })
++                .await
++        },
++        move |_view, response, ctx| {
++            if let Ok(CallJsFunctionResponse::Success(output)) = response {
++                if let Ok(message) = output.to_value::<String>() {
++                    if !message.trim().is_empty() {
++                        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
++                            toast_stack.add_ephemeral_toast(
++                                DismissibleToast::new(message, ToastFlavor::Default),
++                                window_id,
++                                ctx,
++                            );
++                        });
++                    }
++                }
++            }
++        },
++    );
++}
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index ef043239..d955a2d0 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -1,6 +1,7 @@
+ use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
+ 
+ use super::plugin::PluginHandle;
++use crate::plugin::app_requests::{PluginAppRequest, ToastKind};
+ use crate::plugin::events::{
+     CommandFinishedEvent, CommandStartedEvent, OptionalToast, EVENT_COMMAND_FINISHED,
+     EVENT_COMMAND_STARTED,
+@@ -48,12 +49,58 @@ pub fn warp(plugin: PluginHandle, ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>>
+     )?;
+     api.set("commands", commands(plugin.clone(), ctx)?)?;
+     api.set("terminal", terminal(plugin.clone(), ctx)?)?;
++    api.set("ui", ui(plugin.clone(), ctx)?)?;
++    api.set("keymap", keymap(plugin.clone(), ctx)?)?;
+ 
+     #[cfg(feature = "completions_v2")]
+     api.set("completions", completions(plugin, ctx)?)?;
+     Ok(api)
+ }
+ 
++/// Returns a JS object representing the UI namespace for the Warp Plugin API.
++///
++/// `toast(message: string, kind?: "info" | "warn" | "error")` — shows a transient toast.
++fn ui<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
++    let ui = Object::new(ctx)?;
++    ui.set(
++        "toast",
++        Function::new(
++            ctx,
++            MutFn::from(move |message: String, kind: Opt<String>| {
++                let kind = match kind.0.as_deref() {
++                    Some("error") => ToastKind::Error,
++                    Some("warn") => ToastKind::Warn,
++                    _ => ToastKind::Info,
++                };
++                plugin
++                    .get_mut()
++                    .send_app_request(PluginAppRequest::ShowToast { message, kind });
++            }),
++        ),
++    )?;
++    Ok(ui)
++}
++
++/// Returns a JS object representing the Keymap namespace for the Warp Plugin API.
++///
++/// `bind(commandId: string, keys: string)` — binds a key sequence (e.g. `"ctrl-b g"`) to a
++///     command registered via `warp.commands.register`. The user's `keybindings.yaml` overrides it.
++fn keymap<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
++    let keymap = Object::new(ctx)?;
++    keymap.set(
++        "bind",
++        Function::new(
++            ctx,
++            MutFn::from(move |command_id: String, keys: String| {
++                plugin
++                    .get_mut()
++                    .send_app_request(PluginAppRequest::BindKey { keys, command_id });
++            }),
++        ),
++    )?;
++    Ok(keymap)
++}
++
+ /// Returns a JS object representing the Terminal namespace for the Warp Plugin API.
+ ///
+ /// API methods:
+diff --git a/app/src/plugin/host/native/plugin.rs b/app/src/plugin/host/native/plugin.rs
+index 6fc3474d..a89bc590 100644
+--- a/app/src/plugin/host/native/plugin.rs
++++ b/app/src/plugin/host/native/plugin.rs
+@@ -6,9 +6,10 @@ use anyhow::anyhow;
+ use rquickjs::Context;
+ use warp_js::{JsFunctionId, JsFunctionRegistry, SerializedJsValue};
+ 
++use crate::plugin::app_requests::PluginAppRequest;
+ use crate::plugin::service::{
+-    RegisterCommandRequest, RegisterCommandService, RegisterEventHandlerRequest,
+-    RegisterEventHandlerService,
++    PluginAppRequestEnvelope, PluginAppRequestService, RegisterCommandRequest,
++    RegisterCommandService, RegisterEventHandlerRequest, RegisterEventHandlerService,
+ };
+ 
+ cfg_if::cfg_if! {
+@@ -50,6 +51,7 @@ impl PluginHandle {
+ pub(super) struct AppServiceCallers {
+     register_command_caller: Box<dyn ipc::ServiceCaller<RegisterCommandService>>,
+     register_event_handler_caller: Box<dyn ipc::ServiceCaller<RegisterEventHandlerService>>,
++    app_request_caller: Box<dyn ipc::ServiceCaller<PluginAppRequestService>>,
+     #[cfg(feature = "completions_v2")]
+     register_command_signatures_caller:
+         Box<dyn ipc::ServiceCaller<RegisterCommandSignatureService>>,
+@@ -64,6 +66,7 @@ impl AppServiceCallers {
+             register_event_handler_caller: ipc::service_caller::<RegisterEventHandlerService>(
+                 app_client.clone(),
+             ),
++            app_request_caller: ipc::service_caller::<PluginAppRequestService>(app_client.clone()),
+             #[cfg(feature = "completions_v2")]
+             register_command_signatures_caller: ipc::service_caller::<
+                 RegisterCommandSignatureService,
+@@ -145,6 +148,18 @@ impl Plugin {
+         }
+     }
+ 
++    /// Sends a request to be handled on the app's foreground executor (`warp.ui.toast`,
++    /// `warp.keymap.bind`).
++    pub(super) fn send_app_request(&mut self, request: PluginAppRequest) {
++        if let Err(e) = warpui::r#async::block_on(
++            self.app_services
++                .app_request_caller
++                .call(PluginAppRequestEnvelope { request }),
++        ) {
++            log::warn!("Failed to send plugin app request: {e:?}");
++        }
++    }
++
+     pub(super) fn js_function_registry_mut(&mut self) -> &mut JsFunctionRegistry {
+         &mut self.js_function_registry
+     }
+diff --git a/app/src/plugin/mod.rs b/app/src/plugin/mod.rs
+index 8a28fc7a..aad50725 100644
+--- a/app/src/plugin/mod.rs
++++ b/app/src/plugin/mod.rs
+@@ -1,4 +1,5 @@
+ pub(crate) mod app;
++pub(crate) mod app_requests;
+ pub(crate) mod commands;
+ pub(crate) mod events;
+ pub(crate) mod service;
+diff --git a/app/src/plugin/service/app_requests.rs b/app/src/plugin/service/app_requests.rs
+new file mode 100644
+index 00000000..b0c6953b
+--- /dev/null
++++ b/app/src/plugin/service/app_requests.rs
+@@ -0,0 +1,25 @@
++//! IPC service carrying host→app requests that need an `AppContext` (`warp.ui.toast`,
++//! `warp.keymap.bind`). Hosted by the app; the handler enqueues onto the
++//! [`crate::plugin::app_requests`] channel drained by the `PluginHost` model.
++
++use serde::{Deserialize, Serialize};
++
++use crate::plugin::app_requests::PluginAppRequest;
++
++#[derive(Clone, Serialize, Deserialize, Debug)]
++pub struct PluginAppRequestEnvelope {
++    pub request: PluginAppRequest,
++}
++
++#[derive(Clone, Serialize, Deserialize, Debug)]
++pub struct PluginAppRequestResponse {
++    pub success: bool,
++}
++
++/// IPC service that relays a [`PluginAppRequest`] from the plugin host to the app.
++pub struct PluginAppRequestService {}
++
++impl ipc::Service for PluginAppRequestService {
++    type Request = PluginAppRequestEnvelope;
++    type Response = PluginAppRequestResponse;
++}
+diff --git a/app/src/plugin/service/mod.rs b/app/src/plugin/service/mod.rs
+index 9ee43c5c..efc7bfcb 100644
+--- a/app/src/plugin/service/mod.rs
++++ b/app/src/plugin/service/mod.rs
+@@ -4,12 +4,14 @@ cfg_if::cfg_if! {
+         pub use completions::*;
+     }
+ }
++mod app_requests;
+ mod call_js_function;
+ mod commands;
+ mod events;
+ mod logging;
+ mod plugin_host_bootstrap;
+ 
++pub use app_requests::*;
+ pub use call_js_function::*;
+ pub use commands::*;
+ pub use events::*;
+diff --git a/app/src/workspace/action.rs b/app/src/workspace/action.rs
+index 5db9830c..75972e6b 100644
+--- a/app/src/workspace/action.rs
++++ b/app/src/workspace/action.rs
+@@ -124,6 +124,10 @@ pub enum AutoCloudHandoffTrigger {
+ 
+ #[derive(Debug, Clone)]
+ pub enum WorkspaceAction {
++    /// oh-my-warp: run a plugin command (registered via `warp.commands.register`) by id. Used as
++    /// the action for plugin keybindings registered via `warp.keymap.bind`. See PLUGIN_SPEC.md (M3).
++    #[cfg_attr(not(feature = "plugin_host"), allow(dead_code))]
++    RunPluginCommand(String),
+     ActivateTab(usize),
+     ActivatePrevTab,
+     ActivateNextTab,
+@@ -827,6 +831,8 @@ impl WorkspaceAction {
+     pub fn should_save_app_state_on_action(&self) -> bool {
+         use WorkspaceAction::*;
+         match self {
++            // oh-my-warp: running a plugin command shouldn't trigger app-state saves.
++            RunPluginCommand(_) => false,
+             #[cfg(not(target_family = "wasm"))]
+             ContinueConversationLocally { .. } => true,
+             ActivateTab(_)
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index 96e8a71f..5c2b57ba 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -22827,6 +22827,12 @@ impl TypedActionView for Workspace {
+         }
+ 
+         match action {
++            RunPluginCommand(command_id) => {
++                #[cfg(feature = "plugin_host")]
++                crate::plugin::commands::run_plugin_command(command_id, ctx);
++                #[cfg(not(feature = "plugin_host"))]
++                let _ = command_id;
++            }
+             ActivateTab(index) => self.activate_tab(*index, ctx),
+             ActivateTabByNumber(num) => self.activate_tab(num.saturating_sub(1), ctx),
+             ActivatePrevTab => self.activate_prev_tab(ctx),

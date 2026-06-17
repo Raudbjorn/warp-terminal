@@ -1,0 +1,353 @@
+From 3554af188fc2db92e894bbbb0b1b15b032eb8d10 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Mon, 25 May 2026 01:27:52 -0400
+Subject: [PATCH 36/48] Persist browser panes (URL) across app restart: new
+ browser_panes table + LeafContents::Browser { url } (oh-my-warp)
+
+---
+ app/src/app_state.rs                          | 16 ++++++-----
+ app/src/browser/view.rs                       | 12 ++++++++-
+ app/src/launch_configs/launch_config.rs       |  2 +-
+ app/src/pane_group/mod.rs                     | 14 ++++++----
+ app/src/pane_group/pane/browser_pane.rs       |  7 +++--
+ app/src/persistence/sqlite.rs                 | 24 ++++++++++++-----
+ app/src/workspace/view.rs                     | 21 +++++++++------
+ .../down.sql                                  |  1 +
+ .../up.sql                                    |  8 ++++++
+ crates/persistence/src/model.rs               | 27 ++++++++++++++++---
+ crates/persistence/src/schema.rs              | 10 +++++++
+ 11 files changed, 110 insertions(+), 32 deletions(-)
+ create mode 100644 crates/persistence/migrations/2026-05-25-000000_add_browser_panes/down.sql
+ create mode 100644 crates/persistence/migrations/2026-05-25-000000_add_browser_panes/up.sql
+
+diff --git a/app/src/app_state.rs b/app/src/app_state.rs
+index b2363d3f..3c6f5589 100644
+--- a/app/src/app_state.rs
++++ b/app/src/app_state.rs
+@@ -146,9 +146,12 @@ pub enum LeafContents {
+     /// The in-app network log pane. Not persisted across restarts because the
+     /// backing log is an in-memory ring buffer that starts empty on launch.
+     NetworkLog,
+-    /// The embedded browser pane (oh-my-warp). Not persisted: each owns a live
+-    /// Chrome + CDP screencast session created at open time.
+-    Browser,
++    /// The embedded browser pane (oh-my-warp). We persist only the current URL —
++    /// the Chrome + CDP screencast session itself is ephemeral and recreated on
++    /// restore (navigating to the stored URL).
++    Browser {
++        url: String,
++    },
+     /// An entrypoint pane type to launch other pane types from a search palette. The default view
+     /// when creating a tab.
+     Welcome {
+@@ -177,9 +180,10 @@ impl LeafContents {
+             LeafContents::NetworkLog
+             // Environment management panes are opened on-demand via workspace
+             // actions and have no persistable state.
+-            | LeafContents::EnvironmentManagement(_)
+-            // Browser panes (oh-my-warp) own a live CDP session, not restorable state.
+-            | LeafContents::Browser => false,
++            | LeafContents::EnvironmentManagement(_) => false,
++            // Browser panes (oh-my-warp): persist the URL; the live CDP session
++            // is rebuilt on restore.
++            LeafContents::Browser { .. } => true,
+             LeafContents::Terminal(_)
+             | LeafContents::Notebook(_)
+             | LeafContents::AIDocument(_)
+diff --git a/app/src/browser/view.rs b/app/src/browser/view.rs
+index 66d82925..95697d5c 100644
+--- a/app/src/browser/view.rs
++++ b/app/src/browser/view.rs
+@@ -73,11 +73,21 @@ thread_local! {
+ /// Sets the initial URL for the *next* browser pane created (consumed once by
+ /// [`BrowserView::new`]). Backs the `warp.ui.openWebTab` plugin bridge; the input
+ /// is normalized like an address-bar entry (bare hosts gain `https://`, non-URLs
+-/// become a web search) via [`normalize_url`].
++/// become a web search) via [`normalize_url`]. Also used by the persistence
++/// restore path (`pane_group::mod`) to navigate restored panes to the URL
++/// they were last viewing.
+ pub fn set_next_browser_url(url: String) {
+     NEXT_BROWSER_URL.with(|cell| cell.set(Some(normalize_url(&url))));
+ }
+ 
++impl BrowserView {
++    /// The current page URL — read by `BrowserPane::snapshot` when persisting
++    /// the pane so it can be restored to the same page across app restarts.
++    pub fn current_url(&self) -> &str {
++        &self.url
++    }
++}
++
+ /// The CSS viewport size the current frame represents (shared with input
+ /// closures so they can map pointer positions without borrowing the view).
+ type CssSize = Rc<Cell<Option<(f32, f32)>>>;
+diff --git a/app/src/launch_configs/launch_config.rs b/app/src/launch_configs/launch_config.rs
+index f3d3ad6e..1896a87c 100644
+--- a/app/src/launch_configs/launch_config.rs
++++ b/app/src/launch_configs/launch_config.rs
+@@ -156,7 +156,7 @@ impl TryFrom<PaneNodeSnapshot> for PaneTemplateType {
+                 | LeafContents::ExecutionProfileEditor
+                 | LeafContents::GetStarted
+                 | LeafContents::NetworkLog
+-                | LeafContents::Browser
++                | LeafContents::Browser { .. }
+                 | LeafContents::Welcome { .. }
+                 | LeafContents::AIDocument(_)
+                 | LeafContents::EnvironmentManagement(_)
+diff --git a/app/src/pane_group/mod.rs b/app/src/pane_group/mod.rs
+index 8a887ace..5af2b6fc 100644
+--- a/app/src/pane_group/mod.rs
++++ b/app/src/pane_group/mod.rs
+@@ -1949,12 +1949,16 @@ impl PaneGroup {
+                     "Network log pane should not have been persisted, as it cannot be restored"
+                 ))
+             }
+-            LeafContents::Browser => {
++            LeafContents::Browser { url } => {
+                 // Browser panes (oh-my-warp) construct a fresh Chrome + CDP
+-                // session here. This arm is reached for newly-opened panes/tabs
+-                // (e.g. "New Web Tab"); it is never reached during session
+-                // restore because `is_persisted()` is false (so `save_pane_state`
+-                // never writes a browser leaf to restore).
++                // session here. Reached for newly-opened panes/tabs ("New Web
++                // Tab", `warp.ui.openWebTab`) AND on session restore: the URL
++                // captured at save time (or `""` for a default "New Web Tab")
++                // is propagated into `BrowserView::new` via the one-shot URL
++                // override; an empty URL falls back to the configured home.
++                if !url.is_empty() {
++                    crate::browser::view::set_next_browser_url(url.clone());
++                }
+                 let pane: Box<dyn AnyPaneContent + 'static> = Box::new(BrowserPane::new(ctx));
+                 let pane_id = pane.as_pane().id();
+                 pane_contents.insert(pane_id, pane);
+diff --git a/app/src/pane_group/pane/browser_pane.rs b/app/src/pane_group/pane/browser_pane.rs
+index f5a901b9..948c0224 100644
+--- a/app/src/pane_group/pane/browser_pane.rs
++++ b/app/src/pane_group/pane/browser_pane.rs
+@@ -80,8 +80,11 @@ impl PaneContent for BrowserPane {
+         ctx.unsubscribe_to_view(&self.view);
+     }
+ 
+-    fn snapshot(&self, _app: &AppContext) -> LeafContents {
+-        LeafContents::Browser
++    fn snapshot(&self, app: &AppContext) -> LeafContents {
++        // Persist the current URL so the pane restores to the same page on next
++        // launch (the CDP/Chrome session itself is ephemeral and rebuilt).
++        let url = self.browser_view(app).as_ref(app).current_url().to_owned();
++        LeafContents::Browser { url }
+     }
+ 
+     fn has_application_focus(&self, ctx: &mut ViewContext<PaneGroup>) -> bool {
+diff --git a/app/src/persistence/sqlite.rs b/app/src/persistence/sqlite.rs
+index 4d952888..f1338b4d 100644
+--- a/app/src/persistence/sqlite.rs
++++ b/app/src/persistence/sqlite.rs
+@@ -40,7 +40,7 @@ use lsp::supported_servers::LSPServerType;
+ use num_traits::FromPrimitive;
+ use pathfinder_geometry::rect::RectF;
+ use pathfinder_geometry::vector::Vector2F;
+-use persistence::model::AMBIENT_AGENT_PANE_KIND;
++use persistence::model::{AMBIENT_AGENT_PANE_KIND, BROWSER_PANE_KIND};
+ use uuid::Uuid;
+ use warpui::platform::FullscreenState;
+ use warpui::windowing::{MIN_WINDOW_HEIGHT, MIN_WINDOW_WIDTH};
+@@ -1134,9 +1134,8 @@ fn save_pane_state(
+         LeafContents::GetStarted => GET_STARTED_PANE_KIND,
+         LeafContents::Welcome { .. } => WELCOME_PANE_KIND,
+         LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
+-        LeafContents::EnvironmentManagement(_)
+-        | LeafContents::NetworkLog
+-        | LeafContents::Browser => {
++        LeafContents::Browser { .. } => BROWSER_PANE_KIND,
++        LeafContents::EnvironmentManagement(_) | LeafContents::NetworkLog => {
+             // These pane types are filtered out before this function is
+             // called; see `LeafContents::is_persisted` and the skip in
+             // `save_app_state`. Reaching this arm would mean a `pane_nodes`
+@@ -1378,8 +1377,14 @@ fn save_pane_state(
+         LeafContents::NetworkLog => {
+             // Unreachable: filtered by `is_persisted` in `save_app_state`.
+         }
+-        LeafContents::Browser => {
+-            // Unreachable: filtered by `is_persisted` in `save_app_state`.
++        LeafContents::Browser { url } => {
++            let browser_pane = model::NewBrowserPane {
++                id,
++                url: url.clone(),
++            };
++            diesel::insert_into(schema::browser_panes::dsl::browser_panes)
++                .values(browser_pane)
++                .execute(conn)?;
+         }
+     }
+ 
+@@ -2365,6 +2370,13 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
+                         task_id,
+                     })
+                 }
++                BROWSER_PANE_KIND => {
++                    let pane = schema::browser_panes::dsl::browser_panes
++                        .find(node.id)
++                        .select(model::BrowserPane::as_select())
++                        .first(conn)?;
++                    LeafContents::Browser { url: pane.url }
++                }
+                 other => bail!("Unrecognized pane kind: {other}"),
+             };
+ 
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index b42f7e46..61858b31 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -2182,10 +2182,10 @@ impl Workspace {
+                 me.show_plugin_palette(title.clone(), items.clone(), ctx);
+             }
+             crate::plugin::PluginHostEvent::OpenWebTab { url } => {
+-                // Set the one-shot initial-URL override, then open a browser tab;
+-                // `BrowserView::new` consumes it synchronously during construction.
+-                crate::browser::view::set_next_browser_url(url.clone());
+-                me.open_web_tab(ctx);
++                // URL flows through `LeafContents::Browser { url }` so it's also
++                // persisted across restart; the restore arm propagates it into
++                // `BrowserView::new` via the one-shot URL override.
++                me.open_web_tab(Some(url.clone()), ctx);
+             }
+         });
+     }
+@@ -14606,12 +14606,17 @@ impl Workspace {
+         });
+     }
+ 
+-    /// Opens an embedded browser pane (oh-my-warp) as its own new tab.
+-    pub(crate) fn open_web_tab(&mut self, ctx: &mut ViewContext<Self>) {
++    /// Opens an embedded browser pane (oh-my-warp) as its own new tab. `url` is
++    /// the initial page to navigate to; pass `None` (or an empty string) to use
++    /// the configured home page. The URL is plumbed through `LeafContents::Browser`
++    /// so it's also persisted across restarts.
++    pub(crate) fn open_web_tab(&mut self, url: Option<String>, ctx: &mut ViewContext<Self>) {
+         let panes_layout = PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
+             is_focused: true,
+             custom_vertical_tabs_title: None,
+-            contents: LeafContents::Browser,
++            contents: LeafContents::Browser {
++                url: url.unwrap_or_default(),
++            },
+         })));
+         self.add_tab_with_pane_layout(
+             panes_layout,
+@@ -23344,7 +23349,7 @@ impl TypedActionView for Workspace {
+                 self.open_browser_pane(ctx);
+             }
+             NewWebTab => {
+-                self.open_web_tab(ctx);
++                self.open_web_tab(None, ctx);
+             }
+             FixSettingsWithOz { error_description } => {
+                 use crate::ai::skills::SkillManager;
+diff --git a/crates/persistence/migrations/2026-05-25-000000_add_browser_panes/down.sql b/crates/persistence/migrations/2026-05-25-000000_add_browser_panes/down.sql
+new file mode 100644
+index 00000000..f6582ae5
+--- /dev/null
++++ b/crates/persistence/migrations/2026-05-25-000000_add_browser_panes/down.sql
+@@ -0,0 +1 @@
++DROP TABLE IF EXISTS browser_panes;
+diff --git a/crates/persistence/migrations/2026-05-25-000000_add_browser_panes/up.sql b/crates/persistence/migrations/2026-05-25-000000_add_browser_panes/up.sql
+new file mode 100644
+index 00000000..72582920
+--- /dev/null
++++ b/crates/persistence/migrations/2026-05-25-000000_add_browser_panes/up.sql
+@@ -0,0 +1,8 @@
++-- oh-my-warp: persist embedded browser panes so they survive app restart.
++-- The pane's current URL is the only state we restore (CDP sessions themselves
++-- are ephemeral and recreated on launch).
++CREATE TABLE browser_panes (
++    id INTEGER PRIMARY KEY NOT NULL REFERENCES pane_nodes(id),
++    kind TEXT NOT NULL DEFAULT 'browser',
++    url TEXT NOT NULL
++);
+diff --git a/crates/persistence/src/model.rs b/crates/persistence/src/model.rs
+index d4fbf395..e6822182 100644
+--- a/crates/persistence/src/model.rs
++++ b/crates/persistence/src/model.rs
+@@ -10,9 +10,9 @@ use warp_multi_agent_api::{self as api};
+ 
+ use super::schema::{
+     active_mcp_servers, agent_conversations, agent_tasks, ai_document_panes, ai_memory_panes,
+-    ambient_agent_panes, app, blocks, cloud_objects_refreshes, code_pane_tabs, code_panes,
+-    code_review_panes, commands, current_user_information, env_var_collection_panes, folders,
+-    generic_string_objects, ignored_suggestions, mcp_environment_variables,
++    ambient_agent_panes, app, blocks, browser_panes, cloud_objects_refreshes, code_pane_tabs,
++    code_panes, code_review_panes, commands, current_user_information, env_var_collection_panes,
++    folders, generic_string_objects, ignored_suggestions, mcp_environment_variables,
+     mcp_server_installations, mcp_server_panes, notebook_panes, notebooks, object_actions,
+     object_metadata, object_permissions, pane_branches, pane_leaves, pane_nodes, panels,
+     project_rules, projects, server_experiments, settings_panes, tab_groups, tabs, team_members,
+@@ -594,6 +594,9 @@ pub const AI_DOCUMENT_PANE_KIND: &str = "ai_document";
+ /// The [`pane_leaves::kind`] value for ambient agent (cloud mode) panes.
+ pub const AMBIENT_AGENT_PANE_KIND: &str = "ambient_agent";
+ 
++/// The [`pane_leaves::kind`] value for oh-my-warp embedded browser panes.
++pub const BROWSER_PANE_KIND: &str = "browser";
++
+ #[derive(Insertable)]
+ #[diesel(table_name = terminal_panes)]
+ pub struct NewTerminalPane {
+@@ -703,6 +706,24 @@ pub struct NewAmbientAgentPane {
+     pub task_id: Option<String>,
+ }
+ 
++/// oh-my-warp: persisted state for an embedded browser pane — just the current
++/// URL (the CDP session itself is ephemeral and recreated on restore).
++#[derive(Identifiable, Queryable, Selectable)]
++#[diesel(table_name = browser_panes)]
++#[diesel(primary_key(id))]
++pub struct BrowserPane {
++    pub id: i32,
++    pub kind: String,
++    pub url: String,
++}
++
++#[derive(Insertable)]
++#[diesel(table_name = browser_panes)]
++pub struct NewBrowserPane {
++    pub id: i32,
++    pub url: String,
++}
++
+ #[derive(Insertable)]
+ #[diesel(table_name = pane_branches)]
+ pub struct NewPaneBranch {
+diff --git a/crates/persistence/src/schema.rs b/crates/persistence/src/schema.rs
+index 8f2383dd..91e8fe5e 100644
+--- a/crates/persistence/src/schema.rs
++++ b/crates/persistence/src/schema.rs
+@@ -75,6 +75,14 @@ diesel::table! {
+     }
+ }
+ 
++diesel::table! {
++    browser_panes (id) {
++        id -> Integer,
++        kind -> Text,
++        url -> Text,
++    }
++}
++
+ diesel::table! {
+     blocks (id) {
+         id -> Nullable<Integer>,
+@@ -514,6 +522,7 @@ diesel::table! {
+ 
+ diesel::joinable!(ambient_agent_panes -> pane_nodes (id));
+ diesel::joinable!(app -> windows (active_window_id));
++diesel::joinable!(browser_panes -> pane_nodes (id));
+ diesel::joinable!(code_pane_tabs -> code_panes (code_pane_id));
+ diesel::joinable!(object_permissions -> object_metadata (object_metadata_id));
+ diesel::joinable!(pane_branches -> pane_nodes (pane_node_id));
+@@ -530,6 +539,7 @@ diesel::joinable!(workspace_language_server -> workspace_metadata (workspace_id)
+ diesel::allow_tables_to_appear_in_same_query!(
+     ambient_agent_panes,
+     app,
++    browser_panes,
+     pane_branches,
+     pane_leaves,
+     pane_nodes,

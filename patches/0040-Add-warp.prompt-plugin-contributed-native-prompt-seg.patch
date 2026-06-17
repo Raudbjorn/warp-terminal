@@ -1,0 +1,389 @@
+From 57309f0999dcb00a464930aab0b3c1065c1e37bd Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 27 May 2026 14:06:16 -0400
+Subject: [PATCH 40/48] Add warp.prompt: plugin-contributed native prompt
+ segments (oh-my-warp)
+
+Lets a plugin push segments into Warp's native prompt chip row via
+`warp.prompt.set([{ text, side?, tooltip? }])` / `warp.prompt.clear()`
+(gated by the `ui` permission). Segments render as native chips after the
+built-in ones; left-grouped first, then right-grouped.
+
+The plugin host can't render synchronously on the UI thread, so the model is
+push: the plugin computes segment text in JS and pushes it (e.g. from
+terminal.onCommandFinished or a timer); a singleton PluginPromptModel caches it
+keyed by plugin id, and every PromptDisplay observes it and re-renders.
+
+- context_chips/plugin_prompt.rs: PluginPromptModel singleton + PromptSegment/PromptSide
+- context_chips/display.rs: subscribe + append plugin chips (reusing render_udi_chip)
+- lib.rs: register the singleton unconditionally (render path is feature-independent)
+- plugin/{app_requests,app/mod,host/native/js_api/mod}.rs: warp.prompt API + SetPrompt relay
+- workspace/view.rs: store pushed segments on the model
+
+True right-edge alignment is a follow-up (the modern UDI prompt has no rprompt region).
+---
+ app/src/context_chips/display.rs         | 24 +++++-
+ app/src/context_chips/mod.rs             |  1 +
+ app/src/context_chips/plugin_prompt.rs   | 98 ++++++++++++++++++++++++
+ app/src/lib.rs                           |  3 +
+ app/src/plugin/app/mod.rs                | 15 ++++
+ app/src/plugin/app_requests.rs           |  7 ++
+ app/src/plugin/host/native/js_api/mod.rs | 56 ++++++++++++++
+ app/src/workspace/view.rs                | 11 +++
+ 8 files changed, 214 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/context_chips/plugin_prompt.rs
+
+diff --git a/app/src/context_chips/display.rs b/app/src/context_chips/display.rs
+index 3c1767d4..3c1c8fdb 100644
+--- a/app/src/context_chips/display.rs
++++ b/app/src/context_chips/display.rs
+@@ -11,7 +11,10 @@ use warpui::{
+     View, ViewContext, ViewHandle,
+ };
+ 
+-use super::display_chip::{DisplayChip, DisplayChipConfig, PromptDisplayChipEvent};
++use super::display_chip::{
++    render_udi_chip, DisplayChip, DisplayChipConfig, PromptDisplayChipEvent, UdiChipConfig,
++};
++use super::plugin_prompt::PluginPromptModel;
+ use super::prompt_type::PromptType;
+ use super::{git_line_changes_from_chips, ChipResult, ContextChipKind};
+ use crate::ai::blocklist::agent_view::AgentViewController;
+@@ -20,6 +23,7 @@ use crate::ai::blocklist::{
+     BlocklistAIInputEvent, BlocklistAIInputModel,
+ };
+ use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentVersion};
++use crate::appearance::Appearance;
+ use crate::completer::SessionContext;
+ use crate::context_chips::display_chip::{DisplayChipAction, PromptChipShellCommand};
+ use crate::settings::InputSettings;
+@@ -139,6 +143,11 @@ impl PromptDisplay {
+             ctx.notify();
+         });
+ 
++        // oh-my-warp: re-render when a plugin pushes prompt segments (`warp.prompt.set`).
++        ctx.subscribe_to_model(&PluginPromptModel::handle(ctx), |_, _, _, ctx| {
++            ctx.notify();
++        });
++
+         Self {
+             prompt,
+             display_chips: vec![],
+@@ -433,6 +442,19 @@ impl View for PromptDisplay {
+             }
+         });
+ 
++        // oh-my-warp: append plugin-contributed segments (`warp.prompt.set`) as native chips —
++        // left-grouped segments first, then right-grouped. (True right-edge alignment is a follow-up;
++        // the modern UDI prompt has no rprompt region.)
++        let plugin_prompt = PluginPromptModel::as_ref(app);
++        if !plugin_prompt.is_empty() {
++            let appearance = Appearance::as_ref(app);
++            let color = appearance.theme().ansi_fg_blue();
++            for segment in plugin_prompt.ordered_segments() {
++                let config = UdiChipConfig::new(color, segment.text.clone());
++                row.add_child(render_udi_chip(config, appearance));
++            }
++        }
++
+         // This is a hack to apply horizontal clipping without vertical clipping (for padding).
+         Container::new(
+             Clipped::new(
+diff --git a/app/src/context_chips/mod.rs b/app/src/context_chips/mod.rs
+index bc621109..d25c5348 100644
+--- a/app/src/context_chips/mod.rs
++++ b/app/src/context_chips/mod.rs
+@@ -9,6 +9,7 @@ pub mod display_menu;
+ pub(crate) mod git_branch_on_click;
+ pub(crate) mod logging;
+ pub mod node_version_popup;
++pub mod plugin_prompt;
+ pub mod prompt;
+ pub mod prompt_snapshot;
+ pub mod prompt_type;
+diff --git a/app/src/context_chips/plugin_prompt.rs b/app/src/context_chips/plugin_prompt.rs
+new file mode 100644
+index 00000000..f4b1a2ee
+--- /dev/null
++++ b/app/src/context_chips/plugin_prompt.rs
+@@ -0,0 +1,98 @@
++//! oh-my-warp: plugin-contributed prompt segments.
++//!
++//! A plugin pushes segments via `warp.prompt.set([...])` (see the `prompt` namespace in the plugin
++//! host's `js_api`). Because the plugin host can't render synchronously on the UI thread, the model
++//! is **push**: the plugin computes segment text in JS and pushes it; this singleton model caches it
++//! keyed by plugin id, and [`crate::context_chips::display::PromptDisplay`] reads it each render and
++//! appends the segments as native chips. Each `set` replaces that plugin's segments (empty clears).
++//!
++//! This lives in `context_chips` (always compiled) rather than the feature-gated `plugin` module so
++//! the render path never depends on the plugin host being built in: with no plugin host the model is
++//! simply always empty.
++
++use std::collections::BTreeMap;
++
++use serde::{Deserialize, Serialize};
++use warpui::{Entity, ModelContext, SingletonEntity};
++
++/// Which side of the prompt a segment is grouped on. Left segments render first (after the built-in
++/// chips), then right segments. (True right-edge alignment is classic-mode only; see PLUGIN_SPEC.md.)
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum PromptSide {
++    #[default]
++    Left,
++    Right,
++}
++
++/// One plugin-contributed prompt segment: the text to show, which side to group it on, and an
++/// optional tooltip.
++#[derive(Clone, Debug, Serialize, Deserialize)]
++pub struct PromptSegment {
++    pub text: String,
++    #[serde(default)]
++    pub side: PromptSide,
++    #[serde(default)]
++    pub tooltip: Option<String>,
++}
++
++/// Singleton model holding the prompt segments each plugin has pushed. Keyed by plugin id (BTreeMap
++/// so render order is stable across frames). Updated by the workspace plugin-host handler; observed
++/// by every `PromptDisplay` so a push re-renders the prompt.
++#[derive(Default)]
++pub struct PluginPromptModel {
++    segments_by_plugin: BTreeMap<String, Vec<PromptSegment>>,
++}
++
++impl PluginPromptModel {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Replaces `plugin_id`'s segments (an empty list removes them) and notifies observers.
++    pub fn set(
++        &mut self,
++        plugin_id: String,
++        segments: Vec<PromptSegment>,
++        ctx: &mut ModelContext<Self>,
++    ) {
++        if segments.is_empty() {
++            self.segments_by_plugin.remove(&plugin_id);
++        } else {
++            self.segments_by_plugin.insert(plugin_id, segments);
++        }
++        ctx.emit(PluginPromptEvent::Changed);
++        ctx.notify();
++    }
++
++    /// All segments in render order: every left segment (across plugins, by plugin id) then every
++    /// right segment.
++    pub fn ordered_segments(&self) -> Vec<&PromptSegment> {
++        let mut out: Vec<&PromptSegment> = Vec::new();
++        for seg in self.segments_by_plugin.values().flatten() {
++            if matches!(seg.side, PromptSide::Left) {
++                out.push(seg);
++            }
++        }
++        for seg in self.segments_by_plugin.values().flatten() {
++            if matches!(seg.side, PromptSide::Right) {
++                out.push(seg);
++            }
++        }
++        out
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.segments_by_plugin.is_empty()
++    }
++}
++
++pub enum PluginPromptEvent {
++    Changed,
++}
++
++impl Entity for PluginPromptModel {
++    type Event = PluginPromptEvent;
++}
++
++impl SingletonEntity for PluginPromptModel {}
+diff --git a/app/src/lib.rs b/app/src/lib.rs
+index 84278e14..fe48dae6 100644
+--- a/app/src/lib.rs
++++ b/app/src/lib.rs
+@@ -1821,6 +1821,9 @@ pub(crate) fn initialize_app(
+     ctx.add_singleton_model(
+         ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel::new,
+     );
++    // oh-my-warp: holds plugin-contributed prompt segments (`warp.prompt.set`). Registered
++    // unconditionally so the prompt render path never depends on the plugin host being built in.
++    ctx.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
+     ctx.add_singleton_model(
+         ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::new,
+     );
+diff --git a/app/src/plugin/app/mod.rs b/app/src/plugin/app/mod.rs
+index 0e8d2279..274b853f 100644
+--- a/app/src/plugin/app/mod.rs
++++ b/app/src/plugin/app/mod.rs
+@@ -2,6 +2,7 @@ mod service_impl;
+ 
+ use std::sync::Arc;
+ 
++use crate::context_chips::plugin_prompt::PromptSegment;
+ use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
+ use crate::view_components::{DismissibleToast, ToastFlavor};
+ use crate::workspace::{ToastStack, WorkspaceAction};
+@@ -182,6 +183,15 @@ impl PluginHost {
+             PluginAppRequest::OpenProject { path } => {
+                 ctx.emit(PluginHostEvent::OpenProject { path });
+             }
++            PluginAppRequest::SetPrompt {
++                plugin_id,
++                segments,
++            } => {
++                ctx.emit(PluginHostEvent::SetPrompt {
++                    plugin_id,
++                    segments,
++                });
++            }
+         }
+     }
+ }
+@@ -201,6 +211,11 @@ pub enum PluginHostEvent {
+     OpenWebTab { url: String },
+     /// Open a new tab with a terminal rooted at `path` (`warp.ui.openProject`).
+     OpenProject { path: String },
++    /// Replace a plugin's prompt segments (`warp.prompt.set`; empty `segments` clears them).
++    SetPrompt {
++        plugin_id: String,
++        segments: Vec<PromptSegment>,
++    },
+ }
+ 
+ impl Drop for PluginHost {
+diff --git a/app/src/plugin/app_requests.rs b/app/src/plugin/app_requests.rs
+index 03dfb816..06fef3e8 100644
+--- a/app/src/plugin/app_requests.rs
++++ b/app/src/plugin/app_requests.rs
+@@ -12,6 +12,8 @@ use std::sync::OnceLock;
+ use async_channel::{Receiver, Sender};
+ use serde::{Deserialize, Serialize};
+ 
++use crate::context_chips::plugin_prompt::PromptSegment;
++
+ /// One entry of a plugin-driven picker (`warp.ui.showPalette`): a label plus the id of the plugin
+ /// command (registered via `warp.commands.register`) to run when the user picks it.
+ ///
+@@ -52,6 +54,11 @@ pub enum PluginAppRequest {
+     OpenWebTab { url: String },
+     /// Open a new tab with a terminal rooted at `path` (`warp.ui.openProject`).
+     OpenProject { path: String },
++    /// Replace a plugin's prompt segments (`warp.prompt.set`; empty `segments` clears them).
++    SetPrompt {
++        plugin_id: String,
++        segments: Vec<PromptSegment>,
++    },
+ }
+ 
+ static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index da6181b7..1414a290 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -2,6 +2,7 @@ use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
+ 
+ use super::manifest::Manifest;
+ use super::plugin::PluginHandle;
++use crate::context_chips::plugin_prompt::{PromptSegment, PromptSide};
+ use crate::plugin::ai_tools::ToolOutput;
+ use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
+ use crate::plugin::events::{
+@@ -73,6 +74,7 @@ pub fn warp<'js>(
+     }
+     if manifest.permits("ui") {
+         api.set("ui", ui(ctx)?)?;
++        api.set("prompt", prompt(plugin_id.to_string(), ctx)?)?;
+     }
+     if manifest.permits("ai") {
+         api.set("ai", ai(plugin.clone(), ctx)?)?;
+@@ -321,6 +323,60 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+     Ok(ui)
+ }
+ 
++/// Returns the `warp.prompt` namespace (capability: `ui`) — plugin-contributed prompt segments.
++///
++/// `set(segments)` — `segments` is `[{ text, side?, tooltip? }]` (`side`: `"left"` | `"right"`,
++///     default left). Replaces *this plugin's* segments in the native prompt (empty array clears);
++///     `clear()` removes them. They render as native chips after the built-in ones. The plugin
++///     chooses when to refresh (e.g. from `terminal.onCommandFinished` or a timer). Fire-and-forget,
++///     like the other relays (see `super::app_request`). The calling plugin's id is captured so each
++///     plugin owns its own segments.
++fn prompt<'js>(plugin_id: String, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
++    let prompt = Object::new(ctx)?;
++
++    let set_plugin_id = plugin_id.clone();
++    prompt.set(
++        "set",
++        Function::new(ctx, move |segments: Vec<Object<'js>>| {
++            let segments: Vec<PromptSegment> = segments
++                .into_iter()
++                .filter_map(|seg| {
++                    let text: String = seg.get("text").ok()?;
++                    if text.is_empty() {
++                        return None;
++                    }
++                    let side = match seg.get::<_, String>("side").ok().as_deref() {
++                        Some("right") => PromptSide::Right,
++                        _ => PromptSide::Left,
++                    };
++                    let tooltip: Option<String> = seg.get("tooltip").ok();
++                    Some(PromptSegment {
++                        text,
++                        side,
++                        tooltip,
++                    })
++                })
++                .collect();
++            super::app_request::send_app_request(PluginAppRequest::SetPrompt {
++                plugin_id: set_plugin_id.clone(),
++                segments,
++            });
++        }),
++    )?;
++
++    prompt.set(
++        "clear",
++        Function::new(ctx, move || {
++            super::app_request::send_app_request(PluginAppRequest::SetPrompt {
++                plugin_id: plugin_id.clone(),
++                segments: Vec::new(),
++            });
++        }),
++    )?;
++
++    Ok(prompt)
++}
++
+ /// Returns a JS object representing the Keymap namespace for the Warp Plugin API.
+ ///
+ /// `bind(commandId: string, keys: string)` — binds a key sequence (e.g. `"ctrl-b g"`) to a
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index 3fbb8bf5..baa6f0bc 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -2193,6 +2193,17 @@ impl Workspace {
+                 // switch-or-create).
+                 me.open_or_focus_project(path, ctx);
+             }
++            crate::plugin::PluginHostEvent::SetPrompt {
++                plugin_id,
++                segments,
++            } => {
++                // Store the plugin's prompt segments (`warp.prompt.set`); every
++                // `PromptDisplay` observes this singleton model and re-renders.
++                crate::context_chips::plugin_prompt::PluginPromptModel::handle(ctx)
++                    .update(ctx, |model, ctx| {
++                        model.set(plugin_id.clone(), segments.clone(), ctx)
++                    });
++            }
+         });
+     }
+ 

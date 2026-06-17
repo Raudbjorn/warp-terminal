@@ -1,0 +1,1277 @@
+From a42651fb75a8b2ec0f68c8e9774dd1c42e3a1d03 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Fri, 22 May 2026 18:48:45 -0400
+Subject: [PATCH 30/48] Add embedded browser: CDP screencast/input session +
+ BrowserView pane (oh-my-warp)
+
+---
+ Cargo.lock                 |   1 +
+ Cargo.toml                 |   5 +
+ app/Cargo.toml             |   1 +
+ app/src/browser/mod.rs     |  13 +
+ app/src/browser/session.rs | 544 ++++++++++++++++++++++++++++++++
+ app/src/browser/view.rs    | 631 +++++++++++++++++++++++++++++++++++++
+ app/src/lib.rs             |   1 +
+ 7 files changed, 1196 insertions(+)
+ create mode 100644 app/src/browser/mod.rs
+ create mode 100644 app/src/browser/session.rs
+ create mode 100644 app/src/browser/view.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 789a4a2c..738331bf 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -14901,6 +14901,7 @@ dependencies = [
+  "tracing-futures",
+  "tracing-opentelemetry",
+  "tracing-subscriber",
++ "tungstenite",
+  "typed-path 0.10.0",
+  "ui_components",
+  "unicase",
+diff --git a/Cargo.toml b/Cargo.toml
+index 7fda31f5..64095359 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -296,6 +296,11 @@ tracing-subscriber = { version = "0.3.22", default-features = false, features =
+   "registry",
+   "std",
+ ] }
++# Blocking WebSocket client for the embedded browser pane's CDP screencast channel
++# (oh-my-warp). This is already in the tree transitively (async-tungstenite wraps
++# it); we use it directly on a dedicated thread to avoid async-runtime integration.
++# `handshake` is the only feature needed for a ws:// localhost client (no TLS).
++tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+ arborium = { version = "2", default-features = false, features = [
+   "lang-rust",
+   "lang-go",
+diff --git a/app/Cargo.toml b/app/Cargo.toml
+index 4745aac2..9da93320 100644
+--- a/app/Cargo.toml
++++ b/app/Cargo.toml
+@@ -216,6 +216,7 @@ toml = "0.8.13"
+ toml_edit.workspace = true
+ tracing.workspace = true
+ tracing-futures = { workspace = true, features = ["futures-03"] }
++tungstenite.workspace = true
+ ui_components.workspace = true
+ unicase = "2.7.0"
+ unicode-general-category.workspace = true
+diff --git a/app/src/browser/mod.rs b/app/src/browser/mod.rs
+new file mode 100644
+index 00000000..b2ace1da
+--- /dev/null
++++ b/app/src/browser/mod.rs
+@@ -0,0 +1,13 @@
++//! Embedded browser pane (oh-my-warp).
++//!
++//! Renders a real browser *inside* Warp's split layout by streaming Chrome's
++//! viewport over the Chrome DevTools Protocol (`Page.startScreencast`) and
++//! drawing the decoded frames in a GPUI pane. See `BROWSER_PANE_SPEC.md` for the
++//! design rationale (Strategy 1: stream frames, don't embed an engine).
++//!
++//! - [`session`] — spawns Chrome + the CDP screencast thread, decodes frames.
++//! - [`view`] — the [`view::BrowserView`] GPUI view that renders frames; wrapped
++//!   by [`crate::pane_group::BrowserPane`] to live in the pane tree.
++
++pub mod session;
++pub mod view;
+diff --git a/app/src/browser/session.rs b/app/src/browser/session.rs
+new file mode 100644
+index 00000000..e04060ec
+--- /dev/null
++++ b/app/src/browser/session.rs
+@@ -0,0 +1,544 @@
++//! Embedded browser pane: the CDP screencast + input session (oh-my-warp).
++//!
++//! Strategy 1 from `BROWSER_PANE_SPEC.md`: we do *not* embed a browser engine.
++//! We spawn a real Chrome with the DevTools remote-debugging endpoint, drive the
++//! Chrome DevTools Protocol's `Page.startScreencast`, stream the resulting JPEG
++//! frames back to a GPUI pane, and forward the user's mouse/scroll/navigation
++//! back over CDP `Input.*` / `Page.*`.
++//!
++//! Everything runs on a dedicated OS thread (blocking `tungstenite`) decoupled
++//! from the UI thread:
++//! - **frames + URL changes** flow out via the `update_tx` channel (drained by
++//!   the view on the foreground executor),
++//! - **commands** (navigate / click / scroll / back / forward / reload) flow in
++//!   via the `cmd` channel, drained each loop iteration.
++//!
++//! A short socket read timeout lets the single thread interleave reading frames
++//! with sending queued commands without a second socket.
++//!
++//! ## Screencast protocol notes (verified against Chrome)
++//! - Frames arrive as `Page.screencastFrame` (base64 JPEG + a `sessionId`) and
++//!   **each must be acked** (`Page.screencastFrameAck`) or the stream stalls.
++//! - Screencast is **change-driven**; an idle page costs nothing.
++//! - Input coordinates are CSS pixels relative to the viewport, so the frame
++//!   carries `css_width`/`css_height` for the view to map clicks into.
++
++use std::io::ErrorKind;
++use std::net::TcpStream;
++use std::process::{Child, Command};
++use std::sync::atomic::{AtomicBool, Ordering};
++use std::sync::Arc;
++use std::thread::JoinHandle;
++use std::time::Duration;
++
++use anyhow::{anyhow, Context, Result};
++use base64::engine::general_purpose::STANDARD as BASE64;
++use base64::Engine as _;
++use serde::Deserialize;
++use serde_json::{json, Value};
++use tungstenite::{Message, WebSocket};
++use warpui::image_cache::StaticImage;
++
++/// The fallback page a freshly-opened browser pane navigates to when no start
++/// page is configured (see [`BrowserConfig`]).
++pub const DEFAULT_URL: &str = "https://example.com";
++
++/// User-configurable browser-pane settings, from `~/.warp/oh-my-warp.toml`'s
++/// `[browser]` table (with `OMW_BROWSER_*` env overrides).
++pub struct BrowserConfig {
++    /// The start page (`[browser] home`, `OMW_BROWSER_HOME`).
++    pub home: String,
++    /// Invert scroll-wheel direction (`[browser] reverse_scroll`,
++    /// `OMW_BROWSER_REVERSE_SCROLL`).
++    pub reverse_scroll: bool,
++}
++
++impl Default for BrowserConfig {
++    fn default() -> Self {
++        Self {
++            home: DEFAULT_URL.to_owned(),
++            reverse_scroll: false,
++        }
++    }
++}
++
++/// Loads [`BrowserConfig`] from `~/.warp/oh-my-warp.toml` (`[browser]` table),
++/// then applies `OMW_BROWSER_*` environment overrides.
++pub fn load_config() -> BrowserConfig {
++    let mut config = BrowserConfig::default();
++
++    if let Some(home_dir) = std::env::var_os("HOME") {
++        let path = std::path::Path::new(&home_dir).join(".warp/oh-my-warp.toml");
++        if let Ok(contents) = std::fs::read_to_string(&path) {
++            if let Ok(value) = contents.parse::<toml::Value>() {
++                if let Some(browser) = value.get("browser") {
++                    if let Some(home) = browser.get("home").and_then(|v| v.as_str()) {
++                        let home = home.trim();
++                        if !home.is_empty() {
++                            config.home = home.to_owned();
++                        }
++                    }
++                    if let Some(reverse) = browser.get("reverse_scroll").and_then(|v| v.as_bool()) {
++                        config.reverse_scroll = reverse;
++                    }
++                }
++            }
++        }
++    }
++
++    if let Ok(home) = std::env::var("OMW_BROWSER_HOME") {
++        let home = home.trim();
++        if !home.is_empty() {
++            config.home = home.to_owned();
++        }
++    }
++    if let Ok(reverse) = std::env::var("OMW_BROWSER_REVERSE_SCROLL") {
++        config.reverse_scroll = matches!(reverse.trim(), "1" | "true" | "yes");
++    }
++
++    config
++}
++
++/// macOS path to the system Chrome binary that hosts the CDP endpoint.
++const CHROME_PATH: &str = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
++
++/// How long the read blocks before we wake to drain queued input commands.
++const READ_TIMEOUT: Duration = Duration::from_millis(16);
++
++/// A decoded viewport frame plus the CSS viewport size it represents (used by
++/// the view to map pane-local clicks into CDP input coordinates).
++pub struct ViewportFrame {
++    pub image: Arc<StaticImage>,
++    pub css_width: f32,
++    pub css_height: f32,
++}
++
++/// An update produced by the session thread for the view to apply.
++pub enum SessionUpdate {
++    /// A freshly decoded viewport frame.
++    Frame(ViewportFrame),
++    /// The main frame navigated; carries the new URL (updates the address bar).
++    Url(String),
++}
++
++/// A command from the view to the session thread, translated to CDP.
++/// Mouse coordinates are already in CSS viewport pixels.
++#[derive(Clone)]
++pub enum BrowserCommand {
++    Navigate(String),
++    Reload,
++    Back,
++    Forward,
++    MouseMove {
++        x: f64,
++        y: f64,
++    },
++    MouseDown {
++        x: f64,
++        y: f64,
++        click_count: i64,
++    },
++    MouseUp {
++        x: f64,
++        y: f64,
++        click_count: i64,
++    },
++    Wheel {
++        x: f64,
++        y: f64,
++        delta_x: f64,
++        delta_y: f64,
++    },
++    /// Resize the browser viewport (CSS px) to match the pane, so the page fills
++    /// it instead of letterboxing.
++    Resize {
++        width: u32,
++        height: u32,
++    },
++    /// Insert literal text into the focused page element (typing).
++    InsertText(String),
++    /// Press + release a named key in the page (Enter, Backspace, arrows, …).
++    KeyPress {
++        key: String,
++        code: String,
++        vk: i64,
++    },
++}
++
++/// A single CDP DevTools target as reported by `GET /json`.
++#[derive(Deserialize)]
++struct CdpTarget {
++    #[serde(rename = "type")]
++    target_type: String,
++    #[serde(rename = "webSocketDebuggerUrl")]
++    ws_url: Option<String>,
++}
++
++/// Owns a spawned Chrome process and the background thread streaming its
++/// viewport / accepting input. Dropping it stops the thread and kills Chrome.
++pub struct BrowserSession {
++    child: Option<Child>,
++    stop: Arc<AtomicBool>,
++    thread: Option<JoinHandle<()>>,
++}
++
++impl BrowserSession {
++    /// Spawns Chrome pointed at `url`, then starts a background thread that
++    /// connects to its CDP endpoint, pushes updates into `update_tx`, and drains
++    /// commands from `cmd_rx`. Returns immediately. The caller owns the command
++    /// `Sender` (so input/UI closures can send without holding the session).
++    pub fn spawn(
++        url: &str,
++        update_tx: async_channel::Sender<SessionUpdate>,
++        cmd_rx: async_channel::Receiver<BrowserCommand>,
++    ) -> Result<Self> {
++        let port = free_port()?;
++        let profile = std::env::temp_dir().join(format!("omw-browser-{port}"));
++
++        let child = Command::new(CHROME_PATH)
++            .arg(format!("--remote-debugging-port={port}"))
++            .arg(format!("--user-data-dir={}", profile.display()))
++            // Accept the CDP WebSocket upgrade regardless of Origin.
++            .arg("--remote-allow-origins=*")
++            .arg("--no-first-run")
++            .arg("--no-default-browser-check")
++            // Keep the tab live so the compositor keeps emitting frames.
++            .arg("--disable-background-timer-throttling")
++            .arg("--disable-backgrounding-occluded-windows")
++            .arg("--disable-renderer-backgrounding")
++            // Headless so no separate Chrome window appears; the anti-throttle
++            // flags above keep the (windowless) tab compositing so screencast
++            // frames keep flowing. --window-size sets the viewport dimensions.
++            .arg("--headless=new")
++            .arg("--window-size=1100,800")
++            .arg(url)
++            .spawn()
++            .with_context(|| format!("failed to spawn Chrome at {CHROME_PATH}"))?;
++
++        let stop = Arc::new(AtomicBool::new(false));
++        let stop_thread = stop.clone();
++        let thread = std::thread::Builder::new()
++            .name("omw-browser-cdp".to_owned())
++            .spawn(move || {
++                if let Err(e) = run_session(port, &update_tx, &cmd_rx, &stop_thread) {
++                    log::warn!("[omw-browser] CDP session ended: {e:#}");
++                }
++            })
++            .context("failed to spawn browser CDP thread")?;
++
++        log::info!("[omw-browser] spawned Chrome on CDP port {port} → {url}");
++        Ok(Self {
++            child: Some(child),
++            stop,
++            thread: Some(thread),
++        })
++    }
++}
++
++impl Drop for BrowserSession {
++    fn drop(&mut self) {
++        self.stop.store(true, Ordering::SeqCst);
++        // Killing Chrome closes the CDP socket, which unblocks the thread's read
++        // so it exits on its own; we don't join (avoid stalling the UI thread).
++        if let Some(mut child) = self.child.take() {
++            let _ = child.kill();
++            let _ = child.wait();
++        }
++        drop(self.thread.take());
++    }
++}
++
++/// Asks the OS for an unused TCP port (bind to :0, read it back, drop).
++fn free_port() -> Result<u16> {
++    let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
++    Ok(listener.local_addr()?.port())
++}
++
++/// Polls `GET /json` until a `page` target with a WebSocket URL is available.
++fn discover_target(port: u16, stop: &AtomicBool) -> Result<String> {
++    let url = format!("http://127.0.0.1:{port}/json");
++    for _ in 0..150 {
++        if stop.load(Ordering::SeqCst) {
++            return Err(anyhow!("stopped before CDP target was ready"));
++        }
++        if let Ok(resp) = reqwest::blocking::get(&url) {
++            if let Ok(targets) = resp.json::<Vec<CdpTarget>>() {
++                if let Some(ws) = targets
++                    .into_iter()
++                    .find(|t| t.target_type == "page" && t.ws_url.is_some())
++                    .and_then(|t| t.ws_url)
++                {
++                    return Ok(ws);
++                }
++            }
++        }
++        std::thread::sleep(Duration::from_millis(100));
++    }
++    Err(anyhow!("no CDP page target appeared on port {port}"))
++}
++
++/// Sends a CDP command, auto-incrementing the request id.
++fn cdp_send(
++    socket: &mut WebSocket<TcpStream>,
++    next_id: &mut i64,
++    method: &str,
++    params: Value,
++) -> Result<()> {
++    *next_id += 1;
++    let msg = json!({ "id": *next_id, "method": method, "params": params });
++    socket
++        .send(Message::Text(msg.to_string()))
++        .map_err(|e| anyhow!("CDP send {method}: {e}"))
++}
++
++/// Starts (or restarts) the JPEG screencast.
++fn start_screencast(socket: &mut WebSocket<TcpStream>, next_id: &mut i64) -> Result<()> {
++    cdp_send(
++        socket,
++        next_id,
++        "Page.startScreencast",
++        json!({ "format": "jpeg", "quality": 70, "maxWidth": 1600, "maxHeight": 1000, "everyNthFrame": 1 }),
++    )
++}
++
++/// Translates one [`BrowserCommand`] into the corresponding CDP message(s).
++fn apply_command(
++    socket: &mut WebSocket<TcpStream>,
++    next_id: &mut i64,
++    cmd: BrowserCommand,
++) -> Result<()> {
++    match cmd {
++        BrowserCommand::Navigate(url) => {
++            cdp_send(socket, next_id, "Page.navigate", json!({ "url": url }))
++        }
++        BrowserCommand::Reload => cdp_send(socket, next_id, "Page.reload", json!({})),
++        BrowserCommand::Back => cdp_send(
++            socket,
++            next_id,
++            "Runtime.evaluate",
++            json!({ "expression": "history.back()" }),
++        ),
++        BrowserCommand::Forward => cdp_send(
++            socket,
++            next_id,
++            "Runtime.evaluate",
++            json!({ "expression": "history.forward()" }),
++        ),
++        BrowserCommand::MouseMove { x, y } => cdp_send(
++            socket,
++            next_id,
++            "Input.dispatchMouseEvent",
++            json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),
++        ),
++        BrowserCommand::MouseDown { x, y, click_count } => {
++            // Move to the point first so hover/target state is set, then press.
++            cdp_send(
++                socket,
++                next_id,
++                "Input.dispatchMouseEvent",
++                json!({ "type": "mouseMoved", "x": x, "y": y, "button": "none", "buttons": 0 }),
++            )?;
++            cdp_send(
++                socket,
++                next_id,
++                "Input.dispatchMouseEvent",
++                json!({ "type": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": click_count }),
++            )
++        }
++        BrowserCommand::MouseUp { x, y, click_count } => cdp_send(
++            socket,
++            next_id,
++            "Input.dispatchMouseEvent",
++            json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": click_count }),
++        ),
++        BrowserCommand::Wheel {
++            x,
++            y,
++            delta_x,
++            delta_y,
++        } => cdp_send(
++            socket,
++            next_id,
++            "Input.dispatchMouseEvent",
++            json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": delta_x, "deltaY": delta_y }),
++        ),
++        BrowserCommand::Resize { width, height } => {
++            log::info!("[omw-browser] resize viewport to {width}x{height}");
++            cdp_send(
++                socket,
++                next_id,
++                "Emulation.setDeviceMetricsOverride",
++                json!({
++                    "width": width,
++                    "height": height,
++                    "deviceScaleFactor": 2,
++                    "mobile": false,
++                }),
++            )
++        }
++        BrowserCommand::InsertText(text) => {
++            cdp_send(socket, next_id, "Input.insertText", json!({ "text": text }))
++        }
++        BrowserCommand::KeyPress { key, code, vk } => {
++            cdp_send(
++                socket,
++                next_id,
++                "Input.dispatchKeyEvent",
++                json!({ "type": "keyDown", "key": key, "code": code, "windowsVirtualKeyCode": vk }),
++            )?;
++            cdp_send(
++                socket,
++                next_id,
++                "Input.dispatchKeyEvent",
++                json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": vk }),
++            )
++        }
++    }
++}
++
++/// Connects to the CDP endpoint, starts the screencast, and pumps frames out /
++/// commands in until the socket closes or `stop` is set.
++fn run_session(
++    port: u16,
++    update_tx: &async_channel::Sender<SessionUpdate>,
++    cmd_rx: &async_channel::Receiver<BrowserCommand>,
++    stop: &AtomicBool,
++) -> Result<()> {
++    let ws_url = discover_target(port, stop)?;
++    let stream = TcpStream::connect(("127.0.0.1", port)).context("connect CDP TCP socket")?;
++    stream.set_nodelay(true).ok();
++    let (mut socket, _resp) = tungstenite::client::client(ws_url.as_str(), stream)
++        .map_err(|e| anyhow!("CDP WebSocket handshake failed: {e}"))?;
++    // After the (blocking) handshake, switch to a short read timeout so the loop
++    // can interleave reads with draining the command channel.
++    socket
++        .get_mut()
++        .set_read_timeout(Some(READ_TIMEOUT))
++        .context("set CDP read timeout")?;
++
++    let mut next_id = 0i64;
++    cdp_send(&mut socket, &mut next_id, "Page.enable", json!({}))?;
++    start_screencast(&mut socket, &mut next_id)?;
++    log::info!("[omw-browser] screencast started on port {port}");
++
++    loop {
++        if stop.load(Ordering::SeqCst) {
++            return Ok(());
++        }
++
++        // Drain any queued input/navigation commands first (low latency),
++        // coalescing consecutive mouse-moves to the latest so rapid hover
++        // movement doesn't flood CDP (clicks/scrolls flush any pending move).
++        let mut pending_move: Option<BrowserCommand> = None;
++        let mut pending_resize: Option<BrowserCommand> = None;
++        while let Ok(cmd) = cmd_rx.try_recv() {
++            match cmd {
++                BrowserCommand::MouseMove { .. } => pending_move = Some(cmd),
++                BrowserCommand::Resize { .. } => pending_resize = Some(cmd),
++                other => {
++                    // Resize first (changes the coordinate space), then move.
++                    if let Some(rs) = pending_resize.take() {
++                        apply_command(&mut socket, &mut next_id, rs)?;
++                    }
++                    if let Some(mv) = pending_move.take() {
++                        apply_command(&mut socket, &mut next_id, mv)?;
++                    }
++                    apply_command(&mut socket, &mut next_id, other)?;
++                }
++            }
++        }
++        if let Some(rs) = pending_resize.take() {
++            apply_command(&mut socket, &mut next_id, rs)?;
++        }
++        if let Some(mv) = pending_move.take() {
++            apply_command(&mut socket, &mut next_id, mv)?;
++        }
++
++        match socket.read() {
++            Ok(Message::Text(text)) => {
++                if update_tx.is_closed() {
++                    return Ok(()); // view dropped
++                }
++                handle_cdp_message(&mut socket, &mut next_id, &text, update_tx)?;
++            }
++            Ok(Message::Ping(payload)) => {
++                socket
++                    .send(Message::Pong(payload))
++                    .map_err(|e| anyhow!("CDP pong: {e}"))?;
++            }
++            Ok(Message::Close(_)) => return Ok(()),
++            Ok(_) => {}
++            // Read timeout: no frame waiting — loop back to drain commands.
++            Err(tungstenite::Error::Io(e))
++                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
++            Err(e) => return Err(anyhow!("CDP read: {e}")),
++        }
++    }
++}
++
++/// Handles one CDP event message: screencast frames (decoded + acked) and main
++/// frame navigations (URL updates).
++fn handle_cdp_message(
++    socket: &mut WebSocket<TcpStream>,
++    next_id: &mut i64,
++    text: &str,
++    update_tx: &async_channel::Sender<SessionUpdate>,
++) -> Result<()> {
++    let value: Value = match serde_json::from_str(text) {
++        Ok(v) => v,
++        Err(_) => return Ok(()),
++    };
++    match value.get("method").and_then(Value::as_str) {
++        Some("Page.screencastFrame") => {
++            let params = &value["params"];
++            let Some(data_b64) = params["data"].as_str() else {
++                return Ok(());
++            };
++            let session_id = params["sessionId"].clone();
++            let css_width = params["metadata"]["deviceWidth"].as_f64().unwrap_or(0.0) as f32;
++            let css_height = params["metadata"]["deviceHeight"].as_f64().unwrap_or(0.0) as f32;
++
++            match decode_frame(data_b64) {
++                Ok(image) => {
++                    let _ = update_tx.try_send(SessionUpdate::Frame(ViewportFrame {
++                        image,
++                        css_width,
++                        css_height,
++                    }));
++                }
++                Err(e) => log::warn!("[omw-browser] frame decode failed: {e:#}"),
++            }
++
++            // Ack so Chrome sends the next frame (backpressure).
++            cdp_send(
++                socket,
++                next_id,
++                "Page.screencastFrameAck",
++                json!({ "sessionId": session_id }),
++            )
++        }
++        Some("Page.frameNavigated") => {
++            let frame = &value["params"]["frame"];
++            // Main frame only (no parentId).
++            if frame.get("parentId").is_none() {
++                if let Some(url) = frame["url"].as_str() {
++                    let _ = update_tx.try_send(SessionUpdate::Url(url.to_owned()));
++                }
++                // Screencast can stop across a navigation; restart it so the new
++                // page keeps streaming (e.g. after following a link).
++                start_screencast(socket, next_id)?;
++            }
++            Ok(())
++        }
++        _ => Ok(()),
++    }
++}
++
++/// Decodes a base64 JPEG screencast frame into an `Arc<StaticImage>`.
++fn decode_frame(data_b64: &str) -> Result<Arc<StaticImage>> {
++    let jpeg = BASE64.decode(data_b64).context("base64 decode")?;
++    let rgba = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
++        .context("jpeg decode")?
++        .into_rgba8();
++    Ok(Arc::new(StaticImage::from_rgba(rgba)))
++}
+diff --git a/app/src/browser/view.rs b/app/src/browser/view.rs
+new file mode 100644
+index 00000000..6d0b1638
+--- /dev/null
++++ b/app/src/browser/view.rs
+@@ -0,0 +1,631 @@
++//! The backing GPUI view for the embedded browser pane (oh-my-warp).
++//!
++//! Owns a [`BrowserSession`] (a spawned Chrome + CDP screencast/input thread,
++//! see [`super::session`]) and renders a toolbar (back / forward / reload + an
++//! editable address bar) above the live viewport.
++//!
++//! Threading: session updates (frames + URL changes) arrive on an
++//! `async_channel` drained on the foreground executor (`spawn_stream_local`);
++//! input (clicks / scroll / navigation) is sent back over a command channel the
++//! view owns, so UI closures can dispatch without holding the session. The UI
++//! thread never blocks on the network or JPEG decode.
++//!
++//! Click mapping: [`FrameImage`] reports the exact (letterbox-corrected) rect it
++//! drew into via a shared [`BoundsSink`]; the view maps a pane-local pointer
++//! position into CSS viewport pixels (using the frame's `css_size`) for CDP
++//! `Input.*`.
++
++use std::cell::Cell;
++use std::rc::Rc;
++use std::sync::Arc;
++use std::time::Duration;
++
++use instant::Instant;
++
++use warpui::elements::{
++    Border, BoundsSink, ChildView, Clipped, ConstrainedBox, Container, CornerRadius,
++    CrossAxisAlignment, DispatchEventResult, Empty, EventHandler, Expanded, Flex, FrameImage,
++    MainAxisSize, MouseStateHandle, ParentElement, Radius, SizeSink,
++};
++use warpui::geometry::vector::Vector2F;
++use warpui::image_cache::StaticImage;
++use warpui::keymap::Keystroke;
++use warpui::text_layout::ClipConfig;
++use warpui::ui_components::components::UiComponent;
++use warpui::{
++    AppContext, BlurContext, Element, Entity, FocusContext, ModelHandle, SingletonEntity,
++    TypedActionView, View, ViewContext, ViewHandle,
++};
++
++use super::session::{load_config, BrowserCommand, BrowserSession, SessionUpdate, DEFAULT_URL};
++use crate::appearance::Appearance;
++use crate::editor::{
++    BaselinePositionComputationMethod, EditorView, Event as EditorEvent, SingleLineEditorOptions,
++};
++use crate::pane_group::focus_state::PaneFocusHandle;
++use crate::pane_group::pane::view::{self, HeaderContent, StandardHeader, StandardHeaderOptions};
++use crate::pane_group::{BackingView, PaneConfiguration, PaneEvent};
++use crate::ui_components::buttons::icon_button;
++use crate::ui_components::icons;
++
++/// Header text for the browser pane.
++pub const BROWSER_HEADER_TEXT: &str = "Browser";
++
++/// Multiplier applied to scroll-wheel deltas before forwarding to CDP. Tunable.
++const SCROLL_SCALE: f64 = 1.0;
++
++/// The CSS viewport size the current frame represents (shared with input
++/// closures so they can map pointer positions without borrowing the view).
++type CssSize = Rc<Cell<Option<(f32, f32)>>>;
++
++/// Which sub-target keyboard focus belongs to. Pane activation focuses whichever
++/// is current (set synchronously on click), so the page doesn't steal focus back
++/// from the address bar (and vice versa).
++#[derive(Clone, Copy, PartialEq)]
++enum FocusTarget {
++    Page,
++    AddressBar,
++}
++
++/// Event emitted by the [`BrowserView`].
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum BrowserViewEvent {
++    Pane(PaneEvent),
++}
++
++/// Actions handled by the [`BrowserView`].
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum BrowserViewAction {
++    /// Move keyboard focus to the page (so typing forwards to the browser, not
++    /// the address bar). Dispatched when the viewport is clicked.
++    FocusViewport,
++}
++
++/// A pane view that renders a live, interactive browser viewport over CDP.
++pub struct BrowserView {
++    pane_configuration: ModelHandle<PaneConfiguration>,
++    focus_handle: Option<PaneFocusHandle>,
++    /// The most recent decoded frame, drawn by [`Self::render`].
++    current_frame: Option<Arc<StaticImage>>,
++    /// CSS viewport size for the current frame (for click mapping).
++    css_size: CssSize,
++    /// Window-space rect the frame was last drawn into (for click mapping).
++    viewport_rect: BoundsSink,
++    /// The viewport element's allocated size (logical px), for sizing Chrome.
++    viewport_size: SizeSink,
++    /// The last viewport size requested of Chrome (to avoid redundant resizes).
++    requested_size: Rc<Cell<Option<(u32, u32)>>>,
++    /// The current page URL (updated on navigation).
++    url: String,
++    /// The editable address bar.
++    url_editor: ViewHandle<EditorView>,
++    /// Outbound command channel to the session thread.
++    cmd_tx: async_channel::Sender<BrowserCommand>,
++    /// Scroll-wheel direction multiplier (-1.0 if `reverse_scroll` is set).
++    scroll_sign: f64,
++    /// Tracks recent clicks (last press time + count) to synthesize the CDP
++    /// `clickCount` for double/triple-click (text selection) in the page.
++    click_state: Rc<Cell<(Option<Instant>, i64)>>,
++    /// Where keyboard focus should go when the pane is (re)activated.
++    focus_target: Rc<Cell<FocusTarget>>,
++    /// Whether the page view (`BrowserView` itself) currently holds focus. Driven
++    /// by `on_focus`/`on_blur`; key-forwarding checks this so we stop forwarding
++    /// the instant focus leaves (rather than relying on the sticky focus target).
++    page_focused: Rc<Cell<bool>>,
++    back_button: MouseStateHandle,
++    forward_button: MouseStateHandle,
++    reload_button: MouseStateHandle,
++    /// Kept alive for the pane's lifetime; dropping it kills Chrome + the thread.
++    _session: Option<BrowserSession>,
++}
++
++impl BrowserView {
++    pub fn new(ctx: &mut ViewContext<Self>) -> Self {
++        let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new(BROWSER_HEADER_TEXT));
++        let config = load_config();
++        let url = config.home.clone();
++        let scroll_sign = if config.reverse_scroll { -1.0 } else { 1.0 };
++
++        // session updates out (frames + URL), commands in (clicks / nav).
++        let (update_tx, update_rx) = async_channel::unbounded::<SessionUpdate>();
++        let (cmd_tx, cmd_rx) = async_channel::unbounded::<BrowserCommand>();
++        let session = match BrowserSession::spawn(&url, update_tx, cmd_rx) {
++            Ok(session) => Some(session),
++            Err(e) => {
++                log::warn!("[omw-browser] failed to start browser session: {e:#}");
++                None
++            }
++        };
++
++        let url_editor = ctx.add_typed_action_view(|ctx| {
++            EditorView::single_line(
++                SingleLineEditorOptions {
++                    select_all_on_focus: true,
++                    // Center the text vertically using font metrics.
++                    baseline_position_computation_method: BaselinePositionComputationMethod::Grid,
++                    ..SingleLineEditorOptions::default()
++                },
++                ctx,
++            )
++        });
++        url_editor.update(ctx, |editor, ctx| editor.set_buffer_text(&url, ctx));
++        ctx.subscribe_to_view(
++            &url_editor,
++            |me: &mut Self, _editor, event, ctx| match event {
++                EditorEvent::Enter => me.submit_url(ctx),
++                // Keep the focus target in sync when the address bar gains focus by
++                // any means (click, tab, etc.) so pane activation keeps it focused.
++                EditorEvent::Focused => me.focus_target.set(FocusTarget::AddressBar),
++                _ => {}
++            },
++        );
++
++        ctx.spawn_stream_local(
++            update_rx,
++            |view: &mut Self, update, ctx| {
++                match update {
++                    SessionUpdate::Frame(frame) => {
++                        view.current_frame = Some(frame.image);
++                        view.css_size.set(Some((frame.css_width, frame.css_height)));
++                    }
++                    SessionUpdate::Url(url) => {
++                        view.url = url.clone();
++                        view.url_editor
++                            .update(ctx, |editor, ctx| editor.set_buffer_text(&url, ctx));
++                    }
++                }
++                ctx.notify();
++            },
++            |_view, _ctx| {},
++        );
++
++        Self {
++            pane_configuration,
++            focus_handle: None,
++            current_frame: None,
++            css_size: Rc::new(Cell::new(None)),
++            viewport_rect: Rc::new(Cell::new(None)),
++            viewport_size: Rc::new(Cell::new(None)),
++            requested_size: Rc::new(Cell::new(None)),
++            url,
++            url_editor,
++            cmd_tx,
++            scroll_sign,
++            click_state: Rc::new(Cell::new((None, 0))),
++            focus_target: Rc::new(Cell::new(FocusTarget::AddressBar)),
++            page_focused: Rc::new(Cell::new(false)),
++            back_button: MouseStateHandle::default(),
++            forward_button: MouseStateHandle::default(),
++            reload_button: MouseStateHandle::default(),
++            _session: session,
++        }
++    }
++
++    pub fn pane_configuration(&self) -> ModelHandle<PaneConfiguration> {
++        self.pane_configuration.clone()
++    }
++
++    pub fn focus(&mut self, ctx: &mut ViewContext<Self>) {
++        // Focus whichever sub-target is current. The target is set synchronously
++        // on click (page vs address bar), so pane activation doesn't steal focus
++        // back to the page from the address bar.
++        match self.focus_target.get() {
++            FocusTarget::Page => ctx.focus_self(),
++            FocusTarget::AddressBar => ctx.focus(&self.url_editor),
++        }
++    }
++
++    /// Reads the address bar and navigates to it (called on Enter), then returns
++    /// focus to the page.
++    fn submit_url(&mut self, ctx: &mut ViewContext<Self>) {
++        let input = self.url_editor.as_ref(ctx).buffer_text(ctx);
++        let _ = self
++            .cmd_tx
++            .try_send(BrowserCommand::Navigate(normalize_url(&input)));
++        self.focus_target.set(FocusTarget::Page);
++        ctx.focus_self();
++    }
++
++    /// A toolbar nav button that sends `command` when clicked.
++    fn nav_button(
++        &self,
++        appearance: &Appearance,
++        icon: icons::Icon,
++        state: MouseStateHandle,
++        command: BrowserCommand,
++    ) -> Box<dyn Element> {
++        let cmd_tx = self.cmd_tx.clone();
++        let button = icon_button(appearance, icon, false, state)
++            .build()
++            .on_click(move |_ctx, _app, _pos| {
++                let _ = cmd_tx.try_send(command.clone());
++            })
++            .finish();
++        Container::new(button).with_margin_right(2.0).finish()
++    }
++
++    fn render_toolbar(&self, app: &AppContext) -> Box<dyn Element> {
++        let appearance = Appearance::as_ref(app);
++        let theme = appearance.theme();
++
++        // Accent border when the address bar is focused, neutral outline otherwise
++        // (matches Warp's input chrome).
++        let border_color = if self.url_editor.is_focused(app) {
++            theme.accent()
++        } else {
++            theme.outline()
++        };
++
++        // Leading affordance: a lock for https pages, a globe otherwise.
++        let lead_icon = if self.url.starts_with("https://") {
++            icons::Icon::Lock
++        } else {
++            icons::Icon::Globe
++        };
++        let lead = ConstrainedBox::new(
++            lead_icon
++                .to_warpui_icon(theme.sub_text_color(theme.surface_2()))
++                .finish(),
++        )
++        .with_width(14.0)
++        .with_height(14.0)
++        .finish();
++
++        // Clicking the address bar must keep focus there: set the target
++        // synchronously on mouse-down (before pane activation focuses the pane),
++        // then propagate so the editor still focuses itself.
++        let focus_ab = self.focus_target.clone();
++        let editor_el = EventHandler::new(
++            // Clip so a long URL scrolls within the box instead of overflowing.
++            Clipped::new(ChildView::new(&self.url_editor).finish()).finish(),
++        )
++        .on_left_mouse_down(move |_ctx, _app, _pos| {
++            focus_ab.set(FocusTarget::AddressBar);
++            DispatchEventResult::PropagateToParent
++        })
++        .finish();
++        let field = Flex::row()
++            .with_cross_axis_alignment(CrossAxisAlignment::Center)
++            .with_child(Container::new(lead).with_margin_right(6.0).finish())
++            .with_child(Expanded::new(1.0, editor_el).finish());
++
++        // The address bar: an editable single-line editor in a rounded, bordered box.
++        let address = Container::new(field.finish())
++            .with_background(theme.surface_2())
++            .with_border(Border::all(1.0).with_border_fill(border_color))
++            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.0)))
++            .with_padding_left(8.0)
++            .with_padding_right(8.0)
++            .with_padding_top(5.0)
++            // Slightly less bottom padding raises the bottom border ~1px so the
++            // text reads centered.
++            .with_padding_bottom(4.0)
++            .with_margin_left(4.0)
++            // Keep the right border off the toolbar edge (avoids a clipped edge).
++            .with_margin_right(2.0)
++            .finish();
++
++        let row = Flex::row()
++            .with_cross_axis_alignment(CrossAxisAlignment::Center)
++            .with_child(self.nav_button(
++                appearance,
++                icons::Icon::ArrowLeft,
++                self.back_button.clone(),
++                BrowserCommand::Back,
++            ))
++            .with_child(self.nav_button(
++                appearance,
++                icons::Icon::ArrowRight,
++                self.forward_button.clone(),
++                BrowserCommand::Forward,
++            ))
++            .with_child(self.nav_button(
++                appearance,
++                icons::Icon::Refresh,
++                self.reload_button.clone(),
++                BrowserCommand::Reload,
++            ))
++            .with_child(Expanded::new(1.0, address).finish());
++
++        // Toolbar background distinguishes it from the page viewport below. It
++        // self-sizes to the row + padding (no fixed height), so the address box
++        // hugs its content and reads as a properly proportioned input.
++        Container::new(row.finish())
++            .with_background(theme.surface_1())
++            .with_uniform_padding(6.0)
++            .finish()
++    }
++
++    /// If the pane size changed since the last request, ask Chrome to resize its
++    /// viewport to match so the page fills the pane (no letterboxing).
++    fn sync_viewport_size(&self) {
++        let Some(size) = self.viewport_size.get() else {
++            return;
++        };
++        let (w, h) = (size.x().round() as u32, size.y().round() as u32);
++        if w == 0 || h == 0 {
++            return;
++        }
++        let changed = match self.requested_size.get() {
++            Some((rw, rh)) => {
++                (w as i32 - rw as i32).abs() >= 8 || (h as i32 - rh as i32).abs() >= 8
++            }
++            None => true,
++        };
++        if changed {
++            self.requested_size.set(Some((w, h)));
++            let _ = self.cmd_tx.try_send(BrowserCommand::Resize {
++                width: w,
++                height: h,
++            });
++        }
++    }
++
++    fn render_viewport(&self) -> Box<dyn Element> {
++        let Some(frame) = &self.current_frame else {
++            return Empty::new().finish();
++        };
++        let image = FrameImage::new(frame.clone())
++            .report_bounds(self.viewport_rect.clone())
++            .report_size(self.viewport_size.clone())
++            .finish();
++
++        let (vp_move, css_move, cmd_move) = self.input_handles();
++        let (vp_down, css_down, cmd_down) = self.input_handles();
++        let (vp_up, css_up, cmd_up) = self.input_handles();
++        let css_wheel = self.css_size.clone();
++        let cmd_wheel = self.cmd_tx.clone();
++        let cmd_key = self.cmd_tx.clone();
++        let scroll_scale = SCROLL_SCALE * self.scroll_sign;
++        let click_down = self.click_state.clone();
++        let click_up = self.click_state.clone();
++        let focus_vp = self.focus_target.clone();
++        let page_focused_key = self.page_focused.clone();
++
++        EventHandler::new(image)
++            // Forward cursor movement so the page shows hover feedback (link
++            // highlights, pointer cursors). Coalesced session-side to avoid spam.
++            .on_mouse_in(
++                move |_ctx, _app, pos| {
++                    if let Some((x, y)) = map_to_css(&vp_move, &css_move, pos) {
++                        let _ = cmd_move.try_send(BrowserCommand::MouseMove { x, y });
++                    }
++                    DispatchEventResult::PropagateToParent
++                },
++                None,
++            )
++            .on_left_mouse_down(move |ctx, _app, pos| {
++                // Clicking the page takes keyboard focus, so typing forwards here
++                // rather than to the address bar. Set the target synchronously so
++                // pane activation (below) focuses the page, not the address bar.
++                focus_vp.set(FocusTarget::Page);
++                ctx.dispatch_typed_action(BrowserViewAction::FocusViewport);
++                if let Some((x, y)) = map_to_css(&vp_down, &css_down, pos) {
++                    // Synthesize clickCount for double/triple-click selection.
++                    let now = Instant::now();
++                    let (last, last_count) = click_down.get();
++                    let click_count = match last {
++                        Some(t) if now.duration_since(t) < Duration::from_millis(400) => {
++                            (last_count + 1).min(3)
++                        }
++                        _ => 1,
++                    };
++                    click_down.set((Some(now), click_count));
++                    let _ = cmd_down.try_send(BrowserCommand::MouseDown { x, y, click_count });
++                }
++                DispatchEventResult::StopPropagation
++            })
++            .on_left_mouse_up(move |_ctx, _app, pos| {
++                if let Some((x, y)) = map_to_css(&vp_up, &css_up, pos) {
++                    let click_count = click_up.get().1.max(1);
++                    let _ = cmd_up.try_send(BrowserCommand::MouseUp { x, y, click_count });
++                }
++                DispatchEventResult::StopPropagation
++            })
++            .on_scroll_wheel(move |_ctx, _app, delta, _modifiers| {
++                if let Some((css_w, css_h)) = css_wheel.get() {
++                    let _ = cmd_wheel.try_send(BrowserCommand::Wheel {
++                        x: (css_w / 2.0) as f64,
++                        y: (css_h / 2.0) as f64,
++                        delta_x: delta.x() as f64 * scroll_scale,
++                        delta_y: delta.y() as f64 * scroll_scale,
++                    });
++                }
++                DispatchEventResult::StopPropagation
++            })
++            // Forward typing to the page only while the page view actually holds
++            // focus. This stops the instant focus leaves (e.g. clicking another
++            // pane), and avoids forwarding the address-bar editor's keys (which
++            // reach here because BrowserView is its responder-chain ancestor).
++            // Shortcuts (cmd/ctrl) propagate to Warp.
++            .on_keydown(move |_ctx, _app, keystroke| {
++                if !page_focused_key.get() {
++                    return DispatchEventResult::PropagateToParent;
++                }
++                match map_keystroke(keystroke) {
++                    Some(cmd) => {
++                        let _ = cmd_key.try_send(cmd);
++                        DispatchEventResult::StopPropagation
++                    }
++                    None => DispatchEventResult::PropagateToParent,
++                }
++            })
++            .finish()
++    }
++
++    /// Clones the shared handles a mouse closure needs.
++    fn input_handles(&self) -> (BoundsSink, CssSize, async_channel::Sender<BrowserCommand>) {
++        (
++            self.viewport_rect.clone(),
++            self.css_size.clone(),
++            self.cmd_tx.clone(),
++        )
++    }
++}
++
++/// Maps a window-space pointer position into CSS viewport pixels using the last
++/// drawn image rect + the frame's CSS size. Returns `None` if outside the image.
++fn map_to_css(
++    viewport_rect: &BoundsSink,
++    css_size: &CssSize,
++    global: Vector2F,
++) -> Option<(f64, f64)> {
++    let rect = viewport_rect.get()?;
++    let (css_w, css_h) = css_size.get()?;
++    if rect.width() <= 0.0 || rect.height() <= 0.0 {
++        return None;
++    }
++    let local_x = global.x() - rect.origin().x();
++    let local_y = global.y() - rect.origin().y();
++    if local_x < 0.0 || local_y < 0.0 || local_x > rect.width() || local_y > rect.height() {
++        return None;
++    }
++    Some((
++        (local_x / rect.width() * css_w) as f64,
++        (local_y / rect.height() * css_h) as f64,
++    ))
++}
++
++/// Maps a Warp keystroke to a page-input command, or `None` to let Warp handle
++/// it (modifier shortcuts and unmapped keys propagate instead of forwarding).
++fn map_keystroke(ks: &Keystroke) -> Option<BrowserCommand> {
++    if ks.cmd || ks.ctrl || ks.meta {
++        return None;
++    }
++    let press = |key: &str, code: &str, vk: i64| {
++        Some(BrowserCommand::KeyPress {
++            key: key.to_owned(),
++            code: code.to_owned(),
++            vk,
++        })
++    };
++    match ks.key.as_str() {
++        "enter" => press("Enter", "Enter", 13),
++        "backspace" => press("Backspace", "Backspace", 8),
++        "tab" => press("Tab", "Tab", 9),
++        "delete" => press("Delete", "Delete", 46),
++        "escape" => press("Escape", "Escape", 27),
++        "left" => press("ArrowLeft", "ArrowLeft", 37),
++        "up" => press("ArrowUp", "ArrowUp", 38),
++        "right" => press("ArrowRight", "ArrowRight", 39),
++        "down" => press("ArrowDown", "ArrowDown", 40),
++        "space" => Some(BrowserCommand::InsertText(" ".to_owned())),
++        key if key.chars().count() == 1 => {
++            let text = if ks.shift {
++                key.to_uppercase()
++            } else {
++                key.to_owned()
++            };
++            Some(BrowserCommand::InsertText(text))
++        }
++        _ => None,
++    }
++}
++
++/// Normalizes address-bar input into a URL: passes through explicit schemes,
++/// prefixes `https://` for bare domains, else treats it as a web search.
++fn normalize_url(input: &str) -> String {
++    let s = input.trim();
++    if s.is_empty() {
++        return DEFAULT_URL.to_owned();
++    }
++    if s.contains("://") {
++        return s.to_owned();
++    }
++    let host = s.split('/').next().unwrap_or(s);
++    if host.contains('.') && !host.contains(' ') {
++        format!("https://{s}")
++    } else {
++        format!("https://www.google.com/search?q={}", s.replace(' ', "+"))
++    }
++}
++
++impl Entity for BrowserView {
++    type Event = BrowserViewEvent;
++}
++
++impl View for BrowserView {
++    fn ui_name() -> &'static str {
++        "BrowserView"
++    }
++
++    fn on_focus(&mut self, _focus_ctx: &FocusContext, _ctx: &mut ViewContext<Self>) {
++        self.page_focused.set(true);
++    }
++
++    fn on_blur(&mut self, _blur_ctx: &BlurContext, _ctx: &mut ViewContext<Self>) {
++        // Stop forwarding keys the instant the page view loses focus.
++        self.page_focused.set(false);
++    }
++
++    fn render(&self, app: &AppContext) -> Box<dyn Element> {
++        // Keep Chrome's viewport sized to the pane (from the last layout).
++        self.sync_viewport_size();
++        Flex::column()
++            .with_main_axis_size(MainAxisSize::Max)
++            .with_child(self.render_toolbar(app))
++            .with_child(Expanded::new(1.0, self.render_viewport()).finish())
++            .finish()
++    }
++}
++
++impl TypedActionView for BrowserView {
++    type Action = BrowserViewAction;
++
++    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
++        match action {
++            BrowserViewAction::FocusViewport => {
++                // Focus the page for keyboard input, and route through the pane
++                // focus system so the workspace's focused-pane state stays in
++                // sync (otherwise focus doesn't cleanly transfer to other panes).
++                self.focus_target.set(FocusTarget::Page);
++                ctx.focus_self();
++                ctx.emit(BrowserViewEvent::Pane(PaneEvent::FocusSelf));
++            }
++        }
++    }
++}
++
++impl BackingView for BrowserView {
++    type PaneHeaderOverflowMenuAction = BrowserViewAction;
++    type CustomAction = BrowserViewAction;
++    type AssociatedData = ();
++
++    fn handle_pane_header_overflow_menu_action(
++        &mut self,
++        _action: &Self::PaneHeaderOverflowMenuAction,
++        _ctx: &mut ViewContext<Self>,
++    ) {
++        // No overflow menu items are registered.
++    }
++
++    fn close(&mut self, ctx: &mut ViewContext<Self>) {
++        ctx.emit(BrowserViewEvent::Pane(PaneEvent::Close));
++    }
++
++    fn focus_contents(&mut self, ctx: &mut ViewContext<Self>) {
++        self.focus(ctx);
++    }
++
++    fn render_header_content(
++        &self,
++        _ctx: &view::HeaderRenderContext<'_>,
++        _app: &AppContext,
++    ) -> HeaderContent {
++        HeaderContent::Standard(StandardHeader {
++            title: BROWSER_HEADER_TEXT.to_owned(),
++            title_secondary: None,
++            title_style: None,
++            title_clip_config: ClipConfig::start(),
++            title_max_width: None,
++            left_of_title: None,
++            right_of_title: None,
++            left_of_overflow: None,
++            options: StandardHeaderOptions::default(),
++        })
++    }
++
++    fn set_focus_handle(&mut self, focus_handle: PaneFocusHandle, _ctx: &mut ViewContext<Self>) {
++        self.focus_handle = Some(focus_handle);
++    }
++}
+diff --git a/app/src/lib.rs b/app/src/lib.rs
+index ae9387c8..84278e14 100644
+--- a/app/src/lib.rs
++++ b/app/src/lib.rs
+@@ -11,6 +11,7 @@ mod auth;
+ mod autoupdate;
+ mod banner;
+ mod billing;
++mod browser;
+ mod changelog_model;
+ mod chip_configurator;
+ mod cloud_object;

@@ -1,0 +1,46 @@
+From 2f87772f66b4aaf65d12e7dc67dbed381375bbd2 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 20 May 2026 12:29:17 -0400
+Subject: [PATCH 05/48] Compile Metal shaders under nix via
+ WARP_METAL_DEVELOPER_DIR
+
+Under nix/devenv, DEVELOPER_DIR points at the nix apple-sdk (no `metal`), and
+setting it to Xcode globally breaks the nix linker. Have warpui's build.rs apply
+WARP_METAL_DEVELOPER_DIR to only the metal/metallib xcrun calls, so the shader
+compile uses the system Xcode while the rest of the build stays on nix.
+---
+ crates/warpui/build.rs | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/crates/warpui/build.rs b/crates/warpui/build.rs
+index ae9d5966..5e39f469 100644
+--- a/crates/warpui/build.rs
++++ b/crates/warpui/build.rs
+@@ -88,6 +88,15 @@ fn compile_metal_shaders() {
+         compile_args.push("-gline-tables-only");
+     }
+     let result = Command::new("xcrun")
++        // oh-my-warp: when building under nix/devenv, DEVELOPER_DIR points at the
++        // nix apple-sdk (which has no `metal`). If WARP_METAL_DEVELOPER_DIR is set
++        // (see devenv.nix), point xcrun at the system Xcode for the shader compile
++        // only, leaving the rest of the build on the nix toolchain.
++        .envs(
++            std::env::var("WARP_METAL_DEVELOPER_DIR")
++                .ok()
++                .map(|d| ("DEVELOPER_DIR", d)),
++        )
+         .args(&compile_args)
+         .output()
+         .expect("error compiling metal shaders to .air");
+@@ -98,6 +107,11 @@ fn compile_metal_shaders() {
+     );
+ 
+     let result = Command::new("xcrun")
++        .envs(
++            std::env::var("WARP_METAL_DEVELOPER_DIR")
++                .ok()
++                .map(|d| ("DEVELOPER_DIR", d)),
++        )
+         .args(["-sdk", "macosx", "metallib", air_path, "-o", lib_path])
+         .output()
+         .expect("error compiling metal shaders to .metallib");

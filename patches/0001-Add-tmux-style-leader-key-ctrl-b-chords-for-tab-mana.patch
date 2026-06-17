@@ -1,0 +1,141 @@
+From c2ecc0558492b2e690bceb2b3a6b2ddc83593457 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 20 May 2026 11:05:27 -0400
+Subject: [PATCH 01/48] Add tmux-style leader-key (ctrl-b) chords for tab
+ management
+
+Introduces a configurable leader/prefix key (default ctrl-b) so you can run
+actions with tmux-style chords, e.g. 'ctrl-b ,' renames the active tab.
+
+The chord engine is upstream (Matcher::push_keystroke already matches
+multi-keystroke sequences and the input pipeline only forwards to the PTY on
+MatchResult::None). This adds:
+- app/src/util/leader.rs: LEADER constant + an extensible (suffix -> WorkspaceAction)
+  table, registered on the Workspace context (ancestor of the focused terminal).
+  Defaults: , rename tab | c new tab | & close tab | n/p next/prev tab.
+- workspace::init: calls register_leader_bindings(app).
+- util::mod: declares the leader module.
+- bindings.rs: allowlists ctrl-b in PTY_NON_COMPLIANT_KEYSTROKES so the leader is
+  captured from the shell (tmux-style) and passes binding validation.
+
+Not yet compiled locally (repo pins Rust 1.92.0 via nix devshell); verify with
+'nix develop && cargo check -p warp'.
+---
+ app/src/util/bindings.rs |  6 +++-
+ app/src/util/leader.rs   | 61 ++++++++++++++++++++++++++++++++++++++++
+ app/src/util/mod.rs      |  1 +
+ app/src/workspace/mod.rs |  4 +++
+ 4 files changed, 71 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/util/leader.rs
+
+diff --git a/app/src/util/bindings.rs b/app/src/util/bindings.rs
+index 54c56951..68bafd92 100644
+--- a/app/src/util/bindings.rs
++++ b/app/src/util/bindings.rs
+@@ -213,7 +213,11 @@ lazy_static! {
+         // on TerminalView on all platforms.
+         Keystroke::parse("ctrl-c").expect("should be able to construct ctrl-c keystroke"),
+         // The resume conversation binding uses cmd-shift-R on Mac and should be allowed
+-        Keystroke::parse("cmd-shift-R").expect("should be able to construct cmd-shift-R keystroke")
++        Keystroke::parse("cmd-shift-R").expect("should be able to construct cmd-shift-R keystroke"),
++        // oh-my-warp: the tmux-style leader/prefix key (default ctrl-b) is
++        // intentionally captured from the PTY so it can begin a `<leader> <key>`
++        // chord. See `crate::util::leader`. Keep in sync with `leader::LEADER`.
++        Keystroke::parse("ctrl-b").expect("should be able to construct ctrl-b keystroke")
+     ]);
+ }
+ 
+diff --git a/app/src/util/leader.rs b/app/src/util/leader.rs
+new file mode 100644
+index 00000000..13e18021
+--- /dev/null
++++ b/app/src/util/leader.rs
+@@ -0,0 +1,61 @@
++//! oh-my-warp: tmux-style "leader key" (prefix) bindings.
++//!
++//! Press the leader (default `ctrl-b`), release, then press a suffix key to run
++//! an action — e.g. `ctrl-b ,` renames the current tab, the way tmux's
++//! `prefix ,` renames a window.
++//!
++//! The chord engine itself is upstream: `Matcher::push_keystroke` already
++//! matches multi-keystroke sequences (it returns `Pending` after the leader and
++//! the matching `Action` after the suffix), and the input pipeline only forwards
++//! a key to the shell on `MatchResult::None`. So all this module does is register
++//! a curated, easy-to-extend table of `<leader> <suffix>` bindings on the
++//! `Workspace` context, which is an ancestor of the focused terminal.
++//!
++//! ## Adding your own shortcut
++//! Add a row to `leader_bindings`: `("<suffix>", WorkspaceAction::Something)`.
++//! The suffix is any key string accepted by `Keystroke::parse` (e.g. `"c"`,
++//! `"&"`, `"n"`), then rebuild Warp. Only fieldless `WorkspaceAction`s work in
++//! this table; actions that need arguments (pane splits, locator-based pane ops)
++//! are a planned follow-up.
++//!
++//! ## Note on `ctrl-b`
++//! `ctrl-b` is the control character `^B`. Like tmux, claiming it as the leader
++//! captures it from the shell (you lose readline's backward-char) while a Warp
++//! session is focused. The leader keystroke is allowlisted past Warp's
++//! PTY-conflict check via `PTY_NON_COMPLIANT_KEYSTROKES` in
++//! `crate::util::bindings`; if you change `LEADER` to another `ctrl-<letter>`,
++//! add that keystroke to the allowlist there too or binding validation will fail.
++
++use crate::workspace::WorkspaceAction;
++use warpui::id;
++use warpui::keymap::FixedBinding;
++use warpui::AppContext;
++
++/// The leader (prefix) keystroke. Change this to use a different prefix; if you
++/// pick another `ctrl-<letter>`, also add it to `PTY_NON_COMPLIANT_KEYSTROKES`
++/// in `crate::util::bindings`.
++pub const LEADER: &str = "ctrl-b";
++
++/// The curated leader chords: `(suffix_key, action)`. Each entry becomes the
++/// sequence `<LEADER> <suffix>`. Add your own rows here.
++fn leader_bindings() -> Vec<(&'static str, WorkspaceAction)> {
++    vec![
++        (",", WorkspaceAction::RenameActiveTab), // tmux: rename window
++        ("c", WorkspaceAction::AddDefaultTab),   // tmux: new window
++        ("&", WorkspaceAction::CloseActiveTab),  // tmux: kill window
++        ("n", WorkspaceAction::ActivateNextTab), // tmux: next window
++        ("p", WorkspaceAction::ActivatePrevTab), // tmux: previous window
++    ]
++}
++
++/// Registers the leader chords on the `Workspace` context. Called once at
++/// startup from `crate::workspace::init`.
++pub fn register_leader_bindings(app: &mut AppContext) {
++    let bindings: Vec<FixedBinding> = leader_bindings()
++        .into_iter()
++        .map(|(suffix, action)| {
++            FixedBinding::new(format!("{LEADER} {suffix}"), action, id!("Workspace"))
++        })
++        .collect();
++    app.register_fixed_bindings(bindings);
++}
+diff --git a/app/src/util/mod.rs b/app/src/util/mod.rs
+index 5f5f1281..338a6274 100644
+--- a/app/src/util/mod.rs
++++ b/app/src/util/mod.rs
+@@ -6,6 +6,7 @@ pub mod extensions;
+ pub mod file;
+ pub mod git;
+ pub mod image;
++pub mod leader;
+ pub(crate) mod link_detection;
+ pub mod links;
+ pub mod openable_file_type;
+diff --git a/app/src/workspace/mod.rs b/app/src/workspace/mod.rs
+index d80043dd..7b3aab20 100644
+--- a/app/src/workspace/mod.rs
++++ b/app/src/workspace/mod.rs
+@@ -81,6 +81,10 @@ pub fn init(app: &mut AppContext) {
+     use warpui::keymap::macros::*;
+     app.register_binding_validator::<Workspace>(is_binding_pty_compliant);
+ 
++    // oh-my-warp: register tmux-style <leader> chords (e.g. `ctrl-b ,` = rename
++    // the active tab) on the Workspace context. See `crate::util::leader`.
++    crate::util::leader::register_leader_bindings(app);
++
+     modal::init(app);
+     native_modal::init(app);
+     lightbox_view::init(app);

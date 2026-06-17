@@ -1,0 +1,237 @@
+From e4f5c1f03d48e79b5f08bda69418553695be667d Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Thu, 21 May 2026 11:37:28 -0400
+Subject: [PATCH 18/48] Surface plugin commands in the command palette + run
+ with toast (oh-my-warp)
+
+A PluginCommandDataSource reads the plugin command registry and yields synthetic
+'plugin:<id>' CommandBindings (reusing existing rendering). The palette accept
+handler recognizes the prefix, invokes the plugin callback via CallJsFunctionService,
+and shows the returned string as an ephemeral toast. See PLUGIN_SPEC.md (M1).
+---
+ .../search/command_palette/data_sources.rs    | 15 ++++
+ app/src/search/command_palette/mod.rs         |  2 +
+ .../plugin_command_data_source.rs             | 56 +++++++++++++++
+ app/src/search/command_palette/view.rs        | 72 +++++++++++++++++++
+ 4 files changed, 145 insertions(+)
+ create mode 100644 app/src/search/command_palette/plugin_command_data_source.rs
+
+diff --git a/app/src/search/command_palette/data_sources.rs b/app/src/search/command_palette/data_sources.rs
+index 04fb981f..19b3fb73 100644
+--- a/app/src/search/command_palette/data_sources.rs
++++ b/app/src/search/command_palette/data_sources.rs
+@@ -12,6 +12,8 @@ use crate::search::action::CommandBindingDataSource;
+ use crate::search::binding_source::BindingSource;
+ use crate::search::command_palette::mixer::{CommandPaletteItemAction, ItemSummary};
+ use crate::search::command_palette::new_session::NewSessionDataSource;
++#[cfg(feature = "plugin_host")]
++use crate::search::command_palette::plugin_command_data_source::PluginCommandDataSource;
+ use crate::search::command_palette::repos::RepoDataSource;
+ use crate::search::command_palette::{files, launch_config, navigation, tabs, CommandPaletteMixer};
+ use crate::search::data_source::QueryResult;
+@@ -31,6 +33,8 @@ pub struct DataSourceStore {
+     all_conversation_data_source: ModelHandle<conversations::DataSource>,
+     repo_data_source: ModelHandle<RepoDataSource>,
+     tabs_data_source: Option<ModelHandle<tabs::DataSource>>,
++    #[cfg(feature = "plugin_host")]
++    plugin_command_data_source: ModelHandle<PluginCommandDataSource>,
+ }
+ 
+ impl DataSourceStore {
+@@ -58,6 +62,9 @@ impl DataSourceStore {
+ 
+         let repo_data_source = ctx.add_model(|_| RepoDataSource::new());
+ 
++        #[cfg(feature = "plugin_host")]
++        let plugin_command_data_source = ctx.add_model(|_| PluginCommandDataSource);
++
+         Self {
+             actions_data_source,
+             sessions_data_source,
+@@ -67,6 +74,8 @@ impl DataSourceStore {
+             all_conversation_data_source,
+             repo_data_source,
+             tabs_data_source: None,
++            #[cfg(feature = "plugin_host")]
++            plugin_command_data_source,
+         }
+     }
+ 
+@@ -113,6 +122,12 @@ impl DataSourceStore {
+                 HashSet::from([QueryFilter::Actions]),
+             );
+ 
++            #[cfg(feature = "plugin_host")]
++            mixer.add_sync_source(
++                self.plugin_command_data_source.clone(),
++                HashSet::from([QueryFilter::Actions]),
++            );
++
+             if let Some(new_session_data_source) = &self.new_session_data_source {
+                 mixer.add_sync_source(
+                     new_session_data_source.clone(),
+diff --git a/app/src/search/command_palette/mod.rs b/app/src/search/command_palette/mod.rs
+index b21c1c19..bb506963 100644
+--- a/app/src/search/command_palette/mod.rs
++++ b/app/src/search/command_palette/mod.rs
+@@ -7,6 +7,8 @@ pub mod mixer;
+ pub mod navigation;
+ #[cfg_attr(not(feature = "local_tty"), allow(dead_code))]
+ pub mod new_session;
++#[cfg(feature = "plugin_host")]
++pub mod plugin_command_data_source;
+ pub mod render_util;
+ pub mod repos;
+ mod selected_items;
+diff --git a/app/src/search/command_palette/plugin_command_data_source.rs b/app/src/search/command_palette/plugin_command_data_source.rs
+new file mode 100644
+index 00000000..840a20c0
+--- /dev/null
++++ b/app/src/search/command_palette/plugin_command_data_source.rs
+@@ -0,0 +1,56 @@
++//! oh-my-warp: command-palette data source for commands registered by JS plugins.
++//!
++//! Reads the live [`crate::plugin::commands`] registry and yields a synthetic [`CommandBinding`]
++//! per plugin command (named `plugin:<id>`), reusing the existing binding rendering. The palette's
++//! accept handler recognizes the `plugin:` prefix and invokes the plugin callback. See
++//! `command_palette/view.rs` and PLUGIN_SPEC.md (Milestone 1).
++
++use std::sync::Arc;
++
++use fuzzy_match::{match_indices_case_insensitive, FuzzyMatchResult};
++use warpui::{AppContext, Entity};
++
++use crate::search::action::search_item::MatchedBinding;
++use crate::search::command_palette::mixer::CommandPaletteItemAction;
++use crate::search::data_source::{Query, QueryResult};
++use crate::search::mixer::{DataSourceRunErrorWrapper, SyncDataSource};
++use crate::util::bindings::CommandBinding;
++
++/// Prefix on the synthetic [`CommandBinding`] name so the palette accept handler can recognize a
++/// plugin command and route it to the plugin host instead of dispatching a typed action.
++pub const PLUGIN_COMMAND_BINDING_PREFIX: &str = "plugin:";
++
++/// Data source that surfaces plugin-registered commands in the command palette.
++pub struct PluginCommandDataSource;
++
++impl Entity for PluginCommandDataSource {
++    type Event = ();
++}
++
++impl SyncDataSource for PluginCommandDataSource {
++    type Action = CommandPaletteItemAction;
++
++    fn run_query(
++        &self,
++        query: &Query,
++        _app: &AppContext,
++    ) -> Result<Vec<QueryResult<Self::Action>>, DataSourceRunErrorWrapper> {
++        let term = query.text.trim().to_lowercase();
++        Ok(crate::plugin::commands::all()
++            .into_iter()
++            .filter_map(|command| {
++                let match_result = if term.is_empty() {
++                    FuzzyMatchResult::no_match()
++                } else {
++                    match_indices_case_insensitive(&command.title.to_lowercase(), &term)?
++                };
++                let binding = CommandBinding::new(
++                    format!("{PLUGIN_COMMAND_BINDING_PREFIX}{}", command.id),
++                    command.title,
++                    None,
++                );
++                Some(MatchedBinding::new(match_result, Arc::new(binding)).into())
++            })
++            .collect())
++    }
++}
+diff --git a/app/src/search/command_palette/view.rs b/app/src/search/command_palette/view.rs
+index 4f4041ff..d4a96ad9 100644
+--- a/app/src/search/command_palette/view.rs
++++ b/app/src/search/command_palette/view.rs
+@@ -713,6 +713,69 @@ impl View {
+     }
+ 
+     /// Handles the `CommandPaletteItemAction` action and closes the search panel.
++    /// oh-my-warp: runs a plugin-registered command by invoking its JS callback in the plugin host
++    /// and showing the returned string (if any) as a toast. See PLUGIN_SPEC.md (Milestone 1).
++    #[cfg(feature = "plugin_host")]
++    fn run_plugin_command(&mut self, command_id: String, ctx: &mut ViewContext<Self>) {
++        use crate::plugin::service::{
++            CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
++        };
++        use crate::plugin::PluginHost;
++        use crate::view_components::{DismissibleToast, ToastFlavor};
++        use crate::workspace::ToastStack;
++        use warp_js::SerializedJsValue;
++
++        let window_id = ctx.window_id();
++        let Some(function_id) = crate::plugin::commands::function_id(&command_id) else {
++            return;
++        };
++        let Some(caller) = PluginHost::handle(ctx)
++            .as_ref(ctx)
++            .plugin_service_caller::<CallJsFunctionService>()
++        else {
++            log::warn!("Plugin host unavailable; cannot run plugin command {command_id:?}");
++            return;
++        };
++        let Ok(input) = SerializedJsValue::from_value(String::new()) else {
++            return;
++        };
++
++        ctx.spawn(
++            async move {
++                caller
++                    .call(CallJsFunctionRequest {
++                        id: function_id,
++                        serialized_input: input,
++                    })
++                    .await
++            },
++            move |_view, response, ctx| {
++                let toast = match response {
++                    Ok(CallJsFunctionResponse::Success(output)) => {
++                        match output.to_value::<String>() {
++                            Ok(message) if !message.trim().is_empty() => {
++                                Some(DismissibleToast::new(message, ToastFlavor::Default))
++                            }
++                            _ => None,
++                        }
++                    }
++                    Ok(CallJsFunctionResponse::Error { message }) => {
++                        Some(DismissibleToast::new(message, ToastFlavor::Error))
++                    }
++                    Err(e) => Some(DismissibleToast::new(
++                        format!("Plugin command failed: {e:?}"),
++                        ToastFlavor::Error,
++                    )),
++                };
++                if let Some(toast) = toast {
++                    ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
++                        toast_stack.add_ephemeral_toast(toast, window_id, ctx);
++                    });
++                }
++            },
++        );
++    }
++
+     fn handle_result_accepted(
+         &mut self,
+         result_action: CommandPaletteItemAction,
+@@ -779,6 +842,15 @@ impl View {
+ 
+         match result_action.clone() {
+             CommandPaletteItemAction::AcceptBinding { binding } => {
++                #[cfg(feature = "plugin_host")]
++                if let Some(command_id) = binding.name.strip_prefix(
++                    crate::search::command_palette::plugin_command_data_source::PLUGIN_COMMAND_BINDING_PREFIX,
++                ) {
++                    let command_id = command_id.to_owned();
++                    self.run_plugin_command(command_id, ctx);
++                    self.close(ctx, Some(result_action.result_type()));
++                    return;
++                }
+                 if let Some(action) = binding.action.as_deref() {
+                     self.dispatch_typed_action_on_view(action, ctx);
+                 };

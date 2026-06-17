@@ -1,0 +1,34 @@
+From d5a516f086fb277c6eb58ff2b2f5ebc5ea5d7811 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Thu, 21 May 2026 08:36:18 -0400
+Subject: [PATCH 12/48] Disable RudderStack telemetry egress (oh-my-warp)
+
+Neuter the single network chokepoint (send_rudder_request) so no telemetry
+events are ever transmitted to RudderStack. Events may still be queued
+in-memory/on-disk locally, but nothing leaves the machine. This is the only
+live observability egress in the OSS (gui-feature) build.
+---
+ app/src/server/telemetry/mod.rs | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/app/src/server/telemetry/mod.rs b/app/src/server/telemetry/mod.rs
+index a14d9853..d9653024 100644
+--- a/app/src/server/telemetry/mod.rs
++++ b/app/src/server/telemetry/mod.rs
+@@ -394,13 +394,9 @@ impl TelemetryApi {
+             RudderMessage::Batch(_) => "/v1/batch",
+         };
+ 
+-        self.client
+-            .post(&format!("{}{}", rudder_stack_destination.root_url, path))
+-            .basic_auth(rudder_stack_destination.write_key, Some(""))
+-            .json(&msg)
+-            .send()
+-            .await?
+-            .error_for_status()?;
++        // oh-my-warp: observability stripped — drop the telemetry request instead
++        // of POSTing it to RudderStack so no data ever leaves the machine.
++        let _ = (&self.client, &msg, path, rudder_stack_destination);
+ 
+         Ok(())
+     }

@@ -1,0 +1,98 @@
+From 29ddb010d9cbebf86a1328d83b60de1e0db7d20e Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Thu, 21 May 2026 10:19:01 -0400
+Subject: [PATCH 14/48] Enable the JavaScript plugin host in the default build
+ (oh-my-warp)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Add an omw_plugins feature (= plugin_host) and turn it on by default, so the
+existing QuickJS plugin host spawns and loads ~/.warp/plugins/*/main.js. We
+deliberately avoid completions_v2 (it conflicts with the default classic
+completer); the few host items that are only consumed by completions_v2 get a
+cfg_attr(not(completions_v2)) allow(dead_code) — they gain real consumers in
+Phase 1. See PLUGIN_SPEC.md.
+---
+ app/Cargo.toml                           | 6 ++++++
+ app/src/plugin/app/mod.rs                | 1 +
+ app/src/plugin/host/native/plugin.rs     | 2 ++
+ app/src/plugin/host/native/plugin_ref.rs | 2 ++
+ 4 files changed, 11 insertions(+)
+
+diff --git a/app/Cargo.toml b/app/Cargo.toml
+index 562d8850..4d53c8f2 100644
+--- a/app/Cargo.toml
++++ b/app/Cargo.toml
+@@ -498,6 +498,8 @@ creating_shared_sessions = []
+ cross_repo_context = []
+ codebase_index_persistence = ["full_source_code_embedding"]
+ default = [
++    # oh-my-warp: enable the JavaScript plugin host (see PLUGIN_SPEC.md)
++    "omw_plugins",
+     "agent_mode",
+     "viewing_shared_sessions",
+     "render_continuous_block_selections_with_single_border",
+@@ -799,6 +801,10 @@ read_image_files = []
+ # directly, rather than via the `FeatureFlag` enum, because its value is
+ # required early in the app lifecycle prior to `FeatureFlag` initialization.
+ plugin_host = ["dep:rquickjs", "dep:warp_js", "warp_cli/plugin_host"]
++# oh-my-warp: umbrella feature that turns the JavaScript plugin host on in the
++# default build, without dragging in the completions_v2 classic-vs-v2 machinery.
++# See PLUGIN_SPEC.md.
++omw_plugins = ["plugin_host"]
+ # Enable this feature to automatically perform CPU profiling via pprof.  The
+ # generated profile will be written to profile.pb in the current directory.
+ # NOTE: This may slow down program execution.
+diff --git a/app/src/plugin/app/mod.rs b/app/src/plugin/app/mod.rs
+index ef97b7cb..8253b8a8 100644
+--- a/app/src/plugin/app/mod.rs
++++ b/app/src/plugin/app/mod.rs
+@@ -109,6 +109,7 @@ impl PluginHost {
+     ///
+     /// `S` is assumed to be served by the plugin host process; the returned service caller directs
+     /// requests over the IPC connection to the plugin host process.
++    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
+     pub fn plugin_service_caller<S: ipc::Service>(&self) -> Option<Box<dyn ipc::ServiceCaller<S>>> {
+         self.host_client.clone().map(ipc::service_caller::<S>)
+     }
+diff --git a/app/src/plugin/host/native/plugin.rs b/app/src/plugin/host/native/plugin.rs
+index 8809633f..186766b2 100644
+--- a/app/src/plugin/host/native/plugin.rs
++++ b/app/src/plugin/host/native/plugin.rs
+@@ -69,6 +69,7 @@ impl AppServiceCallers {
+ /// This ultimately the main backing data structure behind the JS plugin API exposed to plugins
+ /// (see [`super::js_api`]).
+ pub(super) struct Plugin {
++    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
+     app_services: AppServiceCallers,
+     js_function_registry: JsFunctionRegistry,
+ }
+@@ -103,6 +104,7 @@ impl Plugin {
+         }
+     }
+ 
++    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
+     pub(super) fn js_function_registry_mut(&mut self) -> &mut JsFunctionRegistry {
+         &mut self.js_function_registry
+     }
+diff --git a/app/src/plugin/host/native/plugin_ref.rs b/app/src/plugin/host/native/plugin_ref.rs
+index d8e90fa9..c940f58d 100644
+--- a/app/src/plugin/host/native/plugin_ref.rs
++++ b/app/src/plugin/host/native/plugin_ref.rs
+@@ -16,6 +16,7 @@ pub(super) enum PluginLoadError {
+ /// default (e.g. Completions/Command Signatures)
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+ pub(super) enum BuiltInPluginType {
++    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
+     Completions,
+ }
+ 
+@@ -43,6 +44,7 @@ pub(super) enum PluginRef {
+     Path(PathBuf),
+ 
+     /// Refers to a "built-in" plugin bundled with the Warp binary.
++    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
+     BuiltIn(BuiltInPluginType),
+ }
+ 

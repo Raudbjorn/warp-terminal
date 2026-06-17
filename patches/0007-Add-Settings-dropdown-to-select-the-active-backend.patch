@@ -1,0 +1,201 @@
+From e3a8f51c9fea4fe50a970e2b4e117fddd2ea7b49 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 20 May 2026 13:03:05 -0400
+Subject: [PATCH 07/48] Add Settings dropdown to select the active backend
+
+BackendSelectorView (a Dropdown mirroring StartupShellView) lists 'Warp
+(Default)' + the configured backends and persists the choice via
+agent_backends::set_selected on pick. Registered as a 'Default backend' widget
+row on the Features settings page. Applies on next launch.
+---
+ .../settings_view/features/agent_backend.rs   | 93 +++++++++++++++++++
+ app/src/settings_view/features/mod.rs         |  3 +
+ app/src/settings_view/features_page.rs        | 36 +++++++
+ 3 files changed, 132 insertions(+)
+ create mode 100644 app/src/settings_view/features/agent_backend.rs
+
+diff --git a/app/src/settings_view/features/agent_backend.rs b/app/src/settings_view/features/agent_backend.rs
+new file mode 100644
+index 00000000..05c26b94
+--- /dev/null
++++ b/app/src/settings_view/features/agent_backend.rs
+@@ -0,0 +1,93 @@
++//! oh-my-warp: Settings dropdown for selecting the active server/agent backend.
++//!
++//! Lists "Warp (Default)" plus any alternative backends defined in
++//! `agent_backends.toml` (see [`crate::util::agent_backends`]). Selecting one
++//! persists the choice; it takes effect on the next launch.
++
++use warpui::{
++    presenter::ChildView, Element, Entity, TypedActionView, View, ViewContext, ViewHandle,
++};
++
++use crate::{
++    util::agent_backends::{self, DEFAULT_BACKEND_ID, DEFAULT_BACKEND_LABEL},
++    view_components::{Dropdown, DropdownItem},
++};
++
++/// A view wrapping a dropdown that selects the active backend.
++pub struct BackendSelectorView {
++    dropdown: ViewHandle<Dropdown<BackendAction>>,
++}
++
++#[derive(Debug, Clone)]
++pub enum BackendAction {
++    /// Select the backend with this id ([`DEFAULT_BACKEND_ID`] = built-in Warp).
++    Select(String),
++}
++
++impl BackendSelectorView {
++    pub fn new(ctx: &mut ViewContext<Self>) -> Self {
++        let dropdown = ctx.add_typed_action_view(|ctx| {
++            let mut dropdown = Dropdown::new(ctx);
++            dropdown.set_top_bar_max_width(260.);
++            dropdown
++        });
++        Self::update_dropdown_state(dropdown.clone(), ctx);
++        Self { dropdown }
++    }
++
++    /// Rebuilds the dropdown items ("Warp (Default)" + configured backends) and
++    /// highlights the currently-selected one.
++    fn update_dropdown_state(
++        dropdown: ViewHandle<Dropdown<BackendAction>>,
++        ctx: &mut ViewContext<Self>,
++    ) {
++        let config = agent_backends::load();
++        let selected_id = config.selected_id().to_string();
++        dropdown.update(ctx, |dropdown, ctx| {
++            let mut items = vec![DropdownItem::new(
++                DEFAULT_BACKEND_LABEL,
++                BackendAction::Select(DEFAULT_BACKEND_ID.to_string()),
++            )];
++            let mut selected_index = 0;
++            for (i, backend) in config.backends.iter().enumerate() {
++                items.push(DropdownItem::new(
++                    backend.display_name().to_string(),
++                    BackendAction::Select(backend.id.clone()),
++                ));
++                if backend.id == selected_id {
++                    selected_index = i + 1;
++                }
++            }
++            dropdown.set_items(items, ctx);
++            dropdown.set_selected_by_index(selected_index, ctx);
++        });
++    }
++}
++
++impl Entity for BackendSelectorView {
++    type Event = ();
++}
++
++impl View for BackendSelectorView {
++    fn ui_name() -> &'static str {
++        "BackendSelectorView"
++    }
++
++    fn render(&self, _app: &warpui::AppContext) -> Box<dyn Element> {
++        ChildView::new(&self.dropdown).finish()
++    }
++}
++
++impl TypedActionView for BackendSelectorView {
++    type Action = BackendAction;
++
++    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
++        match action {
++            BackendAction::Select(id) => {
++                agent_backends::set_selected(id);
++                Self::update_dropdown_state(self.dropdown.clone(), ctx);
++                ctx.notify();
++            }
++        }
++    }
++}
+diff --git a/app/src/settings_view/features/mod.rs b/app/src/settings_view/features/mod.rs
+index 7c254074..9c862e8e 100644
+--- a/app/src/settings_view/features/mod.rs
++++ b/app/src/settings_view/features/mod.rs
+@@ -1,3 +1,6 @@
++pub mod agent_backend;
++pub use agent_backend::BackendSelectorView;
++
+ pub mod undo_close;
+ pub use undo_close::UndoCloseView;
+ 
+diff --git a/app/src/settings_view/features_page.rs b/app/src/settings_view/features_page.rs
+index 5c6bb750..89f38481 100644
+--- a/app/src/settings_view/features_page.rs
++++ b/app/src/settings_view/features_page.rs
+@@ -1405,6 +1405,8 @@ pub struct FeaturesPageView {
+     #[cfg(feature = "local_tty")]
+     startup_shell_view: ViewHandle<features::StartupShellView>,
+     undo_close_view: ViewHandle<features::UndoCloseView>,
++    // oh-my-warp: selector for the active server/agent backend.
++    backend_selector_view: ViewHandle<features::BackendSelectorView>,
+ 
+     max_block_size_input_editor: ViewHandle<EditorView>,
+     valid_max_block_size: bool,
+@@ -2433,6 +2435,7 @@ impl FeaturesPageView {
+         let startup_shell_view = ctx.add_typed_action_view(features::StartupShellView::new);
+ 
+         let undo_close_view = ctx.add_typed_action_view(features::UndoCloseView::new);
++        let backend_selector_view = ctx.add_typed_action_view(features::BackendSelectorView::new);
+ 
+         let appearance_handle = Appearance::handle(ctx);
+ 
+@@ -2638,6 +2641,7 @@ impl FeaturesPageView {
+             #[cfg(feature = "local_tty")]
+             startup_shell_view,
+             undo_close_view,
++            backend_selector_view,
+ 
+             max_block_size_input_editor: block_size_editor,
+             valid_max_block_size: true,
+@@ -2697,6 +2701,8 @@ impl FeaturesPageView {
+ 
+         general_widgets.push(Box::new(SnackbarHeaderWidget::default()));
+         general_widgets.push(Box::new(LinkTooltipWidget::default()));
++        // oh-my-warp: "Default backend" selector row.
++        general_widgets.push(Box::new(BackendSelectorWidget::default()));
+ 
+         #[cfg(feature = "local_fs")]
+         {
+@@ -5455,6 +5461,36 @@ impl SettingsWidget for DesktopNotificationsWidget {
+     }
+ }
+ 
++// oh-my-warp: Settings widget rendering the "Default backend" selector row.
++#[derive(Default)]
++struct BackendSelectorWidget {}
++
++impl SettingsWidget for BackendSelectorWidget {
++    type View = FeaturesPageView;
++
++    fn search_terms(&self) -> &str {
++        "backend server agent default oh-my-warp"
++    }
++
++    fn render(
++        &self,
++        view: &Self::View,
++        appearance: &Appearance,
++        _app: &AppContext,
++    ) -> Box<dyn Element> {
++        Flex::column()
++            .with_children([
++                render_sub_sub_header(
++                    appearance,
++                    "Default backend (applies after restart)".to_string(),
++                    None,
++                ),
++                ChildView::new(&view.backend_selector_view).finish(),
++            ])
++            .finish()
++    }
++}
++
+ #[cfg(feature = "local_tty")]
+ #[derive(Default)]
+ struct StartupShellWidget {}

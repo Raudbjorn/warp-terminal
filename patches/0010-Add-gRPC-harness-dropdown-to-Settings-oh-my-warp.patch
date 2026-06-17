@@ -1,0 +1,262 @@
+From cf9b2346b05f395dfe25bd29b80c8534e4a3dd4f Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 20 May 2026 23:50:58 -0400
+Subject: [PATCH 10/48] Add gRPC harness dropdown to Settings (oh-my-warp)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Settings → Features gains an 'Agent harness (gRPC)' dropdown listing the selected
+backend's grpc_harnesses and persisting the choice via set_grpc_harness(); the
+in-process bridge reads the selected grpc_harness. Mirrors the backend selector.
+---
+ .../settings_view/features/grpc_harness.rs    | 103 ++++++++++++++++++
+ app/src/settings_view/features/mod.rs         |   3 +
+ app/src/settings_view/features_page.rs        |  37 +++++++
+ app/src/util/agent_backends.rs                |  24 +++-
+ 4 files changed, 166 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/settings_view/features/grpc_harness.rs
+
+diff --git a/app/src/settings_view/features/grpc_harness.rs b/app/src/settings_view/features/grpc_harness.rs
+new file mode 100644
+index 00000000..f2b734bc
+--- /dev/null
++++ b/app/src/settings_view/features/grpc_harness.rs
+@@ -0,0 +1,103 @@
++//! oh-my-warp: Settings dropdown for selecting the active gRPC harness.
++//!
++//! Lists the harnesses configured on the selected backend (`grpc_harnesses` in
++//! `agent_backends.toml`, see [`crate::util::agent_backends`]) and persists the
++//! choice via [`agent_backends::set_grpc_harness`]; it takes effect on next launch.
++//! The in-process bridge reads the selected backend's `grpc_harness`.
++
++use warpui::{
++    presenter::ChildView, Element, Entity, TypedActionView, View, ViewContext, ViewHandle,
++};
++
++use crate::{
++    util::agent_backends,
++    view_components::{Dropdown, DropdownItem},
++};
++
++/// A view wrapping a dropdown that selects the active gRPC harness.
++pub struct GrpcHarnessSelectorView {
++    dropdown: ViewHandle<Dropdown<GrpcHarnessAction>>,
++}
++
++#[derive(Debug, Clone)]
++pub enum GrpcHarnessAction {
++    /// Select this harness (empty string = nothing selectable / no gRPC backend).
++    Select(String),
++}
++
++impl GrpcHarnessSelectorView {
++    pub fn new(ctx: &mut ViewContext<Self>) -> Self {
++        let dropdown = ctx.add_typed_action_view(|ctx| {
++            let mut dropdown = Dropdown::new(ctx);
++            dropdown.set_top_bar_max_width(260.);
++            dropdown
++        });
++        Self::update_dropdown_state(dropdown.clone(), ctx);
++        Self { dropdown }
++    }
++
++    /// Rebuilds the dropdown items from the selected backend's `grpc_harnesses`
++    /// and highlights the current `grpc_harness`.
++    fn update_dropdown_state(
++        dropdown: ViewHandle<Dropdown<GrpcHarnessAction>>,
++        ctx: &mut ViewContext<Self>,
++    ) {
++        let config = agent_backends::load();
++        let (harnesses, current) = match config.selected_backend() {
++            Some(b) => (b.grpc_harnesses.clone(), b.grpc_harness.clone()),
++            None => (Vec::new(), String::new()),
++        };
++        dropdown.update(ctx, |dropdown, ctx| {
++            let mut items = Vec::new();
++            let mut selected_index = 0;
++            if harnesses.is_empty() {
++                items.push(DropdownItem::new(
++                    "(no gRPC backend selected)".to_string(),
++                    GrpcHarnessAction::Select(String::new()),
++                ));
++            } else {
++                for (i, harness) in harnesses.iter().enumerate() {
++                    items.push(DropdownItem::new(
++                        harness.clone(),
++                        GrpcHarnessAction::Select(harness.clone()),
++                    ));
++                    if *harness == current {
++                        selected_index = i;
++                    }
++                }
++            }
++            dropdown.set_items(items, ctx);
++            dropdown.set_selected_by_index(selected_index, ctx);
++        });
++    }
++}
++
++impl Entity for GrpcHarnessSelectorView {
++    type Event = ();
++}
++
++impl View for GrpcHarnessSelectorView {
++    fn ui_name() -> &'static str {
++        "GrpcHarnessSelectorView"
++    }
++
++    fn render(&self, _app: &warpui::AppContext) -> Box<dyn Element> {
++        ChildView::new(&self.dropdown).finish()
++    }
++}
++
++impl TypedActionView for GrpcHarnessSelectorView {
++    type Action = GrpcHarnessAction;
++
++    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
++        match action {
++            GrpcHarnessAction::Select(harness) => {
++                if !harness.is_empty() {
++                    agent_backends::set_grpc_harness(harness);
++                }
++                Self::update_dropdown_state(self.dropdown.clone(), ctx);
++                ctx.notify();
++            }
++        }
++    }
++}
+diff --git a/app/src/settings_view/features/mod.rs b/app/src/settings_view/features/mod.rs
+index 9c862e8e..e581ead8 100644
+--- a/app/src/settings_view/features/mod.rs
++++ b/app/src/settings_view/features/mod.rs
+@@ -1,6 +1,9 @@
+ pub mod agent_backend;
+ pub use agent_backend::BackendSelectorView;
+ 
++pub mod grpc_harness;
++pub use grpc_harness::GrpcHarnessSelectorView;
++
+ pub mod undo_close;
+ pub use undo_close::UndoCloseView;
+ 
+diff --git a/app/src/settings_view/features_page.rs b/app/src/settings_view/features_page.rs
+index 89f38481..c5462230 100644
+--- a/app/src/settings_view/features_page.rs
++++ b/app/src/settings_view/features_page.rs
+@@ -1407,6 +1407,8 @@ pub struct FeaturesPageView {
+     undo_close_view: ViewHandle<features::UndoCloseView>,
+     // oh-my-warp: selector for the active server/agent backend.
+     backend_selector_view: ViewHandle<features::BackendSelectorView>,
++    // oh-my-warp: selector for the active gRPC harness.
++    grpc_harness_selector_view: ViewHandle<features::GrpcHarnessSelectorView>,
+ 
+     max_block_size_input_editor: ViewHandle<EditorView>,
+     valid_max_block_size: bool,
+@@ -2436,6 +2438,8 @@ impl FeaturesPageView {
+ 
+         let undo_close_view = ctx.add_typed_action_view(features::UndoCloseView::new);
+         let backend_selector_view = ctx.add_typed_action_view(features::BackendSelectorView::new);
++        let grpc_harness_selector_view =
++            ctx.add_typed_action_view(features::GrpcHarnessSelectorView::new);
+ 
+         let appearance_handle = Appearance::handle(ctx);
+ 
+@@ -2642,6 +2646,7 @@ impl FeaturesPageView {
+             startup_shell_view,
+             undo_close_view,
+             backend_selector_view,
++            grpc_harness_selector_view,
+ 
+             max_block_size_input_editor: block_size_editor,
+             valid_max_block_size: true,
+@@ -2703,6 +2708,8 @@ impl FeaturesPageView {
+         general_widgets.push(Box::new(LinkTooltipWidget::default()));
+         // oh-my-warp: "Default backend" selector row.
+         general_widgets.push(Box::new(BackendSelectorWidget::default()));
++        // oh-my-warp: "Agent harness (gRPC)" selector row.
++        general_widgets.push(Box::new(GrpcHarnessSelectorWidget::default()));
+ 
+         #[cfg(feature = "local_fs")]
+         {
+@@ -5491,6 +5498,36 @@ impl SettingsWidget for BackendSelectorWidget {
+     }
+ }
+ 
++// oh-my-warp: Settings widget rendering the "Agent harness (gRPC)" selector row.
++#[derive(Default)]
++struct GrpcHarnessSelectorWidget {}
++
++impl SettingsWidget for GrpcHarnessSelectorWidget {
++    type View = FeaturesPageView;
++
++    fn search_terms(&self) -> &str {
++        "harness grpc agent claude pi-mono oh-my-warp"
++    }
++
++    fn render(
++        &self,
++        view: &Self::View,
++        appearance: &Appearance,
++        _app: &AppContext,
++    ) -> Box<dyn Element> {
++        Flex::column()
++            .with_children([
++                render_sub_sub_header(
++                    appearance,
++                    "Agent harness (gRPC, applies after restart)".to_string(),
++                    None,
++                ),
++                ChildView::new(&view.grpc_harness_selector_view).finish(),
++            ])
++            .finish()
++    }
++}
++
+ #[cfg(feature = "local_tty")]
+ #[derive(Default)]
+ struct StartupShellWidget {}
+diff --git a/app/src/util/agent_backends.rs b/app/src/util/agent_backends.rs
+index 53a9f04c..12f57b41 100644
+--- a/app/src/util/agent_backends.rs
++++ b/app/src/util/agent_backends.rs
+@@ -55,9 +55,14 @@ pub struct Backend {
+     /// agent operations to this host. Optional; empty = a plain URL-override backend.
+     #[serde(default)]
+     pub grpc_endpoint: String,
+-    /// Harness to spawn on the gRPC host (e.g. `claude`, `pi-mono`, `demo`).
++    /// Harness to spawn on the gRPC host (e.g. `claude`, `pi-mono`, `demo`). This
++    /// is the *selected* harness, set by the Settings → Features dropdown.
+     #[serde(default)]
+     pub grpc_harness: String,
++    /// Options shown in the Settings "Agent harness (gRPC)" dropdown. Should match
++    /// the harnesses your host serves (its `harnesses.toml`).
++    #[serde(default)]
++    pub grpc_harnesses: Vec<String>,
+     /// Bearer token sent to the gRPC host's auth interceptor (optional).
+     #[serde(default)]
+     pub grpc_token: String,
+@@ -177,6 +182,23 @@ pub fn selected_grpc_target() -> Option<GrpcTarget> {
+     })
+ }
+ 
++/// Persists the selected gRPC harness on the currently-selected backend (called by
++/// the Settings → Features "Agent harness (gRPC)" dropdown). No-op for the built-in
++/// Warp backend. Takes effect on the next launch.
++pub fn set_grpc_harness(harness: &str) {
++    let mut config = load();
++    let selected_id = config.selected_id().to_string();
++    if let Some(backend) = config.backends.iter_mut().find(|b| b.id == selected_id) {
++        backend.grpc_harness = harness.to_string();
++        if let Err(e) = save(&config) {
++            log::error!(
++                "oh-my-warp: failed to write {}: {e:#}",
++                config_path().display()
++            );
++        }
++    }
++}
++
+ /// Applies the selected backend's URLs by overriding `ChannelState`. No-op for
+ /// the built-in Warp backend. Call this at startup BEFORE the server client,
+ /// GraphQL, or auth read the URLs.
