@@ -421,7 +421,7 @@ impl SettingsWidget for LocalAIProviderWidget {
                 ))
                 .with_child(Self::render_description(
                     appearance,
-                    "OpenCode sidecar: route requests through a locally-spawned OpenCode process bound to the working directory. The sidecar exposes an OpenAI-compatible endpoint on a random loopback port; we read the port from its startup announcement. Set `Local OpenAI Command` to the binary name or absolute path; the default `opencode` resolves from `$PATH`.",
+                    "OpenCode sidecar: route requests through a locally-spawned OpenCode process bound to the working directory. The sidecar exposes an OpenAI-compatible endpoint on a random loopback port; we read the port from its startup announcement. Set `OpenCode Command` to the binary name or absolute path; the default `opencode` resolves from `$PATH`.",
                 ))
                 .with_child(Self::render_input(
                     appearance,

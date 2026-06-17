@@ -140,14 +140,20 @@ impl LocalOpenAIClient {
     }
 
     pub(crate) fn set_config(&self, config: LocalOpenAISettingsSnapshot) {
+        let old_config = self.config.read().clone();
         let provider_kind = config.provider_kind;
         *self.config.write() = config;
-        // Provider switched away from OpenCode: drop cached sidecars so we do
-        // not leak a child that no caller will use. `clear()` is synchronous
-        // (parking_lot lock) so this runs directly on the UI thread — no
-        // Tokio runtime required, and no fire-and-forget task that could be
-        // dropped before it runs.
-        if provider_kind != LocalProviderKind::OpenCode {
+        // Clear the sidecar pool when:
+        // 1. Switching away from OpenCode (avoid leaking unused children), or
+        // 2. OpenCode settings change (command/args) so stale sidecars are dropped.
+        // `clear()` is synchronous (parking_lot lock) so this runs directly on
+        // the UI thread — no Tokio runtime required, and no fire-and-forget task
+        // that could be dropped before it runs.
+        let should_clear = provider_kind != LocalProviderKind::OpenCode
+            || (provider_kind == LocalProviderKind::OpenCode
+                && (old_config.opencode_command != self.config.read().opencode_command
+                    || old_config.opencode_args != self.config.read().opencode_args));
+        if should_clear {
             self.opencode_pool.clear();
         }
     }
@@ -339,11 +345,7 @@ impl LocalOpenAIClient {
                     .read()
                     .clone()
                     .or_else(|| std::env::current_dir().ok())
-                    .ok_or_else(|| {
-                        OpenCodeError::BadAnnouncement(
-                            "no working directory available for OpenCode sidecar".to_string(),
-                        )
-                    })?;
+                    .ok_or(OpenCodeError::NoWorkingDirectory)?;
                 let sidecar = self
                     .opencode_pool
                     .get_or_spawn(

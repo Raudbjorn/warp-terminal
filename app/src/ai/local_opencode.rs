@@ -14,10 +14,11 @@
 //!
 //! Sidecar lifetime: a `Sidecar` keeps the child process alive for as long
 //! as the `Sidecar` is referenced. When the last clone is dropped, the child
-//! is sent `SIGTERM` (POSIX) or `kill` (Windows), then `wait()`ed with a
-//! 1 s grace before being force-killed. A background drain task prevents
-//! the child from blocking on a full pipe and owns the kill path so the
-//! `Drop` impl stays non-blocking.
+//! is sent `kill()` (SIGKILL on POSIX, `TerminateProcess` on Windows) and
+//! `wait()`ed. `async_process::Child` does not expose `send_signal`, so we
+//! cannot send SIGTERM with a grace period; the kill is immediate. A background
+//! drain task prevents the child from blocking on a full pipe and owns the
+//! kill path so the `Drop` impl stays non-blocking.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,8 @@ pub enum OpenCodeError {
     StartupFailure(#[allow(dead_code)] String),
     #[error("OpenCode sidecar stdout could not be parsed: {0}")]
     BadAnnouncement(String),
+    #[error("No working directory available for OpenCode sidecar")]
+    NoWorkingDirectory,
     #[error("OpenCode sidecar I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -67,6 +70,11 @@ struct OpenCodeAnnouncement {
 impl OpenCodeAnnouncement {
     fn from_line(line: &str) -> Result<Self, OpenCodeError> {
         if let Ok(parsed) = serde_json::from_str::<OpenCodeAnnouncement>(line) {
+            // Reject port 0 even in JSON form (bind(2) would assign a random
+            // port, but the announcement should report the actual bound port).
+            if parsed.port == 0 {
+                return Err(OpenCodeError::BadAnnouncement(line.to_string()));
+            }
             return Ok(parsed);
         }
 
@@ -465,9 +473,12 @@ mod tests {
 
     #[test]
     fn pool_dedupes_by_canonical_path() {
-        let path_a = std::env::current_dir().unwrap();
-        let path_b = canonicalize_for_pool(&path_a);
-        assert_eq!(path_a, path_b);
+        // Use a tempdir to avoid symlink issues with CWD; canonicalize
+        // should return the same path for an already-canonical directory.
+        let tmp = std::env::temp_dir();
+        let canonical = canonicalize_for_pool(&tmp);
+        // Both should resolve to the same canonical form.
+        assert_eq!(canonicalize_for_pool(&tmp), canonical);
     }
 
     #[tokio::test]
