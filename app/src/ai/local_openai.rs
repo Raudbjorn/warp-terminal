@@ -24,8 +24,7 @@ use crate::{
 #[derive(Clone)]
 pub(crate) struct LocalOpenAIClient {
     config: Arc<RwLock<LocalOpenAISettingsSnapshot>>,
-    // `OpenCodeSidecarPool` is already `Clone` + internally synchronized, so no
-    // outer mutex is needed (it would just serialize concurrent requests).
+
     opencode_pool: OpenCodeSidecarPool,
     /// Per-client override for the working directory the OpenCode
     /// sidecar pool keys on. `None` means "use the process CWD at
@@ -262,18 +261,21 @@ impl LocalOpenAIClient {
         let old_config = self.config.read().clone();
         let provider_kind = config.provider_kind;
         *self.config.write() = config;
-        // Clear the sidecar pool when:
-        // 1. Switching away from OpenCode (avoid leaking unused children), or
-        // 2. OpenCode settings change (command/args) so stale sidecars are dropped.
-        // `clear()` is synchronous (parking_lot lock) so this runs directly on
-        // the UI thread — no Tokio runtime required, and no fire-and-forget task
-        // that could be dropped before it runs.
-        let should_clear = provider_kind != LocalProviderKind::OpenCode
-            || (provider_kind == LocalProviderKind::OpenCode
-                && (old_config.opencode_command != self.config.read().opencode_command
-                    || old_config.opencode_args != self.config.read().opencode_args));
-        if should_clear {
-            self.opencode_pool.clear();
+        // Provider switched away from OpenCode: drop cached sidecars
+        // so we do not leak a child that no caller will use. The
+        // pool's internal `tokio::sync::Mutex` lets us clear without
+        // holding an outer lock — we spawn the await to keep this
+        // setter sync (it is called from settings-event handlers).
+        if provider_kind != LocalProviderKind::OpenCode {
+            let pool = self.opencode_pool.clone();
+            // The spawned future is fire-and-forget; the `let _ =`
+            // suppresses the `must_use` warning. We deliberately do
+            // not block on it: any in-flight `get_or_spawn` call
+            // holds a clone of its sidecar handle, so the cleared
+            // entry will be dropped when that handle is released.
+            let _ = tokio::spawn(async move {
+                pool.clear().await;
+            });
         }
     }
 
@@ -464,7 +466,11 @@ impl LocalOpenAIClient {
                     .read()
                     .clone()
                     .or_else(|| std::env::current_dir().ok())
-                    .ok_or(OpenCodeError::NoWorkingDirectory)?;
+                    .ok_or_else(|| {
+                        OpenCodeError::BadAnnouncement(
+                            "no working directory available for OpenCode sidecar".to_string(),
+                        )
+                    })?;
                 let sidecar = self
                     .opencode_pool
                     .get_or_spawn(
@@ -662,8 +668,8 @@ impl LocalOpenAIClient {
                             "no working directory available for OpenCode sidecar".to_string(),
                         )
                     })?;
-                let pool = self.opencode_pool.lock().await;
-                let sidecar = pool
+                let sidecar = self
+                    .opencode_pool
                     .get_or_spawn(&config.opencode_command, &config.opencode_args, &working_dir)
                     .await?;
                 Ok((sidecar.base_url().to_string(), config.api_key.clone()))

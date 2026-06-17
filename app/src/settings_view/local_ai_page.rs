@@ -229,12 +229,18 @@ impl LocalAIProviderWidget {
         ctx.subscribe_to_view(&opencode_args_editor, |_, editor, event, ctx| {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
-                // Split on whitespace; preserve tokens that contain
-                // `=` since the sidecar may receive flag arguments.
-                let value: Vec<String> = buffer_text
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect();
+                // Parse with `shell_words` so quoted arguments with
+                // embedded spaces (e.g. `--label "my model"`) survive
+                // intact. Fall back to whitespace splitting when the
+                // input is not well-formed shell syntax, so a single
+                // stray quote does not lock the user out of saving.
+                let value: Vec<String> = shell_words::split(&buffer_text)
+                    .unwrap_or_else(|_| {
+                        buffer_text
+                            .split_whitespace()
+                            .map(str::to_string)
+                            .collect()
+                    });
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(
                         settings.local_openai_opencode_args.set_value(value, ctx)
