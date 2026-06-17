@@ -41,12 +41,26 @@ pub struct Backend {
     /// Human-friendly name shown in the dropdown (falls back to `id`).
     #[serde(default)]
     pub name: String,
-    /// Server root URL, e.g. `https://warp.my-company.dev`.
+    /// Server root URL, e.g. `https://warp.my-company.dev`. Empty = don't override
+    /// the server URL — e.g. a gRPC-only agent backend that keeps Warp's default
+    /// server for everything except the bridged agent ops.
+    #[serde(default)]
     pub server_url: String,
     /// Websocket / RTC URL, e.g. `wss://rtc.warp.my-company.dev/graphql/v2`.
     /// Optional — if empty, only the server URL is overridden.
     #[serde(default)]
     pub ws_url: String,
+    /// gRPC harness-host endpoint, e.g. `http://127.0.0.1:50061`. When set, the
+    /// in-process agent bridge ([`crate::server::server_api::ai::bridge`]) routes
+    /// agent operations to this host. Optional; empty = a plain URL-override backend.
+    #[serde(default)]
+    pub grpc_endpoint: String,
+    /// Harness to spawn on the gRPC host (e.g. `claude`, `pi-mono`, `demo`).
+    #[serde(default)]
+    pub grpc_harness: String,
+    /// Bearer token sent to the gRPC host's auth interceptor (optional).
+    #[serde(default)]
+    pub grpc_token: String,
 }
 
 impl Backend {
@@ -138,6 +152,31 @@ pub fn set_selected(id: &str) {
     }
 }
 
+/// gRPC routing target for the in-process agent bridge.
+#[derive(Debug, Clone)]
+pub struct GrpcTarget {
+    pub endpoint: String,
+    pub harness: String,
+    pub token: String,
+}
+
+/// The gRPC target of the selected backend, if it defines a `grpc_endpoint`.
+/// Used by the in-process agent bridge to decide whether to route agent ops to a
+/// custom harness host. `None` for the built-in Warp backend or any backend
+/// without a `grpc_endpoint`.
+pub fn selected_grpc_target() -> Option<GrpcTarget> {
+    let config = load();
+    let backend = config.selected_backend()?;
+    if backend.grpc_endpoint.is_empty() {
+        return None;
+    }
+    Some(GrpcTarget {
+        endpoint: backend.grpc_endpoint.clone(),
+        harness: backend.grpc_harness.clone(),
+        token: backend.grpc_token.clone(),
+    })
+}
+
 /// Applies the selected backend's URLs by overriding `ChannelState`. No-op for
 /// the built-in Warp backend. Call this at startup BEFORE the server client,
 /// GraphQL, or auth read the URLs.
@@ -146,12 +185,14 @@ pub fn apply_selected_backend() {
     let Some(backend) = config.selected_backend() else {
         return;
     };
-    if let Err(e) = ChannelState::override_server_root_url(backend.server_url.clone()) {
-        log::error!(
-            "oh-my-warp: invalid server_url for backend '{}': {e:#}",
-            backend.id
-        );
-        return;
+    if !backend.server_url.is_empty() {
+        if let Err(e) = ChannelState::override_server_root_url(backend.server_url.clone()) {
+            log::error!(
+                "oh-my-warp: invalid server_url for backend '{}': {e:#}",
+                backend.id
+            );
+            return;
+        }
     }
     if !backend.ws_url.is_empty() {
         if let Err(e) = ChannelState::override_ws_server_url(backend.ws_url.clone()) {

@@ -1754,7 +1754,9 @@ impl ServerApiProvider {
     }
 
     pub fn get_ai_client(&self) -> Arc<dyn AIClient> {
-        self.server_api.clone()
+        // oh-my-warp: route agent ops through the in-process gRPC bridge when a
+        // gRPC backend is selected; otherwise returns the client unchanged.
+        ai::bridge::maybe_wrap(self.server_api.clone())
     }
 
     pub fn get_command_generation_client(&self) -> Arc<dyn CommandGenerationClient> {

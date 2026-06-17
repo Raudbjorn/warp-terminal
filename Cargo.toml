@@ -235,6 +235,10 @@ prost-build = "0.14.3"
 prost-reflect = "0.16.3"
 prost-types = "0.14.3"
 qrcode = { version = "0.14.1", default-features = false }
+# oh-my-warp: in-process agent bridge — an isolated gRPC crate that carries its own
+# prost 0.13 (tonic 0.12), kept out of the workspace's prost 0.14 so the generated
+# proto code doesn't clash with Warp's prost version.
+warp_agent_grpc = { path = "crates/warp_agent_grpc" }
 rand = "0.8.6"
 rangemap = "1.3.0"
 reqwest = { version = "0.13", features = [

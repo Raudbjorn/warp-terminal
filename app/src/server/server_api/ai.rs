@@ -1011,6 +1011,9 @@ pub struct ListConnectedSelfHostedWorkersResponse {
 
 pub(crate) const CONNECTED_SELF_HOSTED_WORKERS_PATH: &str = "agent/connected-self-hosted-workers";
 
+/// oh-my-warp: in-process gRPC agent bridge that decorates [`AIClient`].
+pub(crate) mod bridge;
+
 #[cfg_attr(test, automock)]
 #[cfg_attr(not(target_family = "wasm"), async_trait)]
 #[cfg_attr(target_family = "wasm", async_trait(?Send))]
