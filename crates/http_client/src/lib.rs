@@ -173,6 +173,13 @@ impl Client {
     }
 
     pub fn from_client_builder(client_builder: reqwest::ClientBuilder) -> reqwest::Result<Self> {
+        // Wrap the user's builder with a custom redirect policy that
+        // re-validates each redirect target against network_policy. The
+        // default reqwest policy follows up to 10 redirects without
+        // re-checking the URL, which would let a loopback URL that passes
+        // the initial check redirect to a public host and bypass LocalOnly
+        // restrictions. The closure is consulted on every hop.
+        let client_builder = client_builder.redirect(network_policy_redirect_policy());
         client_builder.build().map(|client| Self {
             wrapped: client,
             before_request_sent: None,
@@ -659,10 +666,23 @@ fn denied_eventsource_stream()
         yield Err(reqwest_eventsource::Error::StreamEnded);
     }
 }
+/// Custom reqwest redirect policy that re-validates each redirect target
+/// against the network policy. The default reqwest policy follows up to 10
+/// hops without consulting the URL — a loopback URL that passes the initial
+/// `check_url` could redirect to a public host and bypass LocalOnly
+/// restrictions. This policy refuses any redirect whose target is denied by
+/// the policy in effect at request time.
+fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if network_policy::check_url(attempt.url(), "redirect target").is_ok() {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
 
 /// An error returned from `Response::error_for_status` that includes response metadata.
-/// This allows callers to inspect headers (like X-Warp-Error-Code) and the response body when
-/// handling errors.
 #[derive(Debug)]
 pub struct ResponseError {
     pub source: reqwest::Error,
@@ -806,6 +826,7 @@ impl<'c> oauth2::AsyncHttpClient<'c> for Client {
                 .builder(builder, include_warp_headers, iap_token, None)
                 .send()
                 .await
+                .map_err(Error::from)
                 .map_err(Box::new)?;
 
             let mut builder = ::http::Response::builder().status(response.status());

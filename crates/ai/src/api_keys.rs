@@ -177,12 +177,17 @@ pub struct ApiKeyManager {
 
 impl ApiKeyManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let keys = if ChannelState::is_local_only() {
+        let is_local_only = ChannelState::is_local_only();
+        let keys = if is_local_only {
             ApiKeys::default()
         } else {
             Self::load_keys_from_secure_storage(ctx)
         };
-        let grok_tokens = Self::load_grok_tokens_from_secure_storage(ctx);
+        let grok_tokens = if is_local_only {
+            None
+        } else {
+            Self::load_grok_tokens_from_secure_storage(ctx)
+        };
         Self {
             keys,
             grok_tokens,
