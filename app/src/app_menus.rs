@@ -1092,6 +1092,7 @@ fn make_new_elements_menu_items(ctx: &AppContext) -> Vec<MenuItem> {
         )));
     }
 
+    new_elements_menu.push(non_updateable_custom_item(CustomAction::NewWebTab, ctx));
     new_elements_menu.push(non_updateable_custom_item(CustomAction::NewFile, ctx));
 
     let reopen_session_action_updater =

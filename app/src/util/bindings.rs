@@ -26,6 +26,8 @@ pub const MAC_MENUS_CONTEXT: DescriptionContext = DescriptionContext::Custom("ma
 #[repr(isize)]
 pub enum CustomAction {
     NewTab,
+    /// Open an embedded browser pane as a new tab (oh-my-warp).
+    NewWebTab,
     NewFile,
     ShowAboutWarp,
     ShowSettings,
@@ -266,6 +268,7 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
     match custom.into() {
         CustomAction::FocusInput => Keystroke::parse(cmd_or_ctrl_shift("l")).ok(),
         CustomAction::NewTab => Keystroke::parse(cmd_or_ctrl_shift("t")).ok(),
+        CustomAction::NewWebTab => None,
         CustomAction::Cut => Keystroke::parse("cmdorctrl-x").ok(),
         CustomAction::Copy => Keystroke::parse(cmd_or_ctrl_shift("c")).ok(),
         CustomAction::Paste => Keystroke::parse(cmd_or_ctrl_shift("v")).ok(),

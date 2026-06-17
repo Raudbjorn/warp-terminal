@@ -282,8 +282,8 @@ use crate::pane_group::pane::ActionOrigin;
 #[cfg(feature = "local_fs")]
 use crate::pane_group::FilePane;
 use crate::pane_group::{
-    self, AIFactPane, AnyPaneContent, ChildAgentOrigin, CodeDiffPane, CodePane, CodeReviewPanelArg,
-    Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
+    self, AIFactPane, AnyPaneContent, BrowserPane, ChildAgentOrigin, CodeDiffPane, CodePane,
+    CodeReviewPanelArg, Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
     ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions, PaneGroup, PaneId, PanesLayout,
     TabBarHoverIndex, TerminalPaneId,
 };
@@ -645,6 +645,7 @@ pub(crate) const OPEN_GLOBAL_SEARCH_BINDING_NAME: &str = "workspace:open_global_
 pub(crate) const TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME: &str =
     "workspace:toggle_conversation_list_view";
 pub(crate) const NEW_TAB_BINDING_NAME: &str = "workspace:new_tab";
+pub(crate) const NEW_WEB_TAB_BINDING_NAME: &str = "workspace:new_web_tab";
 pub(crate) const NEW_TERMINAL_TAB_BINDING_NAME: &str = "workspace:new_terminal_tab";
 pub(crate) const NEW_AGENT_TAB_BINDING_NAME: &str = "workspace:new_agent_tab";
 pub(crate) const NEW_AMBIENT_AGENT_TAB_BINDING_NAME: &str = "workspace:new_ambient_agent_tab";
@@ -6607,6 +6608,14 @@ impl Workspace {
                 menu_items.push(terminal_item.into_item());
             }
         }
+
+        // oh-my-warp: open an embedded browser pane as a new tab.
+        menu_items.push(
+            MenuItemFields::new("New Web Tab")
+                .with_on_select_action(WorkspaceAction::NewWebTab)
+                .with_icon(icons::Icon::Globe)
+                .into_item(),
+        );
 
         // 3. Cloud Agent (if flags enabled)
         if online_agent_ui_enabled
@@ -14764,6 +14773,37 @@ impl Workspace {
                 ctx,
             );
         });
+    }
+
+    /// Opens an embedded browser pane (oh-my-warp) as a right-split of the
+    /// active pane group. Each pane spawns its own Chrome + CDP screencast
+    /// session, so (unlike the network log) we always open a new one rather
+    /// than focusing an existing one.
+    pub(crate) fn open_browser_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        let pane = BrowserPane::new(ctx);
+        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+            pane_group.add_pane_with_direction(
+                Direction::Right,
+                pane,
+                true, /* focus_new_pane */
+                ctx,
+            );
+        });
+    }
+
+    /// Opens an embedded browser pane (oh-my-warp) as its own new tab.
+    pub(crate) fn open_web_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        let panes_layout = PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
+            is_focused: true,
+            custom_vertical_tabs_title: None,
+            contents: LeafContents::Browser,
+        })));
+        self.add_tab_with_pane_layout(
+            panes_layout,
+            Arc::new(HashMap::new()),
+            Some("Browser".to_owned()),
+            ctx,
+        );
     }
 
     fn show_handoff_environment_creation_modal(&mut self, ctx: &mut ViewContext<Self>) {
@@ -23557,6 +23597,12 @@ impl TypedActionView for Workspace {
             }
             OpenNetworkLogPane => {
                 self.open_network_log_pane(ctx);
+            }
+            OpenBrowserPane => {
+                self.open_browser_pane(ctx);
+            }
+            NewWebTab => {
+                self.open_web_tab(ctx);
             }
             FixSettingsWithOz { error_description } => {
                 use crate::ai::skills::SkillManager;

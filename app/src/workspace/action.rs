@@ -817,6 +817,12 @@ pub enum WorkspaceAction {
     /// Opens (or focuses) the in-app network log pane as a right-split of the
     /// active pane group. Gated on `ContextFlag::NetworkLogConsole`.
     OpenNetworkLogPane,
+    /// Opens an embedded browser pane (oh-my-warp) as a right-split of the active
+    /// pane group, streaming Chrome's viewport over CDP. Bound to the leader
+    /// chord `ctrl-b w`.
+    OpenBrowserPane,
+    /// Opens an embedded browser pane (oh-my-warp) as its own new tab.
+    NewWebTab,
 }
 
 impl From<&WorkspaceAction> for LoginGatedFeature {
@@ -1127,7 +1133,9 @@ impl WorkspaceAction {
             | ShowHandoffEnvironmentCreationModal
             | ShowCloudModeV2EnvironmentCreationModal
             | OpenCreateAuthSecretModal { .. }
-            | OpenNetworkLogPane => false,
+            | OpenNetworkLogPane
+            | OpenBrowserPane
+            | NewWebTab => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
             #[cfg(target_family = "wasm")]

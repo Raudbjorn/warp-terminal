@@ -443,6 +443,12 @@ impl TabData {
         menu_items.append(&mut vec![MenuItemFields::new("Rename tab")
             .with_on_select_action(WorkspaceAction::RenameTab(index))
             .into_item()]);
+        // oh-my-warp: open an embedded browser pane as a right-split.
+        menu_items.push(
+            MenuItemFields::new("Launch Web Pane")
+                .with_on_select_action(WorkspaceAction::OpenBrowserPane)
+                .into_item(),
+        );
         // Group together with rename option (note, resetting doesn't make
         // sense unless you're able to rename a tab).
         let title = self.pane_group.as_ref(ctx).custom_title(ctx);

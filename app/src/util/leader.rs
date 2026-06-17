@@ -87,6 +87,12 @@ fn leader_bindings() -> Vec<(&'static str, &'static str, &'static str, Workspace
             "p",
             WorkspaceAction::ActivatePrevTab,
         ), // tmux: previous window
+        (
+            "leader:open_browser",
+            "Leader: Open Browser",
+            "w",
+            WorkspaceAction::OpenBrowserPane,
+        ), // oh-my-warp: embedded browser pane (w = web)
     ]
 }
 
