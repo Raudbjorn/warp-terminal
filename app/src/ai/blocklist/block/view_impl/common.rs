@@ -16,7 +16,13 @@ use itertools::Itertools;
 use markdown_parser::{FormattedText, FormattedTextInline, TableAlignment};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
-use std::sync::Arc;
+use warp_editor::content::edit::resolve_asset_source_relative_to_directory;
+use warp_editor::content::mermaid_diagram::mermaid_asset_source;
+use warp_util::path::to_relative_path;
+use warpui::elements::shimmering_text::ShimmeringTextStateHandle;
+
+use warpui_core::elements::{Highlight, HighlightedRange};
+use warp_core::channel::ChannelState;
 use warp_core::{
     features::FeatureFlag,
     ui::{appearance::Appearance, color::blend::Blend, theme::color::internal_colors},
@@ -44,35 +50,7 @@ use warpui::{
     },
     Action, AppContext, Element, EventContext, SingletonEntity, View, ViewHandle,
 };
-use warp_core::channel::ChannelState;
-use warp_core::features::FeatureFlag;
-use warp_core::ui::appearance::Appearance;
-use warp_core::ui::color::blend::Blend;
-use warp_core::ui::theme::color::internal_colors;
-use warp_editor::content::edit::resolve_asset_source_relative_to_directory;
-use warp_editor::content::mermaid_diagram::mermaid_asset_source;
-use warp_util::path::to_relative_path;
-use warpui::assets::asset_cache::{AssetCache, AssetSource, AssetState};
-use warpui::elements::new_scrollable::{ScrollableAppearance, SingleAxisConfig};
-use warpui::elements::shimmering_text::ShimmeringTextStateHandle;
-use warpui::elements::{
-    Align, Axis, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty, EventHandler,
-    Expanded, Fill, Flex, FormattedTextElement, HeadingFontSizeMultipliers, Highlight,
-    HighlightedRange, Hoverable, Image as WarpImage, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, NewScrollable, OffsetPositioning, ParentAnchor, ParentElement,
-    ParentOffsetBounds, Radius, SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth,
-    Shrinkable, Stack, Table, TableColumnWidth, TableConfig, TableHeader, TableVerticalSizing,
-    Text, Wrap,
-};
-use warpui::fonts::{Properties, Weight};
-use warpui::image_cache::{CacheOption, ImageType};
-use warpui::keymap::Keystroke;
-use warpui::platform::Cursor;
-use warpui::text_layout::{ClipConfig, TextAlignment, TextStyle};
-use warpui::ui_components::button::Button;
-use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
-use warpui::{Action, AppContext, Element, EventContext, SingletonEntity, View, ViewHandle};
+
 
 use super::output::LinkActionConstructors;
 use super::{add_highlights_to_rich_text, add_highlights_to_text};
@@ -104,13 +82,14 @@ use crate::ai::blocklist::inline_action::inline_action_icons::{self, icon_size};
 use crate::ai::blocklist::inline_action::requested_action::RenderableAction;
 use crate::ai::blocklist::model::{AIBlockModel, AIBlockModelHelper};
 use crate::ai::blocklist::secret_redaction::{redact_secrets_in_element, SecretRedactionState};
-use crate::ai::blocklist::view_util::error_color;
+use crate::notebooks::editor::{markdown_table_appearance, rich_text_styles, MarkdownTableAppearance};
 use crate::ai::blocklist::{BlocklistAIActionModel, ShellCommandExecutor, TextLocation};
+use crate::ai::blocklist::view_util::error_color;
 use crate::ai::loading::shimmering_warp_loading_text;
 use crate::ai::AIRequestUsageModel;
 use crate::code::editor::view::CodeEditorView;
 use crate::code::editor_management::CodeSource;
-use crate::notebooks::editor::{markdown_table_appearance, rich_text_styles};
+
 use crate::search::slash_command_menu::static_commands::commands;
 use crate::settings::{FontSettings, InputSettings};
 use crate::settings_view::SettingsSection;
