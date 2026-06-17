@@ -25,6 +25,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 string-offset.workspace = true
 typed-path.workspace = true
+url.workspace = true
 anyhow.workspace = true
 base16ct = "0.2.0"
 streaming-iterator.workspace = true

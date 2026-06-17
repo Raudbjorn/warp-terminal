@@ -221,8 +221,11 @@ pub enum AIApiError {
     #[error("Response stream ended unexpectedly before completion.")]
     UnexpectedEof,
 
-    #[error("Network policy denied: {0}")]
-    NetworkPolicyDenied(#[source] network_policy::NetworkPolicyDenied),
+    /// Synthesized client-side when a response stream ends without a stream-finished
+    /// event: the server always sends one, but the transport can truncate the response
+    /// between chunks, surfacing as a clean EOF.
+    #[error("Response stream ended unexpectedly before completion.")]
+    UnexpectedEof,
 }
 
 impl From<http_client::ResponseError> for AIApiError {

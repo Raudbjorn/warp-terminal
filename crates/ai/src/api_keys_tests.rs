@@ -1,72 +1,11 @@
-use std::time::{Duration, SystemTime};
-
 use super::*;
 
 fn make_manager(keys: ApiKeys) -> ApiKeyManager {
-    make_manager_with_grok(keys, None)
-}
-
-fn make_manager_with_grok(keys: ApiKeys, grok_tokens: Option<GrokTokens>) -> ApiKeyManager {
     ApiKeyManager {
         keys,
-        grok_tokens,
-        #[cfg(not(target_family = "wasm"))]
-        grok_refresh_allowed: false,
-        #[cfg(not(target_family = "wasm"))]
-        grok_refresh_in_flight: false,
         aws_credentials_state: AwsCredentialsState::Missing,
         aws_credentials_refresh_strategy: AwsCredentialsRefreshStrategy::default(),
-        geap_credentials_state: GeapCredentialsState::Missing,
         secure_storage_write_version: 0,
-        grok_secure_storage_write_version: 0,
-    }
-}
-
-fn make_manager_with_geap(geap_credentials_state: GeapCredentialsState) -> ApiKeyManager {
-    let mut manager = make_manager(ApiKeys::default());
-    manager.geap_credentials_state = geap_credentials_state;
-    manager
-}
-
-fn grok_tokens(access_token: &str, expires_in: Option<u64>) -> GrokTokens {
-    GrokTokens {
-        access_token: access_token.into(),
-        refresh_token: Some("refresh".into()),
-        expires_at: expires_in.map(|secs| SystemTime::now() + Duration::from_secs(secs)),
-        connected_at: None,
-    }
-}
-
-fn geap_credentials(access_token: &str, expires_in: Option<u64>) -> GeapCredentials {
-    GeapCredentials::new(
-        access_token.into(),
-        expires_in.map(|secs| SystemTime::now() + Duration::from_secs(secs)),
-    )
-}
-
-fn geap_binding() -> GeapMintBinding {
-    GeapMintBinding {
-        user_uid: "user-1".into(),
-        audience:
-            "//iam.googleapis.com/projects/1/locations/global/workloadIdentityPools/p/providers/q"
-                .into(),
-        federation: GeapFederation::ServiceAccount {
-            email: "sa@proj.iam.gserviceaccount.com".into(),
-        },
-    }
-}
-
-// The expected binding the request build site passes in is the same type as
-// the stored `minted_for`, so the attach check is a plain `==`.
-fn geap_gate() -> GeapMintBinding {
-    geap_binding()
-}
-
-fn geap_loaded(access_token: &str, expires_in: Option<u64>) -> GeapCredentialsState {
-    GeapCredentialsState::Loaded {
-        credentials: geap_credentials(access_token, expires_in),
-        loaded_at: SystemTime::now(),
-        minted_for: geap_binding(),
     }
 }
 

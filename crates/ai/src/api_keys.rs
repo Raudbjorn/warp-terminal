@@ -1,25 +1,16 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 use uuid::Uuid;
-use warp_core::channel::ChannelState;
 use warp_multi_agent_api as api;
 use warpui_core::{Entity, ModelContext, SingletonEntity};
 use warpui_extras::secure_storage::{self, AppContextExt};
 
 pub use crate::aws_credentials::{AwsCredentials, AwsCredentialsState};
-pub use crate::geap_credentials::{
-    GeapCredentials, GeapCredentialsState, GeapFederation, GeapMintBinding,
-    LoadGeapCredentialsError, GEAP_REFRESH_LEAD_TIME,
-};
 
 const SECURE_STORAGE_KEY: &str = "AiApiKeys";
 pub const DEFAULT_PROFILE_INFERENCE_KEY: &str = "default";
-
-/// Secure-storage key for the connected xAI/Grok subscription's OAuth tokens.
-/// Kept separate from [`SECURE_STORAGE_KEY`] because these are OAuth tokens with
-/// a refresh lifecycle, not a user-pasted static key.
-const GROK_SECURE_STORAGE_KEY: &str = "GrokOAuthTokens";
 
 /// Emitted when user-provided API keys are updated in-memory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +30,8 @@ pub struct ApiKeys {
     pub google: Option<String>,
     pub anthropic: Option<String>,
     pub openai: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub local_multi_agent_server_root_url: Option<String>,
     pub open_router: Option<String>,
     pub custom_endpoints: Vec<CustomEndpoint>,
     pub profile_inference_settings: BTreeMap<String, ProfileInferenceSettings>,
@@ -225,49 +218,21 @@ impl ProfileInferenceSettings {
     }
 }
 
-/// OAuth tokens for a connected xAI / Grok subscription (e.g. SuperGrok).
-///
-/// Persisted to secure storage under [`GROK_SECURE_STORAGE_KEY`], separate from
-/// the BYO [`ApiKeys`] blob because these are OAuth tokens with a refresh
-/// lifecycle rather than a user-pasted static key. `crate::grok_subscription`
-/// owns refreshing them; this module is the storage and request-injection
-/// source of truth that [`ApiKeyManager::api_keys_for_request`] reads from.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct GrokTokens {
-    pub access_token: String,
-    #[serde(default)]
-    pub refresh_token: Option<String>,
-    /// Absolute time at which `access_token` expires, if the provider told us.
-    #[serde(default)]
-    pub expires_at: Option<SystemTime>,
-    /// When the user originally connected the subscription (i.e. when the
-    /// browser OAuth flow completed). Carried over across token refreshes so
-    /// it keeps reflecting the initial connection, not the latest refresh;
-    /// surfaced in the settings UI as "Connected on ...". `None` for tokens
-    /// stored before this field existed.
-    #[serde(default)]
-    pub connected_at: Option<SystemTime>,
-}
-
-impl GrokTokens {
-    /// Returns the access token whenever it is non-empty, regardless of
-    /// expiry. Possibly-expired tokens are still sent so the server stays the
-    /// final authority on token validity (it rejects truly invalid tokens);
-    /// `crate::grok_subscription` refreshes (nearly) expired tokens in the
-    /// background.
-    pub fn access_token_for_request(&self) -> Option<&str> {
-        (!self.access_token.trim().is_empty()).then_some(self.access_token.as_str())
+fn normalize_absolute_http_url(url: Option<String>) -> Option<String> {
+    let url = url?;
+    let url = url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return None;
     }
 
-    /// Returns `true` when the token is known to expire within `lead_time` and
-    /// should be proactively refreshed. Tokens with an unknown expiry never
-    /// report as needing a refresh (there's no expiry signal to act on).
-    pub fn needs_refresh(&self, lead_time: Duration) -> bool {
-        match self.expires_at {
-            Some(expires_at) => expires_at <= SystemTime::now() + lead_time,
-            None => false,
-        }
+    let Ok(parsed) = Url::parse(&url) else {
+        return None;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
     }
+
+    Some(url)
 }
 
 /// Controls how AWS credentials are refreshed by [`ApiKeyManager`].
@@ -289,26 +254,9 @@ pub enum AwsCredentialsRefreshStrategy {
 /// A structure that manages API keys for AI providers.
 pub struct ApiKeyManager {
     keys: ApiKeys,
-    /// OAuth tokens for a connected xAI/Grok subscription, if any. Persisted
-    /// separately from `keys` under [`GROK_SECURE_STORAGE_KEY`];
-    /// `crate::grok_subscription` keeps these fresh.
-    grok_tokens: Option<GrokTokens>,
-    /// Whether background refresh of `grok_tokens` is currently allowed.
-    /// Mirrors the BYO API key policy, which lives in the app layer; wired in
-    /// via `ApiKeyManager::set_grok_refresh_allowed` (`crate::grok_subscription`).
-    #[cfg(not(target_family = "wasm"))]
-    pub(crate) grok_refresh_allowed: bool,
-    /// Guards against overlapping Grok token refreshes: the proactive refresh
-    /// timer and the request-time safety net
-    /// (`ApiKeyManager::refresh_grok_tokens_if_needed`) can otherwise race.
-    #[cfg(not(target_family = "wasm"))]
-    pub(crate) grok_refresh_in_flight: bool,
     pub(crate) aws_credentials_state: AwsCredentialsState,
     aws_credentials_refresh_strategy: AwsCredentialsRefreshStrategy,
-    /// In-memory Gemini Enterprise (GEAP) credential state.
-    pub(crate) geap_credentials_state: GeapCredentialsState,
     secure_storage_write_version: u64,
-    grok_secure_storage_write_version: u64,
 }
 
 impl ApiKeyManager {
@@ -346,24 +294,6 @@ impl ApiKeyManager {
 
     pub fn keys(&self) -> &ApiKeys {
         &self.keys
-    }
-
-    /// The currently stored xAI/Grok OAuth tokens, if the user has connected a
-    /// Grok subscription.
-    pub fn grok_tokens(&self) -> Option<&GrokTokens> {
-        self.grok_tokens.as_ref()
-    }
-
-    /// Stores (or clears, with `None`) the xAI/Grok OAuth tokens and persists
-    /// them to secure storage. No-op when the value is unchanged so we don't
-    /// emit spurious events or schedule redundant keychain writes.
-    pub fn set_grok_tokens(&mut self, tokens: Option<GrokTokens>, ctx: &mut ModelContext<Self>) {
-        if self.grok_tokens == tokens {
-            return;
-        }
-        self.grok_tokens = tokens;
-        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
-        self.write_grok_tokens_to_secure_storage(ctx);
     }
 
     pub fn set_google_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
@@ -836,22 +766,6 @@ impl ApiKeyManager {
         &self.aws_credentials_state
     }
 
-    pub fn set_geap_credentials_state(
-        &mut self,
-        state: GeapCredentialsState,
-        ctx: &mut ModelContext<Self>,
-    ) {
-        if self.geap_credentials_state == state {
-            return;
-        }
-        self.geap_credentials_state = state;
-        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
-    }
-
-    pub fn geap_credentials_state(&self) -> &GeapCredentialsState {
-        &self.geap_credentials_state
-    }
-
     pub fn aws_credentials_refresh_strategy(&self) -> AwsCredentialsRefreshStrategy {
         self.aws_credentials_refresh_strategy.clone()
     }
@@ -918,7 +832,6 @@ impl ApiKeyManager {
         profile_key: &str,
         include_byo_keys: bool,
         include_aws_bedrock_credentials: bool,
-        geap_binding: Option<GeapMintBinding>,
     ) -> Option<api::request::settings::ApiKeys> {
         let profile_settings = self.keys.profile_settings(profile_key);
         let anthropic = include_byo_keys
@@ -938,21 +851,6 @@ impl ApiKeyManager {
             .flatten()
             .unwrap_or_default();
 
-        // The connected Grok subscription's OAuth access token is user-provided
-        // auth, just like a pasted BYO API key, so it respects the same BYO
-        // policy gate: when BYO keys are disabled (e.g. by workspace policy),
-        // the token must not be sent. Possibly-expired tokens ARE sent — the
-        // server is the authority on validity.
-        let grok_oauth_access_token = include_byo_keys
-            .then(|| {
-                self.grok_tokens
-                    .as_ref()
-                    .and_then(GrokTokens::access_token_for_request)
-                    .map(str::to_owned)
-            })
-            .flatten()
-            .unwrap_or_default();
-
         // Also include credentials when running with OIDC-managed Bedrock inference, regardless
         // of the per-user setting flag (which only applies to the local credential chain path).
         let include_aws = include_aws_bedrock_credentials
@@ -969,36 +867,11 @@ impl ApiKeyManager {
             })
             .flatten();
 
-        // Gemini Enterprise (GEAP) credentials attach only when the caller's
-        // gate is on AND the stored token was minted for that same
-        // (user, audience, SA) binding.
-        let google_cloud_credentials: Option<
-            api::request::settings::api_keys::GoogleCloudCredentials,
-        > = geap_binding
-            .as_ref()
-            .and_then(|binding| match self.geap_credentials_state {
-                GeapCredentialsState::Loaded {
-                    ref credentials,
-                    ref minted_for,
-                    ..
-                } if minted_for == binding => credentials
-                    .access_token_for_request()
-                    .map(|_| credentials.clone().into()),
-                GeapCredentialsState::Refreshing {
-                    previous: Some((ref credentials, ref minted_for)),
-                } if minted_for == binding => credentials
-                    .access_token_for_request()
-                    .map(|_| credentials.clone().into()),
-                _ => None,
-            });
-
         if anthropic.is_empty()
             && openai.is_empty()
             && google.is_empty()
             && open_router.is_empty()
-            && grok_oauth_access_token.is_empty()
             && aws_credentials.is_none()
-            && google_cloud_credentials.is_none()
         {
             None
         } else {
@@ -1007,10 +880,8 @@ impl ApiKeyManager {
                 openai,
                 google,
                 open_router,
-                grok_oauth_access_token,
                 allow_use_of_warp_credits: false,
                 aws_credentials,
-                google_cloud_credentials,
             })
         }
     }
@@ -1089,61 +960,6 @@ impl ApiKeyManager {
             }
             if let Err(e) = ctx.secure_storage().write_value(SECURE_STORAGE_KEY, &json) {
                 log::error!("Failed to write API keys to secure storage: {e:#}");
-            }
-        });
-    }
-
-    fn load_grok_tokens_from_secure_storage(ctx: &mut ModelContext<Self>) -> Option<GrokTokens> {
-        let json = match ctx.secure_storage().read_value(GROK_SECURE_STORAGE_KEY) {
-            Ok(json) => json,
-            Err(e) => {
-                if !matches!(e, secure_storage::Error::NotFound) {
-                    log::error!("Failed to read Grok tokens from secure storage: {e:#}");
-                }
-                return None;
-            }
-        };
-
-        match serde_json::from_str(&json) {
-            Ok(tokens) => Some(tokens),
-            Err(e) => {
-                log::error!("Failed to deserialize Grok tokens: {e:#}");
-                None
-            }
-        }
-    }
-
-    fn write_grok_tokens_to_secure_storage(&mut self, ctx: &mut ModelContext<Self>) {
-        // `Some(json)` writes the tokens; `None` removes the stored entry (the
-        // user disconnected). Serialize up front so the deferred callback only
-        // touches the keychain.
-        let payload = match self.grok_tokens.as_ref().map(serde_json::to_string) {
-            Some(Ok(json)) => Some(json),
-            Some(Err(e)) => {
-                log::error!("Failed to serialize Grok tokens: {e:#}");
-                return;
-            }
-            None => None,
-        };
-        self.grok_secure_storage_write_version += 1;
-        let write_version = self.grok_secure_storage_write_version;
-
-        // Defer the keychain write/remove like `write_keys_to_secure_storage`,
-        // skipping stale callbacks so an older write can't clobber a newer one.
-        ctx.spawn(async move { payload }, move |me, payload, ctx| {
-            if write_version != me.grok_secure_storage_write_version {
-                return;
-            }
-            let result = match payload {
-                Some(ref json) => ctx
-                    .secure_storage()
-                    .write_value(GROK_SECURE_STORAGE_KEY, json),
-                None => ctx.secure_storage().remove_value(GROK_SECURE_STORAGE_KEY),
-            };
-            if let Err(e) = result {
-                if !matches!(e, secure_storage::Error::NotFound) {
-                    log::error!("Failed to persist Grok tokens to secure storage: {e:#}");
-                }
             }
         });
     }

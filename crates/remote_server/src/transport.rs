@@ -234,6 +234,18 @@ pub enum ControlPath {
     None,
 }
 
+impl ControlPath {
+    /// Returns the socket path for `WarpManaged` and `UserOwned` variants,
+    /// or `None` for [`ControlPath::None`].
+    #[cfg(not(target_family = "wasm"))]
+    pub fn as_path(&self) -> Option<PathBuf> {
+        match self {
+            ControlPath::WarpManaged(path) | ControlPath::UserOwned(path) => Some(path.clone()),
+            ControlPath::None => None,
+        }
+    }
+}
+
 /// A successful return from [`RemoteTransport::connect`].
 ///
 /// Bundles the live [`RemoteServerClient`] and its [`ClientEvent`]
