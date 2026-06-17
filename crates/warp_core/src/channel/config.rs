@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::AppId;
 
+pub use network_policy::ServicesMode;
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChannelConfig {
     /// The application ID for this channel.
@@ -16,6 +18,9 @@ pub struct ChannelConfig {
     pub server_config: WarpServerConfig,
     /// Configuration for Oz/ambient agents.
     pub oz_config: OzConfig,
+    /// Whether online services are enabled for this channel.
+    #[serde(default)]
+    pub services_mode: ServicesMode,
     /// Configuration for telemetry sending, or [`None`] if telemetry should be
     /// disabled for this build.
     pub telemetry_config: Option<TelemetryConfig>,
@@ -63,6 +68,16 @@ impl WarpServerConfig {
             iap_config: None,
         }
     }
+
+    pub fn local_only() -> Self {
+        Self {
+            server_root_url: "http://127.0.0.1".into(),
+            rtc_server_url: "ws://127.0.0.1/graphql/v2".into(),
+            session_sharing_server_url: None,
+            firebase_auth_api_key: "".into(),
+            iap_config: None,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -80,6 +95,13 @@ impl OzConfig {
     pub fn production() -> Self {
         Self {
             oz_root_url: "https://oz.warp.dev".into(),
+            workload_audience_url: None,
+        }
+    }
+
+    pub fn local_only() -> Self {
+        Self {
+            oz_root_url: "http://127.0.0.1".into(),
             workload_audience_url: None,
         }
     }

@@ -31,6 +31,50 @@ fn restore_env_var(name: &str, previous: Option<OsString>) {
     }
 }
 
+fn args(args: &[&str]) -> Vec<String> {
+    args.iter().map(ToString::to_string).collect()
+}
+
+#[test]
+fn disabled_subcommand_detects_command_after_global_flag() {
+    assert_eq!(
+        Some("agent"),
+        disabled_subcommand(&args(&["warp", "--debug", "agent"]), &["agent"])
+    );
+}
+
+#[test]
+fn disabled_subcommand_skips_global_option_values() {
+    assert_eq!(
+        Some("login"),
+        disabled_subcommand(
+            &args(&[
+                "warp",
+                "--server-root-url",
+                "http://localhost:8080",
+                "login"
+            ]),
+            &["login"],
+        )
+    );
+    assert_eq!(
+        None,
+        disabled_subcommand(&args(&["warp", "--api-key", "agent", "mcp"]), &["agent"])
+    );
+}
+
+#[test]
+fn disabled_subcommand_detects_help_target_and_aliases() {
+    assert_eq!(
+        Some("agent"),
+        disabled_subcommand(&args(&["warp", "help", "agent"]), &["agent"])
+    );
+    assert_eq!(
+        Some("task"),
+        disabled_subcommand(&args(&["warp", "task", "list"]), &["run", "task"])
+    );
+}
+
 #[test]
 fn agent_run_accepts_model() {
     let args = Args::try_parse_from([

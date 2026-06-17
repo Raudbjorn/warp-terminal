@@ -1,0 +1,83 @@
+use crate::FeatureFlag;
+
+pub(super) fn is_online_services_only(feature: FeatureFlag) -> bool {
+    matches!(
+        feature,
+        FeatureFlag::Changelog
+            | FeatureFlag::CocoaSentry
+            | FeatureFlag::CrashReporting
+            | FeatureFlag::Autoupdate
+            | FeatureFlag::LogExpensiveFramesInSentry
+            | FeatureFlag::WithSandboxTelemetry
+            | FeatureFlag::RecordAppActiveEvents
+            | FeatureFlag::CloudObjects
+            | FeatureFlag::FetchChannelVersionsFromWarpServer
+            | FeatureFlag::CreatingSharedSessions
+            | FeatureFlag::ViewingSharedSessions
+            | FeatureFlag::AgentMode
+            | FeatureFlag::AgentModeAnalytics
+            | FeatureFlag::AgentModeWorkflows
+            | FeatureFlag::PromptSuggestionsViaMAA
+            | FeatureFlag::AutoupdateUIRevamp
+            | FeatureFlag::GlobalAIAnalyticsBanner
+            | FeatureFlag::GlobalAIAnalyticsCollection
+            | FeatureFlag::AIMemories
+            | FeatureFlag::AgentModePrimaryXML
+            | FeatureFlag::AgentModePrePlanXML
+            | FeatureFlag::AgentOnboarding
+            | FeatureFlag::SuggestedAgentModeWorkflows
+            | FeatureFlag::ForceLogin
+            | FeatureFlag::UsageBasedPricing
+            | FeatureFlag::AIResumeButton
+            | FeatureFlag::AgentDecidesCommandExecution
+            | FeatureFlag::DriveObjectsAsContext
+            | FeatureFlag::CloudEnvironments
+            | FeatureFlag::CreateEnvironmentSlashCommand
+            | FeatureFlag::ProviderCommand
+            | FeatureFlag::IntegrationCommand
+            | FeatureFlag::ArtifactCommand
+            | FeatureFlag::WebSearchUI
+            | FeatureFlag::WebFetchUI
+            | FeatureFlag::AgentSharedSessions
+            | FeatureFlag::AmbientAgentsCommandLine
+            | FeatureFlag::ScheduledAmbientAgents
+            | FeatureFlag::AgentView
+            | FeatureFlag::AgentViewBlockContext
+            | FeatureFlag::CloudMode
+            | FeatureFlag::CloudModeFromLocalSession
+            | FeatureFlag::CloudModeHostSelector
+            | FeatureFlag::WarpManagedSecrets
+            | FeatureFlag::TeamApiKeys
+            | FeatureFlag::CloudConversations
+            | FeatureFlag::AgentViewPromptChip
+            | FeatureFlag::AgentToolbarEditor
+            | FeatureFlag::AmbientAgentsRTC
+            | FeatureFlag::ConversationArtifacts
+            | FeatureFlag::SyncAmbientPlans
+            | FeatureFlag::AgentViewConversationListView
+            | FeatureFlag::ContextWindowUsageV2
+            | FeatureFlag::AgentManagementView
+            | FeatureFlag::AgentManagementDetailsView
+            | FeatureFlag::InteractiveConversationManagementView
+            | FeatureFlag::AgentTips
+            | FeatureFlag::AgentModeComputerUse
+            | FeatureFlag::OzPlatformSkills
+            | FeatureFlag::OzIdentityFederation
+            | FeatureFlag::OzLaunchModal
+            | FeatureFlag::OzChangelogUpdates
+            | FeatureFlag::OpenWarpLaunchModal
+            | FeatureFlag::ConversationsAsContext
+            | FeatureFlag::OrchestrationLaunchModal
+            | FeatureFlag::OrchestrationViewerStreamer
+            | FeatureFlag::QueueSlashCommand
+            | FeatureFlag::TransferControlTool
+            | FeatureFlag::AgentHarness
+            | FeatureFlag::OzHandoff
+            | FeatureFlag::ConversationApi
+            | FeatureFlag::HOAOnboardingFlow
+            | FeatureFlag::HOARemoteControl
+            | FeatureFlag::HOANotifications
+            | FeatureFlag::CloudModeSetupV2
+            | FeatureFlag::CloudModeInputV2
+    )
+}

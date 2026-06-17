@@ -210,6 +210,15 @@ impl From<reqwest::Error> for AIApiError {
     }
 }
 
+impl From<http_client::Error> for AIApiError {
+    fn from(err: http_client::Error) -> Self {
+        match err {
+            http_client::Error::Reqwest(err) => Self::from_transport_error(err),
+            http_client::Error::NetworkPolicyDenied(err) => AIApiError::Other(anyhow::anyhow!(err)),
+        }
+    }
+}
+
 impl From<serde_json::Error> for AIApiError {
     fn from(err: serde_json::Error) -> Self {
         AIApiError::Deserialization(err.into())

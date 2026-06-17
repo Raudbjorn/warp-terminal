@@ -183,69 +183,39 @@ impl Args {
             } else {
                 use clap::FromArgMatches as _;
 
+                let args: Vec<String> = env::args().collect();
+                if ChannelState::is_local_only() {
+                    exit_if_disabled_subcommand(&args, LOCAL_ONLY_DISABLED_SUBCOMMANDS);
+                }
+
                 // Check for disabled commands before parsing to prevent help from showing (e.g.
                 // `warp environment` should not return help text)
                 if !FeatureFlag::CloudEnvironments.is_enabled() {
-                    let args: Vec<String> = env::args().collect();
-                    if args.len() > 1 && args[1] == "environment" {
-                        eprintln!("error: unrecognized subcommand 'environment'\n");
-                        eprintln!("For more information, try '--help'");
-                        std::process::exit(2);
-                    }
+                    exit_if_disabled_subcommand(&args, &["environment"]);
                 }
 
                 if !FeatureFlag::ProviderCommand.is_enabled() {
-                    let args: Vec<String> = env::args().collect();
-                    if args.len() > 1 && args[1] == "provider" {
-                        eprintln!("error: unrecognized subcommand 'provider'\n");
-                        eprintln!("For more information, try '--help'");
-                        std::process::exit(2);
-                    }
+                    exit_if_disabled_subcommand(&args, &["provider"]);
                 }
 
                 if !FeatureFlag::IntegrationCommand.is_enabled() {
-                    let args: Vec<String> = env::args().collect();
-                    if args.len() > 1 && args[1] == "integration" {
-                        eprintln!("error: unrecognized subcommand 'integration'\n");
-                        eprintln!("For more information, try '--help'");
-                        std::process::exit(2);
-                    }
+                    exit_if_disabled_subcommand(&args, &["integration"]);
                 }
 
                 if !FeatureFlag::ScheduledAmbientAgents.is_enabled() {
-                    let args: Vec<String> = env::args().collect();
-                    if args.len() > 1 && args[1] == "schedule" {
-                        eprintln!("error: unrecognized subcommand 'schedule'\n");
-                        eprintln!("For more information, try '--help'");
-                        std::process::exit(2);
-                    }
+                    exit_if_disabled_subcommand(&args, &["schedule"]);
                 }
 
                 if !FeatureFlag::WarpManagedSecrets.is_enabled() {
-                    let args: Vec<String> = env::args().collect();
-                    if args.len() > 1 && args[1] == "secret" {
-                        eprintln!("error: unrecognized subcommand 'secret'\n");
-                        eprintln!("For more information, try '--help'");
-                        std::process::exit(2);
-                    }
+                    exit_if_disabled_subcommand(&args, &["secret"]);
                 }
 
                 if !FeatureFlag::OzIdentityFederation.is_enabled() {
-                    let args: Vec<String> = env::args().collect();
-                    if args.len() > 1 && args[1] == "federate" {
-                        eprintln!("error: unrecognized subcommand 'federate'\n");
-                        eprintln!("For more information, try '--help'");
-                        std::process::exit(2);
-                    }
+                    exit_if_disabled_subcommand(&args, &["federate"]);
                 }
 
                 if !FeatureFlag::ArtifactCommand.is_enabled() {
-                    let args: Vec<String> = env::args().collect();
-                    if args.len() > 1 && args[1] == "artifact" {
-                        eprintln!("error: unrecognized subcommand 'artifact'\n");
-                        eprintln!("For more information, try '--help'");
-                        std::process::exit(2);
-                    }
+                    exit_if_disabled_subcommand(&args, &["artifact"]);
                 }
 
                 if !FeatureFlag::APIKeyManagement.is_enabled() {
@@ -277,6 +247,15 @@ impl Args {
     /// IMPORTANT: use this instead of [`CommandFactory::command`], since we customize the command at runtime.
     pub fn clap_command() -> clap::Command {
         let mut command = <Args as CommandFactory>::command();
+
+        if ChannelState::is_local_only() {
+            command = command.about("Local terminal CLI").long_about(
+                "Local terminal CLI for commands that do not require Warp online services.",
+            );
+            for subcommand in LOCAL_ONLY_HIDDEN_SUBCOMMANDS {
+                command = command.mut_subcommand(subcommand, |c| c.hide(true));
+            }
+        }
 
         // Hide the environment subcommands and --environment flags from help text
         if !FeatureFlag::CloudEnvironments.is_enabled() {
@@ -369,8 +348,21 @@ impl Args {
         // Substitute the actual binary name into help output. Ideally clap would do this for us.
         let bin_name =
             binary_name().unwrap_or_else(|| ChannelState::channel().cli_command_name().to_string());
-        command = command.after_help(color_print::cformat!(
-            r#"<bold><underline>Examples:</underline></bold>
+        command = if ChannelState::is_local_only() {
+            command.after_help(color_print::cformat!(
+                r#"<bold><underline>Examples:</underline></bold>
+
+  <dim>$</dim> <bold>{bin_name} mcp list</bold>
+
+  <dim>$</dim> <bold>{bin_name} completions powershell</bold>
+
+<bold><underline>Learn more:</underline></bold>
+* Use <bold>{bin_name} help</bold> to learn more about available local commands
+"#
+            ))
+        } else {
+            command.after_help(color_print::cformat!(
+                r#"<bold><underline>Examples:</underline></bold>
 
   <dim>$</dim> <bold>{bin_name} agent run --prompt "Build anything"</bold>
 
@@ -380,7 +372,8 @@ impl Args {
 * Use <bold>{bin_name} help</bold> to learn more about each command
 * Read the documentation at https://docs.warp.dev/reference/cli
 "#
-        ));
+            ))
+        };
 
         command
     }
@@ -430,6 +423,96 @@ impl Args {
 
     pub fn session_sharing_server_url(&self) -> Option<&str> {
         self.session_sharing_server_url.as_deref()
+    }
+}
+
+const LOCAL_ONLY_DISABLED_SUBCOMMANDS: &[&str] = &[
+    "agent",
+    "environment",
+    "run",
+    "task",
+    "model",
+    "login",
+    "logout",
+    "whoami",
+    "provider",
+    "integration",
+    "schedule",
+    "secret",
+    "federate",
+    "harness-support",
+    "artifact",
+];
+
+const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
+    "agent",
+    "environment",
+    "run",
+    "model",
+    "login",
+    "logout",
+    "whoami",
+    "provider",
+    "integration",
+    "schedule",
+    "secret",
+    "federate",
+    "harness-support",
+    "artifact",
+];
+
+#[cfg(not(target_family = "wasm"))]
+const GLOBAL_OPTIONS_WITH_VALUES: &[&str] = &[
+    "--api-key",
+    "--output-format",
+    "--server-root-url",
+    "--ws-server-url",
+    "--session-sharing-server-url",
+    "--parent-pid",
+    "--parent-handle",
+    "--crash-recovery-mechanism",
+];
+
+#[cfg(not(target_family = "wasm"))]
+fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) -> Option<&'a str> {
+    let mut index = 1;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "--" {
+            return None;
+        }
+
+        if arg.starts_with("--") {
+            let option_name = arg.split_once('=').map_or(arg, |(name, _)| name);
+            index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name) && !arg.contains('=') {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+
+        if arg == "help" {
+            return args
+                .iter()
+                .skip(index + 1)
+                .find(|candidate| !candidate.starts_with('-'))
+                .map(String::as_str)
+                .filter(|command| disabled_subcommands.contains(command));
+        }
+
+        return disabled_subcommands.contains(&arg).then_some(arg);
+    }
+
+    None
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn exit_if_disabled_subcommand(args: &[String], disabled_subcommands: &[&str]) {
+    if let Some(command) = disabled_subcommand(args, disabled_subcommands) {
+        eprintln!("error: unrecognized subcommand '{command}'\n");
+        eprintln!("For more information, try '--help'");
+        std::process::exit(2);
     }
 }
 

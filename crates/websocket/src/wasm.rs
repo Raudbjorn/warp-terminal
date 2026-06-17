@@ -9,6 +9,7 @@ pub async fn connect(
     url: impl AsRef<str>,
     protocols: impl IntoIterator<Item = &str>,
 ) -> anyhow::Result<WebSocket> {
+    network_policy::check_url_str(url.as_ref(), "websocket")?;
     let protocols = protocols.into_iter().collect_vec();
     let (meta, stream) = WsMeta::connect(url, (!protocols.is_empty()).then_some(protocols)).await?;
     Ok(WebSocket { stream, meta })
