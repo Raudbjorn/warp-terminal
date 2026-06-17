@@ -195,7 +195,9 @@ impl LocalAIProviderWidget {
                 // the duration is added to `Instant::now()`. On any other invalid
                 // input, reset the editor text to the saved value.
                 let value = match buffer_text.trim().parse::<u64>() {
-                    Ok(value) if value > 0 && value <= 3_600_000 => value,
+                    // Clamp overly-large (but otherwise valid) inputs to the 1-hour
+                    // cap rather than reverting them; reject non-positive/invalid input.
+                    Ok(value) if value > 0 => value.min(3_600_000),
                     _ => {
                         log::warn!(
                             "Invalid local OpenAI timeout: {:?}",
