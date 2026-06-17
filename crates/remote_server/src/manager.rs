@@ -1975,6 +1975,17 @@ impl RemoteServerManager {
 
         #[cfg(not(target_family = "wasm"))]
         {
+            if ChannelState::is_local_only() {
+                ctx.emit(RemoteServerManagerEvent::BinaryInstallComplete {
+                    session_id,
+                    result: Err(Arc::new(Error::Other(anyhow::anyhow!(
+                        "remote server automatic install is disabled in local-only services mode"
+                    )))),
+                    install_source: None,
+                });
+                return;
+            }
+
             let setup_state = if is_update {
                 RemoteServerSetupState::Updating
             } else {

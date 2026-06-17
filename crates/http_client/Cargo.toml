@@ -17,6 +17,7 @@ cfg-if.workspace = true
 futures.workspace = true
 http.workspace = true
 log.workspace = true
+network_policy.workspace = true
 oauth2.workspace = true
 prevent_sleep.workspace = true
 prost.workspace = true
@@ -25,7 +26,12 @@ reqwest-eventsource.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded.workspace = true
+thiserror.workspace = true
 warp_core.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo.workspace = true

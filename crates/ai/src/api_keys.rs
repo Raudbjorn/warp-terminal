@@ -2,6 +2,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use warp_core::channel::ChannelState;
 use warp_multi_agent_api as api;
 use warpui_core::{Entity, ModelContext, SingletonEntity};
 use warpui_extras::secure_storage::{self, AppContextExt};
@@ -176,7 +177,11 @@ pub struct ApiKeyManager {
 
 impl ApiKeyManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let keys = Self::load_keys_from_secure_storage(ctx);
+        let keys = if ChannelState::is_local_only() {
+            ApiKeys::default()
+        } else {
+            Self::load_keys_from_secure_storage(ctx)
+        };
         let grok_tokens = Self::load_grok_tokens_from_secure_storage(ctx);
         Self {
             keys,

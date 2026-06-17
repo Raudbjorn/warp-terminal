@@ -15,6 +15,7 @@ use http::HeaderValue;
 pub use http::header::AUTHORIZATION;
 use http::header::HeaderName;
 pub use http::{HeaderMap, StatusCode};
+use network_policy::NetworkPolicyDenied;
 use reqwest::IntoUrl;
 use reqwest_eventsource::RequestBuilderExt;
 use serde::Serialize;
@@ -89,12 +90,12 @@ cfg_if::cfg_if! {
         // single-threaded (and we don't leverage WebWorkers for async execution in WoW).
         pub type EventSourceStream = futures::stream::LocalBoxStream<
             'static,
-            Result<reqwest_eventsource::Event, reqwest_eventsource::Error>,
+            std::result::Result<reqwest_eventsource::Event, reqwest_eventsource::Error>,
         >;
     } else {
         pub type EventSourceStream = futures::stream::BoxStream<
             'static,
-            Result<reqwest_eventsource::Event, reqwest_eventsource::Error>,
+            std::result::Result<reqwest_eventsource::Event, reqwest_eventsource::Error>,
         >;
     }
 }
@@ -105,6 +106,7 @@ cfg_if::cfg_if! {
 pub struct RequestBuilder<'a> {
     wrapped: reqwest::RequestBuilder,
     client: &'a Client,
+    policy_url: Option<reqwest::Url>,
 
     // The JSON payload of the request, if any, serialized to a pretty-printed String.
     serialized_payload: Option<String>,
@@ -117,6 +119,16 @@ pub struct Request {
     serialized_payload: Option<String>,
     prevent_sleep_reason: Option<&'static str>,
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error(transparent)]
+    NetworkPolicyDenied(#[from] NetworkPolicyDenied),
+    #[error(transparent)]
+    Reqwest(#[from] reqwest::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// A wrapper around a `reqwest::Response` that ensures any async calls to the underlying `Response`
 /// a properly adapted to be run outside of a Tokio context.
@@ -186,10 +198,12 @@ impl Client {
         wrapped: reqwest::RequestBuilder,
         include_warp_headers: bool,
         iap_token: Option<String>,
+        policy_url: Option<reqwest::Url>,
     ) -> RequestBuilder<'_> {
         let mut builder = RequestBuilder {
             wrapped,
             client: self,
+            policy_url,
             serialized_payload: None,
             prevent_sleep_reason: None,
         };
@@ -209,31 +223,36 @@ impl Client {
     pub fn get<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
-        self.builder(self.wrapped.get(url), include_warp_headers, iap_token)
+        let policy_url = url.clone().into_url().ok();
+        self.builder(self.wrapped.get(url), include_warp_headers, iap_token, policy_url)
     }
 
     pub fn post<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
-        self.builder(self.wrapped.post(url), include_warp_headers, iap_token)
+        let policy_url = url.clone().into_url().ok();
+        self.builder(self.wrapped.post(url), include_warp_headers, iap_token, policy_url)
     }
 
     pub fn put<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
-        self.builder(self.wrapped.put(url), include_warp_headers, iap_token)
+        let policy_url = url.clone().into_url().ok();
+        self.builder(self.wrapped.put(url), include_warp_headers, iap_token, policy_url)
     }
 
     pub fn patch<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
-        self.builder(self.wrapped.patch(url), include_warp_headers, iap_token)
+        let policy_url = url.clone().into_url().ok();
+        self.builder(self.wrapped.patch(url), include_warp_headers, iap_token, policy_url)
     }
 
     pub fn delete<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
-        self.builder(self.wrapped.delete(url), include_warp_headers, iap_token)
+        let policy_url = url.clone().into_url().ok();
+        self.builder(self.wrapped.delete(url), include_warp_headers, iap_token, policy_url)
     }
 
     /// Returns the IAP bearer token to attach to a request targeting
@@ -348,17 +367,19 @@ impl Client {
         builder
     }
 
-    pub async fn execute(&self, request: Request) -> reqwest::Result<Response> {
+    pub async fn execute(&self, request: Request) -> Result<Response> {
         self.execute_inner(request).await
     }
 
     /// Core request execution logic shared by all platforms.
-    async fn execute_inner(&self, request: Request) -> reqwest::Result<Response> {
+    async fn execute_inner(&self, request: Request) -> Result<Response> {
         let Request {
             wrapped: request,
             serialized_payload,
             prevent_sleep_reason,
         } = request;
+
+        network_policy::check_url(request.url(), "http request")?;
 
         if let Some(before_response_send_fn) = &self.before_request_sent {
             before_response_send_fn(&request, &serialized_payload);
@@ -410,7 +431,7 @@ impl<'a> RequestBuilder<'a> {
         (self.client, request)
     }
 
-    pub async fn send(self) -> reqwest::Result<Response> {
+    pub async fn send(self) -> Result<Response> {
         let (client, request) = self.build_split();
         client.execute(request?).await
     }
@@ -451,6 +472,23 @@ impl<'a> RequestBuilder<'a> {
     /// Sends the request to the endpoint, which is assumed to be a streaming server-sent-events
     /// endpoint, and returns a corresponding `EventSource`.
     pub fn eventsource(self) -> EventSourceStream {
+        let policy_error = self
+            .policy_url
+            .as_ref()
+            .and_then(|url| network_policy::check_url(url, "eventsource").err());
+
+        if let Some(err) = policy_error {
+            log::warn!("{err}");
+            let stream = denied_eventsource_stream();
+            cfg_if::cfg_if! {
+                if #[cfg(target_family = "wasm")] {
+                    return stream.boxed_local();
+                } else {
+                    return stream.boxed();
+                }
+            }
+        }
+
         cfg_if::cfg_if! {
             if #[cfg(target_family = "wasm")] {
                 let mut stream = self
@@ -615,6 +653,13 @@ impl<'a> RequestBuilder<'a> {
     }
 }
 
+fn denied_eventsource_stream()
+-> impl Stream<Item = std::result::Result<reqwest_eventsource::Event, reqwest_eventsource::Error>> {
+    stream! {
+        yield Err(reqwest_eventsource::Error::StreamEnded);
+    }
+}
+
 /// An error returned from `Response::error_for_status` that includes response metadata.
 /// This allows callers to inspect headers (like X-Warp-Error-Code) and the response body when
 /// handling errors.
@@ -665,7 +710,7 @@ impl Response {
     /// Checks the response status and returns an error if it's not successful.
     /// Unlike `reqwest::Response::error_for_status`, this returns a `ResponseError`
     /// that includes the response headers, allowing callers to inspect them.
-    pub fn error_for_status(self) -> Result<Self, ResponseError> {
+    pub fn error_for_status(self) -> std::result::Result<Self, ResponseError> {
         let headers = self.0.headers().clone();
         match self.0.error_for_status() {
             Ok(response) => Ok(Self(response)),
@@ -679,7 +724,7 @@ impl Response {
 
     /// Checks the response status and returns an error if it's not successful.
     /// Unlike `error_for_status`, this also reads and preserves the response body on errors.
-    pub async fn error_for_status_with_body(self) -> Result<Self, ResponseError> {
+    pub async fn error_for_status_with_body(self) -> std::result::Result<Self, ResponseError> {
         let headers = self.0.headers().clone();
         match self.0.error_for_status_ref() {
             Ok(_) => Ok(self),
@@ -696,7 +741,7 @@ impl Response {
 
     /// Returns a reference to the underlying response if the status is successful,
     /// otherwise returns an error with headers preserved.
-    pub fn error_for_status_ref(&self) -> Result<&reqwest::Response, ResponseError> {
+    pub fn error_for_status_ref(&self) -> std::result::Result<&reqwest::Response, ResponseError> {
         let headers = self.0.headers().clone();
         match self.0.error_for_status_ref() {
             Ok(response) => Ok(response),
@@ -728,26 +773,37 @@ impl Response {
 /// Adapter to use our HTTP client wrapper with [`oauth2`]. This is modeled on the [`reqwest`]
 /// implementation of [`oauth2::AsyncHttpClient`].
 impl<'c> oauth2::AsyncHttpClient<'c> for Client {
-    type Error = oauth2::HttpClientError<reqwest::Error>;
+    type Error = oauth2::HttpClientError<Error>;
 
     #[cfg(target_arch = "wasm32")]
-    type Future = Pin<Box<dyn Future<Output = Result<oauth2::HttpResponse, Self::Error>> + 'c>>;
-    #[cfg(not(target_arch = "wasm32"))]
     type Future =
-        Pin<Box<dyn Future<Output = Result<oauth2::HttpResponse, Self::Error>> + Send + 'c>>;
+        Pin<Box<dyn Future<Output = std::result::Result<oauth2::HttpResponse, Self::Error>> + 'c>>;
+    #[cfg(not(target_arch = "wasm32"))]
+    type Future = Pin<
+        Box<
+            dyn Future<Output = std::result::Result<oauth2::HttpResponse, Self::Error>>
+                + Send
+                + Sync
+                + 'c,
+        >,
+    >;
 
     fn call(&'c self, request: oauth2::HttpRequest) -> Self::Future {
         Box::pin(async move {
+            if let Err(err) = network_policy::check_url_str(&request.uri().to_string(), "oauth") {
+                return Err(oauth2::HttpClientError::Other(err.to_string()));
+            }
+
             let uri = request.uri().to_string();
             let include_warp_headers = Self::include_warp_http_headers(uri.clone());
             let iap_token = self.iap_token_for(uri);
             let builder = reqwest::RequestBuilder::from_parts(
                 self.wrapped.clone(),
-                request.try_into().map_err(Box::new)?,
+                request.try_into().map_err(Error::from).map_err(Box::new)?,
             );
 
             let response = self
-                .builder(builder, include_warp_headers, iap_token)
+                .builder(builder, include_warp_headers, iap_token, None)
                 .send()
                 .await
                 .map_err(Box::new)?;
@@ -763,7 +819,12 @@ impl<'c> oauth2::AsyncHttpClient<'c> for Client {
                 builder = builder.header(name, value);
             }
 
-            let response_body = response.bytes().await.map_err(Box::new)?.to_vec();
+            let response_body = response
+                .bytes()
+                .await
+                .map_err(Error::from)
+                .map_err(Box::new)?
+                .to_vec();
             builder
                 .body(response_body)
                 .map_err(oauth2::HttpClientError::Http)
@@ -792,5 +853,121 @@ mod origin_tests {
     fn third_party_origin_does_not_match() {
         let url = reqwest::Url::parse("https://evil.example.com/graphql/v2").unwrap();
         assert!(!is_warp_server_origin(&url));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt as _;
+    use oauth2::AsyncHttpClient as _;
+
+    use super::*;
+
+    static POLICY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn new_test_client() -> Client {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        Client::from_client_builder(reqwest::ClientBuilder::new().no_proxy())
+            .expect("should not fail to create test client")
+    }
+
+    fn run_with_services_mode<T>(
+        mode: network_policy::ServicesMode,
+        test: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = network_policy::services_mode();
+        network_policy::set_services_mode(mode);
+        let result = test();
+        network_policy::set_services_mode(previous);
+        result
+    }
+
+    async fn run_with_services_mode_async<T>(
+        mode: network_policy::ServicesMode,
+        test: impl Future<Output = T>,
+    ) -> T {
+        let _guard = POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = network_policy::services_mode();
+        network_policy::set_services_mode(mode);
+        let result = test.await;
+        network_policy::set_services_mode(previous);
+        result
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_only_rejects_public_http_requests_before_hooks() {
+        run_with_services_mode_async(network_policy::ServicesMode::LocalOnly, async {
+            let mut client = new_test_client();
+            let hook_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let hook_called_clone = hook_called.clone();
+            client.set_before_request_fn(Box::new(move |_, _| {
+                hook_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            }));
+
+            let request = client
+                .get("https://app.warp.dev/graphql/v2")
+                .build()
+                .unwrap();
+            let err = match client.execute(request).await {
+                Ok(_) => panic!("public HTTP request should be denied"),
+                Err(err) => err,
+            };
+
+            assert!(matches!(err, Error::NetworkPolicyDenied(_)));
+            assert!(!hook_called.load(std::sync::atomic::Ordering::SeqCst));
+        })
+        .await
+    }
+
+    #[test]
+    fn local_only_policy_allows_loopback_http_requests() {
+        run_with_services_mode(network_policy::ServicesMode::LocalOnly, || {
+            let url = reqwest::Url::parse("http://127.0.0.1:11434/v1/chat/completions").unwrap();
+            assert_eq!(network_policy::check_url(&url, "http request"), Ok(()));
+
+            let url = reqwest::Url::parse("http://localhost:8080").unwrap();
+            assert_eq!(network_policy::check_url(&url, "http request"), Ok(()));
+        });
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_only_rejects_public_eventsource_requests() {
+        run_with_services_mode_async(network_policy::ServicesMode::LocalOnly, async {
+            let client = new_test_client();
+            let mut stream = client.get("https://app.warp.dev/events").eventsource();
+            let err = match stream.next().await.unwrap() {
+                Ok(_) => panic!("public EventSource request should be denied"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, reqwest_eventsource::Error::StreamEnded),
+                "unexpected EventSource error: {err:?}"
+            );
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_only_rejects_public_oauth_requests() {
+        run_with_services_mode_async(network_policy::ServicesMode::LocalOnly, async {
+            let client = new_test_client();
+            let request = http::Request::builder()
+                .method(http::Method::POST)
+                .uri("https://github.com/login/oauth/access_token")
+                .body(Vec::new())
+                .unwrap();
+
+            let err = match client.call(request).await {
+                Ok(_) => panic!("public OAuth request should be denied"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("NetworkPolicyDenied"));
+        })
+        .await
     }
 }

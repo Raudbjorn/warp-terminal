@@ -1,6 +1,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use enum_iterator::{cardinality, Sequence};
+
+mod online_services;
+
 #[cfg(feature = "test-util")]
 pub use overrides::{get_overrides, set_overrides};
 
@@ -989,10 +992,18 @@ impl FeatureFlag {
             );
         }
 
+        if network_policy::is_local_only() && self.is_online_services_only() {
+            return false;
+        }
+
         overrides::get_override(*self)
             .or(USER_PREFERENCE_MAP[*self as usize].get())
             .or(Some(FLAG_STATES[*self as usize].load(Ordering::Relaxed)))
             .unwrap_or(false)
+    }
+
+    fn is_online_services_only(&self) -> bool {
+        online_services::is_online_services_only(*self)
     }
 
     #[allow(dead_code)]

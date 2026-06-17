@@ -1190,6 +1190,7 @@ dependencies = [
  "cfg-if",
  "futures",
  "log",
+ "network_policy",
  "reqwest",
  "url",
  "warpui_core",
@@ -6313,13 +6314,17 @@ dependencies = [
  "gloo",
  "http 1.4.0",
  "log",
+ "network_policy",
  "oauth2",
  "prevent_sleep",
  "prost",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "thiserror 2.0.17",
+ "tokio",
  "warp_core",
  "wasm-bindgen-futures",
 ]
@@ -8419,6 +8424,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee6cda3051665f1fb8d9e08fc35c96d5a244fb1be711a03b71118828afc9a873"
 dependencies = [
  "jni-sys",
+]
+
+[[package]]
+name = "network_policy"
+version = "0.0.0"
+dependencies = [
+ "serde",
+ "thiserror 2.0.17",
+ "url",
 ]
 
 [[package]]
@@ -14956,6 +14970,7 @@ dependencies = [
  "line-ending",
  "log",
  "mockito",
+ "network_policy",
  "objc2-foundation 0.3.2",
  "parking_lot",
  "pin-project",
@@ -15043,6 +15058,7 @@ name = "warp_features"
 version = "0.0.0"
 dependencies = [
  "enum-iterator",
+ "network_policy",
 ]
 
 [[package]]
@@ -15919,6 +15935,7 @@ dependencies = [
  "hyper-util",
  "itertools 0.14.0",
  "log",
+ "network_policy",
  "percent-encoding",
  "pin-project",
  "rustls",

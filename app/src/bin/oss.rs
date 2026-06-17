@@ -3,8 +3,10 @@
 #![cfg_attr(feature = "release_bundle", windows_subsystem = "windows")]
 
 use anyhow::Result;
-use warp_core::channel::{Channel, ChannelConfig, ChannelState, OzConfig, WarpServerConfig};
-use warp_core::AppId;
+use warp_core::{
+    channel::{Channel, ChannelConfig, ChannelState, OzConfig, ServicesMode, WarpServerConfig},
+    AppId,
+};
 
 // Simple wrapper around warp::run() for Warp OSS builds.
 fn main() -> Result<()> {
@@ -13,8 +15,9 @@ fn main() -> Result<()> {
         ChannelConfig {
             app_id: AppId::new("dev", "warp", "WarpOss"),
             logfile_name: "warp-oss.log".into(),
-            server_config: WarpServerConfig::production(),
-            oz_config: OzConfig::production(),
+            server_config: WarpServerConfig::local_only(),
+            oz_config: OzConfig::local_only(),
+            services_mode: ServicesMode::LocalOnly,
             telemetry_config: None,
             crash_reporting_config: None,
             autoupdate_config: None,

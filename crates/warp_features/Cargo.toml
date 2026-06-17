@@ -12,3 +12,4 @@ test-util = []
 
 [dependencies]
 enum-iterator.workspace = true
+network_policy.workspace = true

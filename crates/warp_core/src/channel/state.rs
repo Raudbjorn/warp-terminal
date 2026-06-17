@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashSet;
 
+use anyhow::bail;
 use lazy_static::lazy_static;
 use parking_lot::Mutex;
 use url::{Origin, ParseError, Url};
@@ -8,7 +9,7 @@ use url::{Origin, ParseError, Url};
 use super::Channel;
 use crate::channel::config::{
     ChannelConfig, IapConfig, McpOAuthProviderConfig, OzConfig, RudderStackDestination,
-    WarpServerConfig,
+    ServicesMode, WarpServerConfig,
 };
 use crate::features::FeatureFlag;
 use crate::AppId;
@@ -46,6 +47,7 @@ impl ChannelState {
                 logfile_name: "".into(),
                 server_config: WarpServerConfig::production(),
                 oz_config: OzConfig::production(),
+                services_mode: ServicesMode::Online,
                 telemetry_config: None,
                 autoupdate_config: None,
                 crash_reporting_config: None,
@@ -71,6 +73,7 @@ impl ChannelState {
     }
 
     pub fn set(state: ChannelState) {
+        network_policy::set_services_mode(state.config.services_mode);
         *CHANNEL_STATE.lock() = state;
     }
 
@@ -181,12 +184,27 @@ impl ChannelState {
             .unwrap_or_default()
     }
 
+    pub fn services_mode() -> ServicesMode {
+        CHANNEL_STATE.lock().config.services_mode
+    }
+
+    pub fn is_local_only() -> bool {
+        Self::services_mode() == ServicesMode::LocalOnly
+    }
+
+    pub fn ensure_online_services_enabled(service_name: &str) -> anyhow::Result<()> {
+        if Self::is_local_only() {
+            bail!("{service_name} are disabled in local-only services mode");
+        }
+        Ok(())
+    }
+
     /// Returns whether this build has a telemetry config and can therefore ship
     /// telemetry events. Builds like OpenWarp intentionally ship with
     /// `telemetry_config: None`, in which case UI that controls telemetry
     /// should be hidden since the toggle has no effect.
     pub fn is_telemetry_available() -> bool {
-        CHANNEL_STATE.lock().config.telemetry_config.is_some()
+        !Self::is_local_only() && CHANNEL_STATE.lock().config.telemetry_config.is_some()
     }
 
     /// Returns whether this build has a crash reporting config and can therefore
@@ -194,7 +212,7 @@ impl ChannelState {
     /// `crash_reporting_config: None`, in which case UI that controls crash
     /// reporting should be hidden since the toggle has no effect.
     pub fn is_crash_reporting_available() -> bool {
-        CHANNEL_STATE.lock().config.crash_reporting_config.is_some()
+        !Self::is_local_only() && CHANNEL_STATE.lock().config.crash_reporting_config.is_some()
     }
 
     pub fn releases_base_url() -> Cow<'static, str> {

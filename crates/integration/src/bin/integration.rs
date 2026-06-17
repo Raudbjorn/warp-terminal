@@ -6,7 +6,9 @@ use clap::Parser;
 use integration::test::*;
 use integration::Builder;
 use warp_cli::WorkerCommand;
-use warp_core::channel::{Channel, ChannelConfig, ChannelState, OzConfig, WarpServerConfig};
+use warp_core::channel::{
+    Channel, ChannelConfig, ChannelState, OzConfig, ServicesMode, WarpServerConfig,
+};
 use warp_core::AppId;
 
 /// The Warp integration test runner.
@@ -52,6 +54,7 @@ pub fn main() -> Result<()> {
                 oz_root_url: "http://192.0.2.0:9".into(),
                 workload_audience_url: None,
             },
+            services_mode: ServicesMode::Online,
             telemetry_config: None,
             crash_reporting_config: None,
             autoupdate_config: None,

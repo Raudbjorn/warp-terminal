@@ -4,7 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vec1::vec1;
-use warp_core::features::FeatureFlag;
+
+use warp_core::{channel::ChannelState, features::FeatureFlag};
 use warp_graphql::managed_secrets::ManagedSecret;
 use warp_graphql::queries::task_secrets::ManagedSecretValue as GqlManagedSecretValue;
 use warpui_core::{Entity, SingletonEntity};
@@ -49,6 +50,7 @@ impl ManagedSecretManager {
         let client = self.client.clone();
         let actor_provider = self.actor_provider.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             if !FeatureFlag::WarpManagedSecrets.is_enabled() {
                 return Err(anyhow::anyhow!("This feature is not enabled"));
             }
@@ -91,6 +93,7 @@ impl ManagedSecretManager {
     ) -> impl Future<Output = anyhow::Result<()>> + use<> {
         let client = self.client.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             if !FeatureFlag::WarpManagedSecrets.is_enabled() {
                 return Err(anyhow::anyhow!("This feature is not enabled"));
             }
@@ -110,6 +113,7 @@ impl ManagedSecretManager {
         let client = self.client.clone();
         let actor_provider = self.actor_provider.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             if !FeatureFlag::WarpManagedSecrets.is_enabled() {
                 return Err(anyhow::anyhow!("This feature is not enabled"));
             }
@@ -149,6 +153,7 @@ impl ManagedSecretManager {
     pub fn list_secrets(&self) -> impl Future<Output = anyhow::Result<Vec<ManagedSecret>>> + use<> {
         let client = self.client.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             let secrets = client.list_secrets().await?;
             Ok(secrets)
         }
@@ -163,6 +168,7 @@ impl ManagedSecretManager {
     ) -> impl Future<Output = anyhow::Result<HashMap<String, ManagedSecretValue>>> + use<> {
         let client = self.client.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             // We only need the workload token for the duration of the request.
             let workload_token =
                 warp_isolation_platform::issue_workload_token(Some(Duration::from_mins(5))).await?;
@@ -217,7 +223,10 @@ impl ManagedSecretManager {
         options: IdentityTokenOptions,
     ) -> impl Future<Output = anyhow::Result<TaskIdentityToken>> + use<> {
         let client = self.client.clone();
-        async move { client.issue_task_identity_token(options).await }
+        async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
+            client.issue_task_identity_token(options).await
+        }
     }
 
     /// Issue a short-lived OIDC identity token in the JSON shape expected by
@@ -232,6 +241,8 @@ impl ManagedSecretManager {
     > + use<> {
         let client = self.client.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")
+                .map_err(|err| GcpWorkloadIdentityFederationError::new(err.to_string()))?;
             match token_type.as_str() {
                 gcp::TOKEN_TYPE_ID_TOKEN | gcp::TOKEN_TYPE_JWT => (),
                 other => {
