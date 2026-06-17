@@ -157,6 +157,12 @@ impl Client {
                 .http2_keep_alive_while_idle(true);
         }
 
+        // Enforce LocalOnly network policy across redirects
+        #[cfg(not(target_family = "wasm"))]
+        {
+            builder = builder.redirect(network_policy_redirect_policy());
+        }
+
         Self::from_client_builder(builder).expect("should not fail to create client")
     }
 
@@ -423,6 +429,17 @@ fn is_warp_server_origin(url: &reqwest::Url) -> bool {
     .filter_map(|candidate| reqwest::Url::parse(candidate.as_ref()).ok())
     .any(|candidate| candidate.origin() == url.origin())
 }
+
+#[cfg(not(target_family = "wasm"))]
+fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        match network_policy::check_url(attempt.url(), "redirect target") {
+            Ok(()) => attempt.follow(),
+            Err(err) => attempt.error(err),
+        }
+    })
+}
+
 
 impl<'a> RequestBuilder<'a> {
     pub fn build(self) -> reqwest::Result<Request> {

@@ -466,7 +466,7 @@ const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
 #[cfg(not(target_family = "wasm"))]
 const GLOBAL_OPTIONS_WITH_VALUES: &[&str] = &[
     "--api-key",
-    "--output-format",
+    "--output-format", "-o",
     "--server-root-url",
     "--ws-server-url",
     "--session-sharing-server-url",
@@ -484,15 +484,20 @@ fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) ->
             return None;
         }
 
-        if arg.starts_with('-') {
-            // Skip both long (`--foo`, `--foo=bar`) and short (`-v`, `-o value`,
-            // `-obar`, `-abc`) options. The previous implementation only
-            // skipped long options, which let invocations like
-            // `warp -v agent` misidentify `-v` as the subcommand and bypass
-            // local-only gating entirely.
-            let option_name = arg.split_once('=').map_or(arg, |(name, _)| name);
-            index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name) && !arg.contains('=') {
-                2
+        if arg.starts_with("-") && arg.len() > 1 {
+            let option_name = if arg.starts_with("--") {
+                arg.split_once('=').map_or(arg, |(name, _)| name)
+            } else {
+                &arg[..2]
+            };
+            index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name) {
+                if arg.starts_with("--") && !arg.contains('=') {
+                    2
+                } else if arg.starts_with("-") && !arg.starts_with("--") && arg.len() == 2 {
+                    2
+                } else {
+                    1
+                }
             } else {
                 1
             };
