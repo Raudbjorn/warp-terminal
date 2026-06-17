@@ -442,6 +442,7 @@ const LOCAL_ONLY_DISABLED_SUBCOMMANDS: &[&str] = &[
     "federate",
     "harness-support",
     "artifact",
+    "task",
 ];
 
 const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[

@@ -619,6 +619,13 @@ pub(crate) struct LocalOpenAISettingsSnapshot {
     pub provider_kind: LocalProviderKind,
     pub opencode_command: String,
     pub opencode_args: Vec<String>,
+    /// When `true`, multi-turn callers can opt into the OpenAI
+    /// Responses API (`/v1/responses`) and the local provider will
+    /// round-trip reasoning items between turns. The single-shot
+    /// command generation, prediction, and AI input suggestion
+    /// methods continue to use `/v1/chat/completions` regardless
+    /// of this flag.
+    pub use_responses_api: bool,
  }
 
 fn parse_provider_kind(raw: &str) -> LocalProviderKind {
@@ -892,6 +899,15 @@ define_settings_group!(AISettings, settings: [
         private: false,
         toml_path: "agents.local_openai.opencode_args",
         description: "Arguments to pass to the OpenCode binary when spawning a sidecar.",
+    }
+    local_openai_use_responses_api: LocalOpenAIUseResponsesApi {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        private: false,
+        toml_path: "agents.local_openai.use_responses_api",
+        description: "Whether multi-turn local-AI callers should use the OpenAI Responses API (`/v1/responses`) and round-trip reasoning items between turns. Single-shot command generation and prediction keep using `/v1/chat/completions` regardless of this flag.",
     }
     // This field should not be referenced directly to lookup Prompt Suggestions
     // enablement -- use the `is_prompt_suggestions_enabled()` getter.
@@ -1673,6 +1689,7 @@ impl AISettings {
             ),
             opencode_command: self.local_openai_opencode_command.value().clone(),
             opencode_args: self.local_openai_opencode_args.value().clone(),
+            use_responses_api: *self.local_openai_use_responses_api.value(),
         }
     }
 

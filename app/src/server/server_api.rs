@@ -196,6 +196,9 @@ pub enum AIApiError {
     /// between chunks, surfacing as a clean EOF.
     #[error("Response stream ended unexpectedly before completion.")]
     UnexpectedEof,
+
+    #[error("Network policy denied: {0}")]
+    NetworkPolicyDenied(#[source] network_policy::NetworkPolicyDenied),
 }
 
 impl From<http_client::ResponseError> for AIApiError {
@@ -219,7 +222,15 @@ impl From<http_client::Error> for AIApiError {
     fn from(err: http_client::Error) -> Self {
         match err {
             http_client::Error::Reqwest(err) => Self::from_transport_error(err),
-            http_client::Error::NetworkPolicyDenied(err) => AIApiError::NetworkPolicyDenied(err),
+            // NetworkPolicyDenied is deterministic in local-only mode
+            // (the policy is checked before send). Preserve it as a
+            // first-class variant so the AI runtime can short-circuit
+            // recovery and surface the actual reason instead of
+            // falling through to the generic "Other" path with
+            // `is_recoverable: true`.
+            http_client::Error::NetworkPolicyDenied(err) => {
+                AIApiError::NetworkPolicyDenied(err)
+            }
         }
     }
 }
@@ -343,7 +354,9 @@ impl AIApiError {
                 }
                 true
             }
-            // Deterministic denials (LocalOnly policy) won't be fixed by retry/resume.
+            // Network-policy denials are deterministic in local-only
+            // mode — the policy is checked before send — so retrying
+            // is pointless.
             AIApiError::NetworkPolicyDenied(_) => false,
             // By default, attempt recovery on error.
             _ => true,
@@ -356,6 +369,10 @@ impl ErrorExt for AIApiError {
         match self {
             AIApiError::Deserialization(_) => true,
             AIApiError::Transport(error) => error.is_actionable(),
+            // Network-policy denials are not actionable: the request
+            // was stopped before send, and the user needs to either
+            // change modes (online) or accept the offline behavior.
+            AIApiError::NetworkPolicyDenied(_) => false,
             AIApiError::Other(error) => error.is_actionable(),
             AIApiError::Stream { source, .. } => source.is_actionable(),
             AIApiError::ErrorStatus(_, _) => self.is_recoverable(),
