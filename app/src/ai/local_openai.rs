@@ -136,7 +136,7 @@ impl LocalOpenAIClient {
         prompt: String,
         ai_execution_context: Option<WarpAiExecutionContext>,
     ) -> Result<Vec<AIGeneratedCommand>, LocalOpenAIError> {
-        let config = self.configured()?;
+        let config = self.configured_for_command()?;
         let mut user_prompt = format!("User request:\n{prompt}");
         if let Some(context) = ai_execution_context.and_then(|context| context.to_json_string()) {
             user_prompt.push_str("\n\nExecution context JSON:\n");
@@ -193,7 +193,7 @@ impl LocalOpenAIClient {
         http_client: &http_client::Client,
         command: String,
     ) -> Result<GeneratedCommandMetadata, LocalOpenAIError> {
-        let config = self.configured()?;
+        let config = self.configured_for_command()?;
         let content = self
             .chat_completion(
                 http_client,
@@ -234,7 +234,7 @@ impl LocalOpenAIClient {
         http_client: &http_client::Client,
         request: &PredictAMQueriesRequest,
     ) -> Result<PredictAMQueriesResponse, LocalOpenAIError> {
-        let config = self.configured()?;
+        let config = self.configured_for_prediction()?;
         let content = self
             .chat_completion(
                 http_client,
@@ -263,7 +263,7 @@ impl LocalOpenAIClient {
         http_client: &http_client::Client,
         request: &GenerateAIInputSuggestionsRequest,
     ) -> Result<GenerateAIInputSuggestionsResponseV2, LocalOpenAIError> {
-        let config = self.configured()?;
+        let config = self.configured_for_prediction()?;
         let content = self
             .chat_completion(
                 http_client,
@@ -330,11 +330,28 @@ impl LocalOpenAIClient {
             .ok_or(LocalOpenAIError::EmptyResponse)
     }
 
-    fn configured(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
+    /// Returns the current snapshot if it is runnable for the **command** path
+    /// (natural-language → commands, command metadata). The `prediction_model`
+    /// may be empty — only `command_model` is required here so the command path
+    /// doesn't get blocked by an unset prediction model.
+    fn configured_for_command(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
         let config = self.config.read().clone();
         if !config.enabled
             || config.base_url.trim().is_empty()
             || config.command_model.trim().is_empty()
+        {
+            return Err(LocalOpenAIError::NotConfigured);
+        }
+        Ok(config)
+    }
+
+    /// Returns the current snapshot if it is runnable for the **prediction** path
+    /// (agent-mode query prediction, AI input suggestions). Requires the
+    /// `prediction_model` to be set.
+    fn configured_for_prediction(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
+        let config = self.config.read().clone();
+        if !config.enabled
+            || config.base_url.trim().is_empty()
             || config.prediction_model.trim().is_empty()
         {
             return Err(LocalOpenAIError::NotConfigured);
