@@ -1976,23 +1976,18 @@ impl RemoteServerManager {
         #[cfg(not(target_family = "wasm"))]
         {
             if ChannelState::is_local_only() {
-                // Emit SetupStateChanged first so the UI can transition
-                // out of any in-progress install/update state it was
-                // showing. Without this the only state transition on
-                // the local-only failure path is BinaryInstallComplete,
-                // which leaves the state machine stuck because the
-                // failure-path SetupStateChanged normally comes from
-                // the install-task branch below.
-                let error = Error::Other(anyhow::anyhow!(
+                // Mirror the failure-path terminal state so the UI does not
+                // remain stuck on the install/update-in-progress screen.
+                let error = Arc::new(Error::Other(anyhow::anyhow!(
                     "remote server automatic install is disabled in local-only services mode"
-                ));
+                )));
                 ctx.emit(RemoteServerManagerEvent::SetupStateChanged {
                     session_id,
-                    state: RemoteServerSetupState::from(&error),
+                    state: RemoteServerSetupState::from(error.as_ref()),
                 });
                 ctx.emit(RemoteServerManagerEvent::BinaryInstallComplete {
                     session_id,
-                    result: Err(Arc::new(error)),
+                    result: Err(error),
                     install_source: None,
                 });
                 return;

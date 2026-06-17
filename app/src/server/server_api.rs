@@ -197,8 +197,6 @@ pub enum AIApiError {
     #[error("Response stream ended unexpectedly before completion.")]
     UnexpectedEof,
 
-    #[error("Network policy denied: {0}")]
-    NetworkPolicyDenied(#[source] network_policy::NetworkPolicyDenied),
 }
 
 impl From<http_client::ResponseError> for AIApiError {
@@ -222,15 +220,7 @@ impl From<http_client::Error> for AIApiError {
     fn from(err: http_client::Error) -> Self {
         match err {
             http_client::Error::Reqwest(err) => Self::from_transport_error(err),
-            // NetworkPolicyDenied is deterministic in local-only mode
-            // (the policy is checked before send). Preserve it as a
-            // first-class variant so the AI runtime can short-circuit
-            // recovery and surface the actual reason instead of
-            // falling through to the generic "Other" path with
-            // `is_recoverable: true`.
-            http_client::Error::NetworkPolicyDenied(err) => {
-                AIApiError::NetworkPolicyDenied(err)
-            }
+            http_client::Error::NetworkPolicyDenied(err) => AIApiError::NetworkPolicyDenied(err),
         }
     }
 }
@@ -354,9 +344,7 @@ impl AIApiError {
                 }
                 true
             }
-            // Network-policy denials are deterministic in local-only
-            // mode — the policy is checked before send — so retrying
-            // is pointless.
+            // Deterministic denials (LocalOnly policy) won't be fixed by retry/resume.
             AIApiError::NetworkPolicyDenied(_) => false,
             // By default, attempt recovery on error.
             _ => true,
