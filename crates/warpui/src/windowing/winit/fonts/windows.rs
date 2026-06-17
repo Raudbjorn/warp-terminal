@@ -13,7 +13,11 @@ use super::font_handle::FontHandle;
 use super::{FontFamily, LoadedSystemFonts, TextLayoutSystem, ValidateFontSupportsEn};
 use crate::fonts::FontId;
 
-const EN_US_LOCALE: &str = "en-US";
+/// Returns the BCP-47 locale string used to bias DirectWrite Han glyph fallback.
+/// Syncs with the current UI locale (set by `app::i18n` via `crate::set_ui_locale`).
+fn current_fallback_locale() -> String {
+    crate::current_ui_locale()
+}
 
 /// Windows symbol fonts that are used to render window control icons. We specifically do not do any
 /// validation of these fonts (i.e. to check if the font contains english characters).
@@ -163,8 +167,34 @@ impl TextLayoutSystem {
             anyhow::anyhow!("Unable to load typeface from font_kit Handle: {err:?}")
         })?;
 
+        let locale = current_fallback_locale();
+
+        // 按 locale 优先的 CJK 系统字体:DirectWrite 的 IDWriteFontFallback 在 Windows 英文 / 开发环境
+        // 下不参考 locale 解决 Han 字形歧义,默认返回 Microsoft YaHei,导致日文 UI 反倒拿到简体字字形。
+        // 因此对共享 CJK Han 字符,我们在 DirectWrite 回退之前先 prepend 当前 locale 对应的系统字体
+        // (例如 ja-* → Yu Gothic UI)。
+        let mut fallback_font_vec: Vec<FontId> = Vec::new();
+        if is_shared_cjk_han(character) {
+            for family in preferred_cjk_families_for_locale(&locale) {
+                if let Ok(fam) = source.select_family_by_name(family) {
+                    for fk_handle in fam.fonts() {
+                        if let Ok(handle) =
+                            load_font_from_handle(fk_handle, ValidateFontSupportsEn::No)
+                        {
+                            if let Ok(id) = self.insert_font(handle) {
+                                fallback_font_vec.push(id);
+                            }
+                        }
+                    }
+                    if !fallback_font_vec.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+
         let fallback_result =
-            loaded_font.get_fallbacks(character.to_string().as_str(), EN_US_LOCALE);
+            loaded_font.get_fallbacks(character.to_string().as_str(), &locale);
 
         // Convert each font-kit fallback `Font` into a UI framework `FontHandle` and load it into
         // fontdb. We deliberately avoid `font_kit::Font::handle()` here: its default impl reads
@@ -176,22 +206,17 @@ impl TextLayoutSystem {
         // `DirectWriteSource::create_handle_from_dwrite_font` does for enumerated system fonts.
         // This lets fontdb mmap the file lazily and lets `insert_font` dedup by `(path, index)`,
         // so the same fallback family is loaded at most once per process.
-        let fallback_font_vec = fallback_result
-            .fonts
-            .into_iter()
-            .flat_map(|fallback_font| {
-                let loaded_handle =
-                    fallback_font_path_handle(&fallback_font.font).or_else(|| {
-                        // Last-resort fallback for fonts that aren't backed by a local file (e.g.
-                        // custom collection loaders). These don't appear in practice for DirectWrite
-                        // system fallbacks, but preserve the original byte-copy behavior so we
-                        // degrade gracefully instead of dropping the glyph.
-                        let handle = fallback_font.font.handle()?;
-                        load_font_from_handle(&handle, ValidateFontSupportsEn::No).ok()
-                    })?;
-                self.insert_font(loaded_handle).ok()
-            })
-            .collect_vec();
+        fallback_font_vec.extend(fallback_result.fonts.into_iter().flat_map(|fallback_font| {
+            let loaded_handle = fallback_font_path_handle(&fallback_font.font).or_else(|| {
+                // Last-resort fallback for fonts that aren't backed by a local file (e.g.
+                // custom collection loaders). These don't appear in practice for DirectWrite
+                // system fallbacks, but preserve the original byte-copy behavior so we
+                // degrade gracefully instead of dropping the glyph.
+                let handle = fallback_font.font.handle()?;
+                load_font_from_handle(&handle, ValidateFontSupportsEn::No).ok()
+            })?;
+            self.insert_font(loaded_handle).ok()
+        }));
 
         Ok(fallback_font_vec)
     }
@@ -240,6 +265,69 @@ fn load_font_from_handle(
             Ok(FontHandle::from(typeface))
         }
     }
+}
+
+/// 共享 CJK Han 码点判定:这些字符在 ja / zh-Hans / zh-Hant / ko 之间字形不同,
+/// 用于把 DirectWrite 回退偏向当前 locale 的本地字体(例如 ja-* → Yu Gothic UI)。
+/// 覆盖到 Extension G(0x3134F),后续若 Unicode 再扩展可在此追加。
+fn is_shared_cjk_han(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4DBF       // CJK Unified Ideographs Extension A
+            | 0x4E00..=0x9FFF // CJK Unified Ideographs
+            | 0xF900..=0xFAFF // CJK Compatibility Ideographs
+            | 0x20000..=0x2A6DF // Extension B
+            | 0x2A700..=0x2B73F // Extension C
+            | 0x2B740..=0x2B81F // Extension D
+            | 0x2B820..=0x2CEAF // Extension E
+            | 0x2CEB0..=0x2EBEF // Extension F
+            | 0x30000..=0x3134F // Extension G
+    )
+}
+
+/// 提取 BCP-47 标签的主语言子标签(primary subtag),已统一 ASCII 小写。
+/// 例如 `ja-jp` → `ja`、`zh-hant-tw` → `zh`、`kok-in` → `kok`。
+/// 用于精确判断主语言,避免 `starts_with("ko")` 这类前缀匹配把
+/// `kok-IN`(孔卡尼语)误判为韩文,或 `zha-CN`(壮语)误判为中文。
+fn primary_subtag(lower: &str) -> &str {
+    lower
+        .split(|c: char| c == '-' || c == '_')
+        .next()
+        .unwrap_or("")
+}
+
+/// 按 locale 优先返回 Windows 系统 CJK 字体族(按优先级)。
+/// 用于覆盖 DirectWrite 不参考 locale 的 Han 回退(默认偏向 Microsoft YaHei /
+/// 简体中文,这在 Windows 英文 / 开发环境下尤其明显)。
+///
+/// 路由同时识别 BCP-47 region 子标签(zh-TW / zh-HK / zh-MO)和 script 子标签
+/// (zh-Hant / zh-Hans,可带 region:zh-Hant-TW 等),调用方无需事先规范化 tag。
+fn preferred_cjk_families_for_locale(locale: &str) -> &'static [&'static str] {
+    let lower = locale.to_ascii_lowercase();
+    match primary_subtag(&lower) {
+        "ja" => &["Yu Gothic UI", "Yu Gothic", "Meiryo UI", "Meiryo", "MS Gothic"],
+        "ko" => &["Malgun Gothic", "Gulim", "Dotum"],
+        "zh" if is_zh_traditional(&lower) => {
+            &["Microsoft JhengHei UI", "Microsoft JhengHei", "PMingLiU", "MingLiU"]
+        }
+        "zh" => &["Microsoft YaHei UI", "Microsoft YaHei", "SimSun"],
+        _ => &[],
+    }
+}
+
+/// `lower`(已 ASCII 小写化的 BCP-47 标签)是否指向繁体中文。
+/// 同时匹配 region 形式(zh-tw / zh-hk / zh-mo)和 script 子标签形式
+/// (zh-hant、zh-hant-tw、zh-foo-hant 等)。要求连字符边界,
+/// 避免 `zh-hansolo` 之类意外匹配。
+fn is_zh_traditional(lower: &str) -> bool {
+    if primary_subtag(lower) != "zh" {
+        return false;
+    }
+    if lower.starts_with("zh-tw") || lower.starts_with("zh-hk") || lower.starts_with("zh-mo") {
+        return true;
+    }
+    // 遍历主标签后的连字符子标签。
+    lower.split('-').skip(1).any(|sub| sub == "hant")
 }
 
 /// Builds a path-backed [`FontHandle`] for a font-kit DirectWrite `Font` by reaching through
