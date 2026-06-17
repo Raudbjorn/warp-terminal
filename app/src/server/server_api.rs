@@ -221,11 +221,7 @@ pub enum AIApiError {
     #[error("Response stream ended unexpectedly before completion.")]
     UnexpectedEof,
 
-    /// Synthesized client-side when a response stream ends without a stream-finished
-    /// event: the server always sends one, but the transport can truncate the response
-    /// between chunks, surfacing as a clean EOF.
-    #[error("Response stream ended unexpectedly before completion.")]
-    UnexpectedEof,
+
 }
 
 impl From<http_client::ResponseError> for AIApiError {
@@ -406,8 +402,7 @@ impl ErrorExt for AIApiError {
             AIApiError::UnexpectedEof => true,
             AIApiError::QuotaLimit { .. }
             | AIApiError::ServerOverloaded
-            | AIApiError::NoContextFound
-            | AIApiError::NetworkPolicyDenied(_) => false,
+            | AIApiError::NoContextFound => false,
         }
     }
 }
@@ -759,6 +754,7 @@ impl ServerApi {
     /// response body, allowing the caller to decode it however they need.
     async fn get_public_api_response(&self, path: &str) -> Result<http_client::Response> {
         Self::ensure_public_api_enabled(path)?;
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -943,6 +939,7 @@ impl ServerApi {
         B: Serialize,
     {
         Self::ensure_public_api_enabled(path)?;
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -1266,6 +1263,7 @@ impl ServerApi {
                 .await
                 .map_err(|err| AIApiError::Other(err.into()));
         }
+
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let request_builder = self.client.post(format!(
@@ -1367,6 +1365,7 @@ impl ServerApi {
                 .await
                 .map_err(|err| AIApiError::Other(err.into()));
         }
+
         let auth_token = self.get_or_refresh_access_token().await?;
         let request_builder = self.client.post(format!(
             "{}/ai/predict_am_queries",
