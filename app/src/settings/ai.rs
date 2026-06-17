@@ -1754,7 +1754,13 @@ impl AISettings {
 
     pub fn is_any_ai_enabled(&self, app: &AppContext) -> bool {
         if ChannelState::is_local_only() {
-            return *self.is_any_ai_enabled;
+            // In local-only mode the cloud/Anthropic backend is unreachable, so the
+            // user-visible "AI enabled" state must reflect whether the local
+            // provider is actually enabled. Without this gate a user with
+            // `agents.local_openai.enabled = false` would still see AI surfaces
+            // (auto-detection, command search, etc.) as live and end up hitting
+            // "configure local provider" errors.
+            return self.is_local_ai_enabled();
         }
 
         // Disable AI for anonymous and logged-out users.

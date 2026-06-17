@@ -1329,7 +1329,9 @@ impl SettingsView {
         // Resolve the initial page: map internal backing-page sections to their default subpage.
         let initial_page = match page {
             Some(SettingsSection::AI) => SettingsSection::WarpAgent,
-            Some(SettingsSection::Code) => SettingsSection::CodeIndexing,
+            // `Code` is a single page now (subpages were folded in), so resolve
+            // it to itself instead of the legacy `CodeIndexing` subpage.
+            Some(SettingsSection::Code) => SettingsSection::Code,
             Some(SettingsSection::Scripting) if !FeatureFlag::WarpControlCli.is_enabled() => {
                 SettingsSection::Appearance
             }
