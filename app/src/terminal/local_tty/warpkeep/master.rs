@@ -223,8 +223,12 @@ fn push_ring(ring: &mut VecDeque<u8>, data: &[u8]) {
         return;
     }
     let overflow = (ring.len() + data.len()).saturating_sub(RING_CAPACITY);
-    for _ in 0..overflow {
-        ring.pop_front();
+    if overflow > 0 {
+        // `VecDeque::drain` removes the leading `overflow` bytes in one batch (O(overflow) total
+        // work, with a memcpy under the hood) instead of `overflow` separate `pop_front` calls
+        // (each of which is a per-element shift). The shell is the hot path here, and the savings
+        // show up on long-running sessions where the ring fills repeatedly.
+        ring.drain(..overflow);
     }
     ring.extend(data);
 }

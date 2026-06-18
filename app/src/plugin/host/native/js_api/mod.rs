@@ -242,9 +242,20 @@ fn network_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
     let network = Object::new(ctx)?;
     network.set(
         "fetch",
+        // `reqwest::blocking::get` has no default timeout, so a hung or unrouteable host would
+        // freeze the plugin runner thread (and the IPC relay it services) indefinitely. Build a
+        // dedicated client with a 10s request timeout — long enough for slow remote APIs, short
+        // enough that one stuck request can't wedge the host. The 10s cap matches our network
+        // policy's max request window, so a plugin can't bypass the policy via `warp.network.fetch`.
         Function::new(ctx, move |url: String| -> rquickjs::Result<Object<'js>> {
             log::info!("plugin warp.network.fetch {url:?}");
-            let response = reqwest::blocking::get(&url).map_err(|e| {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .map_err(|e| {
+                    rquickjs::Exception::throw_message(ctx, &format!("failed to build client: {e}"))
+                })?;
+            let response = client.get(&url).send().map_err(|e| {
                 rquickjs::Exception::throw_message(ctx, &format!("fetch {url:?}: {e}"))
             })?;
             let status = i32::from(response.status().as_u16());
@@ -255,7 +266,6 @@ fn network_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
             Ok(result)
         }),
     )?;
-    Ok(network)
 }
 
 /// Returns a JS object representing the UI namespace for the Warp Plugin API.
@@ -353,8 +363,13 @@ fn install_set_status_item<'js>(
     // a plugin can publish several pills and update each independently.
     ui.set(
         "setStatusItem",
-        Function::new(ctx, move |item_id: String, item: Opt<Object<'js>>| {
-            let item = item.0.and_then(|obj| {
+        // `Opt<rquickjs::Value>` rather than `Opt<Object>`: rquickjs's `FromJs` for `Object`
+        // calls `into_object()` which fails on `null`/`undefined`, throwing a JS `TypeError`
+        // before the `Opt` wrapper can see the missing value. We catch the conversion *outside*
+        // `Opt` and then ask the `Value` for its inner object — `None` for primitives, `Some(obj)`
+        // for objects, and `None` for the documented `null`/non-object "remove" path.
+        Function::new(ctx, move |item_id: String, item: Opt<rquickjs::Value<'js>>| {
+            let item = item.0.and_then(|val| val.into_object()).and_then(|obj| {
                 let text: String = obj.get("text").ok()?;
                 if text.is_empty() {
                     // Empty text is treated as a remove, so plugins don't need separate clear
