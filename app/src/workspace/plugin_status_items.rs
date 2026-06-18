@@ -125,6 +125,16 @@ impl PluginStatusItemsModel {
         ctx.notify();
     }
 
+    /// All pills, in stable render order. Pairs each item with the owning `(plugin_id, item_id)` so
+    /// the render path can build per-pill mouse-state handles keyed by identity.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &StatusItem)> {
+        self.items.iter().flat_map(|(plugin_id, items)| {
+            items
+                .iter()
+                .map(move |(item_id, item)| (plugin_id.as_str(), item_id.as_str(), item))
+        })
+    }
+
     /// Returns the persistent `MouseStateHandle` for `(plugin_id, item_id)`, or `None` if the pill
     /// is passive (no `command_id`). The handle is `Clone` so the render path can hand a copy to
     /// the per-frame `Hoverable` element; the original stays in the model for the next frame.
