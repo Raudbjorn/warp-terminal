@@ -86,6 +86,12 @@ fn is_guarded_scheme(scheme: &str) -> bool {
 }
 
 fn is_loopback_url(url: &Url) -> bool {
+    // Use the url crate's Host enum rather than manual string parsing
+    // of the host. The url crate already parses IPv4 and IPv6 into
+    // standard library types with proper is_loopback() semantics,
+    // including the bracketed IPv6 form (e.g. [::1]) which the
+    // previous string-strip code happened to handle but only by
+    // accident.
     match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => {
@@ -164,4 +170,19 @@ mod tests {
             Ok(())
         );
     }
+
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_is_recognized() {
+        // IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1 should be treated as loopback
+        let url = Url::parse("http://[::ffff:127.0.0.1]:8080").unwrap();
+        assert!(is_loopback_url(&url));
+    }
+
+    #[test]
+    fn ipv6_link_local_is_not_loopback() {
+        // Link-local addresses (fe80::/10) are NOT loopback
+        let url = Url::parse("http://[fe80::1]:8080").unwrap();
+        assert!(!is_loopback_url(&url));
+    }
+
 }

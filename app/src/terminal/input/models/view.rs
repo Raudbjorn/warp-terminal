@@ -15,6 +15,9 @@ use warpui::{
 use crate::ai::blocklist::agent_view::AgentViewController;
 use crate::ai::blocklist::block::cli_controller::{CLISubagentController, CLISubagentEvent};
 use crate::ai::blocklist::{BlocklistAIHistoryEvent, BlocklistAIHistoryModel};
+use crate::ai::execution_profiles::profiles::{
+    AIExecutionProfilesModel, AIExecutionProfilesModelEvent,
+};
 use crate::ai::llms::{LLMId, LLMPreferences, LLMPreferencesEvent};
 use crate::features::FeatureFlag;
 use crate::search::data_source::{Query, QueryFilter};
@@ -321,6 +324,26 @@ impl InlineModelSelectorView {
                 });
             }
         });
+
+        ctx.subscribe_to_model(
+            &AIExecutionProfilesModel::handle(ctx),
+            |me, _, event, ctx| {
+                if !matches!(
+                    event,
+                    AIExecutionProfilesModelEvent::UpdatedActiveProfile { terminal_view_id }
+                        if *terminal_view_id == me.terminal_view_id
+                ) {
+                    return;
+                }
+                if me
+                    .suggestions_mode_model
+                    .as_ref(ctx)
+                    .is_inline_model_selector()
+                {
+                    me.rerun_query(ctx);
+                }
+            },
+        );
 
         ctx.subscribe_to_model(&cli_subagent_controller, |me, _, event, ctx| match event {
             CLISubagentEvent::SpawnedSubagent { .. }

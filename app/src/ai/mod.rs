@@ -36,6 +36,13 @@ pub mod harness_availability;
 pub(crate) mod harness_display;
 pub(crate) mod llms;
 pub(crate) mod local_openai;
+// The real OpenCode sidecar pool spawns a local process (async_process / tokio),
+// which is unavailable on wasm. Swap in a stub there so the app still compiles.
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod local_opencode;
+#[cfg(target_family = "wasm")]
+#[path = "local_opencode_wasm.rs"]
+pub(crate) mod local_opencode;
 pub(crate) mod local_harness_setup;
 pub(crate) mod metadata_project_rules;
 pub mod onboarding;

@@ -2213,6 +2213,21 @@ impl AppearanceSettingsPageView {
         })
     }
 
+    pub fn toggle_cursor_trail(&mut self, ctx: &mut ViewContext<Self>) {
+        TerminalSettings::handle(ctx).update(ctx, |terminal_settings, ctx| {
+            report_if_error!(terminal_settings
+                .cursor_trail_enabled
+                .toggle_and_save_value(ctx));
+            send_telemetry_from_ctx!(
+                TelemetryEvent::FeaturesPageAction {
+                    action: "ToggleCursorTrail".to_string(),
+                    value: terminal_settings.cursor_trail_enabled.value().to_string(),
+                },
+                ctx
+            );
+        });
+    }
+
     pub fn toggle_respect_system_theme(&mut self, ctx: &mut ViewContext<Self>) {
         ThemeSettings::handle(ctx).update(ctx, |theme_settings, ctx| {
             report_if_error!(theme_settings.use_system_theme.toggle_and_save_value(ctx));
@@ -2403,14 +2418,6 @@ impl AppearanceSettingsPageView {
         TabSettings::handle(ctx).update(ctx, |settings, ctx| {
             report_if_error!(settings
                 .show_vertical_tab_panel_in_restored_windows
-                .toggle_and_save_value(ctx));
-        });
-    }
-
-    fn toggle_hide_title_bar_search_bar_in_vertical_tabs(&mut self, ctx: &mut ViewContext<Self>) {
-        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
-            report_if_error!(settings
-                .hide_title_bar_search_bar_in_vertical_tabs
                 .toggle_and_save_value(ctx));
         });
     }

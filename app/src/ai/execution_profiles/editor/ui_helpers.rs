@@ -2,10 +2,12 @@ use pathfinder_geometry::vector::vec2f;
 use thousands::Separable;
 use uuid::Uuid;
 use warp_core::features::FeatureFlag;
+use warp_core::ui::theme::color::internal_colors;
 use warpui::elements::{
-    ChildAnchor, ChildView, ConstrainedBox, Container, CrossAxisAlignment, Dismiss, Flex,
-    Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, ParentAnchor,
-    ParentElement, ParentOffsetBounds, Shrinkable, Stack, Text,
+    Border, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
+    Dismiss, Empty, Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, Shrinkable, Stack,
+    Text,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
@@ -18,13 +20,19 @@ use crate::ai::execution_profiles::{
     ActionPermission,
 };
 use crate::editor::EditorView;
+#[cfg(not(target_family = "wasm"))]
+use crate::local_multi_agent::{
+    LocalMultiAgentManager, LocalMultiAgentStatus, LocalMultiAgentTestStatus, LOCAL_MODEL_ALIAS_IDS,
+};
 use crate::settings::AISettings;
+use crate::settings_view::render_model_chips;
 use crate::ui_components::icons::Icon;
 use crate::view_components::{
     render_warning_box, Dropdown, DropdownItemAction, FilterableDropdown, SubmittableTextInput,
     WarningBoxConfig,
 };
-use crate::{Appearance, TemplatableMCPServerManager};
+use crate::{Appearance, TemplatableMCPServerManager, UserWorkspaces};
+use ai::api_keys::ApiKeyManager;
 
 const CONTEXT_WINDOW_SLIDER_WIDTH: f32 = 220.;
 const CONTEXT_WINDOW_INPUT_BOX_WIDTH: f32 = 120.;
@@ -289,6 +297,387 @@ pub fn render_models_section(
             "The model used when the agent takes control of your computer to interact with graphical applications through mouse movements, clicks, and keyboard input.",
             &view.computer_use_model_dropdown,
         ));
+    }
+
+    Container::new(column.finish())
+        .with_margin_bottom(12.)
+        .finish()
+}
+
+fn render_profile_inference_input(
+    appearance: &Appearance,
+    label: &str,
+    desc: &str,
+    editor: &ViewHandle<EditorView>,
+) -> Box<dyn Element> {
+    let label_elem = Text::new(label.to_string(), appearance.ui_font_family(), 13.)
+        .with_color(appearance.theme().active_ui_text_color().into())
+        .finish();
+    let desc_elem = Text::new(desc.to_string(), appearance.ui_font_family(), 11.)
+        .with_color(
+            appearance
+                .theme()
+                .sub_text_color(appearance.theme().surface_1())
+                .into(),
+        )
+        .finish();
+    let input = appearance
+        .ui_builder()
+        .text_input(editor.clone())
+        .with_style(UiComponentStyles {
+            padding: Some(Coords {
+                top: 8.,
+                bottom: 8.,
+                left: 12.,
+                right: 12.,
+            }),
+            background: Some(appearance.theme().surface_2().into()),
+            ..Default::default()
+        })
+        .build()
+        .finish();
+
+    Container::new(
+        Flex::column()
+            .with_child(label_elem)
+            .with_child(desc_elem)
+            .with_child(Container::new(input).with_margin_top(4.).finish())
+            .finish(),
+    )
+    .with_margin_bottom(12.)
+    .finish()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn render_local_autocomplete_toggle(
+    appearance: &Appearance,
+    view: &ExecutionProfileEditorView,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let is_enabled = ExecutionProfileEditorView::local_inference_settings_enabled(app);
+    let autocomplete_enabled = view
+        .inference_profile_key(app)
+        .map(|profile_key| {
+            ApiKeyManager::as_ref(app).local_ai_autocomplete_enabled_for_profile(&profile_key)
+        })
+        .unwrap_or(false);
+
+    let label = Text::new("Autocomplete".to_string(), appearance.ui_font_family(), 13.)
+        .with_color(appearance.theme().active_ui_text_color().into())
+        .finish();
+    let desc = Text::new(
+        "Use this profile's local provider settings for command autocomplete.".to_string(),
+        appearance.ui_font_family(),
+        11.,
+    )
+    .with_color(
+        appearance
+            .theme()
+            .sub_text_color(appearance.theme().surface_1())
+            .into(),
+    )
+    .finish();
+    let label_desc = Flex::column().with_child(label).with_child(desc).finish();
+
+    let switch_builder = appearance
+        .ui_builder()
+        .switch(view.local_agent_autocomplete_switch.clone())
+        .check(autocomplete_enabled);
+    let switch = if is_enabled {
+        switch_builder
+            .build()
+            .on_click(|ctx, _, _| {
+                ctx.dispatch_typed_action(
+                    ExecutionProfileEditorViewAction::ToggleLocalAIAutocomplete,
+                );
+            })
+            .finish()
+    } else {
+        switch_builder.with_disabled(true).build().finish()
+    };
+
+    Container::new(
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(Shrinkable::new(1., label_desc).finish())
+            .with_child(switch)
+            .finish(),
+    )
+    .with_margin_bottom(12.)
+    .finish()
+}
+
+fn render_custom_endpoint_controls(
+    appearance: &Appearance,
+    view: &ExecutionProfileEditorView,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let is_enabled = FeatureFlag::CustomInferenceEndpoints.is_enabled()
+        && AISettings::as_ref(app).is_any_ai_enabled(app)
+        && UserWorkspaces::as_ref(app).is_custom_inference_enabled(app);
+    let Some(profile_key) = view.inference_profile_key(app) else {
+        return Empty::new().finish();
+    };
+    let endpoints = ApiKeyManager::as_ref(app)
+        .keys()
+        .profile_settings(&profile_key)
+        .custom_endpoints;
+
+    let header_color = if is_enabled {
+        appearance.theme().active_ui_text_color()
+    } else {
+        appearance.theme().disabled_ui_text_color()
+    };
+    let header = Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+        .with_cross_axis_alignment(CrossAxisAlignment::Center)
+        .with_child(
+            Text::new_inline(
+                "Custom endpoints".to_string(),
+                appearance.ui_font_family(),
+                13.,
+            )
+            .with_style(Properties::default().weight(Weight::Semibold))
+            .with_color(header_color.into())
+            .finish(),
+        )
+        .with_child(ChildView::new(&view.custom_inference_add_button).finish())
+        .finish();
+
+    let theme = appearance.theme();
+    let chip_border = internal_colors::fg_overlay_3(theme);
+    let mut column = Flex::column()
+        .with_spacing(12.)
+        .with_child(Container::new(header).with_margin_bottom(4.).finish());
+
+    for (index, endpoint) in endpoints.iter().enumerate() {
+        let model_labels = endpoint
+            .models
+            .iter()
+            .map(|model| model.alias.clone().unwrap_or_else(|| model.name.clone()))
+            .filter(|s| !s.trim().is_empty());
+        let chips = render_model_chips(model_labels, appearance, header_color);
+        let endpoint_name = Text::new_inline(
+            endpoint.name.clone(),
+            appearance.ui_font_family(),
+            appearance.ui_font_size(),
+        )
+        .with_style(Properties::default().weight(Weight::Semibold))
+        .with_color(header_color.into())
+        .finish();
+
+        let left = Flex::column()
+            .with_spacing(8.)
+            .with_child(endpoint_name)
+            .with_child(chips)
+            .finish();
+        let edit_button = view
+            .custom_endpoint_edit_buttons
+            .get(index)
+            .map(|button| ChildView::new(button).finish())
+            .unwrap_or_else(|| Empty::new().finish());
+        let row = Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(Shrinkable::new(1., left).finish())
+            .with_child(edit_button)
+            .finish();
+
+        column.add_child(
+            Container::new(row)
+                .with_uniform_padding(12.)
+                .with_background(internal_colors::fg_overlay_1(theme))
+                .with_border(Border::all(1.).with_border_fill(chip_border))
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+                .finish(),
+        );
+    }
+
+    Container::new(column.finish())
+        .with_margin_bottom(12.)
+        .finish()
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn render_local_agent_status_card(
+    appearance: &Appearance,
+    view: &ExecutionProfileEditorView,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let is_enabled = AISettings::as_ref(app).is_any_ai_enabled(app)
+        && UserWorkspaces::as_ref(app).is_byo_api_key_enabled(app);
+    let manager = LocalMultiAgentManager::as_ref(app);
+    let endpoint = manager
+        .root_url()
+        .map(|url| url.to_string())
+        .unwrap_or_else(|| "Invalid endpoint".to_string());
+    let (title, detail) = match manager.status() {
+        LocalMultiAgentStatus::Disabled => (
+            "Local backend".to_string(),
+            "The local backend starts automatically in no-cloud/BYOK builds.".to_string(),
+        ),
+        LocalMultiAgentStatus::Starting => (
+            "Starting local backend".to_string(),
+            format!("Endpoint: {endpoint}"),
+        ),
+        LocalMultiAgentStatus::Running {
+            root_url,
+            pid,
+            config_hash,
+        } => {
+            let pid_text = pid
+                .map(|pid| format!("pid {pid}"))
+                .unwrap_or_else(|| "reused existing process".to_string());
+            (
+                "Local backend running".to_string(),
+                format!(
+                    "Endpoint: {}. Config {}. {}.",
+                    root_url.as_str(),
+                    config_hash,
+                    pid_text
+                ),
+            )
+        }
+        LocalMultiAgentStatus::Restarting => (
+            "Restarting local backend".to_string(),
+            format!("Endpoint: {endpoint}"),
+        ),
+        LocalMultiAgentStatus::Failed { message } => {
+            ("Local backend error".to_string(), message.clone())
+        }
+    };
+
+    let test_detail = match manager.test_status() {
+        LocalMultiAgentTestStatus::NotRun => None,
+        LocalMultiAgentTestStatus::Testing => {
+            Some("Testing provider health and model discovery...".to_string())
+        }
+        LocalMultiAgentTestStatus::Passed { model_count } => {
+            Some(format!("Last test passed. Found {model_count} models."))
+        }
+        LocalMultiAgentTestStatus::Failed { message } => Some(format!("Test failed: {message}")),
+    };
+
+    let text_color = if is_enabled {
+        appearance.theme().active_ui_text_color()
+    } else {
+        appearance.theme().disabled_ui_text_color()
+    };
+    let detail_color = if is_enabled {
+        appearance
+            .theme()
+            .sub_text_color(appearance.theme().surface_1())
+    } else {
+        appearance.theme().disabled_ui_text_color()
+    };
+
+    let mut text_column = Flex::column()
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_spacing(4.)
+        .with_child(
+            Text::new_inline(title, appearance.ui_font_family(), 13.)
+                .with_style(Properties::default().weight(Weight::Semibold))
+                .with_color(text_color.into())
+                .finish(),
+        )
+        .with_child(
+            Text::new(detail, appearance.ui_font_family(), 11.)
+                .with_color(detail_color.into())
+                .soft_wrap(true)
+                .finish(),
+        );
+    if let Some(test_detail) = test_detail {
+        text_column.add_child(
+            Text::new(test_detail, appearance.ui_font_family(), 11.)
+                .with_color(detail_color.into())
+                .soft_wrap(true)
+                .finish(),
+        );
+    }
+
+    Container::new(
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(12.)
+            .with_child(Shrinkable::new(1., text_column.finish()).finish())
+            .with_child(
+                Flex::row()
+                    .with_spacing(8.)
+                    .with_child(ChildView::new(&view.local_agent_health_button).finish())
+                    .with_child(ChildView::new(&view.local_agent_restart_button).finish())
+                    .finish(),
+            )
+            .finish(),
+    )
+    .with_uniform_padding(12.)
+    .with_background(appearance.theme().surface_2())
+    .with_border(Border::all(1.).with_border_fill(appearance.theme().outline()))
+    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(6.)))
+    .with_margin_bottom(12.)
+    .finish()
+}
+
+pub fn render_local_inference_section(
+    appearance: &Appearance,
+    view: &ExecutionProfileEditorView,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let mut column = Flex::column()
+        .with_child(render_separator(appearance))
+        .with_child(render_section_label("LOCAL INFERENCE", appearance))
+        .with_child(render_profile_inference_input(
+            appearance,
+            "OpenAI API key",
+            "Used by this profile for OpenAI-compatible providers.",
+            &view.openai_api_key_editor,
+        ))
+        .with_child(render_profile_inference_input(
+            appearance,
+            "Anthropic API key",
+            "Used by this profile when Anthropic models are selected.",
+            &view.anthropic_api_key_editor,
+        ))
+        .with_child(render_profile_inference_input(
+            appearance,
+            "Google API key",
+            "Used by this profile when Google models are selected.",
+            &view.google_api_key_editor,
+        ));
+
+    #[cfg(not(target_family = "wasm"))]
+    {
+        column.add_child(render_profile_inference_input(
+            appearance,
+            "OpenAI Base URL",
+            "OpenAI-compatible endpoint for this profile, such as LM Studio or Ollama.",
+            &view.openai_base_url_editor,
+        ));
+        column.add_child(render_local_agent_status_card(appearance, view, app));
+
+        if FeatureFlag::CustomInferenceEndpoints.is_enabled()
+            && UserWorkspaces::as_ref(app).is_custom_inference_enabled(app)
+        {
+            column.add_child(render_custom_endpoint_controls(appearance, view, app));
+        }
+
+        for alias in LOCAL_MODEL_ALIAS_IDS {
+            if alias == "auto-autocomplete" {
+                column.add_child(render_local_autocomplete_toggle(appearance, view, app));
+            }
+            if let Some(dropdown) = view.local_agent_alias_dropdowns.get(alias) {
+                column.add_child(render_filterable_dropdown_row(
+                    appearance,
+                    alias,
+                    "Local model alias used by this profile.",
+                    dropdown,
+                ));
+            }
+        }
     }
 
     Container::new(column.finish())

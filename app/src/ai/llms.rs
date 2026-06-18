@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent, CustomEndpoint, CustomEndpointModel};
+use ai::api_keys::{
+    ApiKeyManager, ApiKeyManagerEvent, CustomEndpoint, CustomEndpointModel,
+    DEFAULT_PROFILE_INFERENCE_KEY,
+};
 pub use ai::LLMId;
 use parking_lot::FairMutex;
 use serde::{de, Deserialize, Serialize};
@@ -13,6 +16,8 @@ use warpui::{AppContext, Entity, EntityId, ModelContext, SingletonEntity};
 use super::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
 use crate::auth::AuthStateProvider;
+#[cfg(not(target_family = "wasm"))]
+use crate::local_multi_agent::LocalMultiAgentConfig;
 use crate::network::{NetworkStatus, NetworkStatusEvent, NetworkStatusKind};
 use crate::report_error;
 use crate::server::server_api::ServerApiProvider;
@@ -568,6 +573,13 @@ pub struct LLMPreferences {
     /// Rebuilt from scratch on every `ApiKeyManagerEvent::KeysUpdated`, so adds, edits, and
     /// removals all immediately propagate to the picker.
     custom_llms: Vec<LLMInfo>,
+    profile_custom_llms: HashMap<String, Vec<LLMInfo>>,
+    #[cfg(not(target_family = "wasm"))]
+    profile_local_models: HashMap<String, ModelsByFeature>,
+    #[cfg(not(target_family = "wasm"))]
+    last_local_multi_agent_config: Option<LocalMultiAgentConfig>,
+    #[cfg(not(target_family = "wasm"))]
+    last_local_multi_agent_discovered_models: Vec<String>,
 }
 
 impl LLMPreferences {
@@ -614,13 +626,22 @@ impl LLMPreferences {
         );
 
         let base_llm_for_terminal_view = HashMap::new();
-        let custom_llms = build_custom_llm_infos(ApiKeyManager::as_ref(ctx).keys());
+        let keys = ApiKeyManager::as_ref(ctx).keys();
+        let custom_llms = build_custom_llm_infos(keys);
+        let profile_custom_llms = build_profile_custom_llm_infos(keys);
 
         let me = Self {
             models_by_feature,
             last_update: None,
             base_llm_for_terminal_view,
             custom_llms,
+            profile_custom_llms,
+            #[cfg(not(target_family = "wasm"))]
+            profile_local_models: HashMap::new(),
+            #[cfg(not(target_family = "wasm"))]
+            last_local_multi_agent_config: None,
+            #[cfg(not(target_family = "wasm"))]
+            last_local_multi_agent_discovered_models: Vec::new(),
         };
 
         // In agent mode eval builds, eagerly kick off a fetch of the model list from the server
@@ -648,14 +669,13 @@ impl LLMPreferences {
         app: &AppContext,
         terminal_view_id: Option<EntityId>,
     ) -> &LLMInfo {
+        let profile_key = Self::active_inference_profile_key(app, terminal_view_id);
+
         if let Some(terminal_view_id) = terminal_view_id {
             let raw_override = self.base_llm_for_terminal_view.get(&terminal_view_id);
             if let Some(llm_id) = raw_override {
-                if let Some(llm_info) = self
-                    .models_by_feature
-                    .agent_mode
-                    .info_for_id(llm_id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(llm_id, app))
+                if let Some(llm_info) =
+                    self.agent_mode_info_for_profile_key(llm_id, &profile_key, app)
                 {
                     return llm_info;
                 }
@@ -668,13 +688,94 @@ impl LLMPreferences {
             .data()
             .base_model
             .clone()
-            .and_then(|id| {
+            .and_then(|id| self.agent_mode_info_for_profile_key(&id, &profile_key, app))
+            .unwrap_or_else(|| self.default_agent_mode_info_for_profile_key(&profile_key))
+    }
+
+    fn active_inference_profile_key(
+        app: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> String {
+        AIExecutionProfilesModel::as_ref(app)
+            .active_profile(terminal_view_id, app)
+            .inference_profile_key()
+    }
+
+    fn agent_mode_info_for_profile_key<'a>(
+        &'a self,
+        id: &LLMId,
+        profile_key: &str,
+        app: &AppContext,
+    ) -> Option<&'a LLMInfo> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(models) = self.local_models_for_profile_key(profile_key) {
+            return models
+                .agent_mode
+                .info_for_id(id)
+                .or_else(|| self.custom_llm_info_for_profile_key_if_enabled(id, profile_key, app));
+        }
+
+        self.models_by_feature
+            .agent_mode
+            .info_for_id(id)
+            .or_else(|| self.custom_llm_info_for_profile_key_if_enabled(id, profile_key, app))
+    }
+
+    fn agent_mode_usable_info_for_profile_key<'a>(
+        &'a self,
+        id: &LLMId,
+        profile_key: &str,
+        app: &AppContext,
+    ) -> Option<&'a LLMInfo> {
+        #[cfg(not(target_family = "wasm"))]
+        let local_info = self
+            .local_models_for_profile_key(profile_key)
+            .and_then(|models| models.agent_mode.usable_info_for_id(id, app));
+        #[cfg(target_family = "wasm")]
+        let local_info: Option<&LLMInfo> = None;
+
+        local_info
+            .or_else(|| {
                 self.models_by_feature
                     .agent_mode
-                    .info_for_id(&id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
+                    .usable_info_for_id(id, app)
             })
-            .unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
+            .or_else(|| self.custom_llm_info_for_profile_key_if_enabled(id, profile_key, app))
+    }
+
+    fn default_agent_mode_info_for_profile_key(&self, profile_key: &str) -> &LLMInfo {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(models) = self.local_models_for_profile_key(profile_key) {
+            return models.agent_mode.default_llm_info();
+        }
+
+        self.models_by_feature.agent_mode.default_llm_info()
+    }
+
+    pub fn get_agent_mode_llm_info_for_terminal<'a>(
+        &'a self,
+        id: &LLMId,
+        app: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> Option<&'a LLMInfo> {
+        let profile_key = Self::active_inference_profile_key(app, terminal_view_id);
+        self.agent_mode_info_for_profile_key(id, &profile_key, app)
+    }
+
+    pub fn get_profile_default_base_model<'a>(
+        &'a self,
+        app: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> &'a LLMInfo {
+        let profile_key = Self::active_inference_profile_key(app, terminal_view_id);
+        let profile = AIExecutionProfilesModel::as_ref(app).active_profile(terminal_view_id, app);
+
+        profile
+            .data()
+            .base_model
+            .as_ref()
+            .and_then(|id| self.agent_mode_info_for_profile_key(id, &profile_key, app))
+            .unwrap_or_else(|| self.default_agent_mode_info_for_profile_key(&profile_key))
     }
 
     pub fn get_active_coding_model<'a>(
@@ -691,19 +792,63 @@ impl LLMPreferences {
         app: &AppContext,
         terminal_view_id: Option<EntityId>,
     ) -> &LLMInfo {
+        let profile_key = Self::active_inference_profile_key(app, terminal_view_id);
+
         let profile = AIExecutionProfilesModel::as_ref(app).active_profile(terminal_view_id, app);
 
         profile
             .data()
             .coding_model
             .clone()
-            .and_then(|id| {
-                self.models_by_feature
-                    .coding
-                    .info_for_id(&id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
-            })
-            .unwrap_or_else(|| self.models_by_feature.coding.default_llm_info())
+            .and_then(|id| self.coding_info_for_profile_key(&id, &profile_key, app))
+            .unwrap_or_else(|| self.default_coding_info_for_profile_key(&profile_key))
+    }
+
+    fn coding_info_for_profile_key<'a>(
+        &'a self,
+        id: &LLMId,
+        profile_key: &str,
+        app: &AppContext,
+    ) -> Option<&'a LLMInfo> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(models) = self.local_models_for_profile_key(profile_key) {
+            return models
+                .coding
+                .info_for_id(id)
+                .or_else(|| self.custom_llm_info_for_profile_key_if_enabled(id, profile_key, app));
+        }
+
+        self.models_by_feature
+            .coding
+            .info_for_id(id)
+            .or_else(|| self.custom_llm_info_for_profile_key_if_enabled(id, profile_key, app))
+    }
+
+    fn coding_usable_info_for_profile_key<'a>(
+        &'a self,
+        id: &LLMId,
+        profile_key: &str,
+        app: &AppContext,
+    ) -> Option<&'a LLMInfo> {
+        #[cfg(not(target_family = "wasm"))]
+        let local_info = self
+            .local_models_for_profile_key(profile_key)
+            .and_then(|models| models.coding.usable_info_for_id(id, app));
+        #[cfg(target_family = "wasm")]
+        let local_info: Option<&LLMInfo> = None;
+
+        local_info
+            .or_else(|| self.models_by_feature.coding.usable_info_for_id(id, app))
+            .or_else(|| self.custom_llm_info_for_profile_key_if_enabled(id, profile_key, app))
+    }
+
+    fn default_coding_info_for_profile_key(&self, profile_key: &str) -> &LLMInfo {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(models) = self.local_models_for_profile_key(profile_key) {
+            return models.coding.default_llm_info();
+        }
+
+        self.models_by_feature.coding.default_llm_info()
     }
 
     /// Returns the set of LLMs available for Agent Mode use.
@@ -711,32 +856,144 @@ impl LLMPreferences {
         &self,
         app: &AppContext,
     ) -> impl Iterator<Item = &LLMInfo> {
-        // Don't show admin-disabled models in the dropdown
+        // In fully-local mode the Warp-hosted (built-in) models can't be reached,
+        // so only custom-endpoint models are offered.
+        let hide_builtin = true;
         self.models_by_feature
             .agent_mode
             .choices
             .iter()
-            .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+            // Don't show admin-disabled models in the dropdown.
+            .filter(move |llm| {
+                !hide_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
             .chain(self.custom_llm_choices(app))
+    }
+
+    /// Returns Agent Mode choices for the active profile in a specific terminal view.
+    pub fn get_base_llm_choices_for_agent_mode_for_terminal(
+        &self,
+        app: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> Vec<&LLMInfo> {
+        let profile_key = Self::active_inference_profile_key(app, terminal_view_id);
+        self.get_base_llm_choices_for_profile_key(app, &profile_key)
+    }
+
+    pub fn get_base_llm_choices_for_profile_key(
+        &self,
+        app: &AppContext,
+        profile_key: &str,
+    ) -> Vec<&LLMInfo> {
+        // In fully-local mode the Warp-hosted (built-in) models can't be reached,
+        // so only custom-endpoint models are offered.
+        let hide_builtin = true;
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(models) = self.local_models_for_profile_key(profile_key) {
+            return models
+                .agent_mode
+                .choices
+                .iter()
+                .filter(move |llm| {
+                    !hide_builtin
+                        && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+                })
+                .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
+                .collect();
+        }
+
+        self.models_by_feature
+            .agent_mode
+            .choices
+            .iter()
+            .filter(move |llm| {
+                !hide_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
+            .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
+            .collect()
     }
 
     /// Returns the set of LLMs available for coding.
     pub fn get_coding_llm_choices(&self, app: &AppContext) -> impl Iterator<Item = &LLMInfo> {
-        // Don't show admin-disabled models in the dropdown
+        let hide_builtin = true;
         self.models_by_feature
             .coding
             .choices
             .iter()
-            .filter(|llm| !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled)))
+            // Don't show admin-disabled models in the dropdown.
+            .filter(move |llm| {
+                !hide_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
             .chain(self.custom_llm_choices(app))
     }
 
-    /// Returns the set of LLMs available for CLI agent.
-    pub fn get_cli_agent_llm_choices(&self, app: &AppContext) -> impl Iterator<Item = &LLMInfo> {
+    pub fn get_cli_agent_llm_choices_for_terminal(
+        &self,
+        app: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> Vec<&LLMInfo> {
+        let profile_key = Self::active_inference_profile_key(app, terminal_view_id);
+        self.get_cli_agent_llm_choices_for_profile_key(app, &profile_key)
+    }
+
+    pub fn get_coding_llm_choices_for_profile_key(
+        &self,
+        app: &AppContext,
+        profile_key: &str,
+    ) -> Vec<&LLMInfo> {
+        // In fully-local mode the Warp-hosted (built-in) models can't be reached,
+        // so only custom-endpoint models are offered.
+        let hide_builtin = true;
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(models) = self.local_models_for_profile_key(profile_key) {
+            return models
+                .coding
+                .choices
+                .iter()
+                .filter(move |llm| {
+                    !hide_builtin
+                        && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+                })
+                .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
+                .collect();
+        }
+
+        self.models_by_feature
+            .coding
+            .choices
+            .iter()
+            .filter(move |llm| {
+                !hide_builtin && !matches!(llm.disable_reason, Some(DisableReason::AdminDisabled))
+            })
+            .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
+            .collect()
+    }
+
+    pub fn get_cli_agent_llm_choices_for_profile_key(
+        &self,
+        app: &AppContext,
+        profile_key: &str,
+    ) -> Vec<&LLMInfo> {
+        // In fully-local mode the Warp-hosted (built-in) models can't be reached,
+        // so only custom-endpoint models are offered.
+        let hide_builtin = true;
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(models) = self.local_models_for_profile_key(profile_key) {
+            let available = models.cli_agent.as_ref().unwrap_or(&models.agent_mode);
+            return available
+                .choices
+                .iter()
+                .filter(move |_| !hide_builtin)
+                .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
+                .collect();
+        }
+
         self.get_cli_agent_available()
             .choices
             .iter()
-            .chain(self.custom_llm_choices(app))
+            .filter(move |_| !hide_builtin)
+            .chain(self.custom_llm_choices_for_profile_key(app, profile_key))
+            .collect()
     }
 
     /// Returns the `LLMInfo` for the CLI agent model.
@@ -745,23 +1002,71 @@ impl LLMPreferences {
         app: &'a AppContext,
         terminal_view_id: Option<EntityId>,
     ) -> &'a LLMInfo {
+        let profile_key = Self::active_inference_profile_key(app, terminal_view_id);
+
         let profile = AIExecutionProfilesModel::as_ref(app).active_profile(terminal_view_id, app);
 
-        let available = self.get_cli_agent_available();
         profile
             .data()
             .cli_agent_model
             .clone()
-            .and_then(|id| {
-                available
-                    .info_for_id(&id)
-                    .or_else(|| self.custom_llm_info_for_id_if_enabled(&id, app))
-            })
-            .unwrap_or_else(|| available.default_llm_info())
+            .and_then(|id| self.cli_agent_info_for_profile_key(&id, &profile_key, app))
+            .unwrap_or_else(|| self.default_cli_agent_info_for_profile_key(&profile_key))
     }
 
-    /// Returns the default CLI agent model as a fallback.
-    pub fn get_default_cli_agent_model(&self) -> &LLMInfo {
+    fn cli_agent_info_for_profile_key<'a>(
+        &'a self,
+        id: &LLMId,
+        profile_key: &str,
+        app: &AppContext,
+    ) -> Option<&'a LLMInfo> {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(models) = self.local_models_for_profile_key(profile_key) {
+            let available = models.cli_agent.as_ref().unwrap_or(&models.agent_mode);
+            return available
+                .info_for_id(id)
+                .or_else(|| self.custom_llm_info_for_profile_key_if_enabled(id, profile_key, app));
+        }
+
+        self.get_cli_agent_available()
+            .info_for_id(id)
+            .or_else(|| self.custom_llm_info_for_profile_key_if_enabled(id, profile_key, app))
+    }
+
+    fn cli_agent_usable_info_for_profile_key<'a>(
+        &'a self,
+        id: &LLMId,
+        profile_key: &str,
+        app: &AppContext,
+    ) -> Option<&'a LLMInfo> {
+        #[cfg(not(target_family = "wasm"))]
+        let local_info = self
+            .local_models_for_profile_key(profile_key)
+            .and_then(|models| {
+                models
+                    .cli_agent
+                    .as_ref()
+                    .unwrap_or(&models.agent_mode)
+                    .usable_info_for_id(id, app)
+            });
+        #[cfg(target_family = "wasm")]
+        let local_info: Option<&LLMInfo> = None;
+
+        local_info
+            .or_else(|| self.get_cli_agent_available().usable_info_for_id(id, app))
+            .or_else(|| self.custom_llm_info_for_profile_key_if_enabled(id, profile_key, app))
+    }
+
+    fn default_cli_agent_info_for_profile_key(&self, profile_key: &str) -> &LLMInfo {
+        #[cfg(not(target_family = "wasm"))]
+        if let Some(models) = self.local_models_for_profile_key(profile_key) {
+            return models
+                .cli_agent
+                .as_ref()
+                .unwrap_or(&models.agent_mode)
+                .default_llm_info();
+        }
+
         self.get_cli_agent_available().default_llm_info()
     }
 
@@ -822,7 +1127,15 @@ impl LLMPreferences {
     /// Resolves an `LLMId` against the user's custom-endpoint LLMs.
     /// Returns `None` if the id isn't a known custom model `config_key`.
     pub fn custom_llm_info_for_id(&self, id: &LLMId) -> Option<&LLMInfo> {
-        self.custom_llms.iter().find(|info| info.id == *id)
+        self.custom_llms
+            .iter()
+            .find(|info| info.id == *id)
+            .or_else(|| {
+                self.profile_custom_llms
+                    .values()
+                    .flat_map(|infos| infos.iter())
+                    .find(|info| info.id == *id)
+            })
     }
 
     /// Footer label for custom endpoint usage keyed by the request config_key.
@@ -835,10 +1148,37 @@ impl LLMPreferences {
             .unwrap_or_else(|| CUSTOM_ENDPOINT_USAGE_FALLBACK_LABEL.to_string())
     }
 
-    fn custom_llm_info_for_id_if_enabled(&self, id: &LLMId, app: &AppContext) -> Option<&LLMInfo> {
+    fn custom_llm_info_for_profile_key<'a>(
+        &'a self,
+        id: &LLMId,
+        profile_key: &str,
+    ) -> Option<&'a LLMInfo> {
+        self.profile_custom_llms
+            .get(profile_key)
+            .into_iter()
+            .flat_map(|infos| infos.iter())
+            .find(|info| info.id == *id)
+    }
+
+    fn custom_llm_info_for_profile_key_if_enabled<'a>(
+        &'a self,
+        id: &LLMId,
+        profile_key: &str,
+        app: &AppContext,
+    ) -> Option<&'a LLMInfo> {
         Self::custom_inference_enabled(app)
-            .then(|| self.custom_llm_info_for_id(id))
+            .then(|| self.custom_llm_info_for_profile_key(id, profile_key))
             .flatten()
+    }
+
+    pub fn custom_llm_info_for_terminal<'a>(
+        &'a self,
+        id: &LLMId,
+        app: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> Option<&'a LLMInfo> {
+        let profile_key = Self::active_inference_profile_key(app, terminal_view_id);
+        self.custom_llm_info_for_profile_key_if_enabled(id, &profile_key, app)
     }
 
     /// Iterator over the user's custom-endpoint LLMs, gated on the feature flag and entitlement.
@@ -852,6 +1192,32 @@ impl LLMPreferences {
         }
     }
 
+    pub fn custom_llm_choices_for_terminal(
+        &self,
+        app: &AppContext,
+        terminal_view_id: Option<EntityId>,
+    ) -> Vec<&LLMInfo> {
+        let profile_key = Self::active_inference_profile_key(app, terminal_view_id);
+        self.custom_llm_choices_for_profile_key(app, &profile_key)
+            .collect()
+    }
+
+    fn custom_llm_choices_for_profile_key<'a>(
+        &'a self,
+        app: &AppContext,
+        profile_key: &str,
+    ) -> std::slice::Iter<'a, LLMInfo> {
+        if !Self::custom_inference_enabled(app) {
+            return (&[] as &[LLMInfo]).iter();
+        }
+
+        self.profile_custom_llms
+            .get(profile_key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+    }
+
     fn custom_inference_enabled(app: &AppContext) -> bool {
         FeatureFlag::CustomInferenceEndpoints.is_enabled()
             && UserWorkspaces::as_ref(app).is_custom_inference_enabled(app)
@@ -861,7 +1227,11 @@ impl LLMPreferences {
     /// with synthetic `LLMInfo`s. Called on every `ApiKeyManagerEvent::KeysUpdated`, so adds,
     /// edits, and removals all propagate immediately.
     fn rebuild_custom_llms(&mut self, app: &AppContext) {
-        self.custom_llms = build_custom_llm_infos(ApiKeyManager::as_ref(app).keys());
+        let keys = ApiKeyManager::as_ref(app).keys();
+        self.custom_llms = build_custom_llm_infos(keys);
+        self.profile_custom_llms = build_profile_custom_llm_infos(keys);
+        #[cfg(not(target_family = "wasm"))]
+        self.rebuild_profile_local_models(app);
     }
 
     fn sanitize_disabled_custom_model_preferences(&mut self, ctx: &mut ModelContext<Self>) {
@@ -944,9 +1314,16 @@ impl LLMPreferences {
         self.models_by_feature.agent_mode.default_llm_info()
     }
 
-    /// Returns the default coding model as a fallback.
-    pub fn get_default_coding_model(&self) -> &LLMInfo {
-        self.models_by_feature.coding.default_llm_info()
+    pub fn get_default_base_model_for_profile_key(&self, profile_key: &str) -> &LLMInfo {
+        self.default_agent_mode_info_for_profile_key(profile_key)
+    }
+
+    pub fn get_default_coding_model_for_profile_key(&self, profile_key: &str) -> &LLMInfo {
+        self.default_coding_info_for_profile_key(profile_key)
+    }
+
+    pub fn get_default_cli_agent_model_for_profile_key(&self, profile_key: &str) -> &LLMInfo {
+        self.default_cli_agent_info_for_profile_key(profile_key)
     }
 
     /// Returns the preferred Codex model, if set by the server.
@@ -970,15 +1347,8 @@ impl LLMPreferences {
         terminal_view_id: EntityId,
         ctx: &mut ModelContext<Self>,
     ) {
-        let profile =
-            AIExecutionProfilesModel::as_ref(ctx).active_profile(Some(terminal_view_id), ctx);
-
-        let profile_default_model_id = profile
-            .data()
-            .base_model
-            .as_ref()
-            .and_then(|id| self.models_by_feature.agent_mode.info_for_id(id))
-            .unwrap_or_else(|| self.models_by_feature.agent_mode.default_llm_info())
+        let profile_default_model_id = self
+            .get_profile_default_base_model(ctx, Some(terminal_view_id))
             .id
             .clone();
 
@@ -1127,6 +1497,84 @@ impl LLMPreferences {
         }
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    pub fn update_local_multi_agent_models(
+        &mut self,
+        config: &LocalMultiAgentConfig,
+        discovered_models: &[String],
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let previous_profile_models = self.profile_local_models.clone();
+        self.last_local_multi_agent_config = Some(config.clone());
+        self.last_local_multi_agent_discovered_models = discovered_models.to_vec();
+        self.rebuild_profile_local_models(ctx);
+
+        let Some(update) = models_by_feature_for_local_multi_agent(config, discovered_models)
+        else {
+            if self.profile_local_models != previous_profile_models {
+                ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
+            }
+            return;
+        };
+
+        if update != self.models_by_feature {
+            self.on_server_update(update, ctx);
+        } else if self.profile_local_models != previous_profile_models {
+            ctx.emit(LLMPreferencesEvent::UpdatedAvailableLLMs);
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn local_models_for_profile_key(&self, profile_key: &str) -> Option<&ModelsByFeature> {
+        self.profile_local_models.get(profile_key)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn rebuild_profile_local_models(&mut self, app: &AppContext) {
+        let Some(config) = self.last_local_multi_agent_config.as_ref() else {
+            return;
+        };
+
+        let keys = ApiKeyManager::as_ref(app).keys();
+        let discovered_models = &self.last_local_multi_agent_discovered_models;
+        let mut profile_models = HashMap::new();
+
+        if let Some(models) = models_by_feature_for_local_multi_agent(config, discovered_models) {
+            profile_models.insert(DEFAULT_PROFILE_INFERENCE_KEY.to_string(), models);
+        }
+
+        for (profile_key, settings) in &keys.profile_inference_settings {
+            let mut profile_config = config.clone();
+            let has_profile_model_list = !settings.local_model_list.trim().is_empty();
+            let has_profile_aliases = !settings.local_model_aliases.trim().is_empty();
+            let has_profile_provider = settings.openai_base_url.is_some()
+                || settings.local_multi_agent_server_root_url.is_some();
+
+            if !has_profile_model_list
+                && !has_profile_aliases
+                && !has_profile_provider
+                && profile_key != DEFAULT_PROFILE_INFERENCE_KEY
+            {
+                continue;
+            }
+
+            if has_profile_model_list {
+                profile_config.local_model_list = settings.local_model_list.clone();
+            }
+            if has_profile_aliases {
+                profile_config.local_model_aliases = settings.local_model_aliases.clone();
+            }
+
+            if let Some(models) =
+                models_by_feature_for_local_multi_agent(&profile_config, discovered_models)
+            {
+                profile_models.insert(profile_key.clone(), models);
+            }
+        }
+
+        self.profile_local_models = profile_models;
+    }
+
     pub fn update_feature_model_choices(
         &mut self,
         choices_result: Result<ModelsByFeature, anyhow::Error>,
@@ -1189,17 +1637,21 @@ impl LLMPreferences {
             for profile_id in profiles.get_all_profile_ids() {
                 if let Some(profile) = profiles.get_profile_by_id(profile_id, ctx) {
                     let profile_data = profile.data();
+                    let profile_key = profile.inference_profile_key();
+
                     let preferred_base_model = profile_data.base_model.clone();
+                    let default_base_model_id = self
+                        .default_agent_mode_info_for_profile_key(&profile_key)
+                        .id
+                        .clone();
                     let effective_base_model_id = preferred_base_model
                         .as_ref()
-                        .unwrap_or(&self.models_by_feature.agent_mode.default_id);
-                    let effective_base_model_usable = self
-                        .models_by_feature
-                        .agent_mode
-                        .usable_info_for_id(effective_base_model_id, ctx)
-                        .or_else(|| {
-                            self.custom_llm_info_for_id_if_enabled(effective_base_model_id, ctx)
-                        });
+                        .unwrap_or(&default_base_model_id);
+                    let effective_base_model_usable = self.agent_mode_usable_info_for_profile_key(
+                        effective_base_model_id,
+                        &profile_key,
+                        ctx,
+                    );
                     let effective_base_model_unusable = effective_base_model_usable.is_none();
                     let effective_base_model_is_configurable = effective_base_model_usable
                         .is_some_and(|info| info.context_window.is_configurable);
@@ -1215,12 +1667,7 @@ impl LLMPreferences {
                     }
                     if let Some(preferred_llm_id) = &profile.data().coding_model {
                         if self
-                            .models_by_feature
-                            .coding
-                            .usable_info_for_id(preferred_llm_id, ctx)
-                            .or_else(|| {
-                                self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
-                            })
+                            .coding_usable_info_for_profile_key(preferred_llm_id, &profile_key, ctx)
                             .is_none()
                         {
                             profiles.set_coding_model(profile_id, None, ctx);
@@ -1228,11 +1675,11 @@ impl LLMPreferences {
                     }
                     if let Some(preferred_llm_id) = &profile.data().cli_agent_model {
                         if self
-                            .get_cli_agent_available()
-                            .usable_info_for_id(preferred_llm_id, ctx)
-                            .or_else(|| {
-                                self.custom_llm_info_for_id_if_enabled(preferred_llm_id, ctx)
-                            })
+                            .cli_agent_usable_info_for_profile_key(
+                                preferred_llm_id,
+                                &profile_key,
+                                ctx,
+                            )
                             .is_none()
                         {
                             profiles.set_cli_agent_model(profile_id, None, ctx);
@@ -1322,7 +1769,28 @@ fn get_new_agent_mode_choices(
 /// Endpoints with empty URL or API key, and models with empty name or config_key, are
 /// skipped — they shouldn't surface in the picker until the user finishes configuring them.
 fn build_custom_llm_infos(keys: &ai::api_keys::ApiKeys) -> Vec<LLMInfo> {
-    keys.custom_endpoints
+    build_custom_llm_infos_from_endpoints(&keys.default_profile_settings().custom_endpoints)
+}
+
+fn build_profile_custom_llm_infos(keys: &ai::api_keys::ApiKeys) -> HashMap<String, Vec<LLMInfo>> {
+    let mut profile_custom_llms = HashMap::new();
+    profile_custom_llms.insert(
+        DEFAULT_PROFILE_INFERENCE_KEY.to_string(),
+        build_custom_llm_infos(keys),
+    );
+
+    for (profile_key, settings) in &keys.profile_inference_settings {
+        profile_custom_llms.insert(
+            profile_key.clone(),
+            build_custom_llm_infos_from_endpoints(&settings.custom_endpoints),
+        );
+    }
+
+    profile_custom_llms
+}
+
+fn build_custom_llm_infos_from_endpoints(endpoints: &[CustomEndpoint]) -> Vec<LLMInfo> {
+    endpoints
         .iter()
         .filter(|ep| !ep.url.trim().is_empty() && !ep.api_key.is_empty())
         .flat_map(|endpoint| {

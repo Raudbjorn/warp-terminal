@@ -238,6 +238,10 @@ fn custom_endpoint_usage_display_label_resolves_alias_name_and_generic_fallback(
         last_update: None,
         base_llm_for_terminal_view: HashMap::new(),
         custom_llms: build_custom_llm_infos(&keys),
+        profile_custom_llms: build_profile_custom_llm_infos(&keys),
+        profile_local_models: HashMap::new(),
+        last_local_multi_agent_config: None,
+        last_local_multi_agent_discovered_models: Vec::new(),
     };
 
     assert_eq!(

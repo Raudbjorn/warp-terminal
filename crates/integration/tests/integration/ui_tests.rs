@@ -126,6 +126,9 @@ integration_tests! {
     test_with_launch_config_with_no_active_pane,
     test_find_query_not_evaluated_on_terminal_mode_change,
     test_custom_open_completions_menu_binding,
+    // Disabled in this fork: SSHes into a remote GCP VM over an IAP tunnel,
+    // which isn't reachable (or authorized) from local/hermetic test runs.
+    #[ignore = "Requires a remote GCP VM over an IAP tunnel; unreachable locally"]
     test_ssh_with_shell_override,
 
     #[ignore = "Affected by agent_view feature flag UI changes"]
@@ -304,6 +307,9 @@ integration_tests! {
     #[ignore = "Affected by agent_view feature flag UI changes"]
     test_selection_last_to_ai_lines,
     test_restored_ai_block_renders_mermaid_and_local_images,
+    test_local_agent_loop_streams_text_reply,
+    test_local_agent_loop_shell_tool_round_trip,
+    test_local_agent_loop_passive_prompt_suggestion,
 
     // Middle-click-paste is only implemented for Linux right now.
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]

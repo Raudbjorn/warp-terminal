@@ -442,6 +442,7 @@ const LOCAL_ONLY_DISABLED_SUBCOMMANDS: &[&str] = &[
     "federate",
     "harness-support",
     "artifact",
+    "task",
 ];
 
 const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
@@ -483,12 +484,12 @@ fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) ->
             return None;
         }
 
-        if arg.starts_with('-') {
-            // Skip long (`--foo`, `--foo=bar`) and short (`-v`, `-obar`, `-abc`)
-            // options, plus long options that consume a separate value
-            // (`--api-key KEY`). The previous implementation only skipped long
-            // options, which let invocations like `warp -v agent` misidentify
-            // `-v` as the subcommand and bypass local-only gating entirely.
+        if arg.starts_with('-') && arg != "-" {
+            // Skip both long (`--foo`, `--foo=bar`) and short (`-v`, `-o value`,
+            // `-obar`, `-abc`) options. The previous implementation only
+            // skipped long options, which let invocations like
+            // `warp -v agent` misidentify `-v` as the subcommand and bypass
+            // local-only gating entirely.
             let option_name = arg.split_once('=').map_or(arg, |(name, _)| name);
             index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name) && !arg.contains('=') {
                 2
@@ -575,6 +576,11 @@ pub enum WorkerCommand {
     #[cfg(not(target_family = "wasm"))]
     #[clap(hide = true)]
     RemoteServerDaemon(RemoteServerIdentityArgs),
+
+    /// Print the remote-server protocol compatibility key.
+    #[cfg(not(target_family = "wasm"))]
+    #[clap(hide = true)]
+    RemoteServerProtocolVersion,
 
     /// Run a headless ripgrep search worker.
     #[cfg(not(target_family = "wasm"))]
