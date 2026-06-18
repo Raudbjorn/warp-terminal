@@ -25,11 +25,12 @@ custom OpenAI-compatible endpoint.** Point it at any compatible server — local
 or any gateway that speaks the OpenAI API).
 
 Configure it in **Settings → AI → Custom inference / model providers**: set the
-base URL (e.g. `http://localhost:11434/v1`), an API key if your endpoint
-requires one, and the model slug to use. Loopback and private-network hosts are
-allowed (over plain HTTP for local hosts, HTTPS for public ones). Until an
-endpoint is configured, the terminal works normally but agent/AI actions have
-nowhere to go.
+base URL (e.g. `http://localhost:11434/v1`), an API key *if your endpoint
+requires one* (local servers like Ollama/LM Studio usually don't), and the
+model slug to use. Loopback and private-network hosts are allowed (over plain
+HTTP for local hosts, HTTPS for public ones). Until an endpoint is
+configured, the terminal works normally but agent/AI actions have nowhere to
+go.
 
 ## Building and running this fork
 
@@ -83,11 +84,10 @@ installed app. (`--packages` also accepts `rpm` and `arch`.)
 
 **macOS.** `./script/bundle --channel oss` produces a `.app` bundle (and a
 matching `.dmg`) at:
-
-```
-target/release-lto/bundle/osx/WarpOss.app
-target/release-lto/bundle/osx/WarpOss.dmg
-```
+```text
+ target/release-lto/bundle/osx/WarpOss.app
+ target/release-lto/bundle/osx/WarpOss.dmg
+ ```
 
 Copy the app into `/Applications` and launch it normally:
 

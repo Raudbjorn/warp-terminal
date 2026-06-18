@@ -296,6 +296,10 @@ pub fn add_custom_model_endpoint(
     model_name: &str,
     config_key: &str,
 ) -> TestStep {
+    assert!(
+        !config_key.trim().is_empty(),
+        "config_key must be non-empty so the model can be selected later by LLMId"
+    );
     let endpoint_name = endpoint_name.to_owned();
     let base_url = base_url.to_owned();
     let api_key = api_key.to_owned();
