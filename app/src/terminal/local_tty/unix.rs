@@ -13,6 +13,7 @@ use std::{io, ptr};
 
 use anyhow::{Context as _, Error, Result};
 use command::blocking::Command;
+use dirs;
 use itertools::Itertools;
 use libc::{self, c_int, winsize, TIOCSCTTY};
 use mio::unix::SourceFd;
@@ -238,7 +239,9 @@ fn omw_warpkeep_wrap(
     }
 
     let exe = std::env::current_exe().ok()?;
-    let mut sessions_dir = PathBuf::from(std::env::var_os("HOME")?);
+    // `dirs::home_dir` is cross-platform (uses `HOME` on Unix, `USERPROFILE` on
+    // Windows) and never panics if the env var is unset.
+    let mut sessions_dir = dirs::home_dir()?;
     sessions_dir.push(".warp/oh-my-warp/sessions");
 
     let mut args: Vec<OsString> = vec![

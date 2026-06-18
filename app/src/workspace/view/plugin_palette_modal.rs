@@ -13,9 +13,10 @@
 
 use fuzzy_match::match_indices_case_insensitive;
 use warpui::elements::{
-    Border, ChildView, Clipped, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
-    Element, Fill, Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, Padding,
-    ParentElement, Radius, Shrinkable, Text,
+    Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, Clipped, ConstrainedBox,
+    Container, CornerRadius, CrossAxisAlignment, Element, Fill, Flex, Hoverable,
+    MainAxisAlignment, MainAxisSize, MouseStateHandle, Padding, ParentElement, Radius,
+    ScrollbarWidth, Shrinkable, Text,
 };
 use warpui::platform::Cursor;
 use warpui::{
@@ -75,6 +76,9 @@ pub struct PluginPaletteModal {
     /// Per-item hover state, indexed by `filtered`'s position. Resized whenever `filtered` changes.
     row_hover_states: Vec<MouseStateHandle>,
     query_editor: ViewHandle<EditorView>,
+    /// Drives the vertical scrollable wrapper so long item lists stay inside the modal
+    /// frame instead of overflowing it. Same pattern as `PluginMarkdownModal`.
+    scroll_state: ClippedScrollStateHandle,
 }
 
 impl PluginPaletteModal {
@@ -108,6 +112,7 @@ impl PluginPaletteModal {
             selected: None,
             row_hover_states: Vec::new(),
             query_editor,
+            scroll_state: ClippedScrollStateHandle::default(),
         }
     }
 
@@ -422,7 +427,22 @@ impl View for PluginPaletteModal {
             }
         }
 
-        let list_container = Container::new(list.finish())
+
+        // Wrap the list in a vertical scrollable so a long picker (more items than
+        // fit in the 480px-tall modal) stays accessible instead of being clipped off.
+        // Same pattern as `PluginMarkdownModal`: state, body, scrollbar width, dim
+        // thumb color, bright thumb color, background fill.
+        let scrollable = ClippedScrollable::vertical(
+            self.scroll_state.clone(),
+            list.finish(),
+            ScrollbarWidth::Auto,
+            theme.disabled_text_color(theme.background()).into(),
+            theme.main_text_color(theme.background()).into(),
+            Fill::None,
+        )
+        .finish();
+
+        let list_container = Container::new(scrollable)
             .with_horizontal_padding(LIST_HORIZONTAL_PADDING)
             .with_vertical_padding(LIST_VERTICAL_PADDING)
             .finish();

@@ -36,6 +36,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use dirs;
 use tungstenite::{Message, WebSocket};
 use warpui::image_cache::StaticImage;
 
@@ -67,8 +68,8 @@ impl Default for BrowserConfig {
 pub fn load_config() -> BrowserConfig {
     let mut config = BrowserConfig::default();
 
-    if let Some(home_dir) = std::env::var_os("HOME") {
-        let path = std::path::Path::new(&home_dir).join(".warp/oh-my-warp.toml");
+    if let Some(home_dir) = dirs::home_dir() {
+        let path = home_dir.join(".warp/oh-my-warp.toml");
         if let Ok(contents) = std::fs::read_to_string(&path) {
             if let Ok(value) = contents.parse::<toml::Value>() {
                 if let Some(browser) = value.get("browser") {
@@ -249,9 +250,14 @@ impl Drop for BrowserSession {
         // so it exits on its own; we don't join (avoid stalling the UI thread).
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
-            let _ = child.wait();
+            // Reap in the background so we don't stall the UI thread waiting
+            // for the killed process to actually exit. `kill` is async from
+            // our perspective; `wait` would block until the OS reaps the
+            // zombie, which can take arbitrarily long on a stuck process.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
         }
-        drop(self.thread.take());
     }
 }
 
@@ -267,8 +273,7 @@ fn free_port() -> Result<u16> {
 /// panes (sufficient for the agent-driven workflow). Falls back to `$TMPDIR` if
 /// `$HOME` is unset.
 fn endpoint_file_path() -> std::path::PathBuf {
-    let dir = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
+    let dir = dirs::home_dir()
         .map(|h| h.join(".warp/oh-my-warp"))
         .unwrap_or_else(|| std::env::temp_dir().join("oh-my-warp"));
     dir.join("browser-active.json")

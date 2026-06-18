@@ -80,11 +80,17 @@ impl Manifest {
             Ok(text) => match serde_json::from_str::<Manifest>(&text) {
                 Ok(manifest) => manifest,
                 Err(e) => {
-                    log::warn!("Invalid plugin manifest {path:?}: {e}; treating as legacy plugin.");
-                    Self::legacy()
+                    // A malformed manifest must NOT escalate to the legacy
+                    // full-permission surface. Treat it as a restricted plugin
+                    // (no permissions, no capabilities) so a hostile or broken
+                    // `plugin.json` cannot silently grant all capabilities.
+                    log::warn!(
+                        "Invalid plugin manifest {path:?}: {e}; loading with zero permissions."
+                    );
+                    Self::default()
                 }
             },
-            Err(_) => Self::legacy(),
+            Err(_) => Self::default(),
         }
     }
 

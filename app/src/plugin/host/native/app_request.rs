@@ -8,8 +8,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use warpui::r#async::{block_on, executor::Background};
-
+use warpui::r#async::executor::Background;
 use crate::plugin::app_requests::PluginAppRequest;
 use crate::plugin::service::{PluginAppRequestEnvelope, PluginAppRequestService};
 
@@ -36,6 +35,10 @@ pub(super) fn initialize_app_request_relay(client: &Arc<ipc::Client>, executor: 
 /// executor, never on the calling (plugin runner) thread.
 pub(super) fn send_app_request(request: PluginAppRequest) {
     if let Some(tx) = APP_REQUEST_TX.get() {
-        let _ = block_on(tx.send(request));
+        // The relay channel is unbounded, so `send` can never block — use the
+        // synchronous `try_send` directly. Avoids spinning up a runtime via
+        // `block_on` (which would panic if we're already on a tokio executor) and
+        // sidesteps the cross-runtime deadlock risk entirely.
+        let _ = tx.try_send(request);
     }
 }

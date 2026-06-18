@@ -654,18 +654,34 @@ fn normalize_url(input: &str) -> String {
     if host.contains('.') && !host.contains(' ') {
         format!("https://{s}")
     } else {
-        format!("https://www.google.com/search?q={}", s.replace(' ', "+"))
+        // Use proper URL encoding (`url` crate) so special characters like
+        // `&`, `?`, `#`, `%` in the search term are escaped correctly.
+        // A naive `s.replace(' ', "+")` would corrupt queries and let a `#`
+        // silently truncate the search by starting a fragment.
+        let encoded: String = url::form_urlencoded::byte_serialize(s.as_bytes()).collect();
+        format!("https://www.google.com/search?q={encoded}")
     }
 }
 
-/// Opens `url` in the system default browser (macOS `open`).
+/// Opens `url` in the user's system default browser. Picks the platform-correct
+/// opener at compile time so the same binary works on macOS / Linux / Windows.
 fn open_in_system_browser(url: &str) {
-    if let Err(e) = std::process::Command::new("open").arg(url).spawn() {
+    let result = if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else if cfg!(target_os = "windows") {
+        // `cmd /c start` searches `PATH` and respects the user's default-browser
+        // association; quoting the URL defends against `&` in the string.
+        std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn()
+    } else {
+        // Linux and other Unixes. `xdg-open` is the freedesktop standard.
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    if let Err(e) = result {
         log::warn!("[omw-browser] failed to open {url} in system browser: {e}");
     }
 }
 
-impl Entity for BrowserView {
+ impl Entity for BrowserView {
     type Event = BrowserViewEvent;
 }
 

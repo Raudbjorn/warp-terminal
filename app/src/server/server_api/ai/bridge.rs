@@ -26,24 +26,48 @@ use warp_agent_grpc::tonic::{self, transport::Channel};
 pub(crate) struct GrpcBridgeAIClient {
     inner: Arc<dyn AIClient>,
     target: GrpcTarget,
+    /// Lazily-built, cached gRPC channel. `Channel` is `Clone` and manages a
+    /// connection pool internally, so a single `OnceCell` is the canonical
+    /// tonic pattern. Building once and reusing eliminates per-request
+    /// connect+handshake latency.
+    channel: tokio::sync::OnceCell<Channel>,
 }
 
 impl GrpcBridgeAIClient {
     pub(crate) fn new(inner: Arc<dyn AIClient>, target: GrpcTarget) -> Self {
-        Self { inner, target }
+        Self {
+            inner,
+            target,
+            channel: tokio::sync::OnceCell::new(),
+        }
     }
 
-    /// Connects a fresh client to the harness host. (Phase 2 connects per call for
-    /// simplicity; pooling a channel is a later optimization.)
-    async fn client(&self) -> anyhow::Result<AgentServiceClient<Channel>> {
-        let channel = Channel::from_shared(self.target.endpoint.clone())
-            .map_err(|e| anyhow::anyhow!("invalid gRPC endpoint '{}': {e}", self.target.endpoint))?
-            .connect()
+    /// Returns a clone of the cached `Channel`, connecting on the first call.
+    async fn channel(&self) -> anyhow::Result<Channel> {
+        self.channel
+            .get_or_try_init(|| async {
+                Channel::from_shared(self.target.endpoint.clone())
+                    .map_err(|e| {
+                        anyhow::anyhow!("invalid gRPC endpoint '{}': {e}", self.target.endpoint)
+                    })?
+                    .connect()
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "gRPC connect to '{}' failed: {e}",
+                            self.target.endpoint
+                        )
+                    })
+            })
             .await
-            .map_err(|e| {
-                anyhow::anyhow!("gRPC connect to '{}' failed: {e}", self.target.endpoint)
-            })?;
-        Ok(AgentServiceClient::new(channel))
+            .cloned()
+    }
+
+    /// Returns an `AgentServiceClient` backed by the cached channel. Building
+    /// the client wrapper is cheap; the expensive part (the `Channel`) is
+    /// shared via [`Self::channel`].
+    fn client(&self, channel: Channel) -> AgentServiceClient<Channel> {
+        AgentServiceClient::new(channel)
     }
 
     /// Attaches the configured bearer token (if any) to a request.
@@ -211,7 +235,7 @@ impl AIClient for GrpcBridgeAIClient {
         &self,
         request: SpawnAgentRequest,
     ) -> anyhow::Result<SpawnAgentResponse, anyhow::Error> {
-        let mut client = self.client().await?;
+        let mut client = self.client(self.channel().await?);
         let mode = match request.mode {
             UserQueryMode::Normal => pb::AgentMode::Normal,
             UserQueryMode::Plan => pb::AgentMode::Plan,
@@ -534,7 +558,7 @@ impl AIClient for GrpcBridgeAIClient {
         &self,
         request: SendAgentMessageRequest,
     ) -> anyhow::Result<SendAgentMessageResponse, anyhow::Error> {
-        let mut client = self.client().await?;
+        let mut client = self.client(self.channel().await?);
         let pb_req = pb::SendMessageRequest {
             to: request.to,
             subject: request.subject,
@@ -556,7 +580,7 @@ impl AIClient for GrpcBridgeAIClient {
         run_id: &str,
         _request: ListAgentMessagesRequest,
     ) -> anyhow::Result<Vec<AgentMessageHeader>, anyhow::Error> {
-        let mut client = self.client().await?;
+        let mut client = self.client(self.channel().await?);
         let pb_req = pb::ListMessagesRequest {
             run_id: run_id.to_string(),
             limit: 0,
@@ -597,7 +621,7 @@ impl AIClient for GrpcBridgeAIClient {
         run_id: &str,
         request: ReportAgentEventRequest,
     ) -> anyhow::Result<ReportAgentEventResponse, anyhow::Error> {
-        let mut client = self.client().await?;
+        let mut client = self.client(self.channel().await?);
         let pb_req = pb::ReportEventRequest {
             run_id: run_id.to_string(),
             event_type: request.event_type,
@@ -622,7 +646,7 @@ impl AIClient for GrpcBridgeAIClient {
         &self,
         message_id: &str,
     ) -> anyhow::Result<ReadAgentMessageResponse, anyhow::Error> {
-        let mut client = self.client().await?;
+        let mut client = self.client(self.channel().await?);
         let pb_req = pb::ReadMessageRequest {
             message_id: message_id.to_string(),
         };
