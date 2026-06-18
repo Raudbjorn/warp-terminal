@@ -179,6 +179,15 @@ impl Client {
         // re-checking the URL, which would let a loopback URL that passes
         // the initial check redirect to a public host and bypass LocalOnly
         // restrictions. The closure is consulted on every hop.
+        //
+        // Note: calling `.redirect(...)` on the passed builder *replaces* any
+        // redirect policy the caller previously configured (reqwest does not
+        // expose composition). Callers that need a custom redirect policy
+        // must extend the local-only enforcement by chaining a Policy::custom
+        // in front of this one, or by configuring the builder before
+        // `from_client_builder` and accepting that their policy will be
+        // overridden. In practice no caller currently sets a redirect policy
+        // of its own; this note documents the gotcha for future use.
         let client_builder = client_builder.redirect(network_policy_redirect_policy());
         client_builder.build().map(|client| Self {
             wrapped: client,
@@ -394,17 +403,22 @@ impl Client {
 
         let _guard = prevent_sleep_reason.map(prevent_sleep::prevent_sleep);
 
-        cfg_if::cfg_if! {
-            if #[cfg(target_family = "wasm")] {
-                let result = self.wrapped.execute(request).await?;
-            } else {
-                // Explicitly await the future before converting from tokio -> futures. This is because
-                // certain calls to tokio (such as tokio::time::sleep) will panic upon creation if they
-                // are not in a tokio runtime. Wrapping the call in an async block first makes sure that it
-                // is lazily evaluated, ensuring that it is created within a tokio runtime.
-                let result = Compat::new(async { self.wrapped.execute(request).await }).await?;
+        let result = match self.wrapped_execute(request).await {
+            Ok(result) => result,
+            Err(err) => {
+                // Redirect-policy denials originate from
+                // [`network_policy_redirect_policy`], which wraps the
+                // structured `NetworkPolicyDenied` in a `reqwest::Error`.
+                // Remap those here so callers see the same error variant
+                // they would have seen if the URL had been denied by the
+                // initial `check_url` (so `is_recoverable()` returns
+                // `false` instead of triggering spurious retries).
+                if let Some(denied) = redirect_denial_from(&err) {
+                    return Err(Error::NetworkPolicyDenied(denied));
+                }
+                return Err(err.into());
             }
-        }
+        };
 
         if let Some(after_response_received_fn) = &self.after_response_received {
             after_response_received_fn(&result);
@@ -412,6 +426,46 @@ impl Client {
 
         Ok(Response(result))
     }
+
+    /// Await the underlying reqwest client, bridging from `tokio` -> `futures`
+    /// on native targets so the future is created inside a tokio runtime.
+    /// Returns the raw `reqwest::Error` so callers can inspect the source
+    /// chain before the `?` conversion in [`Self::execute`].
+    async fn wrapped_execute(
+        &self,
+        request: reqwest::Request,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        cfg_if::cfg_if! {
+            if #[cfg(target_family = "wasm")] {
+                self.wrapped.execute(request).await
+            } else {
+                // Explicitly await the future before converting from tokio -> futures. This is because
+                // certain calls to tokio (such as tokio::time::sleep) will panic upon creation if they
+                // are not in a tokio runtime. Wrapping the call in an async block first makes sure that it
+                // is lazily evaluated, ensuring that it is created within a tokio runtime.
+                Compat::new(async { self.wrapped.execute(request).await }).await
+            }
+        }
+    }
+}
+
+/// If `err` is a `reqwest::redirect` error whose source is a
+/// `NetworkPolicyDenied`, return a clone of that denial. Used by
+/// [`Client::execute_inner`] to remap deterministic LocalOnly denials
+/// surfaced by the redirect policy into the structured error variant
+/// callers expect.
+fn redirect_denial_from(err: &reqwest::Error) -> Option<NetworkPolicyDenied> {
+    if !err.is_redirect() {
+        return None;
+    }
+    let mut source = std::error::Error::source(err);
+    while let Some(current) = source {
+        if let Some(denied) = current.downcast_ref::<NetworkPolicyDenied>() {
+            return Some(denied.clone());
+        }
+        source = current.source();
+    }
+    None
 }
 
 fn is_warp_server_origin(url: &reqwest::Url) -> bool {
@@ -677,7 +731,15 @@ fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
         if check_redirect_target(attempt.url()) {
             attempt.follow()
         } else {
-            attempt.error("network policy denied redirect")
+            // Build a structured `NetworkPolicyDenied` so the error path in
+            // [`Client::execute_inner`] can remap the resulting
+            // `reqwest::Error` to `Error::NetworkPolicyDenied` instead of
+            // the generic `Error::Reqwest(_)` (which would otherwise make
+            // `is_recoverable()` return `true` and trigger spurious retries
+            // for a deterministic LocalOnly denial).
+            let url = attempt.url().clone();
+            let denied = NetworkPolicyDenied::new("redirect target", url.as_str());
+            attempt.error(denied)
         }
     })
 }

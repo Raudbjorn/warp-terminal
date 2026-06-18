@@ -465,6 +465,12 @@ const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
 
 #[cfg(not(target_family = "wasm"))]
 const GLOBAL_OPTIONS_WITH_VALUES: &[&str] = &[
+    // The skip-with-value heuristic below uses the long-form names from this
+    // list. If/when a short option that takes a separate value is introduced
+    // (e.g. `-k KEY` as a single-character alias for `--api-key KEY`), add its
+    // long-form equivalent here AND its short form, so both `warp --api-key KEY agent`
+    // and `warp -k KEY agent` skip the value when detecting the subcommand.
+    // The current CLI has no short option aliases that consume a separate value.
     "--api-key",
     "--output-format",
     "--server-root-url",
