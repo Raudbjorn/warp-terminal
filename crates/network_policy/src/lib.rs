@@ -125,6 +125,21 @@ mod tests {
     }
 
     #[test]
+    fn local_only_allows_ipv4_mapped_loopback() {
+        for url in [
+            "http://[::ffff:127.0.0.1]:8080",
+            "http://[::ffff:7f00:1]:8080",
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert_eq!(
+                check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
+                Ok(()),
+                "expected {url} to be treated as loopback"
+            );
+        }
+    }
+
+    #[test]
     fn local_only_denies_public_http_and_websocket_urls() {
         for url in [
             "https://app.warp.dev",
