@@ -58,7 +58,12 @@ impl SkillPathOrigin {
         let path = path.into();
         match self {
             SkillPathOrigin::Local | SkillPathOrigin::RestoredDisplayOnly => {
-                Ok(LocalOrRemotePath::Local(PathBuf::from(path)))
+                // Normalize the path to collapse duplicate separators (e.g. `//workspace/...`
+                // → `/workspace/...`) so skill cache lookups match the filesystem-derived keys.
+                // We operate on the raw string rather than using `PathBuf::components().collect()`
+                // because the latter re-serialises with platform-specific separators (backslashes
+                // on Windows) and treats leading `//` as a UNC prefix on Windows.
+                Ok(LocalOrRemotePath::Local(PathBuf::from(collapse_slashes(&path))))
             }
             SkillPathOrigin::Remote { host_id } => {
                 let path = StandardizedPath::try_new(&path)
@@ -258,6 +263,40 @@ fn convert_provider(
         api::skill_descriptor::provider::Type::Github(_) => Ok(SkillProvider::Github),
         api::skill_descriptor::provider::Type::OpenCode(_) => Ok(SkillProvider::OpenCode),
     }
+}
+
+/// Collapses runs of `/` in `path` down to a single separator while preserving
+/// the leading double-slash for Windows UNC paths (e.g. `//server/share/foo`).
+/// On non-Windows platforms, the leading `//` is also collapsed.
+fn collapse_slashes(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    let mut last_was_slash = false;
+    #[cfg(windows)]
+    let mut is_unc = path.starts_with("//");
+    #[cfg(not(windows))]
+    let mut is_unc = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '/' {
+            if is_unc && result.is_empty() {
+                // Preserve the first two slashes of a Windows UNC path.
+                result.push('/');
+                result.push('/');
+                is_unc = false;
+                last_was_slash = true;
+                continue;
+            }
+            if !last_was_slash {
+                result.push('/');
+                last_was_slash = true;
+            }
+        } else {
+            result.push(ch);
+            last_was_slash = false;
+        }
+    }
+    result
 }
 
 #[cfg(test)]

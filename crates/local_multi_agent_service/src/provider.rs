@@ -1268,13 +1268,11 @@ impl HarmonyToolCallValueParser<'_> {
             return self.parse_json_string();
         }
         let start = self.index;
-        while let Some((offset, ch)) = self.rest().char_indices().next() {
-            debug_assert_eq!(offset, 0);
-            if ch == ':' {
-                break;
-            }
-            self.index += ch.len_utf8();
-        }
+        let end = self
+            .rest()
+            .find(':')
+            .unwrap_or_else(|| self.rest().len());
+        self.index += end;
         non_empty_str(self.input[start..self.index].trim()).map(str::to_owned)
     }
 
@@ -1310,13 +1308,11 @@ impl HarmonyToolCallValueParser<'_> {
 
     fn parse_bare_value(&mut self) -> Option<Value> {
         let start = self.index;
-        while let Some((offset, ch)) = self.rest().char_indices().next() {
-            debug_assert_eq!(offset, 0);
-            if matches!(ch, ',' | '}' | ']') {
-                break;
-            }
-            self.index += ch.len_utf8();
-        }
+        let end = self
+            .rest()
+            .find(|ch| matches!(ch, ',' | '}' | ']'))
+            .unwrap_or_else(|| self.rest().len());
+        self.index += end;
         let value = self.input[start..self.index].trim();
         if value.is_empty() {
             return None;

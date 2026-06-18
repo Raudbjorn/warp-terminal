@@ -4,11 +4,11 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 use uuid::Uuid;
 use warp_multi_agent_api as api;
-use warpui_core::{Entity, ModelContext, SingletonEntity};
 use warpui_extras::secure_storage::{self, AppContextExt};
+use warp_core::channel::ChannelState;
 
 pub use crate::aws_credentials::{AwsCredentials, AwsCredentialsState};
-
+pub use crate::geap_credentials::GeapCredentialsState;
 const SECURE_STORAGE_KEY: &str = "AiApiKeys";
 pub const DEFAULT_PROFILE_INFERENCE_KEY: &str = "default";
 
