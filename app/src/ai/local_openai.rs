@@ -536,7 +536,7 @@ impl LocalOpenAIClient {
         user_message: String,
         system_message: Option<String>,
     ) -> Result<String, LocalOpenAIError> {
-        let config = self.configured()?;
+        let config = self.configured_for_command()?;
         if !config.use_responses_api {
             return Err(LocalOpenAIError::ResponsesShape(
                 "responses API is not enabled in local_openai settings".to_string(),
@@ -681,7 +681,6 @@ impl LocalOpenAIClient {
         }
     }
 
-    fn configured(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
     /// Returns the current snapshot if it is runnable for the **command** path
     /// (natural-language → commands, command metadata). The `prediction_model`
     /// may be empty — only `command_model` is required here so the command path

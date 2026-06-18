@@ -402,7 +402,8 @@ impl ErrorExt for AIApiError {
             AIApiError::UnexpectedEof => true,
             AIApiError::QuotaLimit { .. }
             | AIApiError::ServerOverloaded
-            | AIApiError::NoContextFound => false,
+            | AIApiError::NoContextFound
+            | AIApiError::NetworkPolicyDenied(_) => false,
         }
     }
 }
