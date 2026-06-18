@@ -674,12 +674,19 @@ fn denied_eventsource_stream()
 /// the policy in effect at request time.
 fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        if network_policy::check_url(attempt.url(), "redirect target").is_ok() {
+        if check_redirect_target(attempt.url()) {
             attempt.follow()
         } else {
             attempt.error("network policy denied redirect")
         }
     })
+}
+
+/// Returns `true` if a redirect target passes the active network policy.
+/// Extracted from [`network_policy_redirect_policy`] so the decision logic
+/// can be unit-tested without a live `reqwest` redirect attempt.
+fn check_redirect_target(url: &reqwest::Url) -> bool {
+    network_policy::check_url(url, "redirect target").is_ok()
 }
 
 /// An error returned from `Response::error_for_status` that includes response metadata.
@@ -989,5 +996,45 @@ mod tests {
             assert!(err.to_string().contains("NetworkPolicyDenied"));
         })
         .await
+    }
+
+    #[test]
+    fn local_only_allows_loopback_redirect_targets() {
+        run_with_services_mode(network_policy::ServicesMode::LocalOnly, || {
+            for url in [
+                "http://127.0.0.1:8080/redirect",
+                "http://localhost:11434/v1/chat/completions",
+            ] {
+                let url = reqwest::Url::parse(url).unwrap();
+                assert!(
+                    check_redirect_target(&url),
+                    "expected {url} to be allowed as redirect target"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn local_only_denies_public_redirect_targets() {
+        run_with_services_mode(network_policy::ServicesMode::LocalOnly, || {
+            for url in [
+                "https://app.warp.dev/redirect",
+                "https://evil.example.com/steal",
+            ] {
+                let url = reqwest::Url::parse(url).unwrap();
+                assert!(
+                    !check_redirect_target(&url),
+                    "expected {url} to be denied as redirect target"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn online_mode_allows_public_redirect_targets() {
+        run_with_services_mode(network_policy::ServicesMode::Online, || {
+            let url = reqwest::Url::parse("https://app.warp.dev/redirect").unwrap();
+            assert!(check_redirect_target(&url));
+        });
     }
 }
