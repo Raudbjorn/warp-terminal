@@ -936,7 +936,7 @@ async fn start_service(
 }
 
 async fn wait_until_healthy(root_url: Url) -> Result<()> {
-    let started = instant::Instant::now();
+    let started = std::time::Instant::now();
     let mut last_error = None;
     while started.elapsed() < Duration::from_secs(10) {
         match health_check(root_url.clone()).await {
@@ -1094,25 +1094,34 @@ fn service_binary_path() -> Option<PathBuf> {
         }
     }
 
-    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()?
-        .to_path_buf();
-    [
-        workspace_root
-            .join("target")
-            .join("debug")
-            .join(SERVICE_BINARY_NAME),
-        workspace_root
-            .join("target")
-            .join("release-lto")
-            .join(SERVICE_BINARY_NAME),
-        workspace_root
-            .join("target")
-            .join("release")
-            .join(SERVICE_BINARY_NAME),
-    ]
-    .into_iter()
-    .find(|binary| binary.is_file())
+    // The `CARGO_MANIFEST_DIR` fallback only makes sense in dev builds. Embedding
+    // the developer's compile-time path into a production binary leaks filesystem
+    // layout, so skip the lookup entirely in release builds.
+    #[cfg(debug_assertions)]
+    {
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()?
+            .to_path_buf();
+        [
+            workspace_root
+                .join("target")
+                .join("debug")
+                .join(SERVICE_BINARY_NAME),
+            workspace_root
+                .join("target")
+                .join("release-lto")
+                .join(SERVICE_BINARY_NAME),
+            workspace_root
+                .join("target")
+                .join("release")
+                .join(SERVICE_BINARY_NAME),
+        ]
+        .into_iter()
+        .find(|binary| binary.is_file())
+    }
+
+    #[cfg(not(debug_assertions))]
+    None
 }
 
 fn default_graphql_db_path() -> String {

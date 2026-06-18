@@ -968,11 +968,23 @@ async fn execute_docker_command(
 }
 
 fn parse_docker_containers(output: &str) -> Result<Vec<DockerContainerSummary>, String> {
-    output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(parse_docker_container)
-        .collect()
+    let mut containers = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match parse_docker_container(line) {
+            Ok(container) => containers.push(container),
+            Err(error) => {
+                // `docker ps` may emit non-JSON lines (CLI configuration warnings,
+                // credential helper notices, daemon connection alerts). Log and
+                // skip them rather than failing the entire list.
+                log::warn!("Skipping unparseable Docker output line: {error}");
+            }
+        }
+    }
+    Ok(containers)
 }
 
 fn parse_docker_container(line: &str) -> Result<DockerContainerSummary, String> {
