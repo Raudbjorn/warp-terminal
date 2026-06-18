@@ -63,8 +63,7 @@ impl SkillPathOrigin {
                 // We operate on the raw string rather than using `PathBuf::components().collect()`
                 // because the latter re-serialises with platform-specific separators (backslashes
                 // on Windows) and treats leading `//` as a UNC prefix on Windows.
-                let normalized = collapse_slashes(&path);
-                Ok(LocalOrRemotePath::Local(PathBuf::from(normalized)))
+                Ok(LocalOrRemotePath::Local(PathBuf::from(collapse_slashes(&path))))
             }
             SkillPathOrigin::Remote { host_id } => {
                 let path = StandardizedPath::try_new(&path)
@@ -77,28 +76,6 @@ impl SkillPathOrigin {
             SkillPathOrigin::Unavailable => Err(SkillConversionError::PathOriginUnavailable),
         }
     }
-}
-
-/// Collapse consecutive `/` separators into a single one.
-///
-/// Skill paths are always forward-slash POSIX-style paths on all platforms, so we normalise
-/// at the string level rather than using [`std::path::PathBuf::components`], which would
-/// re-serialise with backslashes on Windows and misinterpret `//prefix` as a UNC path.
-fn collapse_slashes(path: &str) -> String {
-    let mut result = String::with_capacity(path.len());
-    let mut prev_slash = false;
-    for ch in path.chars() {
-        if ch == '/' {
-            if !prev_slash {
-                result.push(ch);
-            }
-            prev_slash = true;
-        } else {
-            result.push(ch);
-            prev_slash = false;
-        }
-    }
-    result
 }
 
 fn skill_reference_for_path(
@@ -286,6 +263,40 @@ fn convert_provider(
         api::skill_descriptor::provider::Type::Github(_) => Ok(SkillProvider::Github),
         api::skill_descriptor::provider::Type::OpenCode(_) => Ok(SkillProvider::OpenCode),
     }
+}
+
+/// Collapses runs of `/` in `path` down to a single separator while preserving
+/// the leading double-slash for Windows UNC paths (e.g. `//server/share/foo`).
+/// On non-Windows platforms, the leading `//` is also collapsed.
+fn collapse_slashes(path: &str) -> String {
+    let mut result = String::with_capacity(path.len());
+    let mut chars = path.chars().peekable();
+    let mut last_was_slash = false;
+    #[cfg(windows)]
+    let mut is_unc = path.starts_with("//");
+    #[cfg(not(windows))]
+    let mut is_unc = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '/' {
+            if is_unc && result.is_empty() {
+                // Preserve the first two slashes of a Windows UNC path.
+                result.push('/');
+                result.push('/');
+                is_unc = false;
+                last_was_slash = true;
+                continue;
+            }
+            if !last_was_slash {
+                result.push('/');
+                last_was_slash = true;
+            }
+        } else {
+            result.push(ch);
+            last_was_slash = false;
+        }
+    }
+    result
 }
 
 #[cfg(test)]

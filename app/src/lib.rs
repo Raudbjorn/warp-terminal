@@ -291,7 +291,9 @@ use crate::server::telemetry::{AppStartupInfo, CloseTarget, PaletteSource, Telem
 use crate::session_management::{RunningSessionSummary, SessionNavigationData};
 use crate::settings::cloud_preferences_syncer::initialize_cloud_preferences_syncer;
 use crate::settings::manager::SettingsManager;
-use crate::settings::{AISettings, AccessibilitySettings, ScrollSettings, SelectionSettings};
+use crate::settings::{
+    AISettings, AccessibilitySettings, InputSettings, ScrollSettings, SelectionSettings,
+};
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::settings_view::DisplayCount;
 use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
@@ -693,6 +695,11 @@ pub fn run() -> Result<()> {
                 // Daemon handles its own full initialization (including
                 // initialize_app and crash reporting) inside run_daemon_app.
                 return crate::remote_server::run_daemon(args.identity_key.clone());
+            }
+            #[cfg(not(target_family = "wasm"))]
+            warp_cli::Command::Worker(warp_cli::WorkerCommand::RemoteServerProtocolVersion) => {
+                println!("{}", remote_server::protocol::REMOTE_SERVER_PROTOCOL_VERSION);
+                return Ok(());
             }
             #[cfg(not(target_family = "wasm"))]
             warp_cli::Command::Worker(warp_cli::WorkerCommand::RipgrepSearch {
@@ -1386,29 +1393,37 @@ pub(crate) fn initialize_app(
         let mut manager = ::ai::api_keys::ApiKeyManager::new(ctx);
         #[cfg(not(target_family = "wasm"))]
         manager.subscribe_to_settings_changes(ctx);
-        // Gemini Enterprise (GEAP) credential refresh triggers: workspace
-        // settings saves / team changes and the member's enablement toggle.
-        #[cfg(not(target_family = "wasm"))]
-        if FeatureFlag::GeminiEnterprise.is_enabled() {
-            manager.subscribe_to_geap_settings_changes(ctx);
-        }
-        // The Grok subscription refresher (`ai::grok_subscription`) has no
-        // visibility into workspace policy, so wire the BYO API key policy in
-        // here. The initial value resumes proactive refresh of any tokens
-        // restored from secure storage; TeamsChanged keeps the policy aligned
-        // as team data loads or the workspace changes.
-        #[cfg(not(target_family = "wasm"))]
-        if FeatureFlag::SuperGrok.is_enabled() {
-            use crate::workspaces::user_workspaces::UserWorkspacesEvent;
-            ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |manager, event, ctx| {
-                if matches!(event, UserWorkspacesEvent::TeamsChanged) {
-                    let allowed = UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
-                    manager.set_grok_refresh_allowed(allowed, ctx);
+        manager
+    });
+
+    #[cfg(not(target_family = "wasm"))]
+    ctx.add_singleton_model(|ctx| {
+        let mut manager = local_multi_agent::LocalMultiAgentManager::new(ctx);
+        let local_config = manager.config().clone();
+        let local_ai_autocomplete_enabled =
+            *InputSettings::as_ref(ctx).local_ai_autocomplete.value();
+        ::ai::api_keys::ApiKeyManager::handle(ctx).update(ctx, |api_keys, ctx| {
+            api_keys.migrate_default_profile_local_settings_if_needed(
+                local_config.openai_base_url.clone(),
+                local_config.local_model_aliases.clone(),
+                local_config.local_model_list.clone(),
+                local_ai_autocomplete_enabled,
+                ctx,
+            );
+        });
+        let openai_key = ::ai::api_keys::ApiKeyManager::as_ref(ctx)
+        .openai_key_for_profile(::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY);
+        manager.update_provider_config(openai_key, ctx);
+        ctx.subscribe_to_model(
+            &::ai::api_keys::ApiKeyManager::handle(ctx),
+            |manager: &mut local_multi_agent::LocalMultiAgentManager, event, ctx| {
+                if matches!(event, ::ai::api_keys::ApiKeyManagerEvent::KeysUpdated) {
+                    let openai_key = ::ai::api_keys::ApiKeyManager::as_ref(ctx)
+                        .openai_key_for_profile(::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY);
+                    manager.update_provider_config(openai_key, ctx);
                 }
-            });
-            let allowed = UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
-            manager.set_grok_refresh_allowed(allowed, ctx);
-        }
+            },
+        );
         manager
     });
 

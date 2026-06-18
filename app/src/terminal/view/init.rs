@@ -350,7 +350,12 @@ pub fn init(app: &mut AppContext) {
         } else {
             "ctrl-shift-enter"
         })
-        .with_enabled(|| !ChannelState::is_local_only())
+        // The `AcceptPromptSuggestion` keybinding must remain enabled in local-only
+        // mode: prompt suggestions are produced by the local OpenAI prediction
+        // feature, which is exactly the mode where the user accepts them. The
+        // `with_context_predicate(HAS_PENDING_PROMPT_SUGGESTION)` below already
+        // gates the binding to fire only when a suggestion is actually pending,
+        // so no `with_enabled` is needed.
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
             id!("Terminal") & !id!("IMEOpen") & id!(flags::HAS_PENDING_PROMPT_SUGGESTION),

@@ -5,6 +5,8 @@ pub(crate) mod codex_modal;
 pub mod conversation_list;
 #[cfg(enable_crash_recovery)]
 mod crash_recovery;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod docker_containers;
 pub(crate) mod free_tier_limit_hit_modal;
 pub mod global_search;
 pub(crate) mod launch_modal;
@@ -4087,6 +4089,14 @@ impl Workspace {
                 },
                 LeftPanelDisplayedTab::WarpDrive => ToolPanelView::WarpDrive,
                 LeftPanelDisplayedTab::ConversationListView => ToolPanelView::ConversationListView,
+                #[cfg(not(target_family = "wasm"))]
+                LeftPanelDisplayedTab::CodexConversations => ToolPanelView::CodexConversations,
+                #[cfg(not(target_family = "wasm"))]
+                LeftPanelDisplayedTab::OpenCodeConversations => {
+                    ToolPanelView::OpenCodeConversations
+                }
+                #[cfg(not(target_family = "wasm"))]
+                LeftPanelDisplayedTab::DockerContainers => ToolPanelView::DockerContainers,
             };
             lp.restore_active_view_from_snapshot(active_view, ctx);
             lp.set_active_pane_group(pane_group.clone(), &self.working_directories_model, ctx);
@@ -5681,6 +5691,15 @@ impl Workspace {
         }
     }
 
+    fn pane_locator_exists(&self, pane_view_locator: PaneViewLocator, ctx: &AppContext) -> bool {
+        self.tabs.iter().any(|tab| {
+            tab.pane_group.id() == pane_view_locator.pane_group_id
+                && tab.pane_group.read(ctx, |pane_group, _| {
+                    pane_group.has_pane_id(pane_view_locator.pane_id)
+                })
+        })
+    }
+
     /// Searches this workspace's tabs for the given terminal view and focuses it.
     /// Returns true if the terminal view was found and focused.
     fn focus_terminal_view_locally(
@@ -6246,6 +6265,14 @@ impl Workspace {
                     },
                     ctx,
                 );
+            }
+            #[cfg(not(target_family = "wasm"))]
+            LeftPanelEvent::OpenDockerContainerLogs {
+                container_id,
+                container_name,
+                command,
+            } => {
+                self.open_docker_container_logs(container_id, container_name, command, ctx);
             }
         }
     }
@@ -8202,18 +8229,26 @@ impl Workspace {
         // Ensure there is only one settings pane per window
         let settings_pane_manager = SettingsPaneManager::handle(ctx);
         if let Some(locator) = settings_pane_manager.as_ref(ctx).find_pane(ctx.window_id()) {
-            // Update to new page if specified
-            if let Some(page) = page {
-                self.settings_pane.update(ctx, |settings_pane, ctx| {
-                    settings_pane.set_and_refresh_current_page(page, ctx);
-                    if let Some(search_query) = search_query {
-                        settings_pane.set_search_query(search_query, ctx);
-                    }
-                });
+            if self.pane_locator_exists(locator, ctx) {
+                // Update to new page if specified
+                if let Some(page) = page {
+                    self.settings_pane.update(ctx, |settings_pane, ctx| {
+                        settings_pane.set_and_refresh_current_page(page, ctx);
+                        if let Some(search_query) = search_query {
+                            settings_pane.set_search_query(search_query, ctx);
+                        }
+                    });
+                }
+                // Navigate to and focus existing pane
+                self.focus_pane(locator, ctx);
+                return;
             }
-            // Navigate to and focus existing pane
-            self.focus_pane(locator, ctx);
-            return;
+
+            log::warn!("Dropping stale settings pane locator: {locator:?}");
+            let window_id = ctx.window_id();
+            settings_pane_manager.update(ctx, |manager, ctx| {
+                manager.deregister_pane(&window_id, locator.pane_group_id, locator.pane_id, ctx);
+            });
         }
 
         let ps1_grid_info = self.active_session_ps1_grid_info(ctx);
@@ -17264,6 +17299,43 @@ impl Workspace {
         });
     }
 
+    #[cfg(not(target_family = "wasm"))]
+    fn open_docker_container_logs(
+        &mut self,
+        _container_id: &str,
+        _container_name: &str,
+        command: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !ContextFlag::CreateNewSession.is_enabled() {
+            self.toast_stack.update(ctx, |toast_stack, ctx| {
+                let toast =
+                    DismissibleToast::error("Cannot open a new terminal session".to_string());
+                toast_stack.add_ephemeral_toast(toast, ctx);
+            });
+            return;
+        }
+
+        let active_pane_group = self.active_tab_pane_group();
+        active_pane_group.update(ctx, |pane_group, ctx| {
+            pane_group.add_terminal_pane(PaneGroupDirection::Right, None, ctx);
+        });
+
+        let Some(terminal_view_handle) = active_pane_group.as_ref(ctx).active_session_view(ctx)
+        else {
+            self.toast_stack.update(ctx, |toast_stack, ctx| {
+                let toast =
+                    DismissibleToast::error("Could not open Docker container logs.".to_string());
+                toast_stack.add_ephemeral_toast(toast, ctx);
+            });
+            return;
+        };
+
+        terminal_view_handle.update(ctx, |terminal, ctx| {
+            terminal.execute_command_or_set_pending(command, ctx);
+        });
+    }
+
     fn run_tab_config_skill(&mut self, path: &Path, ctx: &mut ViewContext<Self>) {
         if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
             return;
@@ -19609,6 +19681,12 @@ impl Workspace {
                         ToolPanelView::GlobalSearch { .. } => "Global search",
                         ToolPanelView::WarpDrive => "Warp Drive",
                         ToolPanelView::ConversationListView => "Agent conversations",
+                        #[cfg(not(target_family = "wasm"))]
+                        ToolPanelView::CodexConversations => "Codex conversations",
+                        #[cfg(not(target_family = "wasm"))]
+                        ToolPanelView::OpenCodeConversations => "OpenCode conversations",
+                        #[cfg(not(target_family = "wasm"))]
+                        ToolPanelView::DockerContainers => "Docker containers",
                     }
                 } else {
                     "Tools panel"
@@ -19663,6 +19741,12 @@ impl Workspace {
                 ToolPanelView::GlobalSearch { .. } => "Global search",
                 ToolPanelView::WarpDrive => "Warp Drive",
                 ToolPanelView::ConversationListView => "Agent conversations",
+                #[cfg(not(target_family = "wasm"))]
+                ToolPanelView::CodexConversations => "Codex conversations",
+                #[cfg(not(target_family = "wasm"))]
+                ToolPanelView::OpenCodeConversations => "OpenCode conversations",
+                #[cfg(not(target_family = "wasm"))]
+                ToolPanelView::DockerContainers => "Docker containers",
             }
         } else {
             "Tools panel"
@@ -22938,6 +23022,8 @@ impl Workspace {
         if cfg!(feature = "local_fs") && *CodeSettings::as_ref(ctx).show_project_explorer.value() {
             views.push(ToolPanelView::ProjectExplorer);
         }
+        #[cfg(not(target_family = "wasm"))]
+        views.push(ToolPanelView::DockerContainers);
         if FeatureFlag::AgentViewConversationListView.is_enabled()
             && !ChannelState::is_local_only()
             && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)

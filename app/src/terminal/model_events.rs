@@ -324,6 +324,15 @@ impl ModelEventDispatcher {
     ) {
         ctx.emit(ModelEvent::RemoteServerBlockRequested { session_id });
     }
+
+    /// Emits an event so `TerminalView` can render the remote server update block.
+    pub fn request_remote_server_update_block(
+        &mut self,
+        session_id: SessionId,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        ctx.emit(ModelEvent::RemoteServerUpdateBlockRequested { session_id });
+    }
 }
 
 /// The type of prompt for which a `PromptStart` event has been received.
@@ -435,6 +444,12 @@ pub enum ModelEvent {
     /// Emitted by `ModelEventDispatcher::request_remote_server_block`
     /// when the remote-server binary is missing and the user must choose.
     RemoteServerBlockRequested {
+        session_id: SessionId,
+    },
+    /// Emitted by `ModelEventDispatcher::request_remote_server_update_block`
+    /// when an existing remote-server binary should be updated and the user
+    /// must choose.
+    RemoteServerUpdateBlockRequested {
         session_id: SessionId,
     },
     /// Emitted right before the remote shell for a session exits. Used to

@@ -484,7 +484,7 @@ fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) ->
             return None;
         }
 
-        if arg.starts_with('-') {
+        if arg.starts_with('-') && arg != "-" {
             // Skip both long (`--foo`, `--foo=bar`) and short (`-v`, `-o value`,
             // `-obar`, `-abc`) options. The previous implementation only
             // skipped long options, which let invocations like
@@ -576,6 +576,11 @@ pub enum WorkerCommand {
     #[cfg(not(target_family = "wasm"))]
     #[clap(hide = true)]
     RemoteServerDaemon(RemoteServerIdentityArgs),
+
+    /// Print the remote-server protocol compatibility key.
+    #[cfg(not(target_family = "wasm"))]
+    #[clap(hide = true)]
+    RemoteServerProtocolVersion,
 
     /// Run a headless ripgrep search worker.
     #[cfg(not(target_family = "wasm"))]

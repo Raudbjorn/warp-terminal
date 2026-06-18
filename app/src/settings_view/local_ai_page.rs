@@ -7,6 +7,8 @@ use crate::{
 use settings::{Setting, ToggleableSetting};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use warp_core::channel::ChannelState;
+
 use warpui::{
     elements::{
         Container, CrossAxisAlignment, Element, Flex, MouseStateHandle, ParentElement, Text,
@@ -83,9 +85,11 @@ impl SettingsPageMeta for LocalAISettingsPageView {
     fn section() -> SettingsSection {
         SettingsSection::LocalAI
     }
-
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        true
+        // Local AI (openai-compatible endpoint, model selection) only works in
+        // the local-only channel — in Dev/Preview/Stable the local provider
+        // is not configured, so showing this page would just confuse users.
+        ChannelState::is_local_only()
     }
 
     fn update_filter(&mut self, query: &str, ctx: &mut ViewContext<Self>) -> MatchData {
@@ -190,9 +194,14 @@ impl LocalAIProviderWidget {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
                 // Reject non-positive timeouts (`0ms` would make every request fail
-                // immediately) as well as unparseable input, resetting to the saved value.
+                // immediately) and clamp the upper bound to 1 hour to prevent
+                // integer-overflow panics inside `tokio`/`reqwest` timer wheels when
+                // the duration is added to `Instant::now()`. On any other invalid
+                // input, reset the editor text to the saved value.
                 let value = match buffer_text.trim().parse::<u64>() {
-                    Ok(value) if value > 0 => value,
+                    // Clamp overly-large (but otherwise valid) inputs to the 1-hour
+                    // cap rather than reverting them; reject non-positive/invalid input.
+                    Ok(value) if value > 0 => value.min(crate::ai::local_openai::MAX_LOCAL_OPENAI_TIMEOUT_MS),
                     _ => {
                         log::warn!(
                             "Invalid local OpenAI timeout: {:?}",

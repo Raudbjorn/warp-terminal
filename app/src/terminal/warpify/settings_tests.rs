@@ -56,3 +56,125 @@ fn test_wsl_subshell_detection_fail() {
         )
     });
 }
+
+#[cfg(not(windows))]
+#[test]
+fn ssh_remote_server_is_disabled_by_default_even_when_flag_is_enabled() {
+    let _remote_server = FeatureFlag::SshRemoteServer.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        app.add_singleton_model(WarpifySettings::new_with_defaults);
+
+        app.update(|ctx| {
+            assert!(!WarpifySettings::is_ssh_remote_server_enabled(ctx));
+        });
+    });
+}
+
+#[cfg(not(windows))]
+#[test]
+fn ssh_remote_server_requires_user_setting_and_ssh_warpification() {
+    let _remote_server = FeatureFlag::SshRemoteServer.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        let settings = app.add_singleton_model(WarpifySettings::new_with_defaults);
+
+        settings.update(&mut app, |settings, ctx| {
+            settings
+                .enable_ssh_remote_server
+                .load_value(true, true, ctx)
+                .unwrap();
+        });
+        app.update(|ctx| {
+            assert!(WarpifySettings::is_ssh_remote_server_enabled(ctx));
+        });
+
+        settings.update(&mut app, |settings, ctx| {
+            settings
+                .enable_ssh_warpification
+                .load_value(false, true, ctx)
+                .unwrap();
+        });
+        app.update(|ctx| {
+            assert!(!WarpifySettings::is_ssh_remote_server_enabled(ctx));
+        });
+    });
+}
+
+#[cfg(not(windows))]
+#[test]
+fn ssh_extension_download_settings_default_to_channel_values() {
+    App::test((), |app| async move {
+        let settings = app.add_singleton_model(WarpifySettings::new_with_defaults);
+
+        settings.read(&app, |settings, _ctx| {
+            assert_eq!(
+                settings.ssh_extension_download_base_url.value(),
+                &remote_server::setup::default_download_base_url()
+            );
+            assert_eq!(
+                settings.ssh_extension_download_channel.value(),
+                remote_server::setup::default_download_channel()
+            );
+        });
+    });
+}
+
+#[cfg(not(windows))]
+#[test]
+fn ssh_extension_install_options_use_normalized_download_settings() {
+    App::test((), |mut app| async move {
+        let settings = app.add_singleton_model(WarpifySettings::new_with_defaults);
+
+        settings.update(&mut app, |settings, ctx| {
+            settings
+                .ssh_extension_download_base_url
+                .load_value(
+                    "https://downloads.example.com/warp/cli/".to_string(),
+                    true,
+                    ctx,
+                )
+                .unwrap();
+            settings
+                .ssh_extension_download_channel
+                .load_value("preview".to_string(), true, ctx)
+                .unwrap();
+        });
+
+        settings.read(&app, |settings, _ctx| {
+            let options = settings.ssh_extension_install_options();
+            assert_eq!(
+                options.download_base_url,
+                "https://downloads.example.com/warp/cli"
+            );
+            assert_eq!(options.download_channel, "preview");
+        });
+    });
+}
+
+#[cfg(not(windows))]
+#[test]
+fn ssh_extension_install_options_ignore_stale_production_default_for_oss() {
+    App::test((), |mut app| async move {
+        let settings = app.add_singleton_model(WarpifySettings::new_with_defaults);
+
+        settings.update(&mut app, |settings, ctx| {
+            settings
+                .ssh_extension_download_base_url
+                .load_value(
+                    format!("{}/", remote_server::setup::PRODUCTION_DOWNLOAD_BASE_URL),
+                    true,
+                    ctx,
+                )
+                .unwrap();
+        });
+
+        settings.read(&app, |settings, _ctx| {
+            let options = settings.ssh_extension_install_options();
+            assert_eq!(
+                options.download_base_url,
+                remote_server::setup::default_download_base_url()
+            );
+        });
+    });
+}

@@ -94,7 +94,10 @@ fn is_loopback_url(url: &Url) -> bool {
     // accident.
     match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.to_ipv4_mapped().map_or(false, |ipv4| ipv4.is_loopback())
+        }
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         None => false,
     }
@@ -117,6 +120,21 @@ mod tests {
             assert_eq!(
                 check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
                 Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn local_only_allows_ipv4_mapped_loopback() {
+        for url in [
+            "http://[::ffff:127.0.0.1]:8080",
+            "http://[::ffff:7f00:1]:8080",
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert_eq!(
+                check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
+                Ok(()),
+                "expected {url} to be treated as loopback"
             );
         }
     }
@@ -152,4 +170,19 @@ mod tests {
             Ok(())
         );
     }
+
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_is_recognized() {
+        // IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1 should be treated as loopback
+        let url = Url::parse("http://[::ffff:127.0.0.1]:8080").unwrap();
+        assert!(is_loopback_url(&url));
+    }
+
+    #[test]
+    fn ipv6_link_local_is_not_loopback() {
+        // Link-local addresses (fe80::/10) are NOT loopback
+        let url = Url::parse("http://[fe80::1]:8080").unwrap();
+        assert!(!is_loopback_url(&url));
+    }
+
 }
