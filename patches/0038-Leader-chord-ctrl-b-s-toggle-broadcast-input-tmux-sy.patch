@@ -1,0 +1,27 @@
+From 7f7c9637a85029c40a6b825972533ec95a71e68a Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Mon, 25 May 2026 14:07:04 -0400
+Subject: [PATCH 38/48] Leader chord 'ctrl-b s': toggle broadcast input (tmux
+ synchronize-panes) (oh-my-warp)
+
+---
+ app/src/util/leader.rs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/app/src/util/leader.rs b/app/src/util/leader.rs
+index 907495c7..8bc34331 100644
+--- a/app/src/util/leader.rs
++++ b/app/src/util/leader.rs
+@@ -93,6 +93,12 @@ fn leader_bindings() -> Vec<(&'static str, &'static str, &'static str, Workspace
+             "w",
+             WorkspaceAction::OpenBrowserPane,
+         ), // oh-my-warp: embedded browser pane (w = web)
++        (
++            "leader:toggle_broadcast",
++            "Leader: Toggle Broadcast Input",
++            "s",
++            WorkspaceAction::ToggleSyncTerminalInputsInTab,
++        ), // tmux: synchronize-panes (s = sync) — type once, send to every pane in the tab
+     ]
+ }
+ 

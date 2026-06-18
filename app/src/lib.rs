@@ -11,6 +11,7 @@ mod auth;
 mod autoupdate;
 mod banner;
 mod billing;
+mod browser;
 mod changelog_model;
 mod chip_configurator;
 mod cloud_object;
@@ -619,6 +620,13 @@ pub fn run() -> Result<()> {
     // Parse command-line arguments.
     let args = warp_cli::Args::from_env();
 
+    // oh-my-warp: apply the user-selected server/agent backend (configurable via
+    // agent_backends.toml + the Settings "Default backend" dropdown). Done before
+    // the CLI overrides below so an explicit `--server-root-url` still wins, and
+    // unconditionally (unlike the dev-only CLI gate) since picking a backend is a
+    // deliberate fork feature.
+    crate::util::agent_backends::apply_selected_backend();
+
     // Server URL overrides are only honored on internal dev channels. Release channels silently
     // ignore `--server-root-url` / `--ws-server-url` / `--session-sharing-server-url` (and their
     // `WARP_*` env-var equivalents) so shipped builds can't be redirected away from their
@@ -659,6 +667,24 @@ pub fn run() -> Result<()> {
                 // approximation we can get to running a separate binary.
                 crate::terminal::local_tty::server::run_terminal_server(args);
                 return Ok(());
+            }
+            // oh-my-warp: durable terminal sessions (warpkeep). These run a
+            // transparent dtach-style session keeper bundled in this same binary
+            // (see `terminal::local_tty::warpkeep`); dispatch and return before
+            // any GUI initialization, like the terminal server above.
+            #[cfg(all(feature = "local_tty", unix))]
+            warp_cli::Command::Worker(warp_cli::WorkerCommand::Warpkeep(args)) => {
+                return crate::terminal::local_tty::warpkeep::run_attach(
+                    args.dir.clone(),
+                    args.command.clone(),
+                );
+            }
+            #[cfg(all(feature = "local_tty", unix))]
+            warp_cli::Command::Worker(warp_cli::WorkerCommand::WarpkeepMaster(args)) => {
+                return crate::terminal::local_tty::warpkeep::run_master(
+                    args.socket.clone(),
+                    args.command.clone(),
+                );
             }
             #[cfg(feature = "plugin_host")]
             warp_cli::Command::Worker(warp_cli::WorkerCommand::PluginHost { .. }) => {
@@ -1874,6 +1900,15 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(
         ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel::new,
     );
+    // oh-my-warp: holds plugin-contributed prompt segments (`warp.prompt.set`). Registered
+    // unconditionally so the prompt render path never depends on the plugin host being built in.
+    ctx.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
+    // oh-my-warp: holds plugin-contributed tab-bar status pills (`warp.ui.setStatusItem`). Same
+    // pattern as `PluginPromptModel`: registered unconditionally so the tab-bar render path doesn't
+    // depend on the plugin host being built in (empty store ↔ no pills).
+    ctx.add_singleton_model(|_| {
+        crate::workspace::plugin_status_items::PluginStatusItemsModel::new()
+    });
     ctx.add_singleton_model(
         ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::new,
     );

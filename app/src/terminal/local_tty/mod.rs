@@ -16,6 +16,8 @@ pub mod terminal_attributes;
 pub mod terminal_manager;
 #[cfg(unix)]
 mod unix;
+#[cfg(unix)]
+pub mod warpkeep;
 #[cfg(windows)]
 pub mod windows;
 

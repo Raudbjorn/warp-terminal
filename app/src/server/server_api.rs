@@ -202,8 +202,8 @@ pub enum AIApiError {
     #[error("Failed with status code {0}: {1}")]
     ErrorStatus(http::StatusCode, String),
 
-    #[error(transparent)]
-    NetworkPolicyDenied(#[from] network_policy::NetworkPolicyDenied),
+    #[error("Network policy denied: {0}")]
+    NetworkPolicyDenied(#[source] network_policy::NetworkPolicyDenied),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -1836,7 +1836,9 @@ impl ServerApiProvider {
     }
 
     pub fn get_ai_client(&self) -> Arc<dyn AIClient> {
-        self.server_api.clone()
+        // oh-my-warp: route agent ops through the in-process gRPC bridge when a
+        // gRPC backend is selected; otherwise returns the client unchanged.
+        ai::bridge::maybe_wrap(self.server_api.clone())
     }
 
     pub fn get_command_generation_client(&self) -> Arc<dyn CommandGenerationClient> {

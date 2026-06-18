@@ -1,0 +1,115 @@
+syntax = "proto3";
+
+package agent.v1;
+
+// Example agent-backend service, modeled on the Warp agent operations documented
+// in the repo-root BACKEND_INTERFACE.md (§4 "Agent API surface"). This is a clean
+// gRPC re-expression intended as a reference/foundation for a custom backend or
+// middleware. NOTE: it is NOT the actual Warp wire protocol — Warp speaks
+// GraphQL + REST + SSE. To put a gRPC backend behind Warp you bridge the two
+// (see README.md "Bridging into Warp").
+service AgentService {
+  // Spawn a new agent run.             (Warp: POST /api/v1/agent/run)
+  rpc SpawnAgent(SpawnAgentRequest) returns (SpawnAgentResponse);
+
+  // Send a message to one or more runs. (Warp: POST /api/v1/agent/messages)
+  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
+
+  // Read (and mark read) a message.     (Warp: POST /api/v1/agent/messages/{id}/read)
+  rpc ReadMessage(ReadMessageRequest) returns (ReadMessageResponse);
+
+  // List messages for a run.            (Warp: GET /api/v1/agent/messages/{run_id})
+  rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
+
+  // Report an execution event.          (Warp: POST /api/v1/agent/events/{run_id})
+  rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
+
+  // Stream run events (server-streaming, the gRPC analog of Warp's SSE
+  // /api/v1/agent/events/stream).
+  rpc StreamEvents(StreamEventsRequest) returns (stream AgentRunEvent);
+
+  // Drive an LLM turn: stream completion tokens for a prompt. (No single Warp
+  // REST equivalent — this is where a custom backend's model logic lives.)
+  rpc Chat(ChatRequest) returns (stream ChatChunk);
+}
+
+enum AgentMode {
+  AGENT_MODE_UNSPECIFIED = 0;
+  AGENT_MODE_NORMAL = 1;
+  AGENT_MODE_PLAN = 2;
+  AGENT_MODE_ORCHESTRATE = 3;
+}
+
+message SpawnAgentRequest {
+  string prompt = 1;
+  AgentMode mode = 2;
+  string title = 3;
+  string conversation_id = 4; // resume an existing conversation
+  string parent_run_id = 5;   // for child/sub-agent runs
+  string harness = 6;         // which configured harness to run (e.g. "pi-mono", "claude", "demo")
+}
+message SpawnAgentResponse {
+  string task_id = 1;
+  string run_id = 2;
+  bool at_capacity = 3;
+}
+
+message SendMessageRequest {
+  repeated string to = 1; // recipient run ids
+  string subject = 2;
+  string body = 3;
+  string sender_run_id = 4;
+}
+message SendMessageResponse { repeated string message_ids = 1; }
+
+message ReadMessageRequest { string message_id = 1; }
+message ReadMessageResponse { AgentMessage message = 1; }
+
+message ListMessagesRequest {
+  string run_id = 1;
+  uint32 limit = 2;
+  bool unread_only = 3;
+  string since = 4; // RFC3339 timestamp
+}
+message ListMessagesResponse { repeated AgentMessage messages = 1; }
+
+message AgentMessage {
+  string message_id = 1;
+  string sender_run_id = 2;
+  string subject = 3;
+  string body = 4;
+  string sent_at = 5; // RFC3339
+  string read_at = 6; // RFC3339, empty if unread
+}
+
+message ReportEventRequest {
+  string run_id = 1;
+  string event_type = 2;
+  string execution_id = 3;
+  string ref_id = 4;
+}
+message ReportEventResponse { int64 sequence = 1; }
+
+message StreamEventsRequest {
+  repeated string run_ids = 1;
+  int64 since_sequence = 2;
+}
+message AgentRunEvent {
+  string run_id = 1;
+  string event_type = 2; // "output" (stdout), "stderr", "started", "completed"
+  string ref_id = 3;
+  string execution_id = 4;
+  string occurred_at = 5; // RFC3339
+  int64 sequence = 6;
+  string text = 7;        // line of harness output (for "output"/"stderr"); exit info for "completed"
+}
+
+message ChatRequest {
+  string run_id = 1;
+  string prompt = 2;
+  string model = 3;
+}
+message ChatChunk {
+  string delta = 1;
+  bool done = 2;
+}

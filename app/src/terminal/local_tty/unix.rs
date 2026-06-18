@@ -13,6 +13,7 @@ use std::{io, ptr};
 
 use anyhow::{Context as _, Error, Result};
 use command::blocking::Command;
+use dirs;
 use itertools::Itertools;
 use libc::{self, c_int, winsize, TIOCSCTTY};
 use mio::unix::SourceFd;
@@ -215,6 +216,46 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
     spawn_command_in_pty(command, &size, close_fds)
 }
 
+/// oh-my-warp: wrap the shell invocation in a durable `warpkeep` session so that
+/// running processes survive a Warp crash/quit and are recovered on relaunch.
+/// Controlled by the `OMW_WARPKEEP` env var (enabled by default; set
+/// `OMW_WARPKEEP=0` to disable). Returns `Some((program, args))` to spawn in
+/// place of the shell, or `None` to spawn the shell directly.
+///
+/// `warpkeep` is bundled into this same binary (re-invoked as a hidden `worker`
+/// subcommand, like the terminal server), so there is no external dependency and
+/// nothing to find on `$PATH`. It is byte-transparent — it does not redraw or
+/// interpret the screen — so Warp keeps rendering blocks/AI normally, unlike a
+/// multiplexer such as tmux. See `crate::terminal::local_tty::warpkeep`.
+fn omw_warpkeep_wrap(
+    shell_path: &Path,
+    shell_args: &[OsString],
+) -> Option<(PathBuf, Vec<OsString>)> {
+    let enabled = std::env::var("OMW_WARPKEEP")
+        .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true);
+    if !enabled {
+        return None;
+    }
+
+    let exe = std::env::current_exe().ok()?;
+    // `dirs::home_dir` is cross-platform (uses `HOME` on Unix, `USERPROFILE` on
+    // Windows) and never panics if the env var is unset.
+    let mut sessions_dir = dirs::home_dir()?;
+    sessions_dir.push(".warp/oh-my-warp/sessions");
+
+    let mut args: Vec<OsString> = vec![
+        "warpkeep".into(),
+        "--dir".into(),
+        sessions_dir.into_os_string(),
+        // Everything after `--` is the shell command warpkeep runs/keeps.
+        "--".into(),
+        shell_path.as_os_str().to_owned(),
+    ];
+    args.extend(shell_args.iter().cloned());
+    Some((exe, args))
+}
+
 /// Builds the `Command` for a host-shell PTY session: executable, args,
 /// environment variables, and startup directory.
 ///
@@ -240,10 +281,25 @@ fn build_host_shell_command(
         shell_starter.logical_shell_path().display()
     );
 
-    let mut builder = Command::new(shell_starter.logical_shell_path());
-    for arg in shell_starter.args() {
-        builder.arg(arg);
-    }
+    // oh-my-warp: optionally wrap the shell in a durable `warpkeep` session for
+    // crash/quit recovery (see `omw_warpkeep_wrap`). When wrapping, our own
+    // binary (re-invoked as the `warpkeep` worker) becomes the spawned program
+    // and the shell + its args become the session's command.
+    let mut builder =
+        match omw_warpkeep_wrap(shell_starter.logical_shell_path(), shell_starter.args()) {
+            Some((program, wrap_args)) => {
+                let mut builder = Command::new(program);
+                builder.args(wrap_args);
+                builder
+            }
+            None => {
+                let mut builder = Command::new(shell_starter.logical_shell_path());
+                for arg in shell_starter.args() {
+                    builder.arg(arg);
+                }
+                builder
+            }
+        };
 
     // Support an overridden home directory for integration tests, which
     // should execute in a more hermetic environment than one where the home

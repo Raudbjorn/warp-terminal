@@ -12,6 +12,7 @@ use warpui::{
 };
 
 use super::display_chip::{DisplayChip, DisplayChipConfig, PromptDisplayChipEvent};
+use super::plugin_prompt::{render_plugin_chips_for_side, PluginPromptModel, PromptSide};
 use super::prompt_type::PromptType;
 use super::{git_line_changes_from_chips, ChipResult, ContextChipKind};
 use crate::ai::blocklist::agent_view::AgentViewController;
@@ -20,6 +21,7 @@ use crate::ai::blocklist::{
     BlocklistAIInputEvent, BlocklistAIInputModel,
 };
 use crate::ai::document::ai_document_model::{AIDocumentId, AIDocumentVersion};
+use crate::appearance::Appearance;
 use crate::completer::SessionContext;
 use crate::context_chips::display_chip::{DisplayChipAction, PromptChipShellCommand};
 use crate::settings::InputSettings;
@@ -136,6 +138,11 @@ impl PromptDisplay {
         );
 
         ctx.subscribe_to_model(&agent_view_controller, |_, _, _, ctx| {
+            ctx.notify();
+        });
+
+        // oh-my-warp: re-render when a plugin pushes prompt segments (`warp.prompt.set`).
+        ctx.subscribe_to_model(&PluginPromptModel::handle(ctx), |_, _, _, ctx| {
             ctx.notify();
         });
 
@@ -432,6 +439,17 @@ impl View for PromptDisplay {
                 row.add_child(ChildView::new(display_chip).finish());
             }
         });
+
+        // oh-my-warp: append plugin-contributed segments (`warp.prompt.set`) as native chips —
+        // left-grouped first, then right-grouped. (True right-edge alignment is a follow-up;
+        // the modern UDI prompt has no rprompt region.) Same helper feeds the agent input footer.
+        let appearance = Appearance::as_ref(app);
+        for elem in render_plugin_chips_for_side(PromptSide::Left, app, appearance) {
+            row.add_child(elem);
+        }
+        for elem in render_plugin_chips_for_side(PromptSide::Right, app, appearance) {
+            row.add_child(elem);
+        }
 
         // This is a hack to apply horizontal clipping without vertical clipping (for padding).
         Container::new(

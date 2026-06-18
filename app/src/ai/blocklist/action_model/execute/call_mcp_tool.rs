@@ -102,6 +102,57 @@ impl CallMCPToolExecutor {
             let name_owned = name.to_owned();
             let name_clone = name_owned.clone();
 
+            // oh-my-warp: a plugin-registered AI tool (warp.ai.registerTool) is dispatched
+            // in-process to the plugin host, not to an MCP server. Tool args cross as a JSON string;
+            // the plugin's `run(argsJson)` returns a string result. See PLUGIN_SPEC.md (M4).
+            #[cfg(feature = "plugin_host")]
+            if let Some(function_id) = crate::plugin::ai_tools::function_id(&name_owned) {
+                use crate::plugin::service::{
+                    CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
+                };
+                let args_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
+                let Some(caller) = crate::plugin::PluginHost::handle(ctx)
+                    .as_ref(ctx)
+                    .plugin_service_caller::<CallJsFunctionService>()
+                else {
+                    return ActionExecution::Sync(AIAgentActionResultType::CallMCPTool(
+                        CallMCPToolResult::Error("plugin host unavailable".to_owned()),
+                    ));
+                };
+                let Ok(serialized_input) = warp_js::SerializedJsValue::from_value(args_json) else {
+                    return ActionExecution::Sync(AIAgentActionResultType::CallMCPTool(
+                        CallMCPToolResult::Error("failed to serialize tool args".to_owned()),
+                    ));
+                };
+                let name_for_result = name_clone.clone();
+                return ActionExecution::new_async(
+                    async move {
+                        let text = match caller
+                            .call(CallJsFunctionRequest {
+                                id: function_id,
+                                serialized_input,
+                            })
+                            .await
+                        {
+                            Ok(CallJsFunctionResponse::Success(output)) => output
+                                .to_value::<crate::plugin::ai_tools::ToolOutput>()
+                                .map(|o| o.0.unwrap_or_default())
+                                .unwrap_or_default(),
+                            Ok(CallJsFunctionResponse::Error { message }) => {
+                                format!("plugin tool error: {message}")
+                            }
+                            Err(e) => format!("plugin tool dispatch failed: {e:?}"),
+                        };
+                        Ok(rmcp::model::CallToolResult::success(vec![
+                            rmcp::model::Content::text(text),
+                        ]))
+                    },
+                    move |res, ctx| {
+                        handle_call_tool_result(res, server_output_id, name_for_result, ctx)
+                    },
+                );
+            }
+
             let serde_json::Value::Object(mut arguments) = input.clone() else {
                 return ActionExecution::Sync(AIAgentActionResultType::CallMCPTool(
                     CallMCPToolResult::Error("MCP server tool input not an object".to_owned()),

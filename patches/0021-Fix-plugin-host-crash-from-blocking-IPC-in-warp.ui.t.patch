@@ -1,0 +1,218 @@
+From c3485d61363e306e6f557e53b51922975e0239fe Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Thu, 21 May 2026 16:42:15 -0400
+Subject: [PATCH 21/48] Fix plugin host crash from blocking IPC in
+ warp.ui.toast/keymap.bind (oh-my-warp)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+warp.ui.toast / warp.keymap.bind did a blocking IPC round-trip
+(block_on(caller.call(...))) on the plugin runner thread, inside the QuickJS
+callback. That panics on the runner thread, unwinds out of the JS call, and
+drops the PluginRunner mid-call — aborting in JS_FreeRuntime (the runtime is
+freed before the persisted callbacks). Route these requests through a host-side
+channel drained by a background task that performs the IPC (mirroring the
+logger), so the runner thread only does a non-blocking channel send. See
+app/src/plugin/host/native/app_request.rs and PLUGIN_SPEC.md (M3).
+---
+ app/src/plugin/host/native/app_request.rs | 41 +++++++++++++++++++++
+ app/src/plugin/host/native/js_api/mod.rs  | 43 ++++++++++-------------
+ app/src/plugin/host/native/mod.rs         |  5 +++
+ app/src/plugin/host/native/plugin.rs      | 19 ++--------
+ 4 files changed, 66 insertions(+), 42 deletions(-)
+ create mode 100644 app/src/plugin/host/native/app_request.rs
+
+diff --git a/app/src/plugin/host/native/app_request.rs b/app/src/plugin/host/native/app_request.rs
+new file mode 100644
+index 00000000..33c85080
+--- /dev/null
++++ b/app/src/plugin/host/native/app_request.rs
+@@ -0,0 +1,41 @@
++//! oh-my-warp: relays host→app requests (`warp.ui.toast`, `warp.keymap.bind`) to the app process.
++//!
++//! Mirrors the logger (`super::logging`): a plugin callback enqueues onto a channel — a
++//! non-blocking operation — and a background task performs the actual IPC call. This keeps the
++//! blocking IPC round-trip OFF the plugin runner thread. Doing the IPC inline inside the QuickJS
++//! callback (as an earlier version did) blocks/panics on the runner thread and tears the QuickJS
++//! runtime down mid-call, aborting in `JS_FreeRuntime`. See PLUGIN_SPEC.md (M3).
++
++use std::sync::{Arc, OnceLock};
++
++use warpui::r#async::{block_on, executor::Background};
++
++use crate::plugin::app_requests::PluginAppRequest;
++use crate::plugin::service::{PluginAppRequestEnvelope, PluginAppRequestService};
++
++static APP_REQUEST_TX: OnceLock<async_channel::Sender<PluginAppRequest>> = OnceLock::new();
++
++/// Spawns a background task that forwards queued requests to the app via the IPC
++/// `PluginAppRequestService`. Called once during plugin host startup.
++pub(super) fn initialize_app_request_relay(client: &Arc<ipc::Client>, executor: &Arc<Background>) {
++    let caller = ipc::service_caller::<PluginAppRequestService>(client.clone());
++    let (tx, rx) = async_channel::unbounded::<PluginAppRequest>();
++    let _ = APP_REQUEST_TX.set(tx);
++    executor
++        .spawn(async move {
++            while let Ok(request) = rx.recv().await {
++                if let Err(e) = caller.call(PluginAppRequestEnvelope { request }).await {
++                    eprintln!("Failed to send plugin app request: {e:?}");
++                }
++            }
++        })
++        .detach();
++}
++
++/// Enqueues a host→app request (non-blocking). The IPC call is performed on the background
++/// executor, never on the calling (plugin runner) thread.
++pub(super) fn send_app_request(request: PluginAppRequest) {
++    if let Some(tx) = APP_REQUEST_TX.get() {
++        let _ = block_on(tx.send(request));
++    }
++}
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index d955a2d0..91ef8a34 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -49,8 +49,8 @@ pub fn warp(plugin: PluginHandle, ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>>
+     )?;
+     api.set("commands", commands(plugin.clone(), ctx)?)?;
+     api.set("terminal", terminal(plugin.clone(), ctx)?)?;
+-    api.set("ui", ui(plugin.clone(), ctx)?)?;
+-    api.set("keymap", keymap(plugin.clone(), ctx)?)?;
++    api.set("ui", ui(ctx)?)?;
++    api.set("keymap", keymap(ctx)?)?;
+ 
+     #[cfg(feature = "completions_v2")]
+     api.set("completions", completions(plugin, ctx)?)?;
+@@ -60,23 +60,21 @@ pub fn warp(plugin: PluginHandle, ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>>
+ /// Returns a JS object representing the UI namespace for the Warp Plugin API.
+ ///
+ /// `toast(message: string, kind?: "info" | "warn" | "error")` — shows a transient toast.
+-fn ui<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
++///
++/// The request is enqueued (non-blocking) and relayed to the app on a background task; we must not
++/// do the blocking IPC inline on the plugin runner thread (see `super::app_request`).
++fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+     let ui = Object::new(ctx)?;
+     ui.set(
+         "toast",
+-        Function::new(
+-            ctx,
+-            MutFn::from(move |message: String, kind: Opt<String>| {
+-                let kind = match kind.0.as_deref() {
+-                    Some("error") => ToastKind::Error,
+-                    Some("warn") => ToastKind::Warn,
+-                    _ => ToastKind::Info,
+-                };
+-                plugin
+-                    .get_mut()
+-                    .send_app_request(PluginAppRequest::ShowToast { message, kind });
+-            }),
+-        ),
++        Function::new(ctx, |message: String, kind: Opt<String>| {
++            let kind = match kind.0.as_deref() {
++                Some("error") => ToastKind::Error,
++                Some("warn") => ToastKind::Warn,
++                _ => ToastKind::Info,
++            };
++            super::app_request::send_app_request(PluginAppRequest::ShowToast { message, kind });
++        }),
+     )?;
+     Ok(ui)
+ }
+@@ -85,18 +83,13 @@ fn ui<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>>
+ ///
+ /// `bind(commandId: string, keys: string)` — binds a key sequence (e.g. `"ctrl-b g"`) to a
+ ///     command registered via `warp.commands.register`. The user's `keybindings.yaml` overrides it.
+-fn keymap<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
++fn keymap<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+     let keymap = Object::new(ctx)?;
+     keymap.set(
+         "bind",
+-        Function::new(
+-            ctx,
+-            MutFn::from(move |command_id: String, keys: String| {
+-                plugin
+-                    .get_mut()
+-                    .send_app_request(PluginAppRequest::BindKey { keys, command_id });
+-            }),
+-        ),
++        Function::new(ctx, |command_id: String, keys: String| {
++            super::app_request::send_app_request(PluginAppRequest::BindKey { keys, command_id });
++        }),
+     )?;
+     Ok(keymap)
+ }
+diff --git a/app/src/plugin/host/native/mod.rs b/app/src/plugin/host/native/mod.rs
+index bc293db2..0c260e1b 100644
+--- a/app/src/plugin/host/native/mod.rs
++++ b/app/src/plugin/host/native/mod.rs
+@@ -1,3 +1,4 @@
++mod app_request;
+ mod js_api;
+ mod logging;
+ mod plugin;
+@@ -43,6 +44,10 @@ pub fn run() -> Result<()> {
+         // process via `LogService`.
+         initialize_logging(&client, &executor);
+ 
++        // Relay host→app requests (warp.ui.toast / warp.keymap.bind) via a background task, so the
++        // blocking IPC never runs on a plugin runner thread inside a JS callback.
++        app_request::initialize_app_request_relay(&client, &executor);
++
+         // Spawn plugin runners for each plugin.
+         let (plugin_request_tx, plugin_request_rx) = async_channel::unbounded();
+         let mut plugin_runners =
+diff --git a/app/src/plugin/host/native/plugin.rs b/app/src/plugin/host/native/plugin.rs
+index a89bc590..6fc3474d 100644
+--- a/app/src/plugin/host/native/plugin.rs
++++ b/app/src/plugin/host/native/plugin.rs
+@@ -6,10 +6,9 @@ use anyhow::anyhow;
+ use rquickjs::Context;
+ use warp_js::{JsFunctionId, JsFunctionRegistry, SerializedJsValue};
+ 
+-use crate::plugin::app_requests::PluginAppRequest;
+ use crate::plugin::service::{
+-    PluginAppRequestEnvelope, PluginAppRequestService, RegisterCommandRequest,
+-    RegisterCommandService, RegisterEventHandlerRequest, RegisterEventHandlerService,
++    RegisterCommandRequest, RegisterCommandService, RegisterEventHandlerRequest,
++    RegisterEventHandlerService,
+ };
+ 
+ cfg_if::cfg_if! {
+@@ -51,7 +50,6 @@ impl PluginHandle {
+ pub(super) struct AppServiceCallers {
+     register_command_caller: Box<dyn ipc::ServiceCaller<RegisterCommandService>>,
+     register_event_handler_caller: Box<dyn ipc::ServiceCaller<RegisterEventHandlerService>>,
+-    app_request_caller: Box<dyn ipc::ServiceCaller<PluginAppRequestService>>,
+     #[cfg(feature = "completions_v2")]
+     register_command_signatures_caller:
+         Box<dyn ipc::ServiceCaller<RegisterCommandSignatureService>>,
+@@ -66,7 +64,6 @@ impl AppServiceCallers {
+             register_event_handler_caller: ipc::service_caller::<RegisterEventHandlerService>(
+                 app_client.clone(),
+             ),
+-            app_request_caller: ipc::service_caller::<PluginAppRequestService>(app_client.clone()),
+             #[cfg(feature = "completions_v2")]
+             register_command_signatures_caller: ipc::service_caller::<
+                 RegisterCommandSignatureService,
+@@ -148,18 +145,6 @@ impl Plugin {
+         }
+     }
+ 
+-    /// Sends a request to be handled on the app's foreground executor (`warp.ui.toast`,
+-    /// `warp.keymap.bind`).
+-    pub(super) fn send_app_request(&mut self, request: PluginAppRequest) {
+-        if let Err(e) = warpui::r#async::block_on(
+-            self.app_services
+-                .app_request_caller
+-                .call(PluginAppRequestEnvelope { request }),
+-        ) {
+-            log::warn!("Failed to send plugin app request: {e:?}");
+-        }
+-    }
+-
+     pub(super) fn js_function_registry_mut(&mut self) -> &mut JsFunctionRegistry {
+         &mut self.js_function_registry
+     }

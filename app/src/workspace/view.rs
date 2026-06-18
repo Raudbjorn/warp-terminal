@@ -14,6 +14,8 @@ pub(crate) mod left_panel;
 pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
+mod plugin_markdown_modal;
+mod plugin_palette_modal;
 pub(crate) mod right_panel;
 mod startup_directory;
 mod tab_grouping;
@@ -282,8 +284,8 @@ use crate::pane_group::pane::ActionOrigin;
 #[cfg(feature = "local_fs")]
 use crate::pane_group::FilePane;
 use crate::pane_group::{
-    self, AIFactPane, AnyPaneContent, ChildAgentOrigin, CodeDiffPane, CodePane, CodeReviewPanelArg,
-    Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
+    self, AIFactPane, AnyPaneContent, BrowserPane, ChildAgentOrigin, CodeDiffPane, CodePane,
+    CodeReviewPanelArg, Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
     ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions, PaneGroup, PaneId, PanesLayout,
     TabBarHoverIndex, TerminalPaneId,
 };
@@ -507,6 +509,8 @@ use crate::workspace::view::openwarp_launch_modal::{
 use crate::workspace::view::orchestration_launch_modal::{
     OrchestrationLaunchModal, OrchestrationLaunchModalEvent,
 };
+use crate::workspace::view::plugin_markdown_modal::PluginMarkdownModal;
+use crate::workspace::view::plugin_palette_modal::{PluginPaletteEvent, PluginPaletteModal};
 use crate::workspace::view::right_panel::{RightPanelEvent, RightPanelView};
 use crate::workspace::{ForkFromExchange, ForkedConversationDestination};
 use crate::workspaces::user_workspaces::UserWorkspaces;
@@ -643,6 +647,7 @@ pub(crate) const OPEN_GLOBAL_SEARCH_BINDING_NAME: &str = "workspace:open_global_
 pub(crate) const TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME: &str =
     "workspace:toggle_conversation_list_view";
 pub(crate) const NEW_TAB_BINDING_NAME: &str = "workspace:new_tab";
+pub(crate) const NEW_WEB_TAB_BINDING_NAME: &str = "workspace:new_web_tab";
 pub(crate) const NEW_TERMINAL_TAB_BINDING_NAME: &str = "workspace:new_terminal_tab";
 pub(crate) const NEW_AGENT_TAB_BINDING_NAME: &str = "workspace:new_agent_tab";
 pub(crate) const NEW_AMBIENT_AGENT_TAB_BINDING_NAME: &str = "workspace:new_ambient_agent_tab";
@@ -1059,6 +1064,10 @@ pub struct Workspace {
     pending_session_config_tab_config_chip_tutorial:
         Option<PendingSessionConfigTabConfigChipTutorial>,
     new_worktree_modal: ModalViewState<Modal<NewWorktreeModal>>,
+    // oh-my-warp: modal that renders markdown a plugin requested via `warp.ui.showMarkdown` (M4).
+    plugin_markdown_modal: ModalViewState<Modal<PluginMarkdownModal>>,
+    // oh-my-warp: picker a plugin requested via `warp.ui.showPalette` (M4).
+    plugin_palette_modal: ModalViewState<Modal<PluginPaletteModal>>,
     close_session_confirmation_dialog: ViewHandle<CloseSessionConfirmationDialog>,
     rewind_confirmation_dialog: ViewHandle<RewindConfirmationDialog>,
     delete_conversation_confirmation_dialog: ViewHandle<DeleteConversationConfirmationDialog>,
@@ -2100,6 +2109,163 @@ impl Workspace {
         ModalViewState::new(modal)
     }
 
+    // oh-my-warp: builds the modal that renders plugin-supplied markdown (`warp.ui.showMarkdown`).
+    fn build_plugin_markdown_modal(
+        ctx: &mut ViewContext<Self>,
+    ) -> ModalViewState<Modal<PluginMarkdownModal>> {
+        let body = ctx.add_view(PluginMarkdownModal::new);
+        let modal = ctx.add_typed_action_view(|ctx| {
+            // Wider canvas + uniform inner padding so headings/lists breathe; the body itself wraps
+            // the markdown in a ClippedScrollable so long docs stay inside the frame. Title is
+            // replaced by `show_plugin_markdown` with the plugin-supplied one.
+            Modal::new(Some("Plugin".to_string()), body, ctx)
+                .with_dismiss_on_click()
+                .with_modal_style(UiComponentStyles {
+                    width: Some(640.),
+                    height: Some(560.),
+                    ..Default::default()
+                })
+                .with_body_style(UiComponentStyles {
+                    padding: Some(Coords {
+                        top: 20.,
+                        bottom: 20.,
+                        left: 28.,
+                        right: 28.,
+                    }),
+                    ..Default::default()
+                })
+        });
+        ctx.subscribe_to_view(&modal, |me, _, event, ctx| {
+            if matches!(event, ModalEvent::Close) {
+                me.plugin_markdown_modal.close();
+                ctx.notify();
+            }
+        });
+        ModalViewState::new(modal)
+    }
+
+    /// Opens the plugin markdown modal with the given title/body (`warp.ui.showMarkdown`, M4).
+    #[cfg(feature = "plugin_host")]
+    fn show_plugin_markdown(
+        &mut self,
+        title: String,
+        markdown: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.plugin_markdown_modal.view.update(ctx, |modal, ctx| {
+            modal.set_title(Some(title));
+            modal.body().update(ctx, |body, ctx| {
+                body.set_markdown(&markdown, ctx);
+            });
+        });
+        self.plugin_markdown_modal.open();
+        ctx.focus(&self.plugin_markdown_modal.view);
+        ctx.notify();
+    }
+
+    // oh-my-warp: builds the picker modal for `warp.ui.showPalette`.
+    fn build_plugin_palette_modal(
+        ctx: &mut ViewContext<Self>,
+    ) -> ModalViewState<Modal<PluginPaletteModal>> {
+        let body = ctx.add_typed_action_view(PluginPaletteModal::new);
+        ctx.subscribe_to_view(&body, |me, _, event, ctx| match event {
+            PluginPaletteEvent::Selected(command_id) => {
+                me.plugin_palette_modal.close();
+                ctx.notify();
+                // Run the picked command as a fresh top-level invocation (the calling plugin
+                // callback has already returned, so no re-entrant `plugin.get_mut()`).
+                crate::plugin::commands::run_plugin_command(command_id, ctx);
+            }
+        });
+        let modal = ctx.add_typed_action_view(|ctx| {
+            Modal::new(Some("Plugin".to_string()), body, ctx)
+                .with_dismiss_on_click()
+                .with_modal_style(UiComponentStyles {
+                    width: Some(420.),
+                    height: Some(480.),
+                    ..Default::default()
+                })
+        });
+        ctx.subscribe_to_view(&modal, |me, _, event, ctx| {
+            if matches!(event, ModalEvent::Close) {
+                me.plugin_palette_modal.close();
+                ctx.notify();
+            }
+        });
+        ModalViewState::new(modal)
+    }
+
+    /// Opens the picker modal with the given title/items (`warp.ui.showPalette`, M4).
+    #[cfg(feature = "plugin_host")]
+    fn show_plugin_palette(
+        &mut self,
+        title: String,
+        items: Vec<crate::plugin::app_requests::PalettePluginItem>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.plugin_palette_modal.view.update(ctx, |modal, ctx| {
+            modal.set_title(Some(title));
+            modal.body().update(ctx, |body, ctx| {
+                body.set_items(items, ctx);
+            });
+        });
+        self.plugin_palette_modal.open();
+        ctx.focus(&self.plugin_palette_modal.view);
+        ctx.notify();
+    }
+
+    /// Subscribes to [`crate::plugin::PluginHostEvent`]s so plugin UI requests can open
+    /// workspace-owned surfaces (e.g. the markdown modal). See PLUGIN_SPEC.md (M4).
+    #[cfg(feature = "plugin_host")]
+    fn subscribe_to_plugin_host(ctx: &mut ViewContext<Self>) {
+        let plugin_host = crate::plugin::PluginHost::handle(ctx);
+        ctx.subscribe_to_model(&plugin_host, |me, _, event, ctx| match event {
+            crate::plugin::PluginHostEvent::ShowMarkdown { title, markdown } => {
+                me.show_plugin_markdown(title.clone(), markdown.clone(), ctx);
+            }
+            crate::plugin::PluginHostEvent::ShowPalette { title, items } => {
+                me.show_plugin_palette(title.clone(), items.clone(), ctx);
+            }
+            crate::plugin::PluginHostEvent::OpenWebTab { url } => {
+                // URL flows through `LeafContents::Browser { url }` so it's also
+                // persisted across restart; the restore arm propagates it into
+                // `BrowserView::new` via the one-shot URL override.
+                me.open_web_tab(Some(url.clone()), ctx);
+            }
+            crate::plugin::PluginHostEvent::OpenProject { path } => {
+                // Backs the sessionizer plugin: focus an existing tab rooted at
+                // `path` if one is open, else open a new one (tmux-sessionizer's
+                // switch-or-create).
+                me.open_or_focus_project(path, ctx);
+            }
+            crate::plugin::PluginHostEvent::SetPrompt {
+                plugin_id,
+                segments,
+            } => {
+                // Store the plugin's prompt segments (`warp.prompt.set`); every
+                // `PromptDisplay` observes this singleton model and re-renders.
+                crate::context_chips::plugin_prompt::PluginPromptModel::handle(ctx)
+                    .update(ctx, |model, ctx| {
+                        model.set(plugin_id.clone(), segments.clone(), ctx)
+                    });
+            }
+            crate::plugin::PluginHostEvent::SetStatusItem {
+                plugin_id,
+                item_id,
+                item,
+            } => {
+                // Store the plugin's tab-bar pill (`warp.ui.setStatusItem`). The tab-bar render
+                // path observes the singleton (see `Workspace::new`) and re-renders.
+                crate::workspace::plugin_status_items::PluginStatusItemsModel::handle(ctx).update(
+                    ctx,
+                    |model, ctx| {
+                        model.set(plugin_id.clone(), item_id.clone(), item.clone(), ctx);
+                    },
+                );
+            }
+        });
+    }
+
     fn build_new_worktree_modal(
         ctx: &mut ViewContext<Self>,
     ) -> ModalViewState<Modal<NewWorktreeModal>> {
@@ -2845,6 +3011,16 @@ impl Workspace {
             ctx.notify();
         });
 
+        // oh-my-warp: re-render the tab bar when a plugin pushes a status pill
+        // (`warp.ui.setStatusItem`). The render path reads the singleton each frame; this just
+        // wakes us up when it changes.
+        ctx.observe(
+            &crate::workspace::plugin_status_items::PluginStatusItemsModel::handle(ctx),
+            |_, _, ctx| {
+                ctx.notify();
+            },
+        );
+
         let changelog_model = ChangelogModel::handle(ctx);
         ctx.subscribe_to_model(&changelog_model, |me, _, event, ctx| {
             me.handle_changelog_event(event, ctx);
@@ -2924,6 +3100,8 @@ impl Workspace {
 
         let tab_config_params_modal = Self::build_tab_config_params_modal(ctx);
         let new_worktree_modal = Self::build_new_worktree_modal(ctx);
+        let plugin_markdown_modal = Self::build_plugin_markdown_modal(ctx);
+        let plugin_palette_modal = Self::build_plugin_palette_modal(ctx);
 
         let session_config_modal = Self::build_session_config_modal(ctx);
 
@@ -3172,6 +3350,9 @@ impl Workspace {
         Self::observe_server_api(ctx);
 
         Self::subscribe_to_workspace_toast_stack(toast_stack.clone(), ctx);
+        // oh-my-warp: open plugin UI surfaces (markdown panel) on PluginHost events (M4).
+        #[cfg(feature = "plugin_host")]
+        Self::subscribe_to_plugin_host(ctx);
         Self::subscribe_to_tab_config_errors(toast_stack.clone(), ctx);
         Self::subscribe_to_settings_errors(ctx);
         Self::subscribe_to_shared_session_manager(ctx);
@@ -3317,6 +3498,8 @@ impl Workspace {
             show_session_config_tab_config_chip: false,
             pending_session_config_tab_config_chip_tutorial: None,
             new_worktree_modal,
+            plugin_markdown_modal,
+            plugin_palette_modal,
             close_session_confirmation_dialog,
             rewind_confirmation_dialog,
             delete_conversation_confirmation_dialog,
@@ -6511,6 +6694,14 @@ impl Workspace {
                 menu_items.push(terminal_item.into_item());
             }
         }
+
+        // oh-my-warp: open an embedded browser pane as a new tab.
+        menu_items.push(
+            MenuItemFields::new("New Web Tab")
+                .with_on_select_action(WorkspaceAction::NewWebTab)
+                .with_icon(icons::Icon::Globe)
+                .into_item(),
+        );
 
         // 3. Cloud Agent (if flags enabled)
         if online_agent_ui_enabled
@@ -12652,6 +12843,36 @@ impl Workspace {
         }
     }
 
+    /// Switch-or-create for a project directory (backs `warp.ui.openProject`): if
+    /// any tab already has a terminal whose cwd is `path` (or a subdirectory of
+    /// it), activate that tab; otherwise open a fresh tab rooted at `path`. This
+    /// gives the sessionizer tmux-style "jump to the session if it exists" behavior
+    /// rather than piling up duplicate tabs.
+    fn open_or_focus_project(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
+        let target = PathBuf::from(path);
+        let mut existing_tab: Option<usize> = None;
+        for index in 0..self.tabs.len() {
+            let Some(pane_group) = self.get_pane_group_view(index).cloned() else {
+                continue;
+            };
+            let rooted_here = pane_group
+                .as_ref(ctx)
+                .terminal_view_working_directories(ctx)
+                .any(|(_, cwd)| match cwd {
+                    Some(LocalOrRemotePath::Local(p)) => p == target || p.starts_with(&target),
+                    _ => false,
+                });
+            if rooted_here {
+                existing_tab = Some(index);
+                break;
+            }
+        }
+        match existing_tab {
+            Some(index) => self.activate_tab(index, ctx),
+            None => self.handle_open_repository(path, ctx),
+        }
+    }
+
     fn handle_open_repository(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
         let path_buf = PathBuf::from(path);
         ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
@@ -14676,6 +14897,42 @@ impl Workspace {
                 ctx,
             );
         });
+    }
+
+    /// Opens an embedded browser pane (oh-my-warp) as a right-split of the
+    /// active pane group. Each pane spawns its own Chrome + CDP screencast
+    /// session, so (unlike the network log) we always open a new one rather
+    /// than focusing an existing one.
+    pub(crate) fn open_browser_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        let pane = BrowserPane::new(ctx);
+        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+            pane_group.add_pane_with_direction(
+                Direction::Right,
+                pane,
+                true, /* focus_new_pane */
+                ctx,
+            );
+        });
+    }
+
+    /// Opens an embedded browser pane (oh-my-warp) as its own new tab. `url` is
+    /// the initial page to navigate to; pass `None` (or an empty string) to use
+    /// the configured home page. The URL is plumbed through `LeafContents::Browser`
+    /// so it's also persisted across restarts.
+    pub(crate) fn open_web_tab(&mut self, url: Option<String>, ctx: &mut ViewContext<Self>) {
+        let panes_layout = PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
+            is_focused: true,
+            custom_vertical_tabs_title: None,
+            contents: LeafContents::Browser {
+                url: url.unwrap_or_default(),
+            },
+        })));
+        self.add_tab_with_pane_layout(
+            panes_layout,
+            Arc::new(HashMap::new()),
+            Some("Browser".to_owned()),
+            ctx,
+        );
     }
 
     fn show_handoff_environment_creation_modal(&mut self, ctx: &mut ViewContext<Self>) {
@@ -20040,6 +20297,40 @@ impl Workspace {
         .finish()
     }
 
+    /// oh-my-warp: renders the "leader engaged" pill shown in the tab bar while a
+    /// leader/prefix chord is pending (e.g. after pressing `ctrl-b`), or `None`
+    /// when no chord is in progress. The pending state comes from the keymap
+    /// matcher via `AppContext::keymap_pending_keystrokes`.
+    fn render_leader_indicator(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        let pending = ctx.keymap_pending_keystrokes()?;
+        if pending.is_empty() {
+            return None;
+        }
+        let label = pending
+            .iter()
+            .map(|keystroke| keystroke.displayed())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = Text::new_inline(format!("LEADER {label}"), appearance.ui_font_family(), 11.)
+            .with_color(PhenomenonStyle::body_text())
+            .with_selectable(false)
+            .finish();
+        let pill = Container::new(text)
+            .with_padding_left(8.)
+            .with_padding_right(8.)
+            .with_padding_top(2.)
+            .with_padding_bottom(2.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_background_color(blended_colors::neutral_1(appearance.theme()))
+            .with_margin_right(8.)
+            .finish();
+        Some(pill)
+    }
+
     fn render_tab_bar_contents(
         &self,
         hover_fixed_width: Option<f32>,
@@ -20047,6 +20338,17 @@ impl Workspace {
         ctx: &AppContext,
     ) -> Box<dyn Element> {
         let mut tab_bar = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        // oh-my-warp: show the leader/prefix indicator while a chord is pending.
+        if let Some(indicator) = self.render_leader_indicator(appearance, ctx) {
+            tab_bar.add_child(indicator);
+        }
+        // oh-my-warp: render plugin-contributed status pills (`warp.ui.setStatusItem`) right of
+        // the leader indicator — same anchor, so they share the "system status" eyeline.
+        if let Some(pills) =
+            crate::workspace::plugin_status_items::render_plugin_status_items(ctx, appearance)
+        {
+            tab_bar.add_child(pills);
+        }
         let is_web_anonymous_user = self
             .auth_state
             .is_user_web_anonymous_user()
@@ -23131,6 +23433,25 @@ impl TypedActionView for Workspace {
         }
 
         match action {
+            RunPluginCommand(command_id) => {
+                #[cfg(feature = "plugin_host")]
+                {
+                    // oh-my-warp: a palette item whose command id is
+                    // `warp:openProject:<path>` opens that project (switch-or-create)
+                    // instead of running a registered plugin command. This lets
+                    // plugins (e.g. sessionizer) build fully-dynamic project pickers
+                    // via `showPalette` without registering a command per project —
+                    // which would re-enter `plugin.get_mut()` from inside the command
+                    // callback and crash the host.
+                    if let Some(path) = command_id.strip_prefix("warp:openProject:") {
+                        self.open_or_focus_project(path, ctx);
+                    } else {
+                        crate::plugin::commands::run_plugin_command(command_id, ctx);
+                    }
+                }
+                #[cfg(not(feature = "plugin_host"))]
+                let _ = command_id;
+            }
             ActivateTab(index) => self.activate_tab(*index, ctx),
             ActivateTabByNumber(num) => self.activate_tab(num.saturating_sub(1), ctx),
             ActivatePrevTab => self.activate_prev_tab(ctx),
@@ -23476,6 +23797,12 @@ impl TypedActionView for Workspace {
             }
             OpenNetworkLogPane => {
                 self.open_network_log_pane(ctx);
+            }
+            OpenBrowserPane => {
+                self.open_browser_pane(ctx);
+            }
+            NewWebTab => {
+                self.open_web_tab(None, ctx);
             }
             FixSettingsWithOz { error_description } => {
                 use crate::ai::skills::SkillManager;
@@ -26284,6 +26611,16 @@ impl View for Workspace {
 
         if self.new_worktree_modal.is_open() {
             stack.add_child(self.new_worktree_modal.render());
+        }
+
+        // oh-my-warp: plugin markdown modal (`warp.ui.showMarkdown`, M4).
+        if self.plugin_markdown_modal.is_open() {
+            stack.add_child(self.plugin_markdown_modal.render());
+        }
+
+        // oh-my-warp: plugin picker modal (`warp.ui.showPalette`, M4).
+        if self.plugin_palette_modal.is_open() {
+            stack.add_child(self.plugin_palette_modal.render());
         }
 
         if self.workflow_modal.as_ref(app).is_open() {

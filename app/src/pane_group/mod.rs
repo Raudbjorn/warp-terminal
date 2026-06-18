@@ -177,6 +177,7 @@ mod tests;
 
 pub use pane::ai_document_pane::AIDocumentPane;
 pub use pane::ai_fact_pane::AIFactPane;
+pub use pane::browser_pane::BrowserPane;
 pub use pane::code_diff_pane::CodeDiffPane;
 pub use pane::code_pane::CodePane;
 pub use pane::env_var_collection_pane::EnvVarCollectionPane;
@@ -1947,6 +1948,25 @@ impl PaneGroup {
                     "Network log pane should not have been persisted, as it cannot be restored"
                 ))
             }
+            LeafContents::Browser { url } => {
+                // Browser panes (oh-my-warp) construct a fresh Chrome + CDP
+                // session here. Reached for newly-opened panes/tabs ("New Web
+                // Tab", `warp.ui.openWebTab`) AND on session restore: the URL
+                // captured at save time (or `""` for a default "New Web Tab")
+                // is propagated into `BrowserView::new` via the one-shot URL
+                // override; an empty URL falls back to the configured home.
+                if !url.is_empty() {
+                    crate::browser::view::set_next_browser_url(url.clone());
+                }
+                let pane: Box<dyn AnyPaneContent + 'static> = Box::new(BrowserPane::new(ctx));
+                let pane_id = pane.as_pane().id();
+                pane_contents.insert(pane_id, pane);
+                let focus = InitialFocus {
+                    focused_pane: leaf.is_focused.then_some(pane_id),
+                    active_session: None,
+                };
+                Ok((PaneData::new(pane_id), focus))
+            }
             LeafContents::GetStarted => {
                 if !FeatureFlag::GetStartedTab.is_enabled() {
                     Err(anyhow::anyhow!("GetStarted pane not supported"))
@@ -1967,6 +1987,13 @@ impl PaneGroup {
                 // They are opened on-demand via workspace actions.
                 Err(anyhow::anyhow!(
                     "Environment management panes are not restored"
+                ))
+            }
+            LeafContents::Welcome { .. } => {
+                // Welcome panes are not restored from persistence.
+                // They are opened on-demand via workspace actions.
+                Err(anyhow::anyhow!(
+                    "Welcome panes are not restored"
                 ))
             }
         };

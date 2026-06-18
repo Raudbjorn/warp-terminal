@@ -107,6 +107,15 @@ fn compile_metal_shaders() {
         compile_args.push("-gline-tables-only");
     }
     let result = Command::new("xcrun")
+        // oh-my-warp: when building under nix/devenv, DEVELOPER_DIR points at the
+        // nix apple-sdk (which has no `metal`). If WARP_METAL_DEVELOPER_DIR is set
+        // (see devenv.nix), point xcrun at the system Xcode for the shader compile
+        // only, leaving the rest of the build on the nix toolchain.
+        .envs(
+            std::env::var("WARP_METAL_DEVELOPER_DIR")
+                .ok()
+                .map(|d| ("DEVELOPER_DIR", d)),
+        )
         .args(&compile_args)
         .output()
         .expect("error compiling metal shaders to .air");
@@ -117,6 +126,11 @@ fn compile_metal_shaders() {
     );
 
     let result = Command::new("xcrun")
+        .envs(
+            std::env::var("WARP_METAL_DEVELOPER_DIR")
+                .ok()
+                .map(|d| ("DEVELOPER_DIR", d)),
+        )
         .args(["-sdk", "macosx", "metallib", air_path, "-o", lib_path])
         .output()
         .expect("error compiling metal shaders to .metallib");

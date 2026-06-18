@@ -1,0 +1,1350 @@
+From 0b8028adf5ec796dae09b18a825291947943e1b7 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 20 May 2026 22:48:46 -0400
+Subject: [PATCH 09/48] Add in-process gRPC agent bridge (oh-my-warp)
+
+Routes Warp's agent control ops to a custom gRPC harness host when a gRPC
+backend is selected (agent_backends Backend.grpc_endpoint/harness/token).
+
+- Decorator over Arc<dyn AIClient> (server_api/ai/bridge.rs) injected at
+  ServerApi::get_ai_client(); the 5 control ops (spawn_agent, send/read/list
+  messages, report_event) call the harness host, all other methods forward.
+- gRPC client + generated proto types live in an isolated crate
+  (crates/warp_agent_grpc: tonic 0.12 + its own prost 0.13) to avoid clashing
+  with the app's prost 0.14.
+- Phase 3 (live event stream via ServerApi::stream_agent_events) still pending.
+---
+ Cargo.lock                               | 225 ++++++++-
+ Cargo.toml                               |   4 +
+ app/Cargo.toml                           |   1 +
+ app/src/server/server_api.rs             |   4 +-
+ app/src/server/server_api/ai.rs          |   3 +
+ app/src/server/server_api/ai/bridge.rs   | 558 +++++++++++++++++++++++
+ app/src/util/agent_backends.rs           |  55 ++-
+ crates/warp_agent_grpc/Cargo.toml        |  16 +
+ crates/warp_agent_grpc/build.rs          |   5 +
+ crates/warp_agent_grpc/proto/agent.proto | 115 +++++
+ crates/warp_agent_grpc/src/lib.rs        |  13 +
+ 11 files changed, 968 insertions(+), 31 deletions(-)
+ create mode 100644 app/src/server/server_api/ai/bridge.rs
+ create mode 100644 crates/warp_agent_grpc/Cargo.toml
+ create mode 100644 crates/warp_agent_grpc/build.rs
+ create mode 100644 crates/warp_agent_grpc/proto/agent.proto
+ create mode 100644 crates/warp_agent_grpc/src/lib.rs
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 79126398..b40b91fa 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -557,12 +557,12 @@ name = "app-installation-detection"
+ version = "0.1.0"
+ dependencies = [
+  "anyhow",
+- "axum",
++ "axum 0.8.4",
+  "axum-extra",
+  "command",
+  "nix 0.26.4",
+  "tokio",
+- "tower",
++ "tower 0.5.2",
+  "tower-http",
+  "tracing",
+  "tracing-subscriber",
+@@ -1768,7 +1768,7 @@ dependencies = [
+  "rustls-pki-types",
+  "tokio",
+  "tokio-rustls",
+- "tower",
++ "tower 0.5.2",
+  "tracing",
+ ]
+ 
+@@ -1903,13 +1903,40 @@ dependencies = [
+  "tracing",
+ ]
+ 
++[[package]]
++name = "axum"
++version = "0.7.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
++dependencies = [
++ "async-trait",
++ "axum-core 0.4.5",
++ "bytes",
++ "futures-util",
++ "http 1.4.0",
++ "http-body 1.0.1",
++ "http-body-util",
++ "itoa",
++ "matchit 0.7.3",
++ "memchr",
++ "mime",
++ "percent-encoding",
++ "pin-project-lite",
++ "rustversion",
++ "serde",
++ "sync_wrapper",
++ "tower 0.5.2",
++ "tower-layer",
++ "tower-service",
++]
++
+ [[package]]
+ name = "axum"
+ version = "0.8.4"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "021e862c184ae977658b36c4500f7feac3221ca5da43e3f25bd04ab6c79a29b5"
+ dependencies = [
+- "axum-core",
++ "axum-core 0.5.2",
+  "bytes",
+  "form_urlencoded",
+  "futures-util",
+@@ -1919,7 +1946,7 @@ dependencies = [
+  "hyper",
+  "hyper-util",
+  "itoa",
+- "matchit",
++ "matchit 0.8.4",
+  "memchr",
+  "mime",
+  "percent-encoding",
+@@ -1931,12 +1958,32 @@ dependencies = [
+  "serde_urlencoded",
+  "sync_wrapper",
+  "tokio",
+- "tower",
++ "tower 0.5.2",
+  "tower-layer",
+  "tower-service",
+  "tracing",
+ ]
+ 
++[[package]]
++name = "axum-core"
++version = "0.4.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "09f2bd6146b97ae3359fa0cc6d6b376d9539582c7b4220f041a33ec24c226199"
++dependencies = [
++ "async-trait",
++ "bytes",
++ "futures-util",
++ "http 1.4.0",
++ "http-body 1.0.1",
++ "http-body-util",
++ "mime",
++ "pin-project-lite",
++ "rustversion",
++ "sync_wrapper",
++ "tower-layer",
++ "tower-service",
++]
++
+ [[package]]
+ name = "axum-core"
+ version = "0.5.2"
+@@ -1963,8 +2010,8 @@ version = "0.10.1"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "45bf463831f5131b7d3c756525b305d40f1185b688565648a92e1392ca35713d"
+ dependencies = [
+- "axum",
+- "axum-core",
++ "axum 0.8.4",
++ "axum-core 0.5.2",
+  "bytes",
+  "futures-util",
+  "http 1.4.0",
+@@ -1974,7 +2021,7 @@ dependencies = [
+  "pin-project-lite",
+  "rustversion",
+  "serde",
+- "tower",
++ "tower 0.5.2",
+  "tower-layer",
+  "tower-service",
+ ]
+@@ -4851,7 +4898,7 @@ dependencies = [
+  "itertools 0.14.0",
+  "prost",
+  "prost-reflect",
+- "prost-types",
++ "prost-types 0.14.3",
+  "thiserror 2.0.17",
+ ]
+ 
+@@ -6310,10 +6357,10 @@ dependencies = [
+ name = "http_server"
+ version = "0.0.0"
+ dependencies = [
+- "axum",
++ "axum 0.8.4",
+  "log",
+  "tokio",
+- "tower",
++ "tower 0.5.2",
+  "tower-http",
+  "warp_core",
+  "warpui_core",
+@@ -6386,6 +6433,19 @@ dependencies = [
+  "tower-service",
+ ]
+ 
++[[package]]
++name = "hyper-timeout"
++version = "0.5.2"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "2b90d566bffbce6a75bd8b09a05aa8c2cb1fabb6cb348f8840c9e4c90a0d83b0"
++dependencies = [
++ "hyper",
++ "hyper-util",
++ "pin-project-lite",
++ "tokio",
++ "tower-service",
++]
++
+ [[package]]
+ name = "hyper-util"
+ version = "0.1.16"
+@@ -7889,6 +7949,12 @@ dependencies = [
+  "regex-automata",
+ ]
+ 
++[[package]]
++name = "matchit"
++version = "0.7.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
++
+ [[package]]
+ name = "matchit"
+ version = "0.8.4"
+@@ -8021,7 +8087,7 @@ source = "git+https://github.com/warpdotdev/mermaid-to-svg.git?rev=40cecf2be376e
+ dependencies = [
+  "dagre_rust",
+  "graphlib_rust",
+- "petgraph",
++ "petgraph 0.8.3",
+  "regex",
+  "serde_yaml 0.9.34+deprecated",
+  "thiserror 1.0.63",
+@@ -9676,6 +9742,16 @@ dependencies = [
+  "warp_multi_agent_api",
+ ]
+ 
++[[package]]
++name = "petgraph"
++version = "0.7.1"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "3672b37090dbd86368a4145bc067582552b29c27377cad4e0a306c97f9bd7772"
++dependencies = [
++ "fixedbitset",
++ "indexmap 2.12.0",
++]
++
+ [[package]]
+ name = "petgraph"
+ version = "0.8.3"
+@@ -10191,6 +10267,26 @@ dependencies = [
+  "prost-derive",
+ ]
+ 
++[[package]]
++name = "prost-build"
++version = "0.13.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
++dependencies = [
++ "heck 0.5.0",
++ "itertools 0.14.0",
++ "log",
++ "multimap",
++ "once_cell",
++ "petgraph 0.7.1",
++ "prettyplease",
++ "prost 0.13.5",
++ "prost-types 0.13.5",
++ "regex",
++ "syn 2.0.117",
++ "tempfile",
++]
++
+ [[package]]
+ name = "prost-build"
+ version = "0.14.3"
+@@ -10201,7 +10297,7 @@ dependencies = [
+  "itertools 0.11.0",
+  "log",
+  "multimap",
+- "petgraph",
++ "petgraph 0.8.3",
+  "prettyplease",
+  "prost",
+  "prost-types",
+@@ -10231,7 +10327,7 @@ checksum = "b89455ef41ed200cafc47c76c552ee7792370ac420497e551f16123a9135f76e"
+ dependencies = [
+  "prost",
+  "prost-reflect-derive",
+- "prost-types",
++ "prost-types 0.14.3",
+ ]
+ 
+ [[package]]
+@@ -10240,7 +10336,7 @@ version = "0.16.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "8214ae2c30bbac390db0134d08300e770ef89b6d4e5abf855e8d300eded87e28"
+ dependencies = [
+- "prost-build",
++ "prost-build 0.14.3",
+  "prost-reflect",
+ ]
+ 
+@@ -10255,6 +10351,15 @@ dependencies = [
+  "syn 2.0.117",
+ ]
+ 
++[[package]]
++name = "prost-types"
++version = "0.13.5"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
++dependencies = [
++ "prost 0.13.5",
++]
++
+ [[package]]
+ name = "prost-types"
+ version = "0.14.3"
+@@ -11005,7 +11110,7 @@ dependencies = [
+  "tokio",
+  "tokio-rustls",
+  "tokio-util",
+- "tower",
++ "tower 0.5.2",
+  "tower-http",
+  "tower-service",
+  "url",
+@@ -12090,11 +12195,11 @@ dependencies = [
+ name = "serve-wasm"
+ version = "0.1.0"
+ dependencies = [
+- "axum",
++ "axum 0.8.4",
+  "axum-extra",
+  "clap",
+  "tokio",
+- "tower",
++ "tower 0.5.2",
+  "tower-http",
+  "tracing",
+  "tracing-subscriber",
+@@ -13690,6 +13795,70 @@ version = "1.1.0+spec-1.1.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "d282ade6016312faf3e41e57ebbba0c073e4056dab1232ab1cb624199648f8ed"
+ 
++[[package]]
++name = "tonic"
++version = "0.12.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "877c5b330756d856ffcc4553ab34a5684481ade925ecc54bcd1bf02b1d0d4d52"
++dependencies = [
++ "async-stream",
++ "async-trait",
++ "axum 0.7.9",
++ "base64 0.22.1",
++ "bytes",
++ "h2",
++ "http 1.4.0",
++ "http-body 1.0.1",
++ "http-body-util",
++ "hyper",
++ "hyper-timeout",
++ "hyper-util",
++ "percent-encoding",
++ "pin-project",
++ "prost 0.13.5",
++ "socket2 0.5.10",
++ "tokio",
++ "tokio-stream",
++ "tower 0.4.13",
++ "tower-layer",
++ "tower-service",
++ "tracing",
++]
++
++[[package]]
++name = "tonic-build"
++version = "0.12.3"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "9557ce109ea773b399c9b9e5dca39294110b74f1f342cb347a80d1fce8c26a11"
++dependencies = [
++ "prettyplease",
++ "proc-macro2",
++ "prost-build 0.13.5",
++ "prost-types 0.13.5",
++ "quote",
++ "syn 2.0.117",
++]
++
++[[package]]
++name = "tower"
++version = "0.4.13"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
++dependencies = [
++ "futures-core",
++ "futures-util",
++ "indexmap 1.9.3",
++ "pin-project",
++ "pin-project-lite",
++ "rand 0.8.6",
++ "slab",
++ "tokio",
++ "tokio-util",
++ "tower-layer",
++ "tower-service",
++ "tracing",
++]
++
+ [[package]]
+ name = "tower"
+ version = "0.5.2"
+@@ -13729,7 +13898,7 @@ dependencies = [
+  "pin-project-lite",
+  "tokio",
+  "tokio-util",
+- "tower",
++ "tower 0.5.2",
+  "tower-layer",
+  "tower-service",
+  "tracing",
+@@ -13870,7 +14039,7 @@ checksum = "b8765b90061cba6c22b5831f675da109ae5561588290f9fa2317adab2714d5a6"
+ dependencies = [
+  "memchr",
+  "nom 8.0.0",
+- "petgraph",
++ "petgraph 0.8.3",
+ ]
+ 
+ [[package]]
+@@ -14521,7 +14690,7 @@ dependencies = [
+  "aws-credential-types",
+  "aws-sdk-sts",
+  "aws-types",
+- "axum",
++ "axum 0.8.4",
+  "base64 0.22.1",
+  "bimap",
+  "bincode",
+@@ -14752,6 +14921,7 @@ dependencies = [
+  "walkdir",
+  "warp-command-signatures",
+  "warp-workflows",
++ "warp_agent_grpc",
+  "warp_assets",
+  "warp_cli",
+  "warp_completer",
+@@ -14841,6 +15011,15 @@ dependencies = [
+  "serde",
+ ]
+ 
++[[package]]
++name = "warp_agent_grpc"
++version = "0.1.0"
++dependencies = [
++ "prost 0.13.5",
++ "tonic",
++ "tonic-build",
++]
++
+ [[package]]
+ name = "warp_assets"
+ version = "0.0.0"
+@@ -15166,7 +15345,7 @@ dependencies = [
+  "prost",
+  "prost-reflect",
+  "prost-reflect-build",
+- "prost-types",
++ "prost-types 0.14.3",
+  "regex",
+ ]
+ 
+diff --git a/Cargo.toml b/Cargo.toml
+index 51864444..7fda31f5 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -234,6 +234,10 @@ prost-build = "0.14.3"
+ prost-reflect = "0.16.3"
+ prost-types = "0.14.3"
+ qrcode = { version = "0.14.1", default-features = false }
++# oh-my-warp: in-process agent bridge — an isolated gRPC crate that carries its own
++# prost 0.13 (tonic 0.12), kept out of the workspace's prost 0.14 so the generated
++# proto code doesn't clash with Warp's prost version.
++warp_agent_grpc = { path = "crates/warp_agent_grpc" }
+ rand = "0.8.6"
+ rangemap = "1.3.0"
+ reqwest = { version = "0.13", features = [
+diff --git a/app/Cargo.toml b/app/Cargo.toml
+index abadaecc..562d8850 100644
+--- a/app/Cargo.toml
++++ b/app/Cargo.toml
+@@ -170,6 +170,7 @@ pprof = { workspace = true, optional = true, features = ["protobuf-codec"] }
+ prost.workspace = true
+ prost-types.workspace = true
+ qrcode.workspace = true
++warp_agent_grpc.workspace = true
+ rand.workspace = true
+ rangemap.workspace = true
+ rayon.workspace = true
+diff --git a/app/src/server/server_api.rs b/app/src/server/server_api.rs
+index 53631390..ff1e0b9e 100644
+--- a/app/src/server/server_api.rs
++++ b/app/src/server/server_api.rs
+@@ -1646,7 +1646,9 @@ impl ServerApiProvider {
+     }
+ 
+     pub fn get_ai_client(&self) -> Arc<dyn AIClient> {
+-        self.server_api.clone()
++        // oh-my-warp: route agent ops through the in-process gRPC bridge when a
++        // gRPC backend is selected; otherwise returns the client unchanged.
++        ai::bridge::maybe_wrap(self.server_api.clone())
+     }
+ 
+     pub fn get_cloud_objects_client(&self) -> Arc<dyn ObjectClient> {
+diff --git a/app/src/server/server_api/ai.rs b/app/src/server/server_api/ai.rs
+index 12c43f51..d367b87d 100644
+--- a/app/src/server/server_api/ai.rs
++++ b/app/src/server/server_api/ai.rs
+@@ -1011,6 +1011,9 @@ pub struct ListConnectedSelfHostedWorkersResponse {
+ 
+ pub(crate) const CONNECTED_SELF_HOSTED_WORKERS_PATH: &str = "agent/connected-self-hosted-workers";
+ 
++/// oh-my-warp: in-process gRPC agent bridge that decorates [`AIClient`].
++pub(crate) mod bridge;
++
+ #[cfg_attr(test, automock)]
+ #[cfg_attr(not(target_family = "wasm"), async_trait)]
+ #[cfg_attr(target_family = "wasm", async_trait(?Send))]
+diff --git a/app/src/server/server_api/ai/bridge.rs b/app/src/server/server_api/ai/bridge.rs
+new file mode 100644
+index 00000000..21f00e93
+--- /dev/null
++++ b/app/src/server/server_api/ai/bridge.rs
+@@ -0,0 +1,558 @@
++//! oh-my-warp: in-process bridge that routes Warp's agent operations to a custom
++//! gRPC harness host (see `examples/agent-grpc-backend`) when a gRPC backend is
++//! selected via the backend selector ([`crate::util::agent_backends`]).
++//!
++//! Built in phases (see `examples/agent-grpc-backend/BRIDGE_SPEC.md` §7):
++//!   * **Phase 1 (this file):** a *passthrough* decorator over `Arc<dyn AIClient>`,
++//!     injected at [`super::super::ServerApi::get_ai_client`] and gated on the
++//!     selected backend. It forwards every method to the real client — proving the
++//!     seam compiles + injects with zero behavior change.
++//!   * Phase 2 overrides the agent control ops (spawn/send/read/list/report/…) to
++//!     call the gRPC harness host.
++//!   * Phase 3 bridges the live event stream (`ServerApi::stream_agent_events`).
++//!
++//! Lives as a child module of `ai` so `use super::*` pulls in the `AIClient` trait
++//! and every request/response type without re-importing them.
++
++use super::*;
++use crate::util::agent_backends::GrpcTarget;
++use std::sync::Arc;
++use warp_agent_grpc::pb::{self, agent_service_client::AgentServiceClient};
++use warp_agent_grpc::tonic::{self, transport::Channel};
++
++/// Decorator over the real [`AIClient`]. The agent control ops are routed to the
++/// gRPC harness host; every other method forwards to `inner`.
++pub(crate) struct GrpcBridgeAIClient {
++    inner: Arc<dyn AIClient>,
++    target: GrpcTarget,
++}
++
++impl GrpcBridgeAIClient {
++    pub(crate) fn new(inner: Arc<dyn AIClient>, target: GrpcTarget) -> Self {
++        Self { inner, target }
++    }
++
++    /// Connects a fresh client to the harness host. (Phase 2 connects per call for
++    /// simplicity; pooling a channel is a later optimization.)
++    async fn client(&self) -> anyhow::Result<AgentServiceClient<Channel>> {
++        let channel = Channel::from_shared(self.target.endpoint.clone())
++            .map_err(|e| anyhow::anyhow!("invalid gRPC endpoint '{}': {e}", self.target.endpoint))?
++            .connect()
++            .await
++            .map_err(|e| {
++                anyhow::anyhow!("gRPC connect to '{}' failed: {e}", self.target.endpoint)
++            })?;
++        Ok(AgentServiceClient::new(channel))
++    }
++
++    /// Attaches the configured bearer token (if any) to a request.
++    fn authed<T>(&self, mut req: tonic::Request<T>) -> tonic::Request<T> {
++        if !self.target.token.is_empty() {
++            if let Ok(val) = format!("Bearer {}", self.target.token).parse() {
++                req.metadata_mut().insert("authorization", val);
++            }
++        }
++        req
++    }
++}
++
++/// Wraps `inner` with the gRPC bridge iff a gRPC backend is selected; otherwise
++/// returns `inner` unchanged (built-in Warp behavior). Called from
++/// `ServerApi::get_ai_client()`.
++pub(crate) fn maybe_wrap(inner: Arc<dyn AIClient>) -> Arc<dyn AIClient> {
++    match crate::util::agent_backends::selected_grpc_target() {
++        Some(target) => {
++            log::info!(
++                "oh-my-warp: routing agent ops through gRPC bridge → {} (harness: {})",
++                target.endpoint,
++                if target.harness.is_empty() {
++                    "<default>"
++                } else {
++                    &target.harness
++                }
++            );
++            Arc::new(GrpcBridgeAIClient::new(inner, target))
++        }
++        None => inner,
++    }
++}
++
++#[cfg_attr(not(target_family = "wasm"), async_trait)]
++#[cfg_attr(target_family = "wasm", async_trait(?Send))]
++impl AIClient for GrpcBridgeAIClient {
++    // The agent control ops (spawn / send / read / list / report) route to the
++    // gRPC harness host; every other method forwards to the real client. The live
++    // event stream is bridged separately in Phase 3 (ServerApi::stream_agent_events).
++
++    async fn generate_commands_from_natural_language(
++        &self,
++        prompt: String,
++        ai_execution_context: Option<WarpAiExecutionContext>,
++    ) -> Result<Vec<AIGeneratedCommand>, GenerateCommandsFromNaturalLanguageError> {
++        self.inner
++            .generate_commands_from_natural_language(prompt, ai_execution_context)
++            .await
++    }
++
++    async fn generate_dialogue_answer(
++        &self,
++        transcript: Vec<TranscriptPart>,
++        prompt: String,
++        ai_execution_context: Option<WarpAiExecutionContext>,
++    ) -> anyhow::Result<GenerateDialogueResult> {
++        self.inner
++            .generate_dialogue_answer(transcript, prompt, ai_execution_context)
++            .await
++    }
++
++    async fn generate_metadata_for_command(
++        &self,
++        command: String,
++    ) -> Result<GeneratedCommandMetadata, GeneratedCommandMetadataError> {
++        self.inner.generate_metadata_for_command(command).await
++    }
++
++    async fn get_request_limit_info(&self) -> Result<RequestUsageInfo, anyhow::Error> {
++        self.inner.get_request_limit_info().await
++    }
++
++    async fn get_feature_model_choices(&self) -> Result<ModelsByFeature, anyhow::Error> {
++        self.inner.get_feature_model_choices().await
++    }
++
++    async fn get_available_harnesses(&self) -> Result<Vec<HarnessAvailability>, anyhow::Error> {
++        self.inner.get_available_harnesses().await
++    }
++
++    async fn list_connected_self_hosted_workers(
++        &self,
++    ) -> Result<ListConnectedSelfHostedWorkersResponse, anyhow::Error> {
++        self.inner.list_connected_self_hosted_workers().await
++    }
++
++    async fn get_free_available_models(
++        &self,
++        referrer: Option<String>,
++    ) -> Result<ModelsByFeature, anyhow::Error> {
++        self.inner.get_free_available_models(referrer).await
++    }
++
++    async fn update_merkle_tree(
++        &self,
++        embedding_config: EmbeddingConfig,
++        nodes: Vec<IntermediateNode>,
++    ) -> anyhow::Result<HashMap<NodeHash, bool>> {
++        self.inner.update_merkle_tree(embedding_config, nodes).await
++    }
++
++    async fn generate_code_embeddings(
++        &self,
++        embedding_config: EmbeddingConfig,
++        fragments: Vec<full_source_code_embedding::Fragment>,
++        root_hash: NodeHash,
++        repo_metadata: RepoMetadata,
++    ) -> anyhow::Result<HashMap<ContentHash, bool>> {
++        self.inner
++            .generate_code_embeddings(embedding_config, fragments, root_hash, repo_metadata)
++            .await
++    }
++
++    async fn provide_negative_feedback_response_for_ai_conversation(
++        &self,
++        conversation_id: String,
++        request_ids: Vec<String>,
++    ) -> anyhow::Result<i32, anyhow::Error> {
++        self.inner
++            .provide_negative_feedback_response_for_ai_conversation(conversation_id, request_ids)
++            .await
++    }
++
++    async fn create_agent_task(
++        &self,
++        prompt: String,
++        environment_uid: Option<String>,
++        parent_run_id: Option<String>,
++        config: Option<AgentConfigSnapshot>,
++    ) -> anyhow::Result<AmbientAgentTaskId, anyhow::Error> {
++        self.inner
++            .create_agent_task(prompt, environment_uid, parent_run_id, config)
++            .await
++    }
++
++    async fn update_agent_task(
++        &self,
++        task_id: AmbientAgentTaskId,
++        task_state: Option<AgentTaskState>,
++        session_id: Option<session_sharing_protocol::common::SessionId>,
++        conversation_id: Option<String>,
++        status_message: Option<TaskStatusUpdate>,
++    ) -> anyhow::Result<(), anyhow::Error> {
++        self.inner
++            .update_agent_task(
++                task_id,
++                task_state,
++                session_id,
++                conversation_id,
++                status_message,
++            )
++            .await
++    }
++
++    async fn spawn_agent(
++        &self,
++        request: SpawnAgentRequest,
++    ) -> anyhow::Result<SpawnAgentResponse, anyhow::Error> {
++        let mut client = self.client().await?;
++        let mode = match request.mode {
++            UserQueryMode::Normal => pb::AgentMode::Normal,
++            UserQueryMode::Plan => pb::AgentMode::Plan,
++            UserQueryMode::Orchestrate => pb::AgentMode::Orchestrate,
++        } as i32;
++        let pb_req = pb::SpawnAgentRequest {
++            prompt: request.prompt,
++            mode,
++            title: request.title.unwrap_or_default(),
++            conversation_id: request.conversation_id.unwrap_or_default(),
++            parent_run_id: request.parent_run_id.unwrap_or_default(),
++            harness: self.target.harness.clone(),
++        };
++        let resp = client
++            .spawn_agent(self.authed(tonic::Request::new(pb_req)))
++            .await
++            .map_err(|e| anyhow::anyhow!("gRPC SpawnAgent failed: {e}"))?
++            .into_inner();
++        let task_id = resp.task_id.parse::<AmbientAgentTaskId>().map_err(|e| {
++            anyhow::anyhow!(
++                "harness host returned non-UUID task_id '{}': {e}",
++                resp.task_id
++            )
++        })?;
++        Ok(SpawnAgentResponse {
++            task_id,
++            run_id: resp.run_id,
++            at_capacity: resp.at_capacity,
++        })
++    }
++
++    async fn upload_local_handoff_snapshot(
++        &self,
++        request: UploadLocalHandoffSnapshotRequest,
++    ) -> anyhow::Result<UploadLocalHandoffSnapshotResponse, anyhow::Error> {
++        self.inner.upload_local_handoff_snapshot(request).await
++    }
++
++    async fn fork_conversation(
++        &self,
++        conversation_id: String,
++        title: Option<String>,
++    ) -> anyhow::Result<ForkConversationResponse, anyhow::Error> {
++        self.inner.fork_conversation(conversation_id, title).await
++    }
++
++    async fn list_ambient_agent_tasks(
++        &self,
++        limit: i32,
++        filter: TaskListFilter,
++    ) -> anyhow::Result<Vec<AmbientAgentTask>, anyhow::Error> {
++        self.inner.list_ambient_agent_tasks(limit, filter).await
++    }
++
++    async fn list_agent_runs_raw(
++        &self,
++        limit: i32,
++        filter: TaskListFilter,
++    ) -> anyhow::Result<serde_json::Value, anyhow::Error> {
++        self.inner.list_agent_runs_raw(limit, filter).await
++    }
++
++    async fn get_ambient_agent_task(
++        &self,
++        task_id: &AmbientAgentTaskId,
++    ) -> anyhow::Result<AmbientAgentTask, anyhow::Error> {
++        self.inner.get_ambient_agent_task(task_id).await
++    }
++
++    async fn get_agent_run_raw(
++        &self,
++        task_id: &AmbientAgentTaskId,
++    ) -> anyhow::Result<serde_json::Value, anyhow::Error> {
++        self.inner.get_agent_run_raw(task_id).await
++    }
++
++    async fn submit_run_followup(
++        &self,
++        run_id: &AmbientAgentTaskId,
++        request: RunFollowupRequest,
++    ) -> anyhow::Result<(), anyhow::Error> {
++        self.inner.submit_run_followup(run_id, request).await
++    }
++
++    async fn get_scheduled_agent_history(
++        &self,
++        schedule_id: &str,
++    ) -> anyhow::Result<ScheduledAgentHistory, anyhow::Error> {
++        self.inner.get_scheduled_agent_history(schedule_id).await
++    }
++
++    async fn get_ai_conversation(
++        &self,
++        server_conversation_token: ServerConversationToken,
++    ) -> anyhow::Result<(ConversationData, ServerAIConversationMetadata), anyhow::Error> {
++        self.inner
++            .get_ai_conversation(server_conversation_token)
++            .await
++    }
++
++    async fn list_ai_conversation_metadata(
++        &self,
++        conversation_ids: Option<Vec<String>>,
++    ) -> anyhow::Result<Vec<ServerAIConversationMetadata>> {
++        self.inner
++            .list_ai_conversation_metadata(conversation_ids)
++            .await
++    }
++
++    async fn get_ai_conversation_format(
++        &self,
++        server_conversation_token: ServerConversationToken,
++    ) -> anyhow::Result<AIAgentConversationFormat, anyhow::Error> {
++        self.inner
++            .get_ai_conversation_format(server_conversation_token)
++            .await
++    }
++
++    async fn get_block_snapshot(
++        &self,
++        server_conversation_token: ServerConversationToken,
++    ) -> anyhow::Result<SerializedBlock, anyhow::Error> {
++        self.inner
++            .get_block_snapshot(server_conversation_token)
++            .await
++    }
++
++    async fn delete_ai_conversation(
++        &self,
++        server_conversation_token: String,
++    ) -> anyhow::Result<(), anyhow::Error> {
++        self.inner
++            .delete_ai_conversation(server_conversation_token)
++            .await
++    }
++
++    async fn list_agents(
++        &self,
++        repo: Option<String>,
++    ) -> anyhow::Result<Vec<AgentListItem>, anyhow::Error> {
++        self.inner.list_agents(repo).await
++    }
++
++    async fn cancel_ambient_agent_task(
++        &self,
++        task_id: &AmbientAgentTaskId,
++    ) -> anyhow::Result<(), anyhow::Error> {
++        self.inner.cancel_ambient_agent_task(task_id).await
++    }
++
++    async fn get_task_git_credentials(
++        &self,
++        task_id: String,
++        workload_token: String,
++    ) -> anyhow::Result<Vec<GitCredential>, anyhow::Error> {
++        self.inner
++            .get_task_git_credentials(task_id, workload_token)
++            .await
++    }
++
++    async fn get_task_attachments(
++        &self,
++        task_id: String,
++    ) -> anyhow::Result<Vec<TaskAttachment>, anyhow::Error> {
++        self.inner.get_task_attachments(task_id).await
++    }
++
++    async fn create_file_artifact_upload_target(
++        &self,
++        request: CreateFileArtifactUploadRequest,
++    ) -> anyhow::Result<CreateFileArtifactUploadResponse, anyhow::Error> {
++        self.inner.create_file_artifact_upload_target(request).await
++    }
++
++    async fn confirm_file_artifact_upload(
++        &self,
++        artifact_uid: String,
++        checksum: String,
++    ) -> anyhow::Result<FileArtifactRecord, anyhow::Error> {
++        self.inner
++            .confirm_file_artifact_upload(artifact_uid, checksum)
++            .await
++    }
++
++    async fn get_artifact_download(
++        &self,
++        artifact_uid: &str,
++    ) -> anyhow::Result<ArtifactDownloadResponse, anyhow::Error> {
++        self.inner.get_artifact_download(artifact_uid).await
++    }
++
++    async fn prepare_attachments_for_upload(
++        &self,
++        task_id: &AmbientAgentTaskId,
++        files: &[AttachmentFileInfo],
++    ) -> anyhow::Result<PrepareAttachmentUploadsResponse, anyhow::Error> {
++        self.inner
++            .prepare_attachments_for_upload(task_id, files)
++            .await
++    }
++
++    async fn download_task_attachments(
++        &self,
++        task_id: &AmbientAgentTaskId,
++        attachment_ids: &[String],
++    ) -> anyhow::Result<DownloadAttachmentsResponse, anyhow::Error> {
++        self.inner
++            .download_task_attachments(task_id, attachment_ids)
++            .await
++    }
++
++    async fn get_handoff_snapshot_attachments(
++        &self,
++        task_id: &AmbientAgentTaskId,
++    ) -> anyhow::Result<Vec<TaskAttachment>, anyhow::Error> {
++        self.inner.get_handoff_snapshot_attachments(task_id).await
++    }
++
++    async fn send_agent_message(
++        &self,
++        request: SendAgentMessageRequest,
++    ) -> anyhow::Result<SendAgentMessageResponse, anyhow::Error> {
++        let mut client = self.client().await?;
++        let pb_req = pb::SendMessageRequest {
++            to: request.to,
++            subject: request.subject,
++            body: request.body,
++            sender_run_id: request.sender_run_id,
++        };
++        let resp = client
++            .send_message(self.authed(tonic::Request::new(pb_req)))
++            .await
++            .map_err(|e| anyhow::anyhow!("gRPC SendMessage failed: {e}"))?
++            .into_inner();
++        Ok(SendAgentMessageResponse {
++            message_ids: resp.message_ids,
++        })
++    }
++
++    async fn list_agent_messages(
++        &self,
++        run_id: &str,
++        _request: ListAgentMessagesRequest,
++    ) -> anyhow::Result<Vec<AgentMessageHeader>, anyhow::Error> {
++        let mut client = self.client().await?;
++        let pb_req = pb::ListMessagesRequest {
++            run_id: run_id.to_string(),
++            limit: 0,
++            unread_only: false,
++            since: String::new(),
++        };
++        let resp = client
++            .list_messages(self.authed(tonic::Request::new(pb_req)))
++            .await
++            .map_err(|e| anyhow::anyhow!("gRPC ListMessages failed: {e}"))?
++            .into_inner();
++        Ok(resp
++            .messages
++            .into_iter()
++            .map(|m| AgentMessageHeader {
++                message_id: m.message_id,
++                sender_run_id: m.sender_run_id,
++                subject: m.subject,
++                sent_at: m.sent_at,
++                delivered_at: None,
++                read_at: (!m.read_at.is_empty()).then_some(m.read_at),
++            })
++            .collect())
++    }
++
++    async fn update_event_sequence_on_server(
++        &self,
++        run_id: &str,
++        sequence: i64,
++    ) -> anyhow::Result<(), anyhow::Error> {
++        self.inner
++            .update_event_sequence_on_server(run_id, sequence)
++            .await
++    }
++
++    async fn report_agent_event(
++        &self,
++        run_id: &str,
++        request: ReportAgentEventRequest,
++    ) -> anyhow::Result<ReportAgentEventResponse, anyhow::Error> {
++        let mut client = self.client().await?;
++        let pb_req = pb::ReportEventRequest {
++            run_id: run_id.to_string(),
++            event_type: request.event_type,
++            execution_id: request.execution_id.unwrap_or_default(),
++            ref_id: request.ref_id.unwrap_or_default(),
++        };
++        let resp = client
++            .report_event(self.authed(tonic::Request::new(pb_req)))
++            .await
++            .map_err(|e| anyhow::anyhow!("gRPC ReportEvent failed: {e}"))?
++            .into_inner();
++        Ok(ReportAgentEventResponse {
++            sequence: resp.sequence,
++        })
++    }
++
++    async fn mark_message_delivered(&self, message_id: &str) -> anyhow::Result<(), anyhow::Error> {
++        self.inner.mark_message_delivered(message_id).await
++    }
++
++    async fn read_agent_message(
++        &self,
++        message_id: &str,
++    ) -> anyhow::Result<ReadAgentMessageResponse, anyhow::Error> {
++        let mut client = self.client().await?;
++        let pb_req = pb::ReadMessageRequest {
++            message_id: message_id.to_string(),
++        };
++        let m = client
++            .read_message(self.authed(tonic::Request::new(pb_req)))
++            .await
++            .map_err(|e| anyhow::anyhow!("gRPC ReadMessage failed: {e}"))?
++            .into_inner()
++            .message
++            .unwrap_or_default();
++        Ok(ReadAgentMessageResponse {
++            message_id: m.message_id,
++            sender_run_id: m.sender_run_id,
++            subject: m.subject,
++            body: m.body,
++            sent_at: m.sent_at,
++            delivered_at: None,
++            read_at: (!m.read_at.is_empty()).then_some(m.read_at),
++        })
++    }
++
++    async fn get_public_conversation(
++        &self,
++        conversation_id: &str,
++    ) -> anyhow::Result<serde_json::Value, anyhow::Error> {
++        self.inner.get_public_conversation(conversation_id).await
++    }
++
++    async fn get_run_conversation(
++        &self,
++        run_id: &str,
++    ) -> anyhow::Result<serde_json::Value, anyhow::Error> {
++        self.inner.get_run_conversation(run_id).await
++    }
++
++    async fn generate_code_review_content(
++        &self,
++        request: GenerateCodeReviewContentRequest,
++    ) -> Result<GenerateCodeReviewContentResponse, anyhow::Error> {
++        self.inner.generate_code_review_content(request).await
++    }
++}
+diff --git a/app/src/util/agent_backends.rs b/app/src/util/agent_backends.rs
+index 0a2bf050..53a9f04c 100644
+--- a/app/src/util/agent_backends.rs
++++ b/app/src/util/agent_backends.rs
+@@ -41,12 +41,26 @@ pub struct Backend {
+     /// Human-friendly name shown in the dropdown (falls back to `id`).
+     #[serde(default)]
+     pub name: String,
+-    /// Server root URL, e.g. `https://warp.my-company.dev`.
++    /// Server root URL, e.g. `https://warp.my-company.dev`. Empty = don't override
++    /// the server URL — e.g. a gRPC-only agent backend that keeps Warp's default
++    /// server for everything except the bridged agent ops.
++    #[serde(default)]
+     pub server_url: String,
+     /// Websocket / RTC URL, e.g. `wss://rtc.warp.my-company.dev/graphql/v2`.
+     /// Optional — if empty, only the server URL is overridden.
+     #[serde(default)]
+     pub ws_url: String,
++    /// gRPC harness-host endpoint, e.g. `http://127.0.0.1:50061`. When set, the
++    /// in-process agent bridge ([`crate::server::server_api::ai::bridge`]) routes
++    /// agent operations to this host. Optional; empty = a plain URL-override backend.
++    #[serde(default)]
++    pub grpc_endpoint: String,
++    /// Harness to spawn on the gRPC host (e.g. `claude`, `pi-mono`, `demo`).
++    #[serde(default)]
++    pub grpc_harness: String,
++    /// Bearer token sent to the gRPC host's auth interceptor (optional).
++    #[serde(default)]
++    pub grpc_token: String,
+ }
+ 
+ impl Backend {
+@@ -138,6 +152,31 @@ pub fn set_selected(id: &str) {
+     }
+ }
+ 
++/// gRPC routing target for the in-process agent bridge.
++#[derive(Debug, Clone)]
++pub struct GrpcTarget {
++    pub endpoint: String,
++    pub harness: String,
++    pub token: String,
++}
++
++/// The gRPC target of the selected backend, if it defines a `grpc_endpoint`.
++/// Used by the in-process agent bridge to decide whether to route agent ops to a
++/// custom harness host. `None` for the built-in Warp backend or any backend
++/// without a `grpc_endpoint`.
++pub fn selected_grpc_target() -> Option<GrpcTarget> {
++    let config = load();
++    let backend = config.selected_backend()?;
++    if backend.grpc_endpoint.is_empty() {
++        return None;
++    }
++    Some(GrpcTarget {
++        endpoint: backend.grpc_endpoint.clone(),
++        harness: backend.grpc_harness.clone(),
++        token: backend.grpc_token.clone(),
++    })
++}
++
+ /// Applies the selected backend's URLs by overriding `ChannelState`. No-op for
+ /// the built-in Warp backend. Call this at startup BEFORE the server client,
+ /// GraphQL, or auth read the URLs.
+@@ -146,12 +185,14 @@ pub fn apply_selected_backend() {
+     let Some(backend) = config.selected_backend() else {
+         return;
+     };
+-    if let Err(e) = ChannelState::override_server_root_url(backend.server_url.clone()) {
+-        log::error!(
+-            "oh-my-warp: invalid server_url for backend '{}': {e:#}",
+-            backend.id
+-        );
+-        return;
++    if !backend.server_url.is_empty() {
++        if let Err(e) = ChannelState::override_server_root_url(backend.server_url.clone()) {
++            log::error!(
++                "oh-my-warp: invalid server_url for backend '{}': {e:#}",
++                backend.id
++            );
++            return;
++        }
+     }
+     if !backend.ws_url.is_empty() {
+         if let Err(e) = ChannelState::override_ws_server_url(backend.ws_url.clone()) {
+diff --git a/crates/warp_agent_grpc/Cargo.toml b/crates/warp_agent_grpc/Cargo.toml
+new file mode 100644
+index 00000000..eefa09f6
+--- /dev/null
++++ b/crates/warp_agent_grpc/Cargo.toml
+@@ -0,0 +1,16 @@
++# oh-my-warp: isolated gRPC client + generated types for the in-process agent
++# bridge (app/src/server/server_api/ai/bridge.rs). Deliberately NOT on the
++# workspace's prost 0.14 — it carries tonic 0.12 + its own prost 0.13 so the
++# generated proto code can't clash with the warp app crate's prost version.
++[package]
++name = "warp_agent_grpc"
++version = "0.1.0"
++edition = "2021"
++publish = false
++
++[dependencies]
++tonic = "0.12"
++prost = "0.13"
++
++[build-dependencies]
++tonic-build = "0.12"
+diff --git a/crates/warp_agent_grpc/build.rs b/crates/warp_agent_grpc/build.rs
+new file mode 100644
+index 00000000..8a80aa77
+--- /dev/null
++++ b/crates/warp_agent_grpc/build.rs
+@@ -0,0 +1,5 @@
++fn main() -> Result<(), Box<dyn std::error::Error>> {
++    println!("cargo:rerun-if-changed=proto/agent.proto");
++    tonic_build::compile_protos("proto/agent.proto")?;
++    Ok(())
++}
+diff --git a/crates/warp_agent_grpc/proto/agent.proto b/crates/warp_agent_grpc/proto/agent.proto
+new file mode 100644
+index 00000000..e36c206f
+--- /dev/null
++++ b/crates/warp_agent_grpc/proto/agent.proto
+@@ -0,0 +1,115 @@
++syntax = "proto3";
++
++package agent.v1;
++
++// Example agent-backend service, modeled on the Warp agent operations documented
++// in the repo-root BACKEND_INTERFACE.md (§4 "Agent API surface"). This is a clean
++// gRPC re-expression intended as a reference/foundation for a custom backend or
++// middleware. NOTE: it is NOT the actual Warp wire protocol — Warp speaks
++// GraphQL + REST + SSE. To put a gRPC backend behind Warp you bridge the two
++// (see README.md "Bridging into Warp").
++service AgentService {
++  // Spawn a new agent run.             (Warp: POST /api/v1/agent/run)
++  rpc SpawnAgent(SpawnAgentRequest) returns (SpawnAgentResponse);
++
++  // Send a message to one or more runs. (Warp: POST /api/v1/agent/messages)
++  rpc SendMessage(SendMessageRequest) returns (SendMessageResponse);
++
++  // Read (and mark read) a message.     (Warp: POST /api/v1/agent/messages/{id}/read)
++  rpc ReadMessage(ReadMessageRequest) returns (ReadMessageResponse);
++
++  // List messages for a run.            (Warp: GET /api/v1/agent/messages/{run_id})
++  rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
++
++  // Report an execution event.          (Warp: POST /api/v1/agent/events/{run_id})
++  rpc ReportEvent(ReportEventRequest) returns (ReportEventResponse);
++
++  // Stream run events (server-streaming, the gRPC analog of Warp's SSE
++  // /api/v1/agent/events/stream).
++  rpc StreamEvents(StreamEventsRequest) returns (stream AgentRunEvent);
++
++  // Drive an LLM turn: stream completion tokens for a prompt. (No single Warp
++  // REST equivalent — this is where a custom backend's model logic lives.)
++  rpc Chat(ChatRequest) returns (stream ChatChunk);
++}
++
++enum AgentMode {
++  AGENT_MODE_UNSPECIFIED = 0;
++  AGENT_MODE_NORMAL = 1;
++  AGENT_MODE_PLAN = 2;
++  AGENT_MODE_ORCHESTRATE = 3;
++}
++
++message SpawnAgentRequest {
++  string prompt = 1;
++  AgentMode mode = 2;
++  string title = 3;
++  string conversation_id = 4; // resume an existing conversation
++  string parent_run_id = 5;   // for child/sub-agent runs
++  string harness = 6;         // which configured harness to run (e.g. "pi-mono", "claude", "demo")
++}
++message SpawnAgentResponse {
++  string task_id = 1;
++  string run_id = 2;
++  bool at_capacity = 3;
++}
++
++message SendMessageRequest {
++  repeated string to = 1; // recipient run ids
++  string subject = 2;
++  string body = 3;
++  string sender_run_id = 4;
++}
++message SendMessageResponse { repeated string message_ids = 1; }
++
++message ReadMessageRequest { string message_id = 1; }
++message ReadMessageResponse { AgentMessage message = 1; }
++
++message ListMessagesRequest {
++  string run_id = 1;
++  uint32 limit = 2;
++  bool unread_only = 3;
++  string since = 4; // RFC3339 timestamp
++}
++message ListMessagesResponse { repeated AgentMessage messages = 1; }
++
++message AgentMessage {
++  string message_id = 1;
++  string sender_run_id = 2;
++  string subject = 3;
++  string body = 4;
++  string sent_at = 5; // RFC3339
++  string read_at = 6; // RFC3339, empty if unread
++}
++
++message ReportEventRequest {
++  string run_id = 1;
++  string event_type = 2;
++  string execution_id = 3;
++  string ref_id = 4;
++}
++message ReportEventResponse { int64 sequence = 1; }
++
++message StreamEventsRequest {
++  repeated string run_ids = 1;
++  int64 since_sequence = 2;
++}
++message AgentRunEvent {
++  string run_id = 1;
++  string event_type = 2; // "output" (stdout), "stderr", "started", "completed"
++  string ref_id = 3;
++  string execution_id = 4;
++  string occurred_at = 5; // RFC3339
++  int64 sequence = 6;
++  string text = 7;        // line of harness output (for "output"/"stderr"); exit info for "completed"
++}
++
++message ChatRequest {
++  string run_id = 1;
++  string prompt = 2;
++  string model = 3;
++}
++message ChatChunk {
++  string delta = 1;
++  bool done = 2;
++}
+diff --git a/crates/warp_agent_grpc/src/lib.rs b/crates/warp_agent_grpc/src/lib.rs
+new file mode 100644
+index 00000000..bee86282
+--- /dev/null
++++ b/crates/warp_agent_grpc/src/lib.rs
+@@ -0,0 +1,13 @@
++//! oh-my-warp: isolated gRPC client + message types for the in-process agent
++//! bridge ([`warp`'s `server::server_api::ai::bridge`]).
++//!
++//! This crate carries its own `prost` 0.13 (via `tonic` 0.12) so the generated
++//! proto code never clashes with the warp app crate's `prost` 0.14. `tonic` is
++//! re-exported so the bridge uses one matching tonic version (`warp_agent_grpc::tonic`).
++
++pub use tonic;
++
++/// Generated from `proto/agent.proto` (package `agent.v1`) by `build.rs`.
++pub mod pb {
++    tonic::include_proto!("agent.v1");
++}

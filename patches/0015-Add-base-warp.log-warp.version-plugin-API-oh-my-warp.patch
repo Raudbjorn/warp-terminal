@@ -1,0 +1,64 @@
+From e39d9d9493540f92bcaba0ca50c43b9939cc68d2 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Thu, 21 May 2026 10:19:05 -0400
+Subject: [PATCH 15/48] Add base warp.log/warp.version plugin API (oh-my-warp)
+
+Expose warp.version (the warp.* API semver, PLUGIN_API_VERSION) and
+warp.log(message, level?) to every plugin, independent of completions_v2. This
+is the minimal always-present surface plugins can rely on. See PLUGIN_SPEC.md.
+---
+ app/src/plugin/host/native/js_api/mod.rs | 29 +++++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index fc602680..c1c1cd50 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -1,7 +1,12 @@
+-use rquickjs::{Ctx, Function, Object};
++use rquickjs::{function::Opt, Ctx, Function, Object};
+ 
+ use super::plugin::PluginHandle;
+ 
++/// Semantic version of the `warp.*` plugin API surface. Plugins declare the range
++/// they target via `engines.warp` in their manifest; the surface evolves additively
++/// within a major version. See PLUGIN_SPEC.md.
++pub const PLUGIN_API_VERSION: &str = "1.0.0";
++
+ cfg_if::cfg_if! {
+     if #[cfg(feature = "completions_v2")] {
+         use rquickjs::{prelude::MutFn, Value};
+@@ -12,13 +17,31 @@ cfg_if::cfg_if! {
+ 
+ /// Returns a JS object representing the Warp Plugin API exposed to external JavaScript plugins.
+ ///
+-/// Currently, the API contains a single "completions" namespace for registering command
+-/// signatures.
++/// The base API (always present) exposes:
++/// * `warp.version: string` — the [`PLUGIN_API_VERSION`] of the `warp.*` surface.
++/// * `warp.log(message: string, level?: "info" | "warn" | "error")` — logs through the
++///   host logger (which is relayed to the app via the IPC `LogService`).
++///
++/// Additional namespaces are added behind feature flags (e.g. `completions` under
++/// `completions_v2`). See PLUGIN_SPEC.md for the planned surface.
+ pub fn warp(
+     #[allow(unused_variables)] plugin: PluginHandle,
+     ctx: Ctx<'_>,
+ ) -> rquickjs::Result<Object<'_>> {
+     let api = Object::new(ctx)?;
++
++    api.set("version", PLUGIN_API_VERSION)?;
++    api.set(
++        "log",
++        Function::new(ctx, |message: String, level: Opt<String>| {
++            match level.0.as_deref() {
++                Some("error") => log::error!("{message}"),
++                Some("warn") => log::warn!("{message}"),
++                _ => log::info!("{message}"),
++            }
++        }),
++    )?;
++
+     #[cfg(feature = "completions_v2")]
+     api.set("completions", completions(plugin, ctx)?)?;
+     Ok(api)

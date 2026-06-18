@@ -15,6 +15,8 @@ mod home;
 mod lightbox_view;
 mod native_modal;
 mod one_time_modal_model;
+// oh-my-warp: tab-bar status pills contributed by plugins (`warp.ui.setStatusItem`).
+pub(crate) mod plugin_status_items;
 mod registry;
 pub mod rewind_confirmation_dialog;
 pub mod sync_inputs;
@@ -72,7 +74,7 @@ use crate::workspace::view::{
     LEFT_PANEL_AGENT_CONVERSATIONS_BINDING_NAME, LEFT_PANEL_GLOBAL_SEARCH_BINDING_NAME,
     LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME, LEFT_PANEL_WARP_DRIVE_BINDING_NAME,
     NEW_AGENT_TAB_BINDING_NAME, NEW_AMBIENT_AGENT_TAB_BINDING_NAME, NEW_TAB_BINDING_NAME,
-    NEW_TERMINAL_TAB_BINDING_NAME, OPEN_GLOBAL_SEARCH_BINDING_NAME,
+    NEW_TERMINAL_TAB_BINDING_NAME, NEW_WEB_TAB_BINDING_NAME, OPEN_GLOBAL_SEARCH_BINDING_NAME,
     TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME, TOGGLE_NOTIFICATION_MAILBOX_BINDING_NAME,
     TOGGLE_PROJECT_EXPLORER_BINDING_NAME, TOGGLE_RIGHT_PANEL_BINDING_NAME,
     TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME, TOGGLE_VERTICAL_TABS_PANEL_BINDING_NAME,
@@ -84,6 +86,10 @@ pub fn init(app: &mut AppContext) {
     app.add_singleton_model(|_| cross_window_tab_drag::CrossWindowTabDrag::new());
     use warpui::keymap::macros::*;
     app.register_binding_validator::<Workspace>(is_binding_pty_compliant);
+
+    // oh-my-warp: register tmux-style <leader> chords (e.g. `ctrl-b ,` = rename
+    // the active tab) on the Workspace context. See `crate::util::leader`.
+    crate::util::leader::register_leader_bindings(app);
 
     modal::init(app);
     native_modal::init(app);
@@ -685,6 +691,15 @@ pub fn init(app: &mut AppContext) {
         )
         .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
         .with_custom_action(CustomAction::NewTab)
+        .with_enabled(|| ContextFlag::CreateNewSession.is_enabled()),
+        // oh-my-warp: open an embedded browser pane as a new tab (File menu item).
+        EditableBinding::new(
+            NEW_WEB_TAB_BINDING_NAME,
+            BindingDescription::new("New Web Tab"),
+            WorkspaceAction::NewWebTab,
+        )
+        .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
+        .with_custom_action(CustomAction::NewWebTab)
         .with_enabled(|| ContextFlag::CreateNewSession.is_enabled()),
         EditableBinding::new(
             NEW_TERMINAL_TAB_BINDING_NAME,

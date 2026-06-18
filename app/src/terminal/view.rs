@@ -11683,6 +11683,21 @@ impl TerminalView {
                 }
                 self.did_notify_long_running = false;
 
+                #[cfg(feature = "plugin_host")]
+                {
+                    let event = crate::plugin::events::CommandStartedEvent {
+                        command: command.clone(),
+                        cwd: String::new(),
+                    };
+                    if let Ok(input) = warp_js::SerializedJsValue::from_value(event) {
+                        self.fire_plugin_terminal_event(
+                            crate::plugin::events::EVENT_COMMAND_STARTED,
+                            input,
+                            ctx,
+                        );
+                    }
+                }
+
                 // Snapshot the prompt state as of when the command began executing.
                 // Commands may themselves affect the prompt (if running `git checkout`), for
                 // example, so we want the saved prompt state to match what the user saw when
@@ -12096,6 +12111,30 @@ impl TerminalView {
                 }
 
                 if let BlockType::User(block_completed) = block_type {
+                    #[cfg(feature = "plugin_host")]
+                    {
+                        let event = crate::plugin::events::CommandFinishedEvent {
+                            command: block_completed.command.clone(),
+                            exit_code: block_completed.serialized_block.exit_code.value(),
+                            cwd: block_completed
+                                .serialized_block
+                                .pwd
+                                .clone()
+                                .unwrap_or_default(),
+                            duration_ms: self
+                                .block_duration(&block_completed.serialized_block)
+                                .map(|d| d.as_millis() as f64)
+                                .unwrap_or(0.0),
+                        };
+                        if let Ok(input) = warp_js::SerializedJsValue::from_value(event) {
+                            self.fire_plugin_terminal_event(
+                                crate::plugin::events::EVENT_COMMAND_FINISHED,
+                                input,
+                                ctx,
+                            );
+                        }
+                    }
+
                     if let Some(block_duration) =
                         self.block_duration(&block_completed.serialized_block)
                     {
@@ -15645,6 +15684,65 @@ impl TerminalView {
         }
     }
 
+    /// oh-my-warp: invokes each plugin callback registered for `event_name` with the serialized
+    /// event payload; a callback that returns a string shows it as a toast. See PLUGIN_SPEC.md (M2).
+    #[cfg(feature = "plugin_host")]
+    fn fire_plugin_terminal_event(
+        &mut self,
+        event_name: &'static str,
+        input: warp_js::SerializedJsValue,
+        ctx: &mut ViewContext<TerminalView>,
+    ) {
+        use crate::plugin::service::{
+            CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
+        };
+        use crate::plugin::PluginHost;
+        use crate::view_components::{DismissibleToast, ToastFlavor};
+        use crate::workspace::ToastStack;
+
+        let function_ids = crate::plugin::events::handlers(event_name);
+        if function_ids.is_empty() {
+            return;
+        }
+        let window_id = ctx.window_id();
+        for function_id in function_ids {
+            let Some(caller) = PluginHost::handle(ctx)
+                .as_ref(ctx)
+                .plugin_service_caller::<CallJsFunctionService>()
+            else {
+                return;
+            };
+            let input = input.clone();
+            ctx.spawn(
+                async move {
+                    caller
+                        .call(CallJsFunctionRequest {
+                            id: function_id,
+                            serialized_input: input,
+                        })
+                        .await
+                },
+                move |_view, response, ctx| {
+                    if let Ok(CallJsFunctionResponse::Success(output)) = response {
+                        if let Ok(crate::plugin::events::OptionalToast(Some(message))) =
+                            output.to_value::<crate::plugin::events::OptionalToast>()
+                        {
+                            if !message.trim().is_empty() {
+                                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                                    toast_stack.add_ephemeral_toast(
+                                        DismissibleToast::new(message, ToastFlavor::Default),
+                                        window_id,
+                                        ctx,
+                                    );
+                                });
+                            }
+                        }
+                    }
+                },
+            );
+        }
+    }
+
     fn maybe_send_block_completed_notification(
         &mut self,
         block: &UserBlockCompleted,
@@ -17371,6 +17469,10 @@ impl TerminalView {
                         "terminal:copy",
                         ctx,
                     ))
+                    .into_item(),
+                // oh-my-warp: launch an embedded browser pane as a right-split.
+                MenuItemFields::new("Launch Web Pane")
+                    .with_on_select_action(TerminalAction::OpenBrowserPaneSplit)
                     .into_item(),
             ]);
         }
@@ -25871,6 +25973,7 @@ impl TypedActionView for TerminalView {
             | SplitLeft(_)
             | SplitDown(_)
             | SplitUp(_)
+            | OpenBrowserPaneSplit
             | OpenGridLink(_)
             | OpenRichContentLink(_)
             | ToggleGridSecret { .. }
@@ -26259,6 +26362,12 @@ impl TypedActionView for TerminalView {
             }
             SplitUp(chosen_shell) => {
                 ctx.emit(Event::Pane(PaneEvent::SplitUp(chosen_shell.to_owned())))
+            }
+            OpenBrowserPaneSplit => {
+                // oh-my-warp: split a browser pane to the right of the active
+                // pane group. Reuses the same workspace action the tab right-click
+                // menu and the leader chord use.
+                ctx.dispatch_typed_action(&WorkspaceAction::OpenBrowserPane);
             }
             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
             PromptContextMenu {

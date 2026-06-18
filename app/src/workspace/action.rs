@@ -124,6 +124,10 @@ pub enum AutoCloudHandoffTrigger {
 
 #[derive(Debug, Clone)]
 pub enum WorkspaceAction {
+    /// oh-my-warp: run a plugin command (registered via `warp.commands.register`) by id. Used as
+    /// the action for plugin keybindings registered via `warp.keymap.bind`. See PLUGIN_SPEC.md (M3).
+    #[cfg_attr(not(feature = "plugin_host"), allow(dead_code))]
+    RunPluginCommand(String),
     ActivateTab(usize),
     ActivatePrevTab,
     ActivateNextTab,
@@ -813,6 +817,12 @@ pub enum WorkspaceAction {
     /// Opens (or focuses) the in-app network log pane as a right-split of the
     /// active pane group. Gated on `ContextFlag::NetworkLogConsole`.
     OpenNetworkLogPane,
+    /// Opens an embedded browser pane (oh-my-warp) as a right-split of the active
+    /// pane group, streaming Chrome's viewport over CDP. Bound to the leader
+    /// chord `ctrl-b w`.
+    OpenBrowserPane,
+    /// Opens an embedded browser pane (oh-my-warp) as its own new tab.
+    NewWebTab,
 }
 
 impl From<&WorkspaceAction> for LoginGatedFeature {
@@ -852,6 +862,8 @@ impl WorkspaceAction {
     pub fn should_save_app_state_on_action(&self) -> bool {
         use WorkspaceAction::*;
         match self {
+            // oh-my-warp: running a plugin command shouldn't trigger app-state saves.
+            RunPluginCommand(_) => false,
             #[cfg(not(target_family = "wasm"))]
             ContinueConversationLocally { .. } => true,
             ActivateTab(_)
@@ -1121,7 +1133,9 @@ impl WorkspaceAction {
             | ShowHandoffEnvironmentCreationModal
             | ShowCloudModeV2EnvironmentCreationModal
             | OpenCreateAuthSecretModal { .. }
-            | OpenNetworkLogPane => false,
+            | OpenNetworkLogPane
+            | OpenBrowserPane
+            | NewWebTab => false,
             #[cfg(debug_assertions)]
             ShowHoaOnboardingFlow => false,
             #[cfg(target_family = "wasm")]

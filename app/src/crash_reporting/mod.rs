@@ -14,7 +14,7 @@ use std::sync::Arc;
 use lazy_static::lazy_static;
 use parking_lot::{Mutex, RwLock};
 use regex::Regex;
-use sentry::{ClientInitGuard, IntoDsn, SessionMode};
+use sentry::{ClientInitGuard, SessionMode};
 #[cfg(linux_or_windows)]
 pub use sentry_minidump::run_server as run_minidump_server;
 use warp_core::channel::Channel;
@@ -403,9 +403,10 @@ fn init_sentry(user_id: Option<UserUid>, email: Option<String>, ctx: &mut AppCon
 /// Baseline Sentry client options.
 fn sentry_client_options() -> sentry::ClientOptions {
     sentry::ClientOptions {
-        dsn: ChannelState::sentry_url()
-            .into_dsn()
-            .expect("Invalid Sentry DSN"),
+        // oh-my-warp: observability stripped — force an empty DSN so the Sentry
+        // client (and the minidump server, which shares these options) initializes
+        // in a disabled state and never transmits crash reports.
+        dsn: None,
 
         release: Some(release_version().into()),
         environment: Some(get_environment()),

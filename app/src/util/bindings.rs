@@ -26,6 +26,8 @@ pub const MAC_MENUS_CONTEXT: DescriptionContext = DescriptionContext::Custom("ma
 #[repr(isize)]
 pub enum CustomAction {
     NewTab,
+    /// Open an embedded browser pane as a new tab (oh-my-warp).
+    NewWebTab,
     NewFile,
     ShowAboutWarp,
     ShowSettings,
@@ -213,7 +215,11 @@ lazy_static! {
         // on TerminalView on all platforms.
         Keystroke::parse("ctrl-c").expect("should be able to construct ctrl-c keystroke"),
         // The resume conversation binding uses cmd-shift-R on Mac and should be allowed
-        Keystroke::parse("cmd-shift-R").expect("should be able to construct cmd-shift-R keystroke")
+        Keystroke::parse("cmd-shift-R").expect("should be able to construct cmd-shift-R keystroke"),
+        // oh-my-warp: the tmux-style leader/prefix key (default ctrl-b) is
+        // intentionally captured from the PTY so it can begin a `<leader> <key>`
+        // chord. See `crate::util::leader`. Keep in sync with `leader::LEADER`.
+        Keystroke::parse("ctrl-b").expect("should be able to construct ctrl-b keystroke")
     ]);
 }
 
@@ -262,6 +268,7 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
     match custom.into() {
         CustomAction::FocusInput => Keystroke::parse(cmd_or_ctrl_shift("l")).ok(),
         CustomAction::NewTab => Keystroke::parse(cmd_or_ctrl_shift("t")).ok(),
+        CustomAction::NewWebTab => None,
         CustomAction::Cut => Keystroke::parse("cmdorctrl-x").ok(),
         CustomAction::Copy => Keystroke::parse(cmd_or_ctrl_shift("c")).ok(),
         CustomAction::Paste => Keystroke::parse(cmd_or_ctrl_shift("v")).ok(),
@@ -807,6 +814,8 @@ pub enum BindingGroup {
     Notifications,
     EnvVarCollection,
     Terminal,
+    /// oh-my-warp: tmux-style leader/prefix chords (see `crate::util::leader`).
+    Leader,
 }
 
 impl BindingGroup {
@@ -825,6 +834,7 @@ impl BindingGroup {
             Self::Notifications => "notifications",
             Self::EnvVarCollection => "env_var_collections",
             Self::Terminal => "terminal",
+            Self::Leader => "leader",
         }
     }
 

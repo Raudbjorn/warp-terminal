@@ -2,9 +2,17 @@ mod service_impl;
 
 use std::sync::Arc;
 
+use crate::context_chips::plugin_prompt::PromptSegment;
+use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
+use crate::view_components::{DismissibleToast, ToastFlavor};
+use crate::workspace::{ToastStack, WorkspaceAction};
 use anyhow::{Context, Result};
 use command::blocking::Command;
-use service_impl::{LogServiceImpl, PluginHostBootstrapServiceImpl};
+use service_impl::{
+    LogServiceImpl, PluginAppRequestServiceImpl, PluginHostBootstrapServiceImpl,
+    RegisterCommandServiceImpl, RegisterEventHandlerServiceImpl, RegisterToolServiceImpl,
+};
+use warpui::keymap::EditableBinding;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::{PLUGIN_HOST_ADDRESS_ENV_VAR, PLUGIN_HOST_FLAG};
@@ -36,6 +44,15 @@ impl PluginHost {
         let plugin_host_bootstrap_service = PluginHostBootstrapServiceImpl::new();
         let connection_address_rx = plugin_host_bootstrap_service.connection_address_rx();
 
+        // Drain host→app requests (warp.ui.toast / warp.keymap.bind) on the foreground executor,
+        // where we have the `ModelContext` needed to touch app state. See `super::app_requests`.
+        let app_request_rx = crate::plugin::app_requests::init_channel();
+        ctx.spawn_stream_local(
+            app_request_rx,
+            |me, request, ctx| me.handle_app_request(request, ctx),
+            |_, _| {},
+        );
+
         // Schedule a task that awaits a request containing the connection address for the plugin
         // host process and uses it to instantiate a Client when it's received.
         let background_executor = ctx.background_executor();
@@ -66,7 +83,11 @@ impl PluginHost {
 
         let server_builder = ipc::ServerBuilder::default()
             .with_service(plugin_host_bootstrap_service)
-            .with_service(LogServiceImpl::new());
+            .with_service(LogServiceImpl::new())
+            .with_service(RegisterCommandServiceImpl::new())
+            .with_service(RegisterEventHandlerServiceImpl::new())
+            .with_service(RegisterToolServiceImpl::new())
+            .with_service(PluginAppRequestServiceImpl::new());
 
         #[cfg(feature = "completions_v2")]
         let server_builder =
@@ -112,6 +133,108 @@ impl PluginHost {
     pub fn plugin_service_caller<S: ipc::Service>(&self) -> Option<Box<dyn ipc::ServiceCaller<S>>> {
         self.host_client.clone().map(ipc::service_caller::<S>)
     }
+
+    /// Handles a host→app request on the foreground executor (see [`super::app_requests`]).
+    fn handle_app_request(&mut self, request: PluginAppRequest, ctx: &mut ModelContext<Self>) {
+        match request {
+            PluginAppRequest::ShowToast { message, kind } => {
+                let Some(window_id) = ctx.windows().active_window() else {
+                    return;
+                };
+                let flavor = match kind {
+                    ToastKind::Error => ToastFlavor::Error,
+                    ToastKind::Info | ToastKind::Warn => ToastFlavor::Default,
+                };
+                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    toast_stack.add_ephemeral_toast(
+                        DismissibleToast::new(message, flavor),
+                        window_id,
+                        ctx,
+                    );
+                });
+            }
+            PluginAppRequest::BindKey { keys, command_id } => {
+                let title = crate::plugin::commands::title(&command_id)
+                    .unwrap_or_else(|| command_id.clone());
+                // `EditableBinding::new` takes a `&'static str` name; plugin command ids are
+                // dynamic, so leak the (small, session-lived) binding name.
+                let name: &'static str =
+                    Box::leak(format!("plugin-keymap:{command_id}").into_boxed_str());
+                let binding = EditableBinding::new(
+                    name,
+                    title,
+                    WorkspaceAction::RunPluginCommand(command_id),
+                )
+                .with_context_predicate(warpui::id!("Workspace"))
+                .with_key_binding(keys);
+                ctx.register_editable_bindings([binding]);
+            }
+            PluginAppRequest::ShowMarkdown { title, markdown } => {
+                // The Workspace owns the modal; emit an event it subscribes to (it has the window
+                // context to open the modal). See `workspace::view`.
+                ctx.emit(PluginHostEvent::ShowMarkdown { title, markdown });
+            }
+            PluginAppRequest::ShowPalette { title, items } => {
+                ctx.emit(PluginHostEvent::ShowPalette { title, items });
+            }
+            PluginAppRequest::OpenWebTab { url } => {
+                ctx.emit(PluginHostEvent::OpenWebTab { url });
+            }
+            PluginAppRequest::OpenProject { path } => {
+                ctx.emit(PluginHostEvent::OpenProject { path });
+            }
+            PluginAppRequest::SetPrompt {
+                plugin_id,
+                segments,
+            } => {
+                ctx.emit(PluginHostEvent::SetPrompt {
+                    plugin_id,
+                    segments,
+                });
+            }
+            PluginAppRequest::SetStatusItem {
+                plugin_id,
+                item_id,
+                item,
+            } => {
+                ctx.emit(PluginHostEvent::SetStatusItem {
+                    plugin_id,
+                    item_id,
+                    item,
+                });
+            }
+        }
+    }
+}
+
+/// Events emitted by the [`PluginHost`] singleton for the `Workspace` to act on (it has the
+/// window/view context that some plugin UI requests need). See PLUGIN_SPEC.md (M4).
+#[derive(Clone, Debug)]
+pub enum PluginHostEvent {
+    /// Show a markdown panel (`warp.ui.showMarkdown`).
+    ShowMarkdown { title: String, markdown: String },
+    /// Show a picker; selecting an item invokes its callback (`warp.ui.showPalette`).
+    ShowPalette {
+        title: String,
+        items: Vec<PalettePluginItem>,
+    },
+    /// Open an embedded browser pane navigated to `url` (`warp.ui.openWebTab`).
+    OpenWebTab { url: String },
+    /// Open a new tab with a terminal rooted at `path` (`warp.ui.openProject`).
+    OpenProject { path: String },
+    /// Replace a plugin's prompt segments (`warp.prompt.set`; empty `segments` clears them).
+    SetPrompt {
+        plugin_id: String,
+        segments: Vec<PromptSegment>,
+    },
+    /// Set (or remove, when `item` is `None`) a plugin-contributed tab-bar status pill
+    /// (`warp.ui.setStatusItem`). The `Workspace` updates the `PluginStatusItemsModel` singleton,
+    /// which the tab bar observes for re-renders.
+    SetStatusItem {
+        plugin_id: String,
+        item_id: String,
+        item: Option<crate::workspace::plugin_status_items::StatusItem>,
+    },
 }
 
 impl Drop for PluginHost {
@@ -134,7 +257,7 @@ impl Drop for PluginHost {
 }
 
 impl Entity for PluginHost {
-    type Event = ();
+    type Event = PluginHostEvent;
 }
 
 impl SingletonEntity for PluginHost {}

@@ -1,0 +1,502 @@
+From 77cc8818ff72e3425e59566fbcb3ec03f1c6bd40 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 3 Jun 2026 08:35:07 -0400
+Subject: [PATCH 45/48] Add warp.ui.setStatusItem(id, item): plugin status
+ pills in the tab bar (oh-my-warp)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A plugin can now publish small, themed pills that live in the tab bar
+(right of the leader indicator) — for live status the user should glance at:
+a build state, an active session count, ccusage today's spend, a CI label.
+
+JS API:
+  warp.ui.setStatusItem("ci",     { text: "CI ✓",      kind: "success", command: "ci.open" });
+  warp.ui.setStatusItem("queue",  { text: "queue 3",   kind: "warn" });
+  warp.ui.setStatusItem("ci",     null);          // remove
+  warp.ui.setStatusItem("queue",  { text: "" });  // also removes (empty text)
+
+Item shape: { text, kind?, tooltip?, command? } where:
+  - kind     info | success | warn | error | accent — picks an ANSI theme color
+             so the pill tracks the active terminal theme.
+  - command  optional plugin command id; clicking the pill dispatches
+             WorkspaceAction::RunPluginCommand(id) — same path palette items
+             and keybindings take, no new routing.
+
+Identity is (plugin_id, item_id) so one plugin can publish several pills
+(e.g. branch + CI + queue) and update each independently.
+
+Wiring:
+  - PluginStatusItemsModel singleton (app/src/workspace/plugin_status_items.rs,
+    always compiled — empty when plugin host isn't built in).
+  - New PluginAppRequest::SetStatusItem + PluginHostEvent::SetStatusItem; the
+    Workspace subscribes (existing subscribe_to_plugin_host fan-in) and updates
+    the singleton.
+  - Workspace observes the singleton -> tab-bar re-renders.
+  - render_plugin_status_items called from render_tab_bar_contents, right after
+    the leader indicator.
+
+Capability: 'ui' (same as toast / showMarkdown / showPalette / prompt).
+---
+ app/src/lib.rs                           |   6 +
+ app/src/plugin/app/mod.rs                |  19 ++
+ app/src/plugin/app_requests.rs           |   9 +
+ app/src/plugin/host/native/js_api/mod.rs |  55 +++++-
+ app/src/workspace/mod.rs                 |   2 +
+ app/src/workspace/plugin_status_items.rs | 215 +++++++++++++++++++++++
+ app/src/workspace/view.rs                |  31 ++++
+ 7 files changed, 336 insertions(+), 1 deletion(-)
+ create mode 100644 app/src/workspace/plugin_status_items.rs
+
+diff --git a/app/src/lib.rs b/app/src/lib.rs
+index fe48dae6..6acbdd57 100644
+--- a/app/src/lib.rs
++++ b/app/src/lib.rs
+@@ -1824,6 +1824,12 @@ pub(crate) fn initialize_app(
+     // oh-my-warp: holds plugin-contributed prompt segments (`warp.prompt.set`). Registered
+     // unconditionally so the prompt render path never depends on the plugin host being built in.
+     ctx.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
++    // oh-my-warp: holds plugin-contributed tab-bar status pills (`warp.ui.setStatusItem`). Same
++    // pattern as `PluginPromptModel`: registered unconditionally so the tab-bar render path doesn't
++    // depend on the plugin host being built in (empty store ↔ no pills).
++    ctx.add_singleton_model(|_| {
++        crate::workspace::plugin_status_items::PluginStatusItemsModel::new()
++    });
+     ctx.add_singleton_model(
+         ai::blocklist::orchestration_event_streamer::OrchestrationEventStreamer::new,
+     );
+diff --git a/app/src/plugin/app/mod.rs b/app/src/plugin/app/mod.rs
+index 274b853f..12794780 100644
+--- a/app/src/plugin/app/mod.rs
++++ b/app/src/plugin/app/mod.rs
+@@ -192,6 +192,17 @@ impl PluginHost {
+                     segments,
+                 });
+             }
++            PluginAppRequest::SetStatusItem {
++                plugin_id,
++                item_id,
++                item,
++            } => {
++                ctx.emit(PluginHostEvent::SetStatusItem {
++                    plugin_id,
++                    item_id,
++                    item,
++                });
++            }
+         }
+     }
+ }
+@@ -216,6 +227,14 @@ pub enum PluginHostEvent {
+         plugin_id: String,
+         segments: Vec<PromptSegment>,
+     },
++    /// Set (or remove, when `item` is `None`) a plugin-contributed tab-bar status pill
++    /// (`warp.ui.setStatusItem`). The `Workspace` updates the `PluginStatusItemsModel` singleton,
++    /// which the tab bar observes for re-renders.
++    SetStatusItem {
++        plugin_id: String,
++        item_id: String,
++        item: Option<crate::workspace::plugin_status_items::StatusItem>,
++    },
+ }
+ 
+ impl Drop for PluginHost {
+diff --git a/app/src/plugin/app_requests.rs b/app/src/plugin/app_requests.rs
+index 29613a85..c192180f 100644
+--- a/app/src/plugin/app_requests.rs
++++ b/app/src/plugin/app_requests.rs
+@@ -13,6 +13,7 @@ use async_channel::{Receiver, Sender};
+ use serde::{Deserialize, Serialize};
+ 
+ use crate::context_chips::plugin_prompt::PromptSegment;
++use crate::workspace::plugin_status_items::StatusItem;
+ 
+ /// One entry of a plugin-driven picker (`warp.ui.showPalette`): a label plus the id of the plugin
+ /// command (registered via `warp.commands.register`) to run when the user picks it.
+@@ -70,6 +71,14 @@ pub enum PluginAppRequest {
+         plugin_id: String,
+         segments: Vec<PromptSegment>,
+     },
++    /// Set (or remove, when `item` is `None`) a plugin-contributed status pill in the tab bar
++    /// (`warp.ui.setStatusItem`). Identity is `(plugin_id, item_id)` so one plugin can publish
++    /// several pills (e.g. branch + CI + queue) and update them independently.
++    SetStatusItem {
++        plugin_id: String,
++        item_id: String,
++        item: Option<StatusItem>,
++    },
+ }
+ 
+ static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index 2f0c2c60..8a95af61 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -9,6 +9,7 @@ use crate::plugin::events::{
+     CommandFinishedEvent, CommandStartedEvent, OptionalToast, EVENT_COMMAND_FINISHED,
+     EVENT_COMMAND_STARTED,
+ };
++use crate::workspace::plugin_status_items::{StatusItem, StatusItemKind};
+ 
+ /// Semantic version of the `warp.*` plugin API surface. Plugins declare the range
+ /// they target via `engines.warp` in their manifest; the surface evolves additively
+@@ -73,7 +74,11 @@ pub fn warp<'js>(
+         api.set("terminal", terminal(plugin.clone(), ctx)?)?;
+     }
+     if manifest.permits("ui") {
+-        api.set("ui", ui(ctx)?)?;
++        let ui_obj = ui(ctx)?;
++        // `setStatusItem` needs the plugin id so each pill is identified per-plugin; install it as
++        // a per-plugin overlay on the shared `ui` object after the base namespace is built.
++        install_set_status_item(&ui_obj, plugin_id.to_string(), ctx)?;
++        api.set("ui", ui_obj)?;
+         api.set("prompt", prompt(plugin_id.to_string(), ctx)?)?;
+     }
+     if manifest.permits("ai") {
+@@ -334,6 +339,54 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+     Ok(ui)
+ }
+ 
++/// Returns the `warp.ui.setStatusItem`-aware bindings as a `(plugin_id, ui_object)` overlay. The
++/// `ui` namespace is shared across plugins (one function per method), so we install per-plugin
++/// `setStatusItem` separately in [`warp`] after building the base `ui` object — that way each
++/// plugin's call carries its own id without us threading it through every method.
++fn install_set_status_item<'js>(
++    ui: &Object<'js>,
++    plugin_id: String,
++    ctx: Ctx<'js>,
++) -> rquickjs::Result<()> {
++    // `setStatusItem(id, item|null)` — `item` is `{ text, kind?, tooltip?, command? }`. Passing
++    // `null` (or any non-object) removes the pill. The pill is identified by `(plugin_id, id)`, so
++    // a plugin can publish several pills and update each independently.
++    ui.set(
++        "setStatusItem",
++        Function::new(ctx, move |item_id: String, item: Opt<Object<'js>>| {
++            let item = item.0.and_then(|obj| {
++                let text: String = obj.get("text").ok()?;
++                if text.is_empty() {
++                    // Empty text is treated as a remove, so plugins don't need separate clear
++                    // call sites (`setStatusItem("ci", { text: "" })` is fine).
++                    return None;
++                }
++                let kind = match obj.get::<_, String>("kind").ok().as_deref() {
++                    Some("success") => StatusItemKind::Success,
++                    Some("warn") => StatusItemKind::Warn,
++                    Some("error") => StatusItemKind::Error,
++                    Some("accent") => StatusItemKind::Accent,
++                    _ => StatusItemKind::Info,
++                };
++                let tooltip: Option<String> = obj.get("tooltip").ok();
++                let command_id: Option<String> = obj.get("command").ok();
++                Some(StatusItem {
++                    text,
++                    kind,
++                    tooltip,
++                    command_id,
++                })
++            });
++            super::app_request::send_app_request(PluginAppRequest::SetStatusItem {
++                plugin_id: plugin_id.clone(),
++                item_id,
++                item,
++            });
++        }),
++    )?;
++    Ok(())
++}
++
+ /// Returns the `warp.prompt` namespace (capability: `ui`) — plugin-contributed prompt segments.
+ ///
+ /// `set(segments)` — `segments` is `[{ text, side?, tooltip? }]` (`side`: `"left"` | `"right"`,
+diff --git a/app/src/workspace/mod.rs b/app/src/workspace/mod.rs
+index b3f2d4d6..ea8c11b7 100644
+--- a/app/src/workspace/mod.rs
++++ b/app/src/workspace/mod.rs
+@@ -15,6 +15,8 @@ mod home;
+ mod lightbox_view;
+ mod native_modal;
+ mod one_time_modal_model;
++// oh-my-warp: tab-bar status pills contributed by plugins (`warp.ui.setStatusItem`).
++pub(crate) mod plugin_status_items;
+ mod registry;
+ pub mod rewind_confirmation_dialog;
+ pub mod sync_inputs;
+diff --git a/app/src/workspace/plugin_status_items.rs b/app/src/workspace/plugin_status_items.rs
+new file mode 100644
+index 00000000..913fc0bb
+--- /dev/null
++++ b/app/src/workspace/plugin_status_items.rs
+@@ -0,0 +1,215 @@
++//! oh-my-warp: plugin-contributed status pills rendered in the tab bar.
++//!
++//! A plugin pushes status items via `warp.ui.setStatusItem(id, item)` — a tiny, themed pill that
++//! lives next to the leader indicator and can be clicked to run a registered plugin command. Use
++//! this for live status the user should glance at (a build state, a queue depth, an active session
++//! count) rather than for transient notifications (those are `warp.ui.toast`).
++//!
++//! Like the prompt-segment model, this lives outside the feature-gated `plugin` module so the
++//! render path never depends on the plugin host being built in: with no host the store is just
++//! always empty. The actual `setStatusItem` plumbing (plugin app-request relay, JS API) is
++//! `plugin_host`-only.
++
++use std::collections::BTreeMap;
++
++use pathfinder_color::ColorU;
++use serde::{Deserialize, Serialize};
++use warpui::elements::{
++    Container, CornerRadius, CrossAxisAlignment, Element, Flex, Hoverable, MainAxisSize,
++    MouseStateHandle, ParentElement, Radius, Text,
++};
++use warpui::fonts::Weight;
++use warpui::platform::Cursor;
++use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
++
++use crate::appearance::Appearance;
++use crate::ui_components::blended_colors;
++use crate::workspace::WorkspaceAction;
++
++/// Severity-style flavor of a status pill. Maps to a theme color so the pill tracks the active
++/// terminal theme without each plugin hard-coding hex.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
++#[serde(rename_all = "snake_case")]
++pub enum StatusItemKind {
++    #[default]
++    Info,
++    Success,
++    Warn,
++    Error,
++    Accent,
++}
++
++/// One plugin-contributed pill in the tab bar.
++///
++/// `command_id`, when set, names a command registered via `warp.commands.register`; clicking the
++/// pill dispatches `WorkspaceAction::RunPluginCommand(command_id)`, mirroring how `showPalette`
++/// items work — the pill *triggers* a command, it doesn't re-enter the plugin host inline.
++#[derive(Clone, Debug, Default, Serialize, Deserialize)]
++pub struct StatusItem {
++    pub text: String,
++    #[serde(default)]
++    pub kind: StatusItemKind,
++    #[serde(default)]
++    pub tooltip: Option<String>,
++    #[serde(default)]
++    pub command_id: Option<String>,
++}
++
++/// Singleton model storing each plugin's pills, keyed by `(plugin_id, item_id)`. BTreeMaps preserve
++/// stable ordering across frames (sorted by plugin id, then by item id), so the pill positions
++/// don't dance when a plugin updates one of them.
++#[derive(Default)]
++pub struct PluginStatusItemsModel {
++    items: BTreeMap<String, BTreeMap<String, StatusItem>>,
++}
++
++impl PluginStatusItemsModel {
++    pub fn new() -> Self {
++        Self::default()
++    }
++
++    /// Replaces (or removes, if `item` is `None`) the pill identified by `(plugin_id, item_id)`,
++    /// then emits a change event so any view observing this model re-renders.
++    pub fn set(
++        &mut self,
++        plugin_id: String,
++        item_id: String,
++        item: Option<StatusItem>,
++        ctx: &mut ModelContext<Self>,
++    ) {
++        match item {
++            Some(item) => {
++                self.items
++                    .entry(plugin_id)
++                    .or_default()
++                    .insert(item_id, item);
++            }
++            None => {
++                if let Some(plugin_items) = self.items.get_mut(&plugin_id) {
++                    plugin_items.remove(&item_id);
++                    if plugin_items.is_empty() {
++                        self.items.remove(&plugin_id);
++                    }
++                }
++            }
++        }
++        ctx.emit(PluginStatusItemsEvent::Changed);
++        ctx.notify();
++    }
++
++    /// All pills, in stable render order. Pairs each item with the owning `(plugin_id, item_id)` so
++    /// the render path can build per-pill mouse-state handles keyed by identity.
++    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &StatusItem)> {
++        self.items.iter().flat_map(|(plugin_id, items)| {
++            items
++                .iter()
++                .map(move |(item_id, item)| (plugin_id.as_str(), item_id.as_str(), item))
++        })
++    }
++
++    pub fn is_empty(&self) -> bool {
++        self.items.values().all(|m| m.is_empty())
++    }
++}
++
++pub enum PluginStatusItemsEvent {
++    Changed,
++}
++
++impl Entity for PluginStatusItemsModel {
++    type Event = PluginStatusItemsEvent;
++}
++
++impl SingletonEntity for PluginStatusItemsModel {}
++
++/// Maps a [`StatusItemKind`] to the ANSI theme color used to *tint* the pill's text. The background
++/// stays neutral (matching the tab-bar surface) so the pill reads as a status indicator rather than
++/// shouting like a toast — exactly the contrast we want for "glance at it" surfaces.
++fn pill_color_for_kind(kind: StatusItemKind, theme: &crate::themes::theme::WarpTheme) -> ColorU {
++    match kind {
++        StatusItemKind::Info => theme.ansi_fg_blue(),
++        StatusItemKind::Success => theme.ansi_fg_green(),
++        StatusItemKind::Warn => theme.ansi_fg_yellow(),
++        StatusItemKind::Error => theme.ansi_fg_red(),
++        StatusItemKind::Accent => theme.accent_button_color().into_solid(),
++    }
++}
++
++/// Renders all plugin status pills as a single row element, ready to be inserted into the tab bar
++/// next to the leader indicator. Returns `None` when no plugin has set any pills, so the caller can
++/// `if let Some(row) = render_plugin_status_items(...) { tab_bar.add_child(row); }` without
++/// guarding against an empty row.
++pub fn render_plugin_status_items(
++    app: &AppContext,
++    appearance: &Appearance,
++) -> Option<Box<dyn Element>> {
++    let model = PluginStatusItemsModel::as_ref(app);
++    if model.is_empty() {
++        return None;
++    }
++    let theme = appearance.theme();
++    let mut row = Flex::row()
++        .with_cross_axis_alignment(CrossAxisAlignment::Center)
++        .with_main_axis_size(MainAxisSize::Min);
++
++    for (_plugin_id, _item_id, item) in model.iter() {
++        let color = pill_color_for_kind(item.kind, theme);
++        let text = item.text.clone();
++        let ui_font_family = appearance.ui_font_family();
++        let pill = if let Some(command_id) = item.command_id.clone() {
++            // Clickable pill: Hoverable owns the cursor + click handler. Hover swaps the background
++            // to surface_2 so the pill picks up the same "this is interactive" feedback as native
++            // tab-bar buttons. The click dispatches `WorkspaceAction::RunPluginCommand`, mirroring
++            // how palette items and keybindings route — no special handling needed.
++            let bg = blended_colors::neutral_1(theme);
++            // `theme.surface_2()` returns a `Fill` (not `ColorU`), so the two paths use the
++            // different setter overloads: `with_background_color` for the default neutral, and
++            // `with_background` (Fill) for the hover state.
++            let hover_bg = theme.surface_2();
++            Hoverable::new(MouseStateHandle::default(), move |state| {
++                let label = Text::new_inline(text.clone(), ui_font_family, 11.)
++                    .with_color(color.into())
++                    .with_style(warpui::fonts::Properties::default().weight(Weight::Semibold))
++                    .with_selectable(false)
++                    .finish();
++                let mut container = Container::new(label)
++                    .with_padding_left(8.)
++                    .with_padding_right(8.)
++                    .with_padding_top(2.)
++                    .with_padding_bottom(2.)
++                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
++                    .with_margin_right(6.);
++                if state.is_hovered() {
++                    container = container.with_background(hover_bg);
++                } else {
++                    container = container.with_background_color(bg);
++                }
++                container.finish()
++            })
++            .with_cursor(Cursor::PointingHand)
++            .on_click(move |ctx, _, _| {
++                ctx.dispatch_typed_action(WorkspaceAction::RunPluginCommand(command_id.clone()));
++            })
++            .finish()
++        } else {
++            // Non-clickable pill: same chrome, no hover/cursor (it's a read-only badge).
++            let label = Text::new_inline(text, ui_font_family, 11.)
++                .with_color(color.into())
++                .with_style(warpui::fonts::Properties::default().weight(Weight::Semibold))
++                .with_selectable(false)
++                .finish();
++            Container::new(label)
++                .with_padding_left(8.)
++                .with_padding_right(8.)
++                .with_padding_top(2.)
++                .with_padding_bottom(2.)
++                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
++                .with_background_color(blended_colors::neutral_1(theme))
++                .with_margin_right(6.)
++                .finish()
++        };
++        row.add_child(pill);
++    }
++
++    Some(row.finish())
++}
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index ac840158..ebe6bb09 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -2216,6 +2216,20 @@ impl Workspace {
+                         model.set(plugin_id.clone(), segments.clone(), ctx)
+                     });
+             }
++            crate::plugin::PluginHostEvent::SetStatusItem {
++                plugin_id,
++                item_id,
++                item,
++            } => {
++                // Store the plugin's tab-bar pill (`warp.ui.setStatusItem`). The tab-bar render
++                // path observes the singleton (see `Workspace::new`) and re-renders.
++                crate::workspace::plugin_status_items::PluginStatusItemsModel::handle(ctx).update(
++                    ctx,
++                    |model, ctx| {
++                        model.set(plugin_id.clone(), item_id.clone(), item.clone(), ctx);
++                    },
++                );
++            }
+         });
+     }
+ 
+@@ -2961,6 +2975,16 @@ impl Workspace {
+             ctx.notify();
+         });
+ 
++        // oh-my-warp: re-render the tab bar when a plugin pushes a status pill
++        // (`warp.ui.setStatusItem`). The render path reads the singleton each frame; this just
++        // wakes us up when it changes.
++        ctx.observe(
++            &crate::workspace::plugin_status_items::PluginStatusItemsModel::handle(ctx),
++            |_, _, ctx| {
++                ctx.notify();
++            },
++        );
++
+         let changelog_model = ChangelogModel::handle(ctx);
+         ctx.subscribe_to_model(&changelog_model, |me, _, event, ctx| {
+             me.handle_changelog_event(event, ctx);
+@@ -19997,6 +20021,13 @@ impl Workspace {
+         if let Some(indicator) = self.render_leader_indicator(appearance, ctx) {
+             tab_bar.add_child(indicator);
+         }
++        // oh-my-warp: render plugin-contributed status pills (`warp.ui.setStatusItem`) right of
++        // the leader indicator — same anchor, so they share the "system status" eyeline.
++        if let Some(pills) =
++            crate::workspace::plugin_status_items::render_plugin_status_items(ctx, appearance)
++        {
++            tab_bar.add_child(pills);
++        }
+         let is_web_anonymous_user = self
+             .auth_state
+             .is_user_web_anonymous_user()

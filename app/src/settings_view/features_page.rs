@@ -1402,6 +1402,10 @@ pub struct FeaturesPageView {
     #[cfg(feature = "local_tty")]
     startup_shell_view: ViewHandle<features::StartupShellView>,
     undo_close_view: ViewHandle<features::UndoCloseView>,
+    // oh-my-warp: selector for the active server/agent backend.
+    backend_selector_view: ViewHandle<features::BackendSelectorView>,
+    // oh-my-warp: selector for the active gRPC harness.
+    grpc_harness_selector_view: ViewHandle<features::GrpcHarnessSelectorView>,
 
     max_block_size_input_editor: ViewHandle<EditorView>,
     valid_max_block_size: bool,
@@ -2421,6 +2425,9 @@ impl FeaturesPageView {
         let startup_shell_view = ctx.add_typed_action_view(features::StartupShellView::new);
 
         let undo_close_view = ctx.add_typed_action_view(features::UndoCloseView::new);
+        let backend_selector_view = ctx.add_typed_action_view(features::BackendSelectorView::new);
+        let grpc_harness_selector_view =
+            ctx.add_typed_action_view(features::GrpcHarnessSelectorView::new);
 
         let appearance_handle = Appearance::handle(ctx);
 
@@ -2626,6 +2633,8 @@ impl FeaturesPageView {
             #[cfg(feature = "local_tty")]
             startup_shell_view,
             undo_close_view,
+            backend_selector_view,
+            grpc_harness_selector_view,
 
             max_block_size_input_editor: block_size_editor,
             valid_max_block_size: true,
@@ -2683,6 +2692,13 @@ impl FeaturesPageView {
 
         general_widgets.push(Box::new(SnackbarHeaderWidget::default()));
         general_widgets.push(Box::new(LinkTooltipWidget::default()));
+        // oh-my-warp: "Default backend" selector row.
+        general_widgets.push(Box::new(BackendSelectorWidget::default()));
+        // oh-my-warp: "Agent harness (gRPC)" selector row.
+        general_widgets.push(Box::new(GrpcHarnessSelectorWidget::default()));
+        // oh-my-warp: installed-plugins list.
+        #[cfg(feature = "plugin_host")]
+        general_widgets.push(Box::new(PluginsWidget::default()));
 
         #[cfg(feature = "local_fs")]
         {
@@ -5367,6 +5383,134 @@ impl SettingsWidget for DesktopNotificationsWidget {
         }
 
         column.finish()
+    }
+}
+
+// oh-my-warp: Settings widget listing installed plugins (M4). A read-only view of the
+// `~/.warp/plugins` manifests; the plugin host parses the same manifests independently to gate
+// capabilities. See PLUGIN_SPEC.md.
+#[cfg(feature = "plugin_host")]
+#[derive(Default)]
+struct PluginsWidget {}
+
+#[cfg(feature = "plugin_host")]
+impl SettingsWidget for PluginsWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "plugins extensions manifest permissions oh-my-warp"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        use super::settings_page::{render_sub_header, render_sub_header_with_description};
+
+        let mut children: Vec<Box<dyn Element>> = vec![render_sub_header(
+            appearance,
+            "Plugins (~/.warp/plugins)".to_string(),
+            None,
+        )];
+        let plugins = crate::plugin::installed::installed_plugins();
+        if plugins.is_empty() {
+            children.push(render_sub_header_with_description(
+                appearance,
+                "No plugins installed".to_string(),
+                "Drop a folder containing main.js (and an optional plugin.json) into \
+                 ~/.warp/plugins."
+                    .to_string(),
+            ));
+        } else {
+            for plugin in plugins {
+                let title = format!("{} · {} · v{}", plugin.name, plugin.id, plugin.version);
+                let permissions = if plugin.permissions.is_empty() {
+                    "none".to_string()
+                } else {
+                    plugin.permissions.join(", ")
+                };
+                let manifest_note = if plugin.has_manifest {
+                    String::new()
+                } else {
+                    " · no plugin.json (legacy)".to_string()
+                };
+                let mut description = format!(
+                    "permissions: {permissions} · engines.warp {}{manifest_note}",
+                    plugin.engines_warp
+                );
+                if !plugin.description.is_empty() {
+                    description = format!("{} · {description}", plugin.description);
+                }
+                children.push(render_sub_header_with_description(
+                    appearance,
+                    title,
+                    description,
+                ));
+            }
+        }
+        Flex::column().with_children(children).finish()
+    }
+}
+
+// oh-my-warp: Settings widget rendering the "Default backend" selector row.
+#[derive(Default)]
+struct BackendSelectorWidget {}
+
+impl SettingsWidget for BackendSelectorWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "backend server agent default oh-my-warp"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        Flex::column()
+            .with_children([
+                render_sub_sub_header(
+                    appearance,
+                    "Default backend (applies after restart)".to_string(),
+                    None,
+                ),
+                ChildView::new(&view.backend_selector_view).finish(),
+            ])
+            .finish()
+    }
+}
+
+// oh-my-warp: Settings widget rendering the "Agent harness (gRPC)" selector row.
+#[derive(Default)]
+struct GrpcHarnessSelectorWidget {}
+
+impl SettingsWidget for GrpcHarnessSelectorWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "harness grpc agent claude pi-mono oh-my-warp"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        _app: &AppContext,
+    ) -> Box<dyn Element> {
+        Flex::column()
+            .with_children([
+                render_sub_sub_header(
+                    appearance,
+                    "Agent harness (gRPC, applies after restart)".to_string(),
+                    None,
+                ),
+                ChildView::new(&view.grpc_harness_selector_view).finish(),
+            ])
+            .finish()
     }
 }
 

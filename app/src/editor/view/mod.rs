@@ -621,9 +621,13 @@ pub fn init(ctx: &mut AppContext) {
         EditableBinding::new("editor_view:down", "Move cursor down", EditorAction::Down)
             .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
             .with_key_binding("ctrl-n"),
+        // oh-my-warp: ctrl-b is the tmux-style leader/prefix key (see
+        // crate::util::leader), so it is intentionally NOT bound to cursor-left
+        // here — an exact single-key ctrl-b binding would shadow the leader chord
+        // (the matcher fires an exact match before a longer sequence). Use the
+        // Left arrow for cursor-left.
         EditableBinding::new("editor_view:left", "Move cursor left", EditorAction::Left)
-            .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
-            .with_key_binding("ctrl-b"),
+            .with_context_predicate(id!("EditorView") & !id!("IMEOpen")),
         EditableBinding::new(
             "editor_view:right",
             "Move cursor right",

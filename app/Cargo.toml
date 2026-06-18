@@ -172,6 +172,7 @@ pprof = { workspace = true, optional = true, features = ["protobuf-codec"] }
 prost.workspace = true
 prost-types.workspace = true
 qrcode.workspace = true
+warp_agent_grpc.workspace = true
 rand.workspace = true
 rangemap.workspace = true
 rayon.workspace = true
@@ -182,6 +183,7 @@ rust-embed.workspace = true
 sentry-log = { workspace = true, optional = true }
 inventory = "0.3"
 schemars = "1"
+semver = "1"
 serde.workspace = true
 serde_bytes.workspace = true
 serde-bytes-repr.workspace = true
@@ -216,6 +218,7 @@ toml = "0.8.13"
 toml_edit.workspace = true
 tracing.workspace = true
 tracing-futures = { workspace = true, features = ["futures-03"] }
+tungstenite.workspace = true
 ui_components.workspace = true
 unicase = "2.7.0"
 unicode-general-category.workspace = true
@@ -503,6 +506,8 @@ creating_shared_sessions = []
 cross_repo_context = []
 codebase_index_persistence = ["full_source_code_embedding"]
 default = [
+    # oh-my-warp: enable the JavaScript plugin host (see PLUGIN_SPEC.md)
+    "omw_plugins",
     "agent_mode",
     "viewing_shared_sessions",
     "render_continuous_block_selections_with_single_border",
@@ -807,6 +812,10 @@ read_image_files = []
 # directly, rather than via the `FeatureFlag` enum, because its value is
 # required early in the app lifecycle prior to `FeatureFlag` initialization.
 plugin_host = ["dep:rquickjs", "dep:warp_js", "warp_cli/plugin_host"]
+# oh-my-warp: umbrella feature that turns the JavaScript plugin host on in the
+# default build, without dragging in the completions_v2 classic-vs-v2 machinery.
+# See PLUGIN_SPEC.md.
+omw_plugins = ["plugin_host"]
 # Enable this feature to automatically perform CPU profiling via pprof.  The
 # generated profile will be written to profile.pb in the current directory.
 # NOTE: This may slow down program execution.
@@ -1022,7 +1031,7 @@ git_credential_refresh = []
 category = "public.app-category.developer-tools"
 copyright = "© 2025, Denver Technologies, Inc"
 identifier = "dev.warp.WarpOss"
-name = "WarpOss"
+name = "oh-my-warp"
 resources = ["assets/onboarding"]
 icon = ["channels/oss/icon/no-padding/512x512.png", "channels/oss/icon/no-padding/icon.ico"]
 short_description = "The open-source, cloud-backed terminal for individuals and teams."
