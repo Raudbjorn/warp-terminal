@@ -25,6 +25,9 @@ pub fn build_ssh_args(server: &SshServerInfo) -> Vec<String> {
     } else {
         format!("{}@{}", server.username, server.host)
     };
+    if target.starts_with('-') {
+        args.push("--".into());
+    }
     args.push(target);
     args
 }
@@ -106,5 +109,26 @@ mod tests {
         s.key_path = Some("/path with spaces/id_rsa".into());
         let line = build_ssh_command_line(&s);
         assert!(line.contains("'/path with spaces/id_rsa'"), "actual: {line}");
+    }
+    #[test]
+    fn target_starting_with_dash_gets_option_terminator() {
+        // Argument injection guard: if host or username@host starts with `-`,
+        // ssh would interpret it as a command-line option (e.g. `-oProxyCommand=...`).
+        // The `--` option terminator forces ssh to treat the next arg as a destination.
+        let mut s = server();
+        s.username = String::new();
+        s.host = "-oProxyCommand=evil".into();
+        assert_eq!(
+            build_ssh_args(&s),
+            vec!["ssh", "--", "-oProxyCommand=evil"]
+        );
+
+        let mut s = server();
+        s.username = "-evil".into();
+        s.host = "1.2.3.4".into();
+        assert_eq!(
+            build_ssh_args(&s),
+            vec!["ssh", "--", "-evil@1.2.3.4"]
+        );
     }
 }

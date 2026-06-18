@@ -108,15 +108,28 @@ lazy_static! {
 /// (Simplified Chinese) for every Han code point, which renders Japanese-locale UI text with
 /// Simplified Chinese glyph shapes (e.g. 直/設/規 look "off" to Japanese readers).
 fn cjk_han_font_for_ui_locale() -> ExternalFontFamily {
+    // Parse the BCP-47 primary subtag (split on `-` or `_`) so a locale like
+    // `kok-IN` (Konkani) is not misclassified as Korean. Region/script subtags
+    // are inspected separately for the zh-Hant distinction.
     let locale = warpui::current_ui_locale();
-    let lower = locale.to_ascii_lowercase();
-    if lower.starts_with("ja") {
+    let (primary, rest) = match locale.split_once(|c: char| c == '-' || c == '_') {
+        Some((p, r)) => (p.to_ascii_lowercase(), r.to_ascii_lowercase()),
+        None => (locale.to_ascii_lowercase(), String::new()),
+    };
+    if primary == "ja" || primary == "jpn" {
         NOTO_SANS_JP.clone()
-    } else if lower.starts_with("ko") {
+    } else if primary == "ko" || primary == "kor" {
         NOTO_SANS_KR.clone()
-    } else if lower.starts_with("zh-tw") || lower.starts_with("zh-hk") || lower.starts_with("zh-mo")
-    {
-        NOTO_SANS_TC.clone()
+    } else if primary == "zh" || primary == "zho" {
+        // Traditional Chinese: either an explicit region (TW/HK/MO) or the
+        // Hant script subtag. Region-less `zh-CN` / `zh-SG` stays Simplified.
+        if rest.split(|c: char| c == '-' || c == '_').any(|s| {
+            matches!(s.as_str(), "tw" | "hk" | "mo" | "hant")
+        }) {
+            NOTO_SANS_TC.clone()
+        } else {
+            NOTO_SANS_SC.clone()
+        }
     } else {
         NOTO_SANS_SC.clone()
     }

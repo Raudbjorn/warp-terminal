@@ -204,7 +204,10 @@ mod tests {
     #[test]
     fn fallback_chain_works() {
         init(Some("zh-CN"));
+        set_locale("zh-CN");
         let loader = loader().unwrap();
+
+
         // common-ok 中文已译
         assert_eq!(loader.get("common-ok"), "确定");
         // 不存在的 key — fluent 会返回 key 本身或带 marker 的字符串

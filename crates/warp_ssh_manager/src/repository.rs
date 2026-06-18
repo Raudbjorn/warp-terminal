@@ -179,9 +179,12 @@ impl SshRepository {
         conn: &mut SqliteConnection,
         node_id: &str,
     ) -> Result<(), SshRepositoryError> {
-        diesel::update(ssh_servers::table.find(node_id))
+        let n = diesel::update(ssh_servers::table.find(node_id))
             .set(ssh_servers::last_connected_at.eq(Some(Utc::now().naive_utc())))
             .execute(conn)?;
+        if n == 0 {
+            return Err(SshRepositoryError::NotFound(node_id.to_string()));
+        }
         Ok(())
     }
 
@@ -242,10 +245,18 @@ fn server_from_row(r: SshServerRow) -> Result<SshServerInfo, SshRepositoryError>
         column: "ssh_servers.auth_type",
         value: r.auth_type.clone(),
     })?;
+    // Reject out-of-range ports (DB stores i32; valid port range is 0..=65535) instead of
+    // silently truncating with `as`. Negative or >65535 values indicate DB corruption
+    // or a future migration that broadened the column; surfacing them as an error is
+    // safer than handing the wrong port to ssh.
+    let port = u16::try_from(r.port).map_err(|_| SshRepositoryError::InvalidEnum {
+        column: "ssh_servers.port",
+        value: r.port.to_string(),
+    })?;
     Ok(SshServerInfo {
         node_id: r.node_id,
         host: r.host,
-        port: r.port as u16,
+        port,
         username: r.username,
         auth_type: auth,
         key_path: r.key_path,
