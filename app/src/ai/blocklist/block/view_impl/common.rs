@@ -82,7 +82,7 @@ use crate::ai::blocklist::inline_action::inline_action_icons::{self, icon_size};
 use crate::ai::blocklist::inline_action::requested_action::RenderableAction;
 use crate::ai::blocklist::model::{AIBlockModel, AIBlockModelHelper};
 use crate::ai::blocklist::secret_redaction::{redact_secrets_in_element, SecretRedactionState};
-use crate::notebooks::editor::{markdown_table_appearance, rich_text_styles, MarkdownTableAppearance};
+use crate::notebooks::editor::{rich_text_styles, MarkdownTableAppearance};
 use crate::ai::blocklist::{BlocklistAIActionModel, ShellCommandExecutor, TextLocation};
 use crate::ai::blocklist::view_util::error_color;
 use crate::ai::loading::shimmering_warp_loading_text;

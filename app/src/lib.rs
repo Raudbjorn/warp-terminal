@@ -42,7 +42,7 @@ mod gpu_state;
 mod input_classifier;
 mod interval_timer;
 mod linear;
-#[cfg(feature = "local_fs")]
+mod i18n;
 mod local_control;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod login_item;
@@ -597,6 +597,12 @@ pub fn run() -> Result<()> {
     {
         std::env::set_var("LANG", "en_US.UTF-8");
     }
+    // Initialize the i18n layer so `warpui::current_ui_locale()` reflects the user's
+    // chosen (or system) locale before font fallback / DirectWrite paths query it.
+    // `override_locale` is None until settings expose a UI-language picker; for now
+    // we always defer to the system locale requester.
+    i18n::init(None);
+
     // Perform any necessary platform-specific initialization.
     platform::init();
 
