@@ -55,12 +55,22 @@ pub struct StatusItem {
     pub command_id: Option<String>,
 }
 
+/// Composite key for a status pill: `(plugin_id, item_id)`. We use a tuple rather than allocating
+/// a String at every render so the hot path doesn't churn the allocator.
+type PillKey = (String, String);
+
 /// Singleton model storing each plugin's pills, keyed by `(plugin_id, item_id)`. BTreeMaps preserve
 /// stable ordering across frames (sorted by plugin id, then by item id), so the pill positions
 /// don't dance when a plugin updates one of them.
+///
+/// `mouse_states` holds a `MouseStateHandle` per clickable pill. The render path *must* reuse the
+/// same handle across frames — `MouseStateHandle::default()` per render loses the GPUI hover/
+/// click identity between frames, so the pill never registers hover or click. The map only carries
+/// handles for pills with a `command_id`; passive (read-only) pills don't need one.
 #[derive(Default)]
 pub struct PluginStatusItemsModel {
     items: BTreeMap<String, BTreeMap<String, StatusItem>>,
+    mouse_states: BTreeMap<PillKey, MouseStateHandle>,
 }
 
 impl PluginStatusItemsModel {
@@ -70,6 +80,12 @@ impl PluginStatusItemsModel {
 
     /// Replaces (or removes, if `item` is `None`) the pill identified by `(plugin_id, item_id)`,
     /// then emits a change event so any view observing this model re-renders.
+    ///
+    /// For items with a `command_id` we also pre-create a `MouseStateHandle` so the render path
+    /// can reuse the same handle across frames. Creating a fresh handle on every render breaks
+    /// GPUI's hover/click identity, so the pill never registers interaction. We allocate the handle
+    /// here (not lazily at render time) because the singleton model is borrowed immutably from
+    /// `as_ref(app)` during render, and `BTreeMap::entry` needs `&mut self`.
     pub fn set(
         &mut self,
         plugin_id: String,
@@ -77,12 +93,23 @@ impl PluginStatusItemsModel {
         item: Option<StatusItem>,
         ctx: &mut ModelContext<Self>,
     ) {
+        let key = (plugin_id.clone(), item_id.clone());
         match item {
             Some(item) => {
+                let command_id = item.command_id.clone();
                 self.items
                     .entry(plugin_id)
                     .or_default()
                     .insert(item_id, item);
+                if command_id.is_some() {
+                    // Insert (or keep) a handle. The default handle is a no-op wrapper around an
+                    // internal `Rc<RefCell<...>>` so the entry-or-default clone is cheap.
+                    self.mouse_states.entry(key).or_default();
+                } else {
+                    // Passive pill — no hover/click state needed. Drop any stale handle from a
+                    // prior clickable incarnation so the map doesn't leak.
+                    self.mouse_states.remove(&key);
+                }
             }
             None => {
                 if let Some(plugin_items) = self.items.get_mut(&plugin_id) {
@@ -91,20 +118,20 @@ impl PluginStatusItemsModel {
                         self.items.remove(&plugin_id);
                     }
                 }
+                self.mouse_states.remove(&key);
             }
         }
         ctx.emit(PluginStatusItemsEvent::Changed);
         ctx.notify();
     }
 
-    /// All pills, in stable render order. Pairs each item with the owning `(plugin_id, item_id)` so
-    /// the render path can build per-pill mouse-state handles keyed by identity.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, &StatusItem)> {
-        self.items.iter().flat_map(|(plugin_id, items)| {
-            items
-                .iter()
-                .map(move |(item_id, item)| (plugin_id.as_str(), item_id.as_str(), item))
-        })
+    /// Returns the persistent `MouseStateHandle` for `(plugin_id, item_id)`, or `None` if the pill
+    /// is passive (no `command_id`). The handle is `Clone` so the render path can hand a copy to
+    /// the per-frame `Hoverable` element; the original stays in the model for the next frame.
+    pub fn mouse_state_for(&self, plugin_id: &str, item_id: &str) -> Option<MouseStateHandle> {
+        self.mouse_states
+            .get(&(plugin_id.to_owned(), item_id.to_owned()))
+            .cloned()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -151,8 +178,15 @@ pub fn render_plugin_status_items(
     let mut row = Flex::row()
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
         .with_main_axis_size(MainAxisSize::Min);
+    // Collect (plugin_id, item_id, item) tuples first so we can both iterate them and look up
+    // the persistent mouse-state handle per clickable pill. The handle is created in `set` so
+    // reusing the same instance across frames preserves GPUI's hover/click identity.
+    let entries: Vec<(String, String, StatusItem)> = model
+        .iter()
+        .map(|(p, i, item)| (p.to_owned(), i.to_owned(), item.clone()))
+        .collect();
 
-    for (_plugin_id, _item_id, item) in model.iter() {
+    for (plugin_id, item_id, item) in entries {
         let color = pill_color_for_kind(item.kind, theme);
         let text = item.text.clone();
         let ui_font_family = appearance.ui_font_family();
@@ -166,7 +200,12 @@ pub fn render_plugin_status_items(
             // different setter overloads: `with_background_color` for the default neutral, and
             // `with_background` (Fill) for the hover state.
             let hover_bg = theme.surface_2();
-            Hoverable::new(MouseStateHandle::default(), move |state| {
+            // Reuse the persistent handle. `set` guarantees one exists for any clickable pill, so
+            // the `expect` is a sanity check, not a recoverable branch.
+            let mouse_state = model
+                .mouse_state_for(&plugin_id, &item_id)
+                .expect("clickable pill must have a mouse-state handle allocated by set()");
+            Hoverable::new(mouse_state, move |state| {
                 let label = Text::new_inline(text.clone(), ui_font_family, 11.)
                     .with_color(color.into())
                     .with_style(warpui::fonts::Properties::default().weight(Weight::Semibold))
@@ -210,6 +249,5 @@ pub fn render_plugin_status_items(
         };
         row.add_child(pill);
     }
-
     Some(row.finish())
 }
