@@ -248,6 +248,16 @@ enum PredictionJson {
     String(String),
 }
 
+/// Upper bound for the local-provider request timeout (1 hour). Values loaded from
+/// `settings.toml` or set programmatically bypass the UI validation, so every call
+/// path clamps here to keep `reqwest`/`tokio` timer math from overflowing.
+pub(crate) const MAX_LOCAL_OPENAI_TIMEOUT_MS: u64 = 3_600_000;
+
+fn clamp_timeout(mut config: LocalOpenAISettingsSnapshot) -> LocalOpenAISettingsSnapshot {
+    config.timeout_ms = config.timeout_ms.clamp(1, MAX_LOCAL_OPENAI_TIMEOUT_MS);
+    config
+}
+
 impl LocalOpenAIClient {
     pub(crate) fn new(config: LocalOpenAISettingsSnapshot) -> Self {
         Self {
@@ -291,7 +301,7 @@ impl LocalOpenAIClient {
         prompt: String,
         ai_execution_context: Option<WarpAiExecutionContext>,
     ) -> Result<Vec<AIGeneratedCommand>, LocalOpenAIError> {
-        let config = self.configured()?;
+        let config = self.configured_for_command()?;
         let mut user_prompt = format!("User request:\n{prompt}");
         if let Some(context) = ai_execution_context.and_then(|context| context.to_json_string()) {
             user_prompt.push_str("\n\nExecution context JSON:\n");
@@ -348,7 +358,7 @@ impl LocalOpenAIClient {
         http_client: &http_client::Client,
         command: String,
     ) -> Result<GeneratedCommandMetadata, LocalOpenAIError> {
-        let config = self.configured()?;
+        let config = self.configured_for_command()?;
         let content = self
             .chat_completion(
                 http_client,
@@ -389,7 +399,7 @@ impl LocalOpenAIClient {
         http_client: &http_client::Client,
         request: &PredictAMQueriesRequest,
     ) -> Result<PredictAMQueriesResponse, LocalOpenAIError> {
-        let config = self.configured()?;
+        let config = self.configured_for_prediction()?;
         let content = self
             .chat_completion(
                 http_client,
@@ -418,7 +428,7 @@ impl LocalOpenAIClient {
         http_client: &http_client::Client,
         request: &GenerateAIInputSuggestionsRequest,
     ) -> Result<GenerateAIInputSuggestionsResponseV2, LocalOpenAIError> {
-        let config = self.configured()?;
+        let config = self.configured_for_prediction()?;
         let content = self
             .chat_completion(
                 http_client,
@@ -672,9 +682,29 @@ impl LocalOpenAIClient {
     }
 
     fn configured(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
-        let config = self.config.read().clone();
+    /// Returns the current snapshot if it is runnable for the **command** path
+    /// (natural-language → commands, command metadata). The `prediction_model`
+    /// may be empty — only `command_model` is required here so the command path
+    /// doesn't get blocked by an unset prediction model.
+    fn configured_for_command(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
+        let config = self.config.read();
         if !config.enabled
+            || config.base_url.trim().is_empty()
             || config.command_model.trim().is_empty()
+        {
+            return Err(LocalOpenAIError::NotConfigured);
+        }
+        // Clone only once validated, and clamp the timeout for settings-file values.
+        Ok(clamp_timeout(config.clone()))
+    }
+
+    /// Returns the current snapshot if it is runnable for the **prediction** path
+    /// (agent-mode query prediction, AI input suggestions). Requires the
+    /// `prediction_model` to be set.
+    fn configured_for_prediction(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
+        let config = self.config.read();
+        if !config.enabled
+            || config.base_url.trim().is_empty()
             || config.prediction_model.trim().is_empty()
         {
             return Err(LocalOpenAIError::NotConfigured);
@@ -691,7 +721,8 @@ impl LocalOpenAIClient {
                 }
             }
         }
-        Ok(config)
+        // Clone only once validated, and clamp the timeout for settings-file values.
+        Ok(clamp_timeout(config.clone()))
     }
 }
 

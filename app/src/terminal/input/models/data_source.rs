@@ -1,5 +1,4 @@
 use fuzzy_match::{match_indices_case_insensitive, FuzzyMatchResult};
-use itertools::Itertools;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
 use ordered_float::OrderedFloat;
 use warp_core::ui::appearance::Appearance;
@@ -141,6 +140,8 @@ impl ModelSelectorDataSource {
 
     fn order_model_choices<'a>(
         llm_preferences: &LLMPreferences,
+        terminal_view_id: EntityId,
+        app: &AppContext,
         choices: Vec<&'a LLMInfo>,
     ) -> Vec<&'a LLMInfo> {
         let mut auto_choices = Vec::new();
@@ -150,7 +151,10 @@ impl ModelSelectorDataSource {
         for llm in choices {
             if is_auto(llm) {
                 auto_choices.push(llm);
-            } else if llm_preferences.custom_llm_info_for_id(&llm.id).is_some() {
+            } else if llm_preferences
+                .custom_llm_info_for_terminal(&llm.id, app, Some(terminal_view_id))
+                .is_some()
+            {
                 custom_choices.push(llm);
             } else {
                 other_choices.push(llm);
@@ -189,20 +193,27 @@ impl SyncDataSource for ModelSelectorDataSource {
         };
 
         let choices = if is_full_terminal {
-            llm_preferences.get_cli_agent_llm_choices(app).collect_vec()
+            llm_preferences.get_cli_agent_llm_choices_for_terminal(app, Some(self.terminal_view_id))
         } else {
             llm_preferences
-                .get_base_llm_choices_for_agent_mode(app)
-                .collect_vec()
+                .get_base_llm_choices_for_agent_mode_for_terminal(app, Some(self.terminal_view_id))
         };
-        let choices = Self::order_model_choices(llm_preferences, choices);
+        let choices =
+            Self::order_model_choices(llm_preferences, self.terminal_view_id, app, choices);
 
         let query_text = query.text.trim().to_lowercase();
 
         if query_text.is_empty() {
             return Ok(choices
                 .into_iter()
-                .map(|llm| QueryResult::from(ModelSearchItem::new(llm, &active_llm_id, app)))
+                .map(|llm| {
+                    QueryResult::from(ModelSearchItem::new(
+                        llm,
+                        &active_llm_id,
+                        app,
+                        self.terminal_view_id,
+                    ))
+                })
                 .collect());
         }
 
@@ -220,7 +231,7 @@ impl SyncDataSource for ModelSelectorDataSource {
                 }
 
                 Some(QueryResult::from(
-                    ModelSearchItem::new(llm, &active_llm_id, app)
+                    ModelSearchItem::new(llm, &active_llm_id, app, self.terminal_view_id)
                         .with_name_match_result(Some(match_result.clone()))
                         .with_score(OrderedFloat(match_result.score as f64)),
                 ))
@@ -255,7 +266,12 @@ struct ModelSearchItem {
 }
 
 impl ModelSearchItem {
-    fn new(llm: &LLMInfo, active_llm_id: &LLMId, app: &AppContext) -> Self {
+    fn new(
+        llm: &LLMInfo,
+        active_llm_id: &LLMId,
+        app: &AppContext,
+        terminal_view_id: EntityId,
+    ) -> Self {
         // If the model requires an upgrade but the user already has a BYOK key
         // for this provider, treat it as enabled by clearing the disable reason.
         let disable_reason = if llm.disable_reason == Some(DisableReason::RequiresUpgrade)
@@ -266,7 +282,7 @@ impl ModelSearchItem {
             llm.disable_reason.clone()
         };
         let is_custom_endpoint = LLMPreferences::as_ref(app)
-            .custom_llm_info_for_id(&llm.id)
+            .custom_llm_info_for_terminal(&llm.id, app, Some(terminal_view_id))
             .is_some();
         let is_auto = is_auto(llm);
         let is_using_bedrock = should_show_bedrock_icon_for_model(llm, app);

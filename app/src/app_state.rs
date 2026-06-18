@@ -326,6 +326,12 @@ pub enum LeftPanelDisplayedTab {
     GlobalSearch,
     WarpDrive,
     ConversationListView,
+    #[cfg(not(target_family = "wasm"))]
+    CodexConversations,
+    #[cfg(not(target_family = "wasm"))]
+    OpenCodeConversations,
+    #[cfg(not(target_family = "wasm"))]
+    DockerContainers,
 }
 
 impl From<ToolPanelView> for LeftPanelDisplayedTab {
@@ -335,6 +341,12 @@ impl From<ToolPanelView> for LeftPanelDisplayedTab {
             ToolPanelView::GlobalSearch { .. } => LeftPanelDisplayedTab::GlobalSearch,
             ToolPanelView::WarpDrive => LeftPanelDisplayedTab::WarpDrive,
             ToolPanelView::ConversationListView => LeftPanelDisplayedTab::ConversationListView,
+            #[cfg(not(target_family = "wasm"))]
+            ToolPanelView::CodexConversations => LeftPanelDisplayedTab::CodexConversations,
+            #[cfg(not(target_family = "wasm"))]
+            ToolPanelView::OpenCodeConversations => LeftPanelDisplayedTab::OpenCodeConversations,
+            #[cfg(not(target_family = "wasm"))]
+            ToolPanelView::DockerContainers => LeftPanelDisplayedTab::DockerContainers,
         }
     }
 }

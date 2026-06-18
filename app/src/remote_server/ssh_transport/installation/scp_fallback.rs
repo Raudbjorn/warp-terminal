@@ -123,9 +123,13 @@ async fn is_valid_cached_tarball(path: &Path) -> bool {
 ///
 /// Reuses an existing cached tarball when available; otherwise downloads the
 /// tarball into the cache and returns the newly cached path.
-async fn cached_remote_server_tarball(platform: &RemotePlatform) -> anyhow::Result<PathBuf> {
-    let cache_path = remote_server_tarball_cache_path(platform);
-    if is_valid_cached_tarball(&cache_path).await {
+async fn cached_remote_server_tarball(
+    platform: &RemotePlatform,
+    install_options: &InstallScriptOptions,
+) -> anyhow::Result<PathBuf> {
+    let cache_path = remote_server_tarball_cache_path(platform, install_options);
+    let use_existing_cache = !remote_server::setup::remote_server_artifact_is_moving_latest();
+    if use_existing_cache && is_valid_cached_tarball(&cache_path).await {
         log::info!(
             "Using cached remote-server tarball at {}",
             cache_path.display()
@@ -193,7 +197,7 @@ async fn download_remote_server_tarball_to_cache(
     // cache hit is good enough for this install, so discard our temp file.
     match async_fs::rename(&temp_path, cache_path).await {
         Ok(()) => Ok(()),
-        Err(e) if is_valid_cached_tarball(cache_path).await => {
+        Err(_) if is_valid_cached_tarball(cache_path).await => {
             let _ = async_fs::remove_file(&temp_path).await;
             Ok(())
         }

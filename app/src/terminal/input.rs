@@ -186,6 +186,11 @@ use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::harness_availability::HarnessAvailabilityModel;
 use crate::ai::llms::{LLMPreferences, LLMPreferencesEvent};
 use crate::ai::mcp::TemplatableMCPServerManager;
+#[cfg(not(target_family = "wasm"))]
+use crate::ai::predict::local_command_autocomplete::{
+    AutocompleteBlockContext, LocalCommandAutocompleteProviderSettings,
+    LocalCommandAutocompleteRequest, file_candidates_for_context, request_local_command_autocomplete,
+};
 use crate::ai::predict::next_command_model::{
     is_command_valid, is_next_command_enabled, NextCommandModel, NextCommandModelEvent,
     NextCommandSuggestionState, ZeroStateSuggestionInfo,
@@ -5815,6 +5820,14 @@ impl Input {
         }
     }
 
+    /// The prompt text of the currently shown passive prompt-suggestion banner,
+    /// if any. Used by integration tests to assert a suggestion appeared.
+    pub fn prompt_suggestion_banner_prompt(&self) -> Option<String> {
+        self.prompt_suggestions_banner_state
+            .as_ref()
+            .map(|banner_state| banner_state.prompt_suggestion.prompt.clone())
+    }
+
     // Auto-attach the last block for this query.
     fn auto_attach_last_block_for_query(&mut self, ctx: &mut ViewContext<Self>) {
         let last_block_id = {
@@ -6618,6 +6631,7 @@ impl Input {
         let completer_data = self.completer_data();
         let block_context = Some(BlockContext::from_completed_block(&block_completed));
         let previous_result = self.last_intelligent_autosuggestion_result.take();
+        let terminal_view_id = self.terminal_view_id;
         self.next_command_model.update(ctx, |model, ctx| {
             model.generate_next_command_suggestion(
                 block_completed,
@@ -6625,6 +6639,7 @@ impl Input {
                 completer_data,
                 block_context,
                 previous_result,
+                Some(terminal_view_id),
                 ctx,
             );
         });
@@ -9262,7 +9277,37 @@ impl Input {
         };
         self.abort_latest_autosuggestion_future();
 
-        if FeatureFlag::PartialNextCommandSuggestions.is_enabled() && is_next_command_enabled(ctx) {
+        #[cfg(not(target_family = "wasm"))]
+        let (local_autocomplete_root_url, local_autocomplete_provider_settings) = {
+            let active_profile = AIExecutionProfilesModel::as_ref(ctx)
+                .active_profile(Some(self.terminal_view_id), ctx);
+            let profile_key = active_profile.inference_profile_key();
+            let api_key_manager = ::ai::api_keys::ApiKeyManager::as_ref(ctx);
+            if api_key_manager.local_ai_autocomplete_enabled_for_profile(&profile_key) {
+                (
+                    crate::local_multi_agent::local_no_cloud_root_url(),
+                    LocalCommandAutocompleteProviderSettings {
+                        openai_api_key: api_key_manager.openai_key_for_profile(&profile_key),
+                        openai_base_url: api_key_manager.openai_base_url_for_profile(&profile_key),
+                        local_model_aliases: non_empty_string(
+                            api_key_manager.local_model_aliases_for_profile(&profile_key),
+                        ),
+                    },
+                )
+            } else {
+                (
+                    None,
+                    LocalCommandAutocompleteProviderSettings::default(),
+                )
+            }
+        };
+        #[cfg(target_family = "wasm")]
+        let local_autocomplete_root_url: Option<url::Url> = None;
+
+        if local_autocomplete_root_url.is_none()
+            && FeatureFlag::PartialNextCommandSuggestions.is_enabled()
+            && is_next_command_enabled(ctx)
+        {
             let Some(session) = self.active_session(ctx) else {
                 return;
             };
@@ -9270,6 +9315,7 @@ impl Input {
             if let Some(last_user_block_completed) =
                 completer_data.last_user_block_completed.clone()
             {
+                let terminal_view_id = self.terminal_view_id;
                 self.next_command_model.update(ctx, |model, ctx| {
                     model.generate_next_command_suggestion_with_prefix(
                         Some(buffer_text),
@@ -9278,6 +9324,7 @@ impl Input {
                         completer_data,
                         None,
                         None,
+                        Some(terminal_view_id),
                         ctx,
                     );
                 });
@@ -9308,6 +9355,123 @@ impl Input {
         let abort_handle = ctx
             .spawn_abortable(
                 async move {
+                    #[cfg(not(target_family = "wasm"))]
+                    if let Some(root_url) = local_autocomplete_root_url {
+                        let file_candidates = match completion_context.as_ref() {
+                            Some(completion_context) => {
+                                file_candidates_for_context(completion_context).await
+                            }
+                            None => Vec::new(),
+                        };
+                        let request = LocalCommandAutocompleteRequest {
+                            prefix: buffer_text.clone(),
+                            cwd: local_autocomplete_cwd.clone(),
+                            shell: local_autocomplete_shell.clone(),
+                            platform: local_autocomplete_platform.clone(),
+                            recent_blocks: local_autocomplete_recent_blocks.clone(),
+                            history: local_autocomplete_history.clone(),
+                            file_candidates,
+                        };
+                        let started = std::time::Instant::now();
+                        match request_local_command_autocomplete(
+                            root_url,
+                            &request,
+                            local_autocomplete_provider_settings,
+                        )
+                        .await
+                        {
+                            Ok(response) => {
+                                let duration_ms = started.elapsed().as_millis();
+                                log::debug!(
+                                    "Local AI autocomplete response: prefix_chars={} duration_ms={} source={} parse_status={} command_chars={} raw_output_chars={} recent_blocks={} history={} file_candidates={}",
+                                    buffer_text.chars().count(),
+                                    duration_ms,
+                                    response.source.as_str(),
+                                    response.parse_status.as_str(),
+                                    response.most_likely_action.chars().count(),
+                                    response.raw_output.chars().count(),
+                                    request.recent_blocks.len(),
+                                    request.history.len(),
+                                    request.file_candidates.len(),
+                                );
+                                let skip_completion_spec_validation =
+                                    response.should_skip_completion_spec_validation();
+                                if let Some(command) =
+                                    response.command_suggestion(buffer_text.as_str())
+                                {
+                                    if ignored_suggestions.contains(command) {
+                                        log::info!(
+                                            "Local AI autocomplete rejected response: reason=ignored prefix_chars={} duration_ms={} source={} parse_status={} command_chars={}",
+                                            buffer_text.chars().count(),
+                                            duration_ms,
+                                            response.source.as_str(),
+                                            response.parse_status.as_str(),
+                                            command.chars().count(),
+                                        );
+                                    } else if skip_completion_spec_validation
+                                        || is_command_valid(
+                                            command,
+                                            completion_context.as_ref(),
+                                            session_env_vars.as_ref(),
+                                        )
+                                        .await
+                                    {
+                                        log::debug!(
+                                            "Local AI autocomplete accepted response: prefix_chars={} source={} parse_status={} validation={}",
+                                            buffer_text.chars().count(),
+                                            response.source.as_str(),
+                                            response.parse_status.as_str(),
+                                            if skip_completion_spec_validation {
+                                                "skipped"
+                                            } else {
+                                                "completion_specs"
+                                            },
+                                        );
+                                        return AutoSuggestionResult {
+                                            buffer_text,
+                                            autosuggestion_result: Some(command.to_string()),
+                                        };
+                                    } else {
+                                        log::info!(
+                                            "Local AI autocomplete rejected response: reason=invalid_command prefix_chars={} duration_ms={} source={} parse_status={} command_chars={}",
+                                            buffer_text.chars().count(),
+                                            duration_ms,
+                                            response.source.as_str(),
+                                            response.parse_status.as_str(),
+                                            command.chars().count(),
+                                        );
+                                    }
+                                } else {
+                                    if response.source != "none"
+                                        || !response.raw_output.is_empty()
+                                    {
+                                        log::info!(
+                                            "Local AI autocomplete rejected response: reason=no_command_for_prefix prefix_chars={} duration_ms={} source={} parse_status={} raw_output_chars={}",
+                                            buffer_text.chars().count(),
+                                            duration_ms,
+                                            response.source.as_str(),
+                                            response.parse_status.as_str(),
+                                            response.raw_output.chars().count(),
+                                        );
+                                    } else {
+                                        log::debug!(
+                                            "Local AI autocomplete rejected response: reason=no_command_for_prefix prefix_chars={} source={} parse_status={}",
+                                            buffer_text.chars().count(),
+                                            response.source.as_str(),
+                                            response.parse_status.as_str(),
+                                        );
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                log::debug!(
+                                    "Local AI autocomplete request failed after {} ms: {error:#}",
+                                    started.elapsed().as_millis(),
+                                );
+                            }
+                        }
+                    }
+
                     #[cfg(feature = "local_fs")]
                     // First, use rich history to find commands with a matching prefix that were run
                     // in a similar context, taking into account the most recent block run.
@@ -16200,6 +16364,12 @@ fn maybe_render_ai_input_indicators(
             .with_margin_right(em_width)
             .finish(),
     )
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn non_empty_string(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }
 
 #[cfg(feature = "integration_tests")]

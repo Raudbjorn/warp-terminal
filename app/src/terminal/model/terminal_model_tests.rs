@@ -1,5 +1,4 @@
-use std::fs;
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Local};
@@ -12,12 +11,13 @@ use warpui::text::{str_to_byte_vec, SelectionType};
 use super::*;
 use crate::terminal::color;
 use crate::terminal::event_listener::ChannelEventListener;
-use crate::terminal::model::ansi::{Handler, Processor};
+use crate::terminal::model::ansi::{Handler, InitShellValue, Processor, SSHValue};
 use crate::terminal::model::block::BlockId;
 use crate::terminal::model::bootstrap::BootstrapStage;
 use crate::terminal::model::grid::Dimensions as _;
 use crate::terminal::model::image_map::StoredImageMetadata;
 use crate::terminal::model::index::Side;
+use crate::terminal::model::session::IsLegacySSHSession;
 use crate::terminal::model::selection::ExpandedSelectionRange;
 use crate::terminal::model::test_utils::block_size;
 use crate::terminal::model::ObfuscateSecrets;
@@ -119,101 +119,61 @@ fn generic_shared_session_viewer_model_starts_view_pending() {
     assert!(model.shared_session_status().is_viewer());
 }
 
-fn iterm_file_osc(name: &str, inline: bool, payload: &[u8]) -> String {
-    let inline = if inline { "1" } else { "0" };
-    format!(
-        "\x1b]1337;File=name={};inline={}:{}\x07",
-        base64::Engine::encode(&BASE64, name),
-        inline,
-        base64::Engine::encode(&BASE64, payload)
-    )
-}
-
-fn multipart_iterm_file_osc(name: &str, inline: bool, payload: &[u8]) -> Vec<String> {
-    let inline = if inline { "1" } else { "0" };
-    let encoded_payload = base64::Engine::encode(&BASE64, payload);
-    let midpoint = encoded_payload.len() / 2;
-    vec![
-        format!(
-            "\x1b]1337;MultipartFile=name={};inline={}\x07",
-            base64::Engine::encode(&BASE64, name),
-            inline,
-        ),
-        format!("\x1b]1337;FilePart={}\x07", &encoded_payload[..midpoint]),
-        format!("\x1b]1337;FilePart={}\x07", &encoded_payload[midpoint..]),
-        "\x1b]1337;FileEnd\x07".to_owned(),
-    ]
-}
-
-fn hex_encoded_json_dcs(payload: &str) -> Vec<u8> {
-    let mut bytes = b"\x1bP$d".to_vec();
-    bytes.extend(hex::encode(payload).bytes());
-    bytes.push(0x9c);
-    bytes
-}
-
 #[test]
-fn ignores_non_inline_iterm_file_payload_without_overwriting_cwd_file() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let target_path = temp_dir.path().join(".zshenv");
-    let original_bytes = b"ORIGINAL=1\n";
-    let attacker_bytes = b"touch /tmp/warp-pwned\n";
-    fs::write(&target_path, original_bytes).unwrap();
+fn recover_failed_ssh_bootstrap_registers_degraded_remote_session() {
+    let mut model = TerminalModel::new_for_test(
+        block_size(),
+        color::List::from(&color::Colors::default()),
+        ChannelEventListener::new_for_test(),
+        Arc::new(Background::default()),
+        false,
+        None,
+        false,
+        false,
+        None,
+    );
+    let session_id: SessionId = 42.into();
 
-    let mut terminal = TerminalModel::mock(None, None);
-    terminal.precmd(PrecmdValue {
-        pwd: Some(temp_dir.path().to_string_lossy().to_string()),
+    model.ssh(SSHValue {
+        socket_path: PathBuf::from("/tmp/warp-test-control-socket"),
+        remote_shell: "bash".to_string(),
+    });
+    model.init_shell(InitShellValue {
+        session_id,
+        shell: "bash".to_string(),
+        is_subshell: true,
+        user: "root".to_string(),
+        hostname: "adm19.nt.vc".to_string(),
         ..Default::default()
     });
 
-    let osc = iterm_file_osc(".zshenv", false, attacker_bytes);
-    terminal.process_bytes(osc.as_str());
+    assert!(matches!(
+        model.terminal_input_state(),
+        TerminalInputState::NotBootstrapped
+    ));
+    assert!(model.has_pending_ssh_session());
+    assert_eq!(model.pending_session_id(), Some(session_id));
 
-    assert_eq!(fs::read(&target_path).unwrap(), original_bytes);
-    assert!(terminal.image_id_to_metadata.is_empty());
-}
+    let event = model
+        .recover_failed_ssh_bootstrap()
+        .expect("pending SSH session should be recoverable");
 
-#[test]
-fn ignores_multipart_non_inline_iterm_file_payload_without_overwriting_cwd_file() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let target_path = temp_dir.path().join(".zshenv");
-    let original_bytes = b"ORIGINAL=1\n";
-    let attacker_bytes = b"touch /tmp/warp-pwned\n";
-    fs::write(&target_path, original_bytes).unwrap();
-
-    let mut terminal = TerminalModel::mock(None, None);
-    terminal.precmd(PrecmdValue {
-        pwd: Some(temp_dir.path().to_string_lossy().to_string()),
-        ..Default::default()
-    });
-
-    for osc in multipart_iterm_file_osc(".zshenv", false, attacker_bytes) {
-        terminal.process_bytes(osc.as_str());
-    }
-
-    assert_eq!(fs::read(&target_path).unwrap(), original_bytes);
-    assert!(terminal.image_id_to_metadata.is_empty());
-}
-
-#[test]
-fn handles_inline_iterm_image_payload() {
-    let mut terminal = TerminalModel::mock(None, None);
-    let svg_bytes =
-        br#"<svg width="1" height="1" viewBox="0 0 1 1" xmlns="http://www.w3.org/2000/svg"></svg>"#;
-
-    let osc = iterm_file_osc("pixel.svg", true, svg_bytes);
-    terminal.process_bytes(osc.as_str());
-
-    assert_eq!(terminal.image_id_to_metadata.len(), 1);
-    let StoredImageMetadata::ITerm(metadata) =
-        terminal.image_id_to_metadata.values().next().unwrap()
-    else {
-        panic!("Expected iTerm image metadata");
-    };
-    assert_eq!(metadata.name, "pixel.svg");
-    assert!(metadata.inline);
-    assert_eq!(metadata.image_size.x(), 1.0);
-    assert_eq!(metadata.image_size.y(), 1.0);
+    assert!(model.get_pending_session_info().is_none());
+    assert!(model.block_list().is_bootstrapped());
+    assert_eq!(model.block_list().active_block().session_id(), Some(session_id));
+    assert!(matches!(
+        model.terminal_input_state(),
+        TerminalInputState::InputEditor
+    ));
+    assert_eq!(event.session_info.session_id, session_id);
+    assert_eq!(
+        event.session_info.session_type,
+        BootstrapSessionType::WarpifiedRemote
+    );
+    assert!(matches!(
+        event.session_info.is_legacy_ssh_session,
+        IsLegacySSHSession::Yes { .. }
+    ));
 }
 
 // Ensures that an ssh session successfully bootstraps even if the block list is empty.

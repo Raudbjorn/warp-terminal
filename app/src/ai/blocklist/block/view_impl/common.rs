@@ -16,35 +16,41 @@ use itertools::Itertools;
 use markdown_parser::{FormattedText, FormattedTextInline, TableAlignment};
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
-use warp_core::channel::ChannelState;
-use warp_core::features::FeatureFlag;
-use warp_core::ui::appearance::Appearance;
-use warp_core::ui::color::blend::Blend;
-use warp_core::ui::theme::color::internal_colors;
 use warp_editor::content::edit::resolve_asset_source_relative_to_directory;
 use warp_editor::content::mermaid_diagram::mermaid_asset_source;
 use warp_util::path::to_relative_path;
-use warpui::assets::asset_cache::{AssetCache, AssetSource, AssetState};
-use warpui::elements::new_scrollable::{ScrollableAppearance, SingleAxisConfig};
 use warpui::elements::shimmering_text::ShimmeringTextStateHandle;
-use warpui::elements::{
-    Align, Axis, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty, EventHandler,
-    Expanded, Fill, Flex, FormattedTextElement, HeadingFontSizeMultipliers, Highlight,
-    HighlightedRange, Hoverable, Image as WarpImage, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, NewScrollable, OffsetPositioning, ParentAnchor, ParentElement,
-    ParentOffsetBounds, Radius, SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth,
-    Shrinkable, Stack, Table, TableColumnWidth, TableConfig, TableHeader, TableVerticalSizing,
-    Text, Wrap,
+
+use warpui_core::elements::{Highlight, HighlightedRange};
+use warp_core::channel::ChannelState;
+use warp_core::{
+    features::FeatureFlag,
+    ui::{appearance::Appearance, color::blend::Blend, theme::color::internal_colors},
 };
-use warpui::fonts::{Properties, Weight};
-use warpui::image_cache::{CacheOption, ImageType};
-use warpui::keymap::Keystroke;
-use warpui::platform::Cursor;
-use warpui::text_layout::{ClipConfig, TextAlignment, TextStyle};
-use warpui::ui_components::button::Button;
-use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
-use warpui::{Action, AppContext, Element, EventContext, SingletonEntity, View, ViewHandle};
+use warpui::{
+    assets::asset_cache::{AssetCache, AssetSource, AssetState},
+    elements::{
+        new_scrollable::{ScrollableAppearance, SingleAxisConfig},
+        Align, Axis, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle,
+        ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty,
+        EventHandler, Expanded, Fill, Flex, FormattedTextElement, HeadingFontSizeMultipliers,
+        Hoverable, Image as WarpImage, MainAxisAlignment, MainAxisSize, MouseStateHandle,
+        NewScrollable, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius,
+        SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth, Shrinkable, Stack, Table,
+        TableColumnWidth, TableConfig, TableHeader, TableVerticalSizing, Text, Wrap,
+    },
+    fonts::{Properties, Weight},
+    image_cache::{CacheOption, ImageType},
+    keymap::Keystroke,
+    platform::Cursor,
+    text_layout::{ClipConfig, TextAlignment, TextStyle},
+    ui_components::{
+        button::Button,
+        components::{Coords, UiComponent, UiComponentStyles},
+    },
+    Action, AppContext, Element, EventContext, SingletonEntity, View, ViewHandle,
+};
+
 
 use super::output::LinkActionConstructors;
 use super::{add_highlights_to_rich_text, add_highlights_to_text};
@@ -76,13 +82,14 @@ use crate::ai::blocklist::inline_action::inline_action_icons::{self, icon_size};
 use crate::ai::blocklist::inline_action::requested_action::RenderableAction;
 use crate::ai::blocklist::model::{AIBlockModel, AIBlockModelHelper};
 use crate::ai::blocklist::secret_redaction::{redact_secrets_in_element, SecretRedactionState};
-use crate::ai::blocklist::view_util::error_color;
+use crate::notebooks::editor::{rich_text_styles, MarkdownTableAppearance};
 use crate::ai::blocklist::{BlocklistAIActionModel, ShellCommandExecutor, TextLocation};
+use crate::ai::blocklist::view_util::error_color;
 use crate::ai::loading::shimmering_warp_loading_text;
 use crate::ai::AIRequestUsageModel;
 use crate::code::editor::view::CodeEditorView;
 use crate::code::editor_management::CodeSource;
-use crate::notebooks::editor::{markdown_table_appearance, rich_text_styles};
+
 use crate::search::slash_command_menu::static_commands::commands;
 use crate::settings::{FontSettings, InputSettings};
 use crate::settings_view::SettingsSection;
@@ -2416,6 +2423,25 @@ fn blocklist_base_line_height(app: &AppContext) -> f32 {
 }
 
 const TABLE_BLOCK_CORNER_RADIUS: f32 = 8.0;
+
+fn ai_table_appearance(appearance: &Appearance) -> MarkdownTableAppearance {
+    let theme = appearance.theme();
+    MarkdownTableAppearance {
+        border_color: internal_colors::neutral_4(theme),
+        header_background: theme.surface_2().into_solid(),
+        cell_background: ColorU::transparent_black(),
+        alternate_row_background: Some(theme.surface_1().with_opacity(50).into_solid()),
+        text_color: internal_colors::text_sub(theme, theme.background()),
+        header_text_color: internal_colors::text_main(theme, theme.background()),
+        scrollbar_nonactive_thumb_color: theme.nonactive_ui_detail().into_solid(),
+        scrollbar_active_thumb_color: theme.active_ui_detail().into_solid(),
+        cell_padding: 8.,
+        outer_border: true,
+        column_dividers: true,
+        row_dividers: true,
+    }
+}
+
 fn render_table_section(
     table: &AgentOutputTable,
     table_handles: TableSectionHandles,
@@ -2435,7 +2461,7 @@ fn render_table_section(
     }
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
-    let table_appearance = markdown_table_appearance(appearance);
+    let table_appearance = ai_table_appearance(appearance);
     let notebook_styles = rich_text_styles(appearance, FontSettings::as_ref(app));
     let table_font_family = appearance.ai_font_family();
     let table_font_size = appearance.monospace_font_size();
