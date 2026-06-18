@@ -7,6 +7,8 @@ use crate::{
 use settings::{Setting, ToggleableSetting};
 use std::cell::RefCell;
 use std::collections::HashMap;
+use warp_core::channel::ChannelState;
+
 use warpui::{
     elements::{
         Container, CrossAxisAlignment, Element, Flex, MouseStateHandle, ParentElement, Text,
@@ -83,9 +85,11 @@ impl SettingsPageMeta for LocalAISettingsPageView {
     fn section() -> SettingsSection {
         SettingsSection::LocalAI
     }
-
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        true
+        // Local AI (openai-compatible endpoint, model selection) only works in
+        // the local-only channel — in Dev/Preview/Stable the local provider
+        // is not configured, so showing this page would just confuse users.
+        ChannelState::is_local_only()
     }
 
     fn update_filter(&mut self, query: &str, ctx: &mut ViewContext<Self>) -> MatchData {
