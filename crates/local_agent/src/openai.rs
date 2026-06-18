@@ -277,6 +277,16 @@ impl StreamAccumulator {
         std::mem::take(&mut self.pending_tool_calls)
             .into_values()
             .map(|partial| {
+                if partial.id.trim().is_empty() {
+                    return Err(LocalAgentError::Parse(
+                        "tool call missing required id".to_string(),
+                    ));
+                }
+                if partial.name.trim().is_empty() {
+                    return Err(LocalAgentError::Parse(
+                        "tool call missing required function name".to_string(),
+                    ));
+                }
                 let arguments = if partial.arguments.trim().is_empty() {
                     serde_json::Value::Object(Default::default())
                 } else {

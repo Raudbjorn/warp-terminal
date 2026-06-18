@@ -18,10 +18,16 @@ pub(crate) fn run_turn(
 ) -> BoxStream<'static, Result<AgentEvent, LocalAgentError>> {
     Box::pin(async_stream::try_stream! {
         let request = openai::build_request(&transcript, &tools, &config);
-        let builder = reqwest::Client::new()
+        // Reuse a single `reqwest::Client` across turns so TCP and TLS
+        // sessions are pooled across requests.
+        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+        let client = CLIENT.get_or_init(reqwest::Client::new);
+        let mut builder = client
             .post(openai::endpoint_url(&config.base_url))
-            .bearer_auth(&config.api_key)
             .json(&request);
+        if !config.api_key.trim().is_empty() {
+            builder = builder.bearer_auth(config.api_key.trim());
+        }
         let mut source = EventSource::new(builder)
             .map_err(|err| LocalAgentError::Transport(err.to_string()))?;
         source.set_retry_policy(Box::new(openai::NeverRetry));

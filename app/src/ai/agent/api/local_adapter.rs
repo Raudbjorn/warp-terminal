@@ -160,24 +160,22 @@ fn plan_agent_turn(
                     result: convert_input_tool_result(input_result.result.as_ref()),
                 };
                 // If the task tree somehow lacks the originating tool call
-                // (e.g. a forked or truncated conversation), synthesize one:
+                // (e.g. a forked or truncated conversation), we cannot
+                // safely synthesize an `Assistant` tool call because
                 // OpenAI-compatible servers reject `role:"tool"` messages
-                // without a preceding assistant tool call.
-                if !known_call_ids.contains(&input_result.tool_call_id) {
-                    transcript.push(local_agent::ChatMessage::Assistant {
-                        text: String::new(),
-                        tool_calls: vec![local_agent::ToolCallRequest {
-                            id: input_result.tool_call_id.clone(),
-                            name: "tool".to_string(),
-                            arguments: json!({}),
-                        }],
+                // whose `tool_call_id` doesn't match a preceding assistant
+                // tool call. Fall back to a user message carrying the
+                // rendered result instead.
+                if known_call_ids.contains(&input_result.tool_call_id) {
+                    transcript.push(local_agent::ChatMessage::Tool {
+                        tool_call_id: input_result.tool_call_id.clone(),
+                        content: render_tool_result_text(&message_result),
                     });
-                    known_call_ids.push(input_result.tool_call_id.clone());
+                } else {
+                    transcript.push(local_agent::ChatMessage::User(
+                        render_tool_result_text(&message_result),
+                    ));
                 }
-                transcript.push(local_agent::ChatMessage::Tool {
-                    tool_call_id: input_result.tool_call_id.clone(),
-                    content: render_tool_result_text(&message_result),
-                });
                 input_echo_messages.push(new_task_message(
                     &root_task_id,
                     api::message::Message::ToolCallResult(message_result),
@@ -196,18 +194,23 @@ fn plan_agent_turn(
                     if let Some(trigger) = render_passive_suggestion_trigger(result) {
                         transcript.push(local_agent::ChatMessage::User(trigger));
                     }
-                    if let Some(api::passive_suggestion_result_type::Suggestion::Prompt(prompt)) =
-                        result.suggestion.as_ref()
-                    {
-                        transcript.push(local_agent::ChatMessage::User(prompt.prompt.clone()));
-                        input_echo_messages.push(new_task_message(
-                            &root_task_id,
-                            api::message::Message::UserQuery(api::message::UserQuery {
-                                query: prompt.prompt.clone(),
-                                context: input.context.clone(),
-                                ..Default::default()
-                            }),
-                        ));
+                    match result.suggestion.as_ref() {
+                        Some(api::passive_suggestion_result_type::Suggestion::Prompt(prompt)) => {
+                            transcript.push(local_agent::ChatMessage::User(prompt.prompt.clone()));
+                            input_echo_messages.push(new_task_message(
+                                &root_task_id,
+                                api::message::Message::UserQuery(api::message::UserQuery {
+                                    query: prompt.prompt.clone(),
+                                    context: input.context.clone(),
+                                    ..Default::default()
+                                }),
+                            ));
+                        }
+                        Some(api::passive_suggestion_result_type::Suggestion::CodeDiff(_)) | None => {
+                            return Err(AdapterError::UnsupportedInput(
+                                "passive suggestion result without a prompt is not supported locally",
+                            ));
+                        }
                     }
                 }
             }
@@ -574,20 +577,22 @@ impl ToolRegistry {
                     .as_ref()
                     .map(prost_struct_to_json)
                     .unwrap_or_else(|| json!({ "type": "object" }));
-                if mcp_tools
-                    .insert(
-                        name.clone(),
-                        McpToolBinding {
-                            server_id: server.id.clone(),
-                            tool_name: tool.name.clone(),
-                            description: tool.description.clone(),
-                            parameters,
-                        },
-                    )
-                    .is_some()
-                {
+                // Preserve the first binding for a given mangled name and
+                // warn on subsequent collisions; routing to the wrong MCP
+                // target silently is worse than skipping the second one.
+                if mcp_tools.contains_key(&name) {
                     log::warn!("local agent loop: duplicate MCP tool name {name}");
+                    continue;
                 }
+                mcp_tools.insert(
+                    name,
+                    McpToolBinding {
+                        server_id: server.id.clone(),
+                        tool_name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters,
+                    },
+                );
             }
         }
         Self {

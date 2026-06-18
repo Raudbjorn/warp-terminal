@@ -44,15 +44,21 @@ pub(crate) fn pick_custom_endpoint(
         return None;
     }
     for endpoint in endpoints {
-        if endpoint.url.trim().is_empty() || endpoint.api_key.is_empty() {
+        let base_url = endpoint.url.trim();
+        if base_url.is_empty() {
             continue;
         }
+        let api_key = endpoint.api_key.trim();
         for model in &endpoint.models {
+            let model_slug = model.name.trim();
+            if model_slug.is_empty() {
+                continue;
+            }
             if !model.config_key.is_empty() && model.config_key == active_model_id {
                 return Some(LocalEndpointConfig {
-                    base_url: endpoint.url.clone(),
-                    api_key: endpoint.api_key.clone(),
-                    model_slug: model.name.clone(),
+                    base_url: base_url.to_string(),
+                    api_key: api_key.to_string(),
+                    model_slug: model_slug.to_string(),
                 });
             }
         }
@@ -162,7 +168,6 @@ pub(crate) fn parse_command_suggestion(
 }
 
 /// Pulls the first usable command line out of a model reply, tolerating code
-/// fences and inline backticks a model might add despite the instructions.
 fn extract_command(model_output: &str) -> Option<String> {
     for raw in model_output.lines() {
         let mut line = raw.trim();
@@ -170,12 +175,18 @@ fn extract_command(model_output: &str) -> Option<String> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("```") {
-            // A fence line, possibly with a language tag (```sh) or, for a
-            // one-line ```cmd``` block, the command itself.
-            line = rest
-                .trim_start_matches("bash")
-                .trim_start_matches("sh")
-                .trim();
+            // Skip pure opening/closing fences and language tags like
+            // ```sh / ```bash / ```shell.
+            let rest = rest.trim();
+            if rest.is_empty() {
+                continue;
+            }
+            let is_lang_tag = !rest.ends_with("```") && !rest.chars().any(char::is_whitespace);
+            if is_lang_tag {
+                continue;
+            }
+            // One-line fenced command: ```cmd```
+            line = rest.trim_end_matches("```").trim();
             if line.is_empty() {
                 continue;
             }

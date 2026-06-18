@@ -92,9 +92,8 @@ pub(crate) fn resolve_local_route(request: &api::Request) -> Option<LocalRoute> 
 }
 
 /// The local engine understands the plain agent-loop inputs and passive
-/// prompt suggestions; everything else system-driven (code review,
-/// environment creation, skills, orchestration, ...) keeps going to the
-/// server.
+/// prompt suggestions. Everything else (code review, environment
+/// creation, skills, orchestration, ...) is hard-blocked by
 fn is_supported_input(input_type: &api::request::input::Type) -> bool {
     use api::request::input::user_inputs::user_input::Input;
     match input_type {

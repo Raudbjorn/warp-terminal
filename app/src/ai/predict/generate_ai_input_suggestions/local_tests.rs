@@ -152,11 +152,11 @@ fn returns_none_for_builtin_model() {
 }
 
 #[test]
-fn skips_endpoints_with_empty_url_or_key() {
+fn skips_endpoints_with_empty_url() {
     let endpoints = vec![
         endpoint("NoUrl", "  ", "k", &[("m", "cfg-1")]),
-        endpoint("NoKey", "http://localhost:11434/v1", "", &[("m", "cfg-2")]),
+        endpoint("WithEmptyKey", "http://localhost:11434/v1", "", &[("m", "cfg-2")]),
     ];
     assert!(pick_custom_endpoint("cfg-1", &endpoints).is_none());
-    assert!(pick_custom_endpoint("cfg-2", &endpoints).is_none());
+    assert!(pick_custom_endpoint("cfg-2", &endpoints).is_some());
 }
