@@ -484,11 +484,11 @@ fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) ->
         }
 
         if arg.starts_with('-') {
-            // Skip both long (`--foo`, `--foo=bar`) and short (`-v`, `-o value`,
-            // `-obar`, `-abc`) options. The previous implementation only
-            // skipped long options, which let invocations like
-            // `warp -v agent` misidentify `-v` as the subcommand and bypass
-            // local-only gating entirely.
+            // Skip long (`--foo`, `--foo=bar`) and short (`-v`, `-obar`, `-abc`)
+            // options, plus long options that consume a separate value
+            // (`--api-key KEY`). The previous implementation only skipped long
+            // options, which let invocations like `warp -v agent` misidentify
+            // `-v` as the subcommand and bypass local-only gating entirely.
             let option_name = arg.split_once('=').map_or(arg, |(name, _)| name);
             index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name) && !arg.contains('=') {
                 2

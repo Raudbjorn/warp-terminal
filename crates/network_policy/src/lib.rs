@@ -88,7 +88,10 @@ fn is_guarded_scheme(scheme: &str) -> bool {
 fn is_loopback_url(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         None => false,
     }
@@ -111,6 +114,21 @@ mod tests {
             assert_eq!(
                 check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
                 Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn local_only_allows_ipv4_mapped_loopback() {
+        for url in [
+            "http://[::ffff:127.0.0.1]:8080",
+            "http://[::ffff:7f00:1]:8080",
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert_eq!(
+                check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
+                Ok(()),
+                "expected {url} to be treated as loopback"
             );
         }
     }

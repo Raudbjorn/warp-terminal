@@ -122,7 +122,7 @@ enum PredictionJson {
 /// Upper bound for the local-provider request timeout (1 hour). Values loaded from
 /// `settings.toml` or set programmatically bypass the UI validation, so every call
 /// path clamps here to keep `reqwest`/`tokio` timer math from overflowing.
-const MAX_LOCAL_OPENAI_TIMEOUT_MS: u64 = 3_600_000;
+pub(crate) const MAX_LOCAL_OPENAI_TIMEOUT_MS: u64 = 3_600_000;
 
 fn clamp_timeout(mut config: LocalOpenAISettingsSnapshot) -> LocalOpenAISettingsSnapshot {
     config.timeout_ms = config.timeout_ms.clamp(1, MAX_LOCAL_OPENAI_TIMEOUT_MS);
