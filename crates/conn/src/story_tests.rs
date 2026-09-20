@@ -224,3 +224,40 @@ fn an_unfinished_turn_has_no_outcome() {
     assert_eq!(story.turns[0].outcome, None);
     assert_eq!(story.turns[0].steps.len(), 1);
 }
+
+/// The panel merges the story with the live hook entries, so it needs to know
+/// how far the story reaches. Anything the transcript has not recorded yet is
+/// still in flight.
+#[test]
+fn a_turn_ends_at_its_last_record() {
+    let jsonl = transcript(&[
+        &typed("2026-09-20T10:00:00Z", "first ask"),
+        &said("2026-09-20T10:00:30Z", "first outcome"),
+        &typed("2026-09-20T10:01:00Z", "second ask"),
+        &tool("2026-09-20T10:01:10Z", "Bash", "Still working"),
+    ]);
+
+    let story = parse_transcript(&jsonl);
+    assert_eq!(
+        story.turns[0].ended_at,
+        Some("2026-09-20T10:00:30Z".parse().expect("valid time")),
+        "a finished turn ends when it said its last word"
+    );
+    assert_eq!(
+        story.turns[1].last_activity(),
+        "2026-09-20T10:01:10Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("valid time"),
+        "an unfinished turn reaches as far as its last step"
+    );
+}
+
+/// A prompt nothing has happened on yet has no end, so its last activity is
+/// when it was sent.
+#[test]
+fn a_turn_with_no_activity_ends_nowhere() {
+    let jsonl = typed("2026-09-20T10:00:00Z", "just asked");
+    let story = parse_transcript(&jsonl);
+    assert_eq!(story.turns[0].ended_at, None);
+    assert_eq!(story.turns[0].last_activity(), story.turns[0].started_at);
+}

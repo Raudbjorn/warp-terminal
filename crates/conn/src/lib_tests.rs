@@ -1,5 +1,6 @@
 use chrono::{TimeZone, Utc};
 
+use super::story::{ConnStory, ConnTurn};
 use super::{ConnEntry, ConnEntryKind, ConnSession, MAX_ENTRIES};
 
 fn at(seconds: i64) -> chrono::DateTime<Utc> {
@@ -170,4 +171,119 @@ fn different_tools_do_not_coalesce() {
     session.push(tool(3));
 
     assert_eq!(session.entries().len(), 3);
+}
+
+fn responded(text: &str, seconds: i64) -> ConnEntry {
+    ConnEntry::new(
+        ConnEntryKind::Responded {
+            text: Some(text.to_owned()),
+        },
+        at(seconds),
+    )
+}
+
+/// `ended_at` is `None` on a turn nothing has happened on yet, so
+/// `last_activity` falls back to when it started.
+fn turn(started: i64, ended: Option<i64>, outcome: Option<&str>) -> ConnTurn {
+    ConnTurn {
+        started_at: at(started),
+        ended_at: ended.map(at),
+        prompt: "do the thing".to_owned(),
+        steps: vec![],
+        outcome: outcome.map(str::to_owned),
+    }
+}
+
+fn story(turns: Vec<ConnTurn>) -> ConnStory {
+    ConnStory { title: None, turns }
+}
+
+/// Until a story has been read, the hook entries are all there is.
+#[test]
+fn everything_is_in_flight_before_a_story_arrives() {
+    let mut session = ConnSession::default();
+    session.push(prompt("do the thing", 1));
+    session.push(tool(2));
+
+    assert_eq!(session.story(), None);
+    assert_eq!(session.in_flight().len(), 2);
+}
+
+/// The story tells the completed turns better than the hook entries do, so
+/// showing both would repeat the turn the reader has just read.
+#[test]
+fn a_story_supersedes_the_live_entries_it_covers() {
+    let mut session = ConnSession::default();
+    session.push(prompt("do the thing", 1));
+    session.push(tool(2));
+    session.push(responded("done", 3));
+    session.push(prompt("now the next thing", 5));
+    session.push(tool(6));
+
+    assert!(session.adopt_story(story(vec![turn(1, Some(3), Some("done"))]), at(3)));
+
+    let in_flight: Vec<_> = session
+        .in_flight()
+        .iter()
+        .map(|entry| entry.kind.clone())
+        .collect();
+    assert_eq!(
+        in_flight,
+        vec![
+            ConnEntryKind::Prompt {
+                text: "now the next thing".to_owned()
+            },
+            ConnEntryKind::ToolCompleted {
+                tool_name: Some("Bash".to_owned()),
+                target: Some("cargo test".to_owned()),
+                runs: 1,
+            },
+        ],
+        "only the turn the story does not cover is still in flight"
+    );
+}
+
+/// Reads are dispatched in order but resolve off the main thread, so a slow
+/// read can land after a later one. Taking it would rewind the panel.
+#[test]
+fn a_stale_read_does_not_replace_a_newer_story() {
+    let mut session = ConnSession::default();
+    let newer = story(vec![
+        turn(1, Some(3), Some("first")),
+        turn(4, Some(6), Some("second")),
+    ]);
+    let older = story(vec![turn(1, Some(3), Some("first"))]);
+
+    assert!(session.adopt_story(newer, at(6)));
+    assert!(!session.adopt_story(older, at(3)));
+    assert_eq!(
+        session.story().expect("story kept").turns.len(),
+        2,
+        "the later read wins regardless of which resolves first"
+    );
+}
+
+/// The transcript is written asynchronously, so a read triggered by the stop
+/// event can land before the closing message reaches the file. The response is
+/// the single most valuable thing on the panel, so it must not be hidden
+/// behind a story that does not have it yet.
+#[test]
+fn a_story_without_the_final_response_leaves_the_live_entry_visible() {
+    let mut session = ConnSession::default();
+    session.push(prompt("do the thing", 1));
+    session.push(responded("done", 9));
+
+    assert!(session.adopt_story(story(vec![turn(1, Some(3), None)]), at(9)));
+
+    let in_flight: Vec<_> = session
+        .in_flight()
+        .iter()
+        .map(|entry| entry.kind.clone())
+        .collect();
+    assert_eq!(
+        in_flight,
+        vec![ConnEntryKind::Responded {
+            text: Some("done".to_owned())
+        }]
+    );
 }

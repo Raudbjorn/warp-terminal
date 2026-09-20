@@ -10,9 +10,12 @@
 pub mod panel;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
+use ::conn::story::{ConnStory, parse_transcript};
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use warpui::r#async::FutureId;
 use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
 
 use crate::terminal::cli_agent_sessions::event::{CLIAgentEvent, CLIAgentEventType};
@@ -31,6 +34,9 @@ pub struct ConnModel {
     /// churns panes will accumulate history for panes that no longer exist.
     /// Bounded per session by `conn::MAX_ENTRIES`, unbounded in pane count.
     sessions: HashMap<EntityId, ConnSession>,
+    /// The transcript read currently in flight for each pane. Reading it is
+    /// how tests await the read before asserting on the story.
+    reads_in_flight: HashMap<EntityId, FutureId>,
 }
 
 impl Entity for ConnModel {
@@ -53,6 +59,13 @@ impl ConnModel {
     #[allow(dead_code)]
     pub fn session(&self, terminal_view_id: EntityId) -> Option<&ConnSession> {
         self.sessions.get(&terminal_view_id)
+    }
+
+    /// The transcript read in flight for a pane, if any. Tests await it before
+    /// asserting on the story.
+    #[allow(dead_code)]
+    pub fn read_in_flight(&self, terminal_view_id: EntityId) -> Option<FutureId> {
+        self.reads_in_flight.get(&terminal_view_id).copied()
     }
 
     fn handle_cli_session_event(
@@ -98,12 +111,67 @@ impl ConnModel {
             session.project = event.project.clone();
         }
 
-        let Some(kind) = entry_kind(event) else {
-            return;
-        };
-        session.push(ConnEntry::new(kind, Utc::now()));
-        ctx.notify();
+        if let Some(path) = event.payload.transcript_path.as_deref() {
+            session.transcript_path = Some(path.to_owned());
+        }
+
+        let at = Utc::now();
+        if let Some(kind) = entry_kind(event) {
+            session.push(ConnEntry::new(kind, at));
+            ctx.notify();
+        }
+
+        // A finished turn is the point at which the transcript has a complete
+        // chapter to tell, and the only event the plugin reports a transcript
+        // path on. Everything before the turn ended is re-read, which is
+        // wasteful on a long session but keeps the read stateless; an
+        // incremental read is an optimisation for when it starts to show.
+        if matches!(
+            event.event,
+            CLIAgentEventType::Stop | CLIAgentEventType::StopFailure
+        ) {
+            let Some(path) = session.transcript_path.clone() else {
+                return;
+            };
+            self.read_transcript(terminal_view_id, PathBuf::from(path), at, ctx);
+        }
     }
+
+    /// Reads and parses the transcript off the main thread.
+    ///
+    /// The parse is tens of milliseconds on a long session and grows with it,
+    /// so it must never run on the thread that draws frames.
+    fn read_transcript(
+        &mut self,
+        terminal_view_id: EntityId,
+        path: PathBuf,
+        through: DateTime<Utc>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let handle = ctx.spawn(read_story(path), move |me, story, ctx| {
+            me.reads_in_flight.remove(&terminal_view_id);
+            // A transcript that cannot be read or has not been written yet is
+            // not a failure: the live hook entries still describe the session,
+            // just less well.
+            let Some(story) = story else {
+                return;
+            };
+            let Some(session) = me.sessions.get_mut(&terminal_view_id) else {
+                return;
+            };
+            if session.adopt_story(story, through) {
+                ctx.notify();
+            }
+        });
+        self.reads_in_flight
+            .insert(terminal_view_id, handle.future_id());
+    }
+}
+
+/// Runs on a background thread. Returns `None` when the file cannot be read.
+async fn read_story(path: PathBuf) -> Option<ConnStory> {
+    let jsonl = tokio::fs::read_to_string(&path).await.ok()?;
+    Some(parse_transcript(&jsonl))
 }
 
 /// Translates a plugin event into a history entry, or `None` for events that

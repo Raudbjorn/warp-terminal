@@ -14,6 +14,8 @@ pub mod story;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::story::ConnStory;
+
 /// Entries retained per session before the oldest evictable one is dropped.
 ///
 /// Bounds memory and keeps the panel readable on a long session. Prompts are
@@ -91,6 +93,16 @@ pub struct ConnSession {
     pub cwd: Option<String>,
     /// Project name, as the plugin derives it from `cwd`.
     pub project: Option<String>,
+    /// Where the agent writes its transcript, once it reports one. The hook
+    /// events are truncated; this file is not.
+    pub transcript_path: Option<String>,
+    /// The narrative account read from the transcript, covering everything up
+    /// to [`Self::story_through`].
+    story: Option<ConnStory>,
+    /// How far the story reaches. Live entries recorded at or before this
+    /// moment are already told by the story, so showing them again would
+    /// repeat the turn the reader just read.
+    story_through: Option<DateTime<Utc>>,
     /// Chronological history. Order is the product: "I asked X, then it
     /// decided Y, then I asked Z."
     entries: Vec<ConnEntry>,
@@ -102,6 +114,47 @@ pub struct ConnSession {
 impl ConnSession {
     pub fn entries(&self) -> &[ConnEntry] {
         &self.entries
+    }
+
+    pub fn story(&self) -> Option<&ConnStory> {
+        self.story.as_ref()
+    }
+
+    /// Takes a story read from the transcript, covering live entries up to
+    /// `through`. Returns whether it was taken.
+    ///
+    /// `through` is when the turn-completion event that triggered the read
+    /// arrived — our own clock, so it orders reliably even though reads are
+    /// dispatched from the main thread and resolve off it. A read that
+    /// resolves after a later one is stale and is dropped rather than
+    /// rewinding the panel.
+    pub fn adopt_story(&mut self, story: ConnStory, through: DateTime<Utc>) -> bool {
+        if self.story_through.is_some_and(|current| current >= through) {
+            return false;
+        }
+        // The transcript is written asynchronously, so a read can land before
+        // the turn's closing message reaches the file. Trust the story only as
+        // far as it actually goes, so the live entry carrying the response is
+        // still shown rather than hidden behind a story that lacks it.
+        let through = match story.turns.last() {
+            Some(turn) if turn.outcome.is_none() => turn.last_activity(),
+            _ => through,
+        };
+        self.story_through = Some(through);
+        self.story = Some(story);
+        true
+    }
+
+    /// Live entries the story does not yet cover: the turn in flight.
+    ///
+    /// Entries are appended as events arrive, so `at` is non-decreasing and
+    /// the boundary is a partition rather than a scan.
+    pub fn in_flight(&self) -> &[ConnEntry] {
+        let Some(through) = self.story_through else {
+            return &self.entries;
+        };
+        let start = self.entries.partition_point(|entry| entry.at <= through);
+        &self.entries[start..]
     }
 
     /// Number of entries evicted from the front of the history.

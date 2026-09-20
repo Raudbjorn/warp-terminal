@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnTurn {
     pub started_at: DateTime<Utc>,
+    /// The last transcript record that belonged to this turn. `None` for a
+    /// prompt nothing has happened on yet.
+    pub ended_at: Option<DateTime<Utc>>,
     /// The instruction as typed, untruncated.
     pub prompt: String,
     /// What the agent did, in order, in its own words.
@@ -29,6 +32,13 @@ pub struct ConnTurn {
     /// The agent's closing message for this turn, untruncated. `None` while
     /// the turn is still running.
     pub outcome: Option<String>,
+}
+
+impl ConnTurn {
+    /// The last moment this turn is known to have been active.
+    pub fn last_activity(&self) -> DateTime<Utc> {
+        self.ended_at.unwrap_or(self.started_at)
+    }
 }
 
 /// A step the agent took. `runs` counts immediately repeated identical steps,
@@ -89,6 +99,7 @@ pub fn parse_transcript(jsonl: &str) -> ConnStory {
                 started_at: record
                     .timestamp
                     .expect("filtered to records with a timestamp"),
+                ended_at: None,
                 prompt,
                 steps: Vec::new(),
                 outcome: None,
@@ -101,6 +112,7 @@ pub fn parse_transcript(jsonl: &str) -> ConnStory {
         let Some(turn) = turns.last_mut() else {
             continue;
         };
+        turn.ended_at = record.timestamp;
         for step in record.tool_steps() {
             push_step(&mut turn.steps, step);
         }
