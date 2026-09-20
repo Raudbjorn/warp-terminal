@@ -375,3 +375,71 @@ fn tool_rows_stay_when_there_is_no_story() {
             .any(|row| row.starts_with("live: ToolCompleted"))
     );
 }
+
+/// An answer opens with orientation and closes with the conclusion and
+/// whatever decision it is waiting on. Coming back to a pane, the close is the
+/// part worth reading.
+#[test]
+fn a_long_answer_previews_its_conclusion_not_its_opening() {
+    let answer = format!(
+        "Read the repo and both reference repos. Here's what I found.\n\n{}\n\nWant me to start? \
+         I'd do A1-A3 in one pass, then A6.",
+        "F1 — no LICENSE, which disqualifies the repo. ".repeat(20)
+    );
+
+    let preview = super::tail_preview(&answer);
+    assert!(
+        preview.ends_with("I'd do A1-A3 in one pass, then A6."),
+        "the conclusion has to survive: {preview}"
+    );
+    assert!(
+        !preview.contains("Here's what I found"),
+        "the opening is the part you can infer from your own prompt"
+    );
+    assert!(preview.starts_with('…'), "the cut is marked: {preview}");
+}
+
+/// A short answer is its own conclusion and is shown whole.
+#[test]
+fn a_short_answer_is_not_cut() {
+    assert_eq!(
+        super::tail_preview("Four commits, working tree clean."),
+        "Four commits, working tree clean."
+    );
+}
+
+/// The panel draws plain text, so a stray `##` reads as noise rather than as
+/// structure.
+#[test]
+fn heading_markers_are_not_shown() {
+    assert_eq!(
+        super::tail_preview("## What I found\n\nNeither repo gets it from CI."),
+        "What I found · Neither repo gets it from CI."
+    );
+}
+
+/// A prompt cut mid-word reads as a rendering bug rather than as an excerpt.
+#[test]
+fn a_cut_prompt_ends_on_a_word() {
+    let prompt = format!(
+        "{} and have all the hygiene factors",
+        "x".repeat(PREVIEW_CHARS - 10)
+    );
+
+    let cut = truncate(&prompt);
+    let kept = cut.trim_end_matches('…');
+    assert!(prompt.starts_with(kept), "the preview is a prefix: {cut}");
+    assert!(
+        prompt[kept.len()..].starts_with(char::is_whitespace),
+        "the cut lands between words, not inside one: {cut}"
+    );
+}
+
+/// With no word boundary within reach, cutting mid-word beats returning
+/// nothing.
+#[test]
+fn an_unbroken_prompt_is_cut_where_it_must_be() {
+    let prompt = "x".repeat(PREVIEW_CHARS + 50);
+    let cut = truncate(&prompt);
+    assert_eq!(cut.chars().count(), PREVIEW_CHARS + 1);
+}

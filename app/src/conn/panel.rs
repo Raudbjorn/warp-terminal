@@ -39,6 +39,10 @@ const PREVIEW_CHARS: usize = 240;
 /// How far a step is indented under the prompt it belongs to.
 const STEP_INDENT: f32 = 22.;
 
+/// How far back a truncation reaches for a word boundary before giving up and
+/// cutting mid-word.
+const WORD_BOUNDARY_SLACK: usize = 24;
+
 pub struct ConnPanelView {
     /// The pane group whose focused pane this panel follows. Set by the
     /// workspace.
@@ -380,7 +384,7 @@ fn render_row(row: &ConnRow, app: &AppContext) -> Box<dyn Element> {
     match row {
         ConnRow::Turn { at, prompt } => render_turn(*at, prompt, app),
         ConnRow::Step { description, runs } => render_step(description, *runs, app),
-        ConnRow::Outcome(text) => render_labelled("said", truncate(text), false, app),
+        ConnRow::Outcome(text) => render_labelled("said", tail_preview(text), false, app),
         // A new instruction opens a chapter whether the transcript has caught
         // up with it or not.
         ConnRow::NoTranscript => render_notice(
@@ -576,7 +580,7 @@ fn describe_live(kind: &ConnEntryKind) -> (&'static str, String, bool) {
         }
         ConnEntryKind::Responded { text } => (
             "said",
-            text.as_deref().map(truncate).unwrap_or_default(),
+            text.as_deref().map(tail_preview).unwrap_or_default(),
             false,
         ),
         ConnEntryKind::Failed {
@@ -646,14 +650,51 @@ fn format_when(at: DateTime<Utc>) -> String {
 }
 
 /// Truncates on a character boundary, since prompts and responses are
-/// arbitrary user and model text.
+/// arbitrary user and model text, and on a word boundary where there is one
+/// nearby, so a cut prompt does not end mid-word.
 fn truncate(text: &str) -> String {
     let text = text.trim();
     if text.chars().count() <= PREVIEW_CHARS {
         return text.to_owned();
     }
-    let truncated: String = text.chars().take(PREVIEW_CHARS).collect();
-    format!("{truncated}…")
+    let mut kept: String = text.chars().take(PREVIEW_CHARS).collect();
+    if let Some(space) = kept.rfind(char::is_whitespace)
+        && kept[space..].chars().count() < WORD_BOUNDARY_SLACK
+    {
+        kept.truncate(space);
+    }
+    format!("{}…", kept.trim_end())
+}
+
+/// The end of a long message rather than its beginning.
+///
+/// An answer of any length opens with orientation — "here is what I found" —
+/// and closes with the conclusion and whatever decision it is waiting on.
+/// Coming back to a pane, the close is the part worth reading, and the opening
+/// is the part you can infer from your own prompt.
+fn tail_preview(text: &str) -> String {
+    let text = strip_heading_markers(text);
+    let length = text.chars().count();
+    if length <= PREVIEW_CHARS {
+        return text;
+    }
+    let tail: String = text.chars().skip(length - PREVIEW_CHARS).collect();
+    // Start after the first break so the preview does not open mid-word.
+    let start = tail.find(char::is_whitespace).map_or(0, |index| index + 1);
+    format!("…{}", tail[start..].trim_start())
+}
+
+/// Drops Markdown heading markers so a preview reads as prose.
+///
+/// The panel renders plain text, and a stray `##` mid-line reads as noise
+/// rather than as structure.
+fn strip_heading_markers(text: &str) -> String {
+    text.trim()
+        .lines()
+        .map(|line| line.trim_start_matches('#').trim_start())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 impl View for ConnPanelView {
