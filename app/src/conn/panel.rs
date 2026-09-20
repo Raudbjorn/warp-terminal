@@ -25,7 +25,7 @@ use warpui::{
     AppContext, Entity, EntityId, SingletonEntity, View, ViewContext, ViewHandle, WeakViewHandle,
 };
 
-use super::ConnModel;
+use super::{ConnModel, preview};
 use crate::appearance::Appearance;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
 use crate::pane_group::PaneGroup;
@@ -38,10 +38,6 @@ const PREVIEW_CHARS: usize = 240;
 
 /// How far a step is indented under the prompt it belongs to.
 const STEP_INDENT: f32 = 22.;
-
-/// How far back a truncation reaches for a word boundary before giving up and
-/// cutting mid-word.
-const WORD_BOUNDARY_SLACK: usize = 24;
 
 pub struct ConnPanelView {
     /// The pane group whose focused pane this panel follows. Set by the
@@ -653,48 +649,12 @@ fn format_when(at: DateTime<Utc>) -> String {
 /// arbitrary user and model text, and on a word boundary where there is one
 /// nearby, so a cut prompt does not end mid-word.
 fn truncate(text: &str) -> String {
-    let text = text.trim();
-    if text.chars().count() <= PREVIEW_CHARS {
-        return text.to_owned();
-    }
-    let mut kept: String = text.chars().take(PREVIEW_CHARS).collect();
-    if let Some(space) = kept.rfind(char::is_whitespace)
-        && kept[space..].chars().count() < WORD_BOUNDARY_SLACK
-    {
-        kept.truncate(space);
-    }
-    format!("{}…", kept.trim_end())
+    preview::head(text, PREVIEW_CHARS)
 }
 
-/// The end of a long message rather than its beginning.
-///
-/// An answer of any length opens with orientation — "here is what I found" —
-/// and closes with the conclusion and whatever decision it is waiting on.
-/// Coming back to a pane, the close is the part worth reading, and the opening
-/// is the part you can infer from your own prompt.
+/// The end of a long message rather than its beginning. See [`preview::tail`].
 fn tail_preview(text: &str) -> String {
-    let text = strip_heading_markers(text);
-    let length = text.chars().count();
-    if length <= PREVIEW_CHARS {
-        return text;
-    }
-    let tail: String = text.chars().skip(length - PREVIEW_CHARS).collect();
-    // Start after the first break so the preview does not open mid-word.
-    let start = tail.find(char::is_whitespace).map_or(0, |index| index + 1);
-    format!("…{}", tail[start..].trim_start())
-}
-
-/// Drops Markdown heading markers so a preview reads as prose.
-///
-/// The panel renders plain text, and a stray `##` mid-line reads as noise
-/// rather than as structure.
-fn strip_heading_markers(text: &str) -> String {
-    text.trim()
-        .lines()
-        .map(|line| line.trim_start_matches('#').trim_start())
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ")
+    preview::tail(text, PREVIEW_CHARS)
 }
 
 impl View for ConnPanelView {

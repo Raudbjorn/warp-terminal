@@ -8,6 +8,7 @@
 //! delay, alter or block a session.
 
 pub mod panel;
+pub(crate) mod preview;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
