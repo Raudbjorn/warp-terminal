@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ::conn::story::{ConnStory, parse_transcript};
-use ::conn::{ConnEntry, ConnEntryKind, ConnSession, tidy_prompt};
+use ::conn::{ConnEntry, ConnEntryKind, ConnSession, is_harness_prompt, tidy_prompt};
 use chrono::{DateTime, TimeDelta, Utc};
 use warpui::r#async::FutureId;
 use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
@@ -280,11 +280,14 @@ fn entry_kind(event: &CLIAgentEvent) -> Option<ConnEntryKind> {
         CLIAgentEventType::SessionStart => None,
         // A prompt with no text tells the reader nothing, and an empty line in
         // the spine is worse than no line.
+        // A background task notification reaches this hook the same way a typed
+        // instruction does, and would otherwise open a chapter nobody asked
+        // for.
         CLIAgentEventType::PromptSubmit => payload
             .query
             .as_deref()
             .map(str::trim)
-            .filter(|query| !query.is_empty())
+            .filter(|query| !query.is_empty() && !is_harness_prompt(query))
             .map(|query| ConnEntryKind::Prompt {
                 text: tidy_prompt(query),
             }),

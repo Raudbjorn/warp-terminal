@@ -293,6 +293,19 @@ enum ConnRow<'a> {
     /// plugin sends a tool's name and nothing about what it did — which is
     /// why the transcript is read at all.
     Live(&'a ConnEntry),
+    /// No transcript was found, so there is no account to tell and the rows
+    /// below are bare tool names.
+    NoTranscript,
+}
+
+/// Whether the panel is running on hook events alone.
+///
+/// The hooks report a tool's name and nothing about what it did, so this is a
+/// visibly worse panel. Saying so beats letting someone conclude the feature
+/// is broken — most often the cause is fixable, such as a session started with
+/// transcript saving turned off.
+fn is_hook_only(session: &ConnSession) -> bool {
+    session.story().is_none_or(|story| story.turns.is_empty()) && !session.entries().is_empty()
 }
 
 /// Rows one turn occupies: its prompt, its steps, and its closing message if
@@ -305,7 +318,7 @@ fn row_count(session: &ConnSession) -> usize {
     let told = session
         .story()
         .map_or(0, |story| story.turns.iter().map(turn_rows).sum());
-    told + session.in_flight().len()
+    told + session.in_flight().len() + usize::from(is_hook_only(session))
 }
 
 /// Walks the story to the row at `index`.
@@ -314,6 +327,12 @@ fn row_count(session: &ConnSession) -> usize {
 /// asks for the rows in view.
 fn row_at(session: &ConnSession, index: usize) -> Option<ConnRow<'_>> {
     let mut remaining = index;
+    if is_hook_only(session) {
+        if remaining == 0 {
+            return Some(ConnRow::NoTranscript);
+        }
+        remaining -= 1;
+    }
     if let Some(story) = session.story() {
         for turn in &story.turns {
             let rows = turn_rows(turn);
@@ -346,6 +365,11 @@ fn render_row(row: &ConnRow, app: &AppContext) -> Box<dyn Element> {
         ConnRow::Outcome(text) => render_labelled("said", truncate(text), false, app),
         // A new instruction opens a chapter whether the transcript has caught
         // up with it or not.
+        ConnRow::NoTranscript => render_notice(
+            "No transcript for this session, so this is tool names only. A \
+             session started with transcript saving off writes none.",
+            app,
+        ),
         ConnRow::Live(entry) => match &entry.kind {
             ConnEntryKind::Prompt { text } => render_turn(entry.at, text, app),
             kind => {
@@ -429,6 +453,22 @@ fn render_step(description: &str, runs: usize, app: &AppContext) -> Box<dyn Elem
     .with_padding_right(10.)
     .with_padding_top(3.)
     .with_padding_bottom(3.)
+    .finish()
+}
+
+/// A quiet line about the panel itself rather than about the session.
+fn render_notice(message: &'static str, app: &AppContext) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    Container::new(
+        Text::new(
+            message,
+            appearance.ui_font_family(),
+            appearance.ui_font_size() - 1.,
+        )
+        .with_color(appearance.theme().nonactive_ui_text_color().into())
+        .finish(),
+    )
+    .with_uniform_padding(10.)
     .finish()
 }
 

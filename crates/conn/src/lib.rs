@@ -40,6 +40,28 @@ pub fn tidy_prompt(text: &str) -> String {
     out.replace("</pasted_content>", "").trim().to_owned()
 }
 
+/// Blocks the harness submits as prompts, which nobody typed.
+///
+/// Background task notifications arrive through the same path as a real
+/// instruction. In the transcript they are marked `promptSource: "system"`,
+/// but the hook payload carries only the text, so they are recognised by their
+/// opening tag.
+const HARNESS_PROMPT_TAGS: &[&str] = &[
+    "<task-notification>",
+    "<system-reminder>",
+    "<local-command-",
+    "<command-name>",
+];
+
+/// Whether a prompt was written by the harness rather than by a person.
+///
+/// The spine is meant to read as "what I asked for". A notification the user
+/// never wrote breaks that, and it is the one column the panel exists for.
+pub fn is_harness_prompt(text: &str) -> bool {
+    let text = text.trim_start();
+    HARNESS_PROMPT_TAGS.iter().any(|tag| text.starts_with(tag))
+}
+
 /// Entries retained per session before the oldest evictable one is dropped.
 ///
 /// Bounds memory and keeps the panel readable on a long session. Prompts are

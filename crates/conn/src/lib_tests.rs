@@ -311,3 +311,17 @@ fn a_prompt_truncated_inside_the_wrapper_loses_the_fragment() {
 fn a_typed_prompt_is_left_alone() {
     assert_eq!(super::tidy_prompt("  commit changes  "), "commit changes");
 }
+
+/// A background task notification arrives through the same hook as a typed
+/// instruction. Left in, it opens a chapter nobody asked for, in the one
+/// column the panel exists for.
+#[test]
+fn a_harness_notification_is_not_a_prompt() {
+    assert!(super::is_harness_prompt(
+        "<task-notification>\n<task-id>a179a5</task-id>\n</task-notification>"
+    ));
+    assert!(super::is_harness_prompt("  <system-reminder>watch out"));
+    assert!(!super::is_harness_prompt(
+        "combine what we have in this repo with <task-notification> semantics"
+    ));
+}

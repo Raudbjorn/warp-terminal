@@ -38,6 +38,7 @@ fn describe(session: &ConnSession) -> Vec<String> {
             Some(ConnRow::Step { description, runs }) => format!("did: {description} ×{runs}"),
             Some(ConnRow::Outcome(text)) => format!("said: {text}"),
             Some(ConnRow::Live(entry)) => format!("live: {:?}", entry.kind),
+            Some(ConnRow::NoTranscript) => "no transcript".to_owned(),
             None => "missing".to_owned(),
         })
         .collect()
@@ -235,4 +236,50 @@ fn a_permission_summary_keeps_a_real_command() {
         super::drop_json_tail("Wants to run Bash: rm -rf node_modules"),
         "Wants to run Bash: rm -rf node_modules"
     );
+}
+
+/// Hook events alone are a visibly worse panel: a tool's name with nothing
+/// about what it did. Saying so beats letting someone conclude the feature is
+/// broken.
+#[test]
+fn a_session_with_no_transcript_says_so() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "do the thing".to_owned(),
+        },
+        at(10),
+    ));
+
+    assert!(matches!(row_at(&session, 0), Some(ConnRow::NoTranscript)));
+    assert_eq!(row_count(&session), 2, "the notice sits above the events");
+}
+
+/// Once there is a story the notice goes away, rather than sitting above every
+/// session forever.
+#[test]
+fn a_session_with_a_story_shows_no_notice() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "do the thing".to_owned(),
+        },
+        at(10),
+    ));
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            turns: vec![turn(10, "do the thing", vec![], Some("done"))],
+        },
+        at(100),
+    );
+
+    assert!(matches!(row_at(&session, 0), Some(ConnRow::Turn { .. })));
+}
+
+/// An empty session shows its empty state, not a complaint about transcripts.
+#[test]
+fn a_session_with_no_events_shows_no_notice() {
+    let session = ConnSession::default();
+    assert_eq!(row_count(&session), 0);
 }

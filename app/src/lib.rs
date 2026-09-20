@@ -815,6 +815,11 @@ pub fn run() -> Result<()> {
         warpui::set_ui_locale(locale);
     }
 
+    // SAFETY: nothing in this process has started a thread yet. This has to
+    // happen before anything spawns a shell, and before anything reads the
+    // environment concurrently.
+    unsafe { warp_terminal::focus_env::clear_launcher_agent_env() };
+
     // Perform any necessary platform-specific initialization.
     platform::init();
 
