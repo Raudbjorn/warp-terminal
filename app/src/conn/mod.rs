@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ::conn::story::{ConnStory, parse_transcript};
-use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
-use chrono::{DateTime, Utc};
+use ::conn::{ConnEntry, ConnEntryKind, ConnSession, tidy_prompt};
+use chrono::{DateTime, TimeDelta, Utc};
 use warpui::r#async::FutureId;
 use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
 
@@ -37,7 +37,18 @@ pub struct ConnModel {
     /// The transcript read currently in flight for each pane. Reading it is
     /// how tests await the read before asserting on the story.
     reads_in_flight: HashMap<EntityId, FutureId>,
+    /// When a read was last dispatched for each pane, so a busy turn re-reads
+    /// at a steady rate instead of once per tool call.
+    last_read: HashMap<EntityId, DateTime<Utc>>,
 }
+
+/// How often the transcript is re-read while a turn is running.
+///
+/// A turn can run for many minutes, and that is exactly when someone walks
+/// away and comes back, so the account of it cannot wait for the turn to
+/// finish. Re-reading is a whole-file parse — tens of milliseconds on a
+/// background thread — so it is paced rather than done per tool call.
+const READ_INTERVAL: TimeDelta = TimeDelta::seconds(3);
 
 impl Entity for ConnModel {
     type Event = ();
@@ -111,6 +122,7 @@ impl ConnModel {
             session.project = event.project.clone();
         }
 
+        // The plugin only sends the path on `stop`, so it is kept once known.
         if let Some(path) = event.payload.transcript_path.as_deref() {
             session.transcript_path = Some(path.to_owned());
         }
@@ -121,44 +133,67 @@ impl ConnModel {
             ctx.notify();
         }
 
-        // A finished turn is the point at which the transcript has a complete
-        // chapter to tell, and the only event the plugin reports a transcript
-        // path on. Everything before the turn ended is re-read, which is
-        // wasteful on a long session but keeps the read stateless; an
-        // incremental read is an optimisation for when it starts to show.
+        let locator = TranscriptLocator {
+            path: session.transcript_path.clone(),
+            cwd: session.cwd.clone(),
+            session_id: session.session_id.clone(),
+        };
+        if self.should_read(terminal_view_id, event, at) {
+            self.read_transcript(terminal_view_id, locator, at, ctx);
+        }
+    }
+
+    /// Whether this event should trigger a transcript read.
+    ///
+    /// A finished turn always reads: it is the turn boundary and the last
+    /// chance to record the closing message. Anything else reads at most once
+    /// per [`READ_INTERVAL`], and never while a read is already running,
+    /// because a long turn emits events continuously.
+    fn should_read(
+        &self,
+        terminal_view_id: EntityId,
+        event: &CLIAgentEvent,
+        now: DateTime<Utc>,
+    ) -> bool {
         if matches!(
             event.event,
             CLIAgentEventType::Stop | CLIAgentEventType::StopFailure
         ) {
-            let Some(path) = session.transcript_path.clone() else {
-                return;
-            };
-            self.read_transcript(terminal_view_id, PathBuf::from(path), at, ctx);
+            return true;
         }
+        if self.reads_in_flight.contains_key(&terminal_view_id) {
+            return false;
+        }
+        self.last_read
+            .get(&terminal_view_id)
+            .is_none_or(|last| now - *last >= READ_INTERVAL)
     }
 
     /// Reads and parses the transcript off the main thread.
     ///
     /// The parse is tens of milliseconds on a long session and grows with it,
-    /// so it must never run on the thread that draws frames.
+    /// so it must never run on the thread that draws frames. Locating the file
+    /// touches the filesystem too, so that happens in the same place.
     fn read_transcript(
         &mut self,
         terminal_view_id: EntityId,
-        path: PathBuf,
+        locator: TranscriptLocator,
         through: DateTime<Utc>,
         ctx: &mut ModelContext<Self>,
     ) {
-        let handle = ctx.spawn(read_story(path), move |me, story, ctx| {
+        self.last_read.insert(terminal_view_id, through);
+        let handle = ctx.spawn(read_story(locator), move |me, read, ctx| {
             me.reads_in_flight.remove(&terminal_view_id);
-            // A transcript that cannot be read or has not been written yet is
-            // not a failure: the live hook entries still describe the session,
-            // just less well.
-            let Some(story) = story else {
+            // A transcript that cannot be found or read is not a failure: the
+            // live hook entries still describe the session, just less well.
+            let Some((path, story)) = read else {
                 return;
             };
             let Some(session) = me.sessions.get_mut(&terminal_view_id) else {
                 return;
             };
+            // Remember where it was found so the next read skips the search.
+            session.transcript_path = Some(path.to_string_lossy().into_owned());
             if session.adopt_story(story, through) {
                 ctx.notify();
             }
@@ -168,10 +203,71 @@ impl ConnModel {
     }
 }
 
-/// Runs on a background thread. Returns `None` when the file cannot be read.
-async fn read_story(path: PathBuf) -> Option<ConnStory> {
+/// What is known about where a session's transcript lives.
+struct TranscriptLocator {
+    /// A path the plugin reported, which is authoritative when present.
+    path: Option<String>,
+    cwd: Option<String>,
+    session_id: Option<String>,
+}
+
+/// Runs on a background thread. Returns the file it read and the story in it.
+async fn read_story(locator: TranscriptLocator) -> Option<(PathBuf, ConnStory)> {
+    let path = locate_transcript(&locator).await?;
     let jsonl = tokio::fs::read_to_string(&path).await.ok()?;
-    Some(parse_transcript(&jsonl))
+    Some((path, parse_transcript(&jsonl)))
+}
+
+/// Finds a session's transcript.
+///
+/// The plugin reports the path on `stop` only, so the first turn of a session
+/// — which can be the longest, and is the one most worth reading while it is
+/// still running — would otherwise have no account at all until it ended.
+/// Claude Code writes transcripts to a known place, so the path is derived
+/// until the plugin confirms one.
+async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
+    if let Some(path) = locator.path.as_deref() {
+        let path = PathBuf::from(path);
+        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+            return Some(path);
+        }
+    }
+
+    let session_id = locator.session_id.as_deref()?;
+    let file_name = format!("{session_id}.jsonl");
+    let projects = claude_projects_dir()?;
+
+    if let Some(cwd) = locator.cwd.as_deref() {
+        let derived = projects.join(mangle_project_dir(cwd)).join(&file_name);
+        if tokio::fs::try_exists(&derived).await.unwrap_or(false) {
+            return Some(derived);
+        }
+    }
+
+    // The directory name is a guess; the session id is not. When the guess is
+    // wrong, look for the file itself rather than give up on the session.
+    let mut entries = tokio::fs::read_dir(&projects).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let candidate = entry.path().join(&file_name);
+        if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn claude_projects_dir() -> Option<PathBuf> {
+    let root = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::home_dir()?.join(".claude"),
+    };
+    Some(root.join("projects"))
+}
+
+/// Claude Code names a project directory after the working directory it ran
+/// in, with the path separators flattened.
+fn mangle_project_dir(cwd: &str) -> String {
+    cwd.replace(['/', '.'], "-")
 }
 
 /// Translates a plugin event into a history entry, or `None` for events that
@@ -190,7 +286,7 @@ fn entry_kind(event: &CLIAgentEvent) -> Option<ConnEntryKind> {
             .map(str::trim)
             .filter(|query| !query.is_empty())
             .map(|query| ConnEntryKind::Prompt {
-                text: query.to_owned(),
+                text: tidy_prompt(query),
             }),
         CLIAgentEventType::PermissionRequest => Some(ConnEntryKind::PermissionRequested {
             summary: payload.summary.clone(),

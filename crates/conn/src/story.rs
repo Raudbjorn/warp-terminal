@@ -168,8 +168,8 @@ impl Record {
                 .collect::<Vec<_>>()
                 .join(" "),
         };
-        let text = text.trim();
-        (!text.is_empty()).then(|| text.to_owned())
+        let text = crate::tidy_prompt(&text);
+        (!text.is_empty()).then_some(text)
     }
 
     /// Each tool call as the model described it, falling back to the tool's

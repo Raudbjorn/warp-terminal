@@ -16,6 +16,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::story::ConnStory;
 
+/// Strips the wrapper Claude Code puts around pasted text.
+///
+/// A pasted prompt arrives as `<pasted_content id="0e44">…</pasted_content>`.
+/// The tag is addressed to the agent; to a person coming back to the pane it
+/// is noise sitting exactly where the instruction should be.
+pub fn tidy_prompt(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    loop {
+        let Some(start) = rest.find("<pasted_content") else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..start]);
+        // An unterminated tag means the hook truncated the prompt mid-tag, so
+        // there is nothing after it left to keep.
+        let Some(end) = rest[start..].find('>') else {
+            break;
+        };
+        rest = &rest[start + end + 1..];
+    }
+    out.replace("</pasted_content>", "").trim().to_owned()
+}
+
 /// Entries retained per session before the oldest evictable one is dropped.
 ///
 /// Bounds memory and keeps the panel readable on a long session. Prompts are

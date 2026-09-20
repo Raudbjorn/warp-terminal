@@ -213,3 +213,26 @@ fn truncation_counts_characters_not_bytes() {
     let cut = truncate(&long);
     assert_eq!(cut.chars().count(), PREVIEW_CHARS + 1);
 }
+
+/// For a tool with no `command` or `file_path`, the plugin serialises the
+/// whole tool input into the summary. Eighty characters of JSON in the panel
+/// says less than the tool's name on its own.
+#[test]
+fn a_permission_summary_drops_a_raw_json_preview() {
+    assert_eq!(
+        super::drop_json_tail(
+            r#"Wants to run AskUserQuestion: {"questions":[{"question":"FORMAT.md:12 already"#
+        ),
+        "Wants to run AskUserQuestion"
+    );
+}
+
+/// A real command is the most useful thing the permission row can carry, so
+/// only JSON is cut.
+#[test]
+fn a_permission_summary_keeps_a_real_command() {
+    assert_eq!(
+        super::drop_json_tail("Wants to run Bash: rm -rf node_modules"),
+        "Wants to run Bash: rm -rf node_modules"
+    );
+}

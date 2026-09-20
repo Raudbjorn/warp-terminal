@@ -538,9 +538,22 @@ fn describe_permission(
     target: Option<&str>,
 ) -> String {
     if let Some(summary) = summary.filter(|summary| !summary.trim().is_empty()) {
-        return truncate(summary);
+        return truncate(&drop_json_tail(summary));
     }
     describe_tool(tool_name, target)
+}
+
+/// Cuts a raw JSON blob off the end of a summary.
+///
+/// The plugin builds "Wants to run X: <preview>", where the preview is the
+/// tool's `command` or `file_path` — or, for a tool with neither, its whole
+/// input serialised. A wall of JSON in the panel says less than the tool's
+/// name alone.
+fn drop_json_tail(summary: &str) -> String {
+    match summary.split_once(": ") {
+        Some((head, tail)) if tail.trim_start().starts_with(['{', '[']) => head.to_owned(),
+        _ => summary.to_owned(),
+    }
 }
 
 fn describe_tool(tool_name: Option<&str>, target: Option<&str>) -> String {

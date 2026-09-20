@@ -287,3 +287,27 @@ fn a_story_without_the_final_response_leaves_the_live_entry_visible() {
         }]
     );
 }
+
+/// Pasted text arrives wrapped in a tag addressed to the agent. Left in, it
+/// sits exactly where the instruction should be.
+#[test]
+fn a_pasted_prompt_loses_its_wrapper() {
+    assert_eq!(
+        super::tidy_prompt(
+            "<pasted_content id=\"0e44\">\ni really love the ideology\n</pasted_content>"
+        ),
+        "i really love the ideology"
+    );
+}
+
+/// The hook truncates a prompt at 200 characters, which can land inside the
+/// opening tag.
+#[test]
+fn a_prompt_truncated_inside_the_wrapper_loses_the_fragment() {
+    assert_eq!(super::tidy_prompt("<pasted_content id=\"0e4"), "");
+}
+
+#[test]
+fn a_typed_prompt_is_left_alone() {
+    assert_eq!(super::tidy_prompt("  commit changes  "), "commit changes");
+}
