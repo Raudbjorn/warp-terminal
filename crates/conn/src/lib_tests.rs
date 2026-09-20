@@ -325,3 +325,23 @@ fn a_harness_notification_is_not_a_prompt() {
         "combine what we have in this repo with <task-notification> semantics"
     ));
 }
+
+/// A finished turn is read twice at the same boundary: once immediately, and
+/// again after the transcript has had a moment to flush its closing message.
+/// The second read carries the agent's actual last word, so it has to be able
+/// to replace the first.
+#[test]
+fn a_re_read_at_the_same_boundary_replaces_the_story() {
+    let mut session = ConnSession::default();
+    let raced = story(vec![turn(1, Some(3), Some("I'll check the repo."))]);
+    let flushed = story(vec![turn(1, Some(5), Some("No plan on main."))]);
+
+    assert!(session.adopt_story(raced, at(9)));
+    assert!(session.adopt_story(flushed, at(9)));
+    assert_eq!(
+        session.story().expect("story kept").turns[0]
+            .outcome
+            .as_deref(),
+        Some("No plan on main.")
+    );
+}

@@ -175,7 +175,11 @@ impl ConnSession {
     /// resolves after a later one is stale and is dropped rather than
     /// rewinding the panel.
     pub fn adopt_story(&mut self, story: ConnStory, through: DateTime<Utc>) -> bool {
-        if self.story_through.is_some_and(|current| current >= through) {
+        // Strictly older, not equal: a finished turn is read twice at the same
+        // boundary, immediately and again once the transcript has had a moment
+        // to flush its closing message. The second read must be able to
+        // replace the first.
+        if self.story_through.is_some_and(|current| current > through) {
             return false;
         }
         // The transcript is written asynchronously, so a read can land before

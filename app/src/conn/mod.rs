@@ -11,11 +11,12 @@ pub mod panel;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use ::conn::story::{ConnStory, parse_transcript};
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession, is_harness_prompt, tidy_prompt};
 use chrono::{DateTime, TimeDelta, Utc};
-use warpui::r#async::FutureId;
+use warpui::r#async::{FutureId, Timer};
 use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
 
 use crate::terminal::cli_agent_sessions::event::{CLIAgentEvent, CLIAgentEventType};
@@ -49,6 +50,14 @@ pub struct ConnModel {
 /// finish. Re-reading is a whole-file parse — tens of milliseconds on a
 /// background thread — so it is paced rather than done per tool call.
 const READ_INTERVAL: TimeDelta = TimeDelta::seconds(3);
+
+/// How long to wait before re-reading a finished turn.
+///
+/// Claude Code writes the transcript asynchronously, so the read triggered by
+/// the stop event can land before the turn's closing message reaches the file
+/// — leaving the panel showing an earlier line as the agent's last word, with
+/// no further event coming to correct it. One more read closes that window.
+const FLUSH_GRACE: Duration = Duration::from_millis(1500);
 
 impl Entity for ConnModel {
     type Event = ();
@@ -138,8 +147,15 @@ impl ConnModel {
             cwd: session.cwd.clone(),
             session_id: session.session_id.clone(),
         };
+        let finished = matches!(
+            event.event,
+            CLIAgentEventType::Stop | CLIAgentEventType::StopFailure
+        );
         if self.should_read(terminal_view_id, event, at) {
-            self.read_transcript(terminal_view_id, locator, at, ctx);
+            self.read_transcript(terminal_view_id, locator.clone(), at, None, ctx);
+        }
+        if finished {
+            self.read_transcript(terminal_view_id, locator, at, Some(FLUSH_GRACE), ctx);
         }
     }
 
@@ -179,10 +195,11 @@ impl ConnModel {
         terminal_view_id: EntityId,
         locator: TranscriptLocator,
         through: DateTime<Utc>,
+        after: Option<Duration>,
         ctx: &mut ModelContext<Self>,
     ) {
         self.last_read.insert(terminal_view_id, through);
-        let handle = ctx.spawn(read_story(locator), move |me, read, ctx| {
+        let handle = ctx.spawn(read_story(locator, after), move |me, read, ctx| {
             me.reads_in_flight.remove(&terminal_view_id);
             // A transcript that cannot be found or read is not a failure: the
             // live hook entries still describe the session, just less well.
@@ -204,6 +221,7 @@ impl ConnModel {
 }
 
 /// What is known about where a session's transcript lives.
+#[derive(Clone)]
 struct TranscriptLocator {
     /// A path the plugin reported, which is authoritative when present.
     path: Option<String>,
@@ -212,7 +230,13 @@ struct TranscriptLocator {
 }
 
 /// Runs on a background thread. Returns the file it read and the story in it.
-async fn read_story(locator: TranscriptLocator) -> Option<(PathBuf, ConnStory)> {
+async fn read_story(
+    locator: TranscriptLocator,
+    after: Option<Duration>,
+) -> Option<(PathBuf, ConnStory)> {
+    if let Some(after) = after {
+        Timer::after(after).await;
+    }
     let path = locate_transcript(&locator).await?;
     let jsonl = tokio::fs::read_to_string(&path).await.ok()?;
     Some((path, parse_transcript(&jsonl)))
