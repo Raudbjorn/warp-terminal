@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use ::conn::story::ConnTurn;
 use languages::language_by_local_filename;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
@@ -45,6 +46,7 @@ use crate::cloud_object::CloudObjectLookup as _;
 use crate::cloud_object::model::generic_string_model::StringModel;
 use crate::code::editor::{add_color, remove_color};
 use crate::code::icon_from_file_path;
+use crate::conn::{ConnModel, preview as conn_preview};
 use crate::context_chips::display_chip::GitLineChanges;
 use crate::context_chips::github_pr_display_text_from_url;
 use crate::drive::DriveObjectType;
@@ -6868,6 +6870,130 @@ fn render_detail_wrapping_text(
     text.finish()
 }
 
+/// How much of a prompt the hover card shows. Tighter than the docked panel's
+/// budget: the card is 320px wide and is read at a glance.
+const DETAIL_SIDECAR_PROMPT_CHARS: usize = 180;
+
+/// How much of an answer or a step the hover card shows. Looser than the
+/// prompt, because the prompt is yours and the answer is what you came back
+/// for.
+const DETAIL_SIDECAR_BODY_CHARS: usize = 220;
+
+/// A line of the story with its speaker, laid out so the bodies of successive
+/// lines align under one another.
+fn render_detail_story_line(
+    label: &str,
+    body: String,
+    body_color: WarpThemeFill,
+    label_color: WarpThemeFill,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    const LABEL_WIDTH: f32 = 26.;
+    Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_spacing(6.)
+        .with_child(
+            ConstrainedBox::new(
+                Text::new_inline(label.to_owned(), appearance.ui_font_family(), 10.)
+                    .with_color(label_color.into())
+                    .finish(),
+            )
+            .with_width(LABEL_WIDTH)
+            .finish(),
+        )
+        .with_child(
+            Shrinkable::new(
+                1.,
+                render_detail_wrapping_text(body, 12., body_color, None, appearance),
+            )
+            .finish(),
+        )
+        .finish()
+}
+
+/// The story so far for a pane's CLI agent session: what was asked, and either
+/// what it is doing now or what it came back with.
+///
+/// This is the tab list's share of Conn. The docked panel tells the whole story
+/// for the pane you are looking at; the card answers the single question you
+/// have about a pane you are not looking at, which is whether it is still on
+/// the thing you wanted.
+/// The lines the hover card shows for one turn.
+struct ConnStoryLines {
+    prompt: String,
+    /// What has come of the instruction so far, and what to call it. `None`
+    /// for a turn that has only just started, where the instruction alone is
+    /// a complete enough answer.
+    progress: Option<(&'static str, String)>,
+}
+
+/// Decides what the card says about a turn.
+///
+/// A finished turn is told by its closing message. A running one has none yet,
+/// so its latest step is what the session is doing right now, which is the more
+/// useful of the two while you are still waiting on it.
+fn conn_story_lines(turn: &ConnTurn) -> Option<ConnStoryLines> {
+    let prompt = conn_preview::head(&turn.prompt, DETAIL_SIDECAR_PROMPT_CHARS);
+    if prompt.is_empty() {
+        return None;
+    }
+    let progress = match &turn.outcome {
+        Some(outcome) => Some((
+            "said",
+            conn_preview::tail(outcome, DETAIL_SIDECAR_BODY_CHARS),
+        )),
+        None => turn.steps.last().map(|step| {
+            (
+                "now",
+                conn_preview::head(&step.description, DETAIL_SIDECAR_BODY_CHARS),
+            )
+        }),
+    };
+    Some(ConnStoryLines {
+        prompt,
+        progress: progress.filter(|(_, body)| !body.is_empty()),
+    })
+}
+
+/// The story so far for a pane's CLI agent session: what was asked, and either
+/// what it is doing now or what it came back with.
+///
+/// This is the tab list's share of Conn. The docked panel tells the whole story
+/// for the pane you are looking at; the card answers the single question you
+/// have about a pane you are not looking at, which is whether it is still on
+/// the thing you wanted.
+fn render_conn_story_section(
+    terminal_view: &TerminalView,
+    text_colors: &DetailSidecarTextColors,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    let session = ConnModel::as_ref(app).session(terminal_view.id())?;
+    let lines = conn_story_lines(session.story()?.latest_turn()?)?;
+
+    let mut section = Flex::column()
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_spacing(DETAIL_SIDECAR_SECTION_GAP);
+    section.add_child(render_detail_story_line(
+        "you",
+        lines.prompt,
+        text_colors.main,
+        text_colors.disabled,
+        appearance,
+    ));
+    if let Some((label, body)) = lines.progress {
+        section.add_child(render_detail_story_line(
+            label,
+            body,
+            text_colors.sub,
+            text_colors.disabled,
+            appearance,
+        ));
+    }
+    Some(section.finish())
+}
+
 fn render_terminal_detail_primary_line(
     primary_line: &TerminalPrimaryLineData,
     color: WarpThemeFill,
@@ -6996,6 +7122,9 @@ fn render_terminal_detail_section(
         text_colors.sub,
         appearance,
     ));
+    if let Some(story) = render_conn_story_section(terminal_view, &text_colors, appearance, app) {
+        section.add_child(story);
+    }
 
     let mut metadata_row = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
