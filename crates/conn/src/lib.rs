@@ -9,6 +9,8 @@
 //! This crate is deliberately free of Warp dependencies so the history model
 //! stays portable if the store ever moves out of the client process.
 
+pub mod story;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
