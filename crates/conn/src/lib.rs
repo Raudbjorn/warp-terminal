@@ -1,0 +1,187 @@
+//! Session history for Conn, the re-entry layer for CLI agent sessions.
+//!
+//! Warp already tracks a CLI agent session's *current* state. That model is
+//! lossy on purpose: it keeps only the latest prompt and response, and clears
+//! permission details once they stop being relevant. Conn answers a different
+//! question — "what did I ask for, and what has it decided since?" — which
+//! needs the history that model discards.
+//!
+//! This crate is deliberately free of Warp dependencies so the history model
+//! stays portable if the store ever moves out of the client process.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+/// Entries retained per session before the oldest evictable one is dropped.
+///
+/// Bounds memory and keeps the panel readable on a long session. Prompts are
+/// exempt (see [`ConnSession::push`]).
+pub const MAX_ENTRIES: usize = 500;
+
+/// One thing that happened in a session, in the vocabulary of someone
+/// returning to it rather than of the hook that reported it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnEntryKind {
+    /// An instruction the user sent. The spine of the session.
+    Prompt { text: String },
+    /// The agent stopped to ask permission — a fork in the session, and the
+    /// most interesting thing to find on return.
+    PermissionRequested {
+        summary: Option<String>,
+        tool_name: Option<String>,
+        /// The command or file path the tool was about to act on, as far as
+        /// the plugin reports it.
+        target: Option<String>,
+    },
+    /// A pending permission request was answered.
+    PermissionResolved,
+    /// The agent asked the user a question and is waiting.
+    QuestionAsked { summary: Option<String> },
+    /// Consecutive tool calls of the same kind, coalesced.
+    ///
+    /// The Warp plugin reports only a tool name for a completed call, with no
+    /// command or path, so twenty separate `Bash` entries carry exactly as much
+    /// information as one and bury the prompts between them. `runs` keeps the
+    /// sense of how much work happened without the wall of identical rows.
+    ToolCompleted {
+        tool_name: Option<String>,
+        target: Option<String>,
+        runs: usize,
+    },
+    /// The agent finished its turn.
+    Responded { text: Option<String> },
+    /// The turn ended in failure.
+    Failed {
+        error_type: Option<String>,
+        message: Option<String>,
+    },
+}
+
+impl ConnEntryKind {
+    /// Whether this entry may be dropped to stay under [`MAX_ENTRIES`].
+    ///
+    /// Prompts are not evictable: they are the reason Conn exists, they are
+    /// bounded by how fast a person can type, and losing the earliest one
+    /// loses the session's original intent.
+    pub fn is_evictable(&self) -> bool {
+        !matches!(self, ConnEntryKind::Prompt { .. })
+    }
+}
+
+/// A timestamped entry in a session's history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnEntry {
+    pub at: DateTime<Utc>,
+    pub kind: ConnEntryKind,
+}
+
+impl ConnEntry {
+    pub fn new(kind: ConnEntryKind, at: DateTime<Utc>) -> Self {
+        Self { at, kind }
+    }
+}
+
+/// Everything Conn knows about one CLI agent session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ConnSession {
+    /// The agent's own session identifier, once it reports one.
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    /// Project name, as the plugin derives it from `cwd`.
+    pub project: Option<String>,
+    /// Chronological history. Order is the product: "I asked X, then it
+    /// decided Y, then I asked Z."
+    entries: Vec<ConnEntry>,
+    /// Entries dropped to stay under [`MAX_ENTRIES`], so a reader can say how
+    /// much history is missing instead of silently showing a partial log.
+    dropped: usize,
+}
+
+impl ConnSession {
+    pub fn entries(&self) -> &[ConnEntry] {
+        &self.entries
+    }
+
+    /// Number of entries evicted from the front of the history.
+    pub fn dropped(&self) -> usize {
+        self.dropped
+    }
+
+    /// Appends an entry, evicting the oldest evictable one if that would
+    /// exceed [`MAX_ENTRIES`].
+    ///
+    /// A session consisting only of prompts is allowed to exceed the cap: no
+    /// prompt is ever dropped, and human typing bounds how many there can be.
+    pub fn push(&mut self, entry: ConnEntry) {
+        if self.coalesce_tool_run(&entry) {
+            return;
+        }
+        self.entries.push(entry);
+        if self.entries.len() <= MAX_ENTRIES {
+            return;
+        }
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.kind.is_evictable())
+        {
+            self.entries.remove(index);
+            self.dropped += 1;
+        }
+    }
+
+    /// Folds a repeated tool call into the previous entry, returning whether
+    /// it was absorbed.
+    fn coalesce_tool_run(&mut self, incoming: &ConnEntry) -> bool {
+        let ConnEntryKind::ToolCompleted {
+            tool_name,
+            target,
+            runs,
+        } = &incoming.kind
+        else {
+            return false;
+        };
+        let Some(last) = self.entries.last_mut() else {
+            return false;
+        };
+        let ConnEntryKind::ToolCompleted {
+            tool_name: last_tool,
+            target: last_target,
+            runs: last_runs,
+        } = &mut last.kind
+        else {
+            return false;
+        };
+        if last_tool != tool_name || last_target != target {
+            return false;
+        }
+        *last_runs += runs;
+        // The run is still in progress, so the entry's timestamp advances to
+        // the most recent call rather than staying at the first.
+        last.at = incoming.at;
+        true
+    }
+
+    /// Every instruction sent, oldest first. The panel's spine.
+    pub fn prompts(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().filter_map(|entry| match &entry.kind {
+            ConnEntryKind::Prompt { text } => Some(text.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The most recent thing the agent said, if it has finished a turn.
+    pub fn last_response(&self) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .find_map(|entry| match &entry.kind {
+                ConnEntryKind::Responded { text } => text.as_deref(),
+                _ => None,
+            })
+    }
+}
+
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;

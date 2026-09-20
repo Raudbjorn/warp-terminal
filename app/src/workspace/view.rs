@@ -266,6 +266,7 @@ use crate::code_review::GlobalCodeReviewModel;
 use crate::code_review::diff_state::DiffStateModel;
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
+use crate::conn::panel::ConnPanelView;
 use crate::context_chips::ChipRuntimeCapabilities;
 use crate::default_terminal::DefaultTerminal;
 use crate::drive::export::ExportManager;
@@ -1209,6 +1210,10 @@ pub struct Workspace {
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
     right_panel_view: ViewHandle<RightPanelView>,
+    /// Conn occupies the right-hand panel slot. `right_panel_view` is still
+    /// built and still receives code-review actions, but is no longer
+    /// rendered; it goes away with the code_review trim.
+    conn_panel_view: ViewHandle<ConnPanelView>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
     agent_management_view: ViewHandle<AgentManagementView>,
     notification_mailbox_view: Option<ViewHandle<NotificationMailboxView>>,
@@ -3318,6 +3323,9 @@ impl Workspace {
             me.handle_right_panel_event(event.clone(), ctx);
         });
 
+        // Read-only panel with no actions of its own, so a plain view.
+        let conn_panel_view = ctx.add_view(ConnPanelView::new);
+
         // Get persisted filters from window snapshot if restoring.
         let agent_management_filters = match workspace_setting {
             NewWorkspaceSource::Restored {
@@ -3725,6 +3733,7 @@ impl Workspace {
             left_panel_view,
             left_panel_views,
             right_panel_view,
+            conn_panel_view,
             working_directories_model,
             shown_staging_banner_count: 0,
 
@@ -4605,6 +4614,9 @@ impl Workspace {
         self.right_panel_view.update(ctx, |rp, ctx| {
             rp.set_active_pane_group(pane_group.clone(), &self.working_directories_model, ctx);
             rp.set_maximized(right_panel_snapshot.is_maximized, ctx);
+        });
+        self.conn_panel_view.update(ctx, |panel, ctx| {
+            panel.set_active_pane_group(pane_group.clone(), ctx);
         });
 
         ctx.notify();
@@ -5814,6 +5826,13 @@ impl Workspace {
                 ctx,
             );
         });
+        // Conn holds a strong handle to the pane group it reports on, so it has
+        // to be retargeted wherever the right panel is, or a closed tab's
+        // terminals stay alive behind it.
+        let conn_active_pane_group = self.active_tab_pane_group().clone();
+        self.conn_panel_view.update(ctx, |panel, ctx| {
+            panel.set_active_pane_group(conn_active_pane_group, ctx);
+        });
 
         let pane_group = self.active_tab_pane_group();
         let focused_terminal_view_id = self
@@ -6457,7 +6476,7 @@ impl Workspace {
         } else {
             PanelPosition::Right
         };
-        let code_review_position = if left_items.contains(&HeaderToolbarItemKind::CodeReview) {
+        let code_review_position = if left_items.contains(&HeaderToolbarItemKind::Conn) {
             PanelPosition::Left
         } else {
             PanelPosition::Right
@@ -21127,13 +21146,17 @@ impl Workspace {
             theme.sub_text_color(theme.background())
         };
 
-        // Build the button content: Diff icon + optional diff stats
-        let icon = ConstrainedBox::new(icons::Icon::Diff.to_warpui_icon(font_color).finish())
-            .with_width(16.)
-            .with_height(16.)
-            .finish();
+        // Conn reads session history, so the button carries a history glyph
+        // rather than the diff icon this slot used for code review.
+        let icon =
+            ConstrainedBox::new(icons::Icon::ClockRewind.to_warpui_icon(font_color).finish())
+                .with_width(16.)
+                .with_height(16.)
+                .finish();
 
-        let show_diff_stats = *TabSettings::as_ref(ctx).show_code_review_diff_stats;
+        // Diff stats describe a code review, not a session history. The
+        // setting stays until the code_review trim removes it.
+        let show_diff_stats = false;
 
         let line_changes = if show_diff_stats {
             self.active_tab_pane_group()
@@ -21765,7 +21788,7 @@ impl Workspace {
             HeaderToolbarItemKind::AgentManagement => {
                 self.render_agent_management_view_button(appearance, ctx)
             }
-            HeaderToolbarItemKind::CodeReview => self.render_right_panel_button(appearance, ctx),
+            HeaderToolbarItemKind::Conn => self.render_right_panel_button(appearance, ctx),
             HeaderToolbarItemKind::NotificationsMailbox => {
                 self.render_notifications_mailbox_button(appearance, ctx)
             }
@@ -22649,12 +22672,12 @@ impl Workspace {
                     self.render_config_panel_maximized(pane_group, &config, app),
                     app,
                 );
-            } else if !config.contains_item(&HeaderToolbarItemKind::CodeReview) {
+            } else if !config.contains_item(&HeaderToolbarItemKind::Conn) {
                 Self::add_panel_with_separator(
                     &mut main_content,
                     &mut prev_panel_added,
                     self.render_config_panel(
-                        &HeaderToolbarItemKind::CodeReview,
+                        &HeaderToolbarItemKind::Conn,
                         pane_group,
                         &config,
                         app,
@@ -23291,12 +23314,12 @@ impl Workspace {
                     self.render_config_panel_maximized(pane_group, &config, app),
                     app,
                 );
-            } else if !config.contains_item(&HeaderToolbarItemKind::CodeReview) {
+            } else if !config.contains_item(&HeaderToolbarItemKind::Conn) {
                 Self::add_panel_with_separator(
                     &mut panels_view,
                     &mut prev_panel_added,
                     self.render_config_panel(
-                        &HeaderToolbarItemKind::CodeReview,
+                        &HeaderToolbarItemKind::Conn,
                         pane_group,
                         &config,
                         app,
@@ -23392,14 +23415,14 @@ impl Workspace {
                 }
                 Some(ChildView::new(&self.left_panel_view).finish())
             }
-            HeaderToolbarItemKind::CodeReview => {
+            HeaderToolbarItemKind::Conn => {
                 if !pane_group.right_panel_open {
                     return None;
                 }
                 if pane_group.is_right_panel_maximized {
                     return None;
                 }
-                Some(ChildView::new(&self.right_panel_view).finish())
+                Some(ChildView::new(&self.conn_panel_view).finish())
             }
             HeaderToolbarItemKind::AgentManagement
             | HeaderToolbarItemKind::NotificationsMailbox => None,
@@ -23416,10 +23439,10 @@ impl Workspace {
         if !pane_group.right_panel_open || !pane_group.is_right_panel_maximized {
             return None;
         }
-        if !HeaderToolbarItemKind::CodeReview.is_supported(app) {
+        if !HeaderToolbarItemKind::Conn.is_supported(app) {
             return None;
         }
-        Some(Shrinkable::new(1.0, ChildView::new(&self.right_panel_view).finish()).finish())
+        Some(Shrinkable::new(1.0, ChildView::new(&self.conn_panel_view).finish()).finish())
     }
 
     /// Offset positioning for agent toasts.

@@ -163,6 +163,9 @@ pub(crate) fn initialize_app_with_team_client(app: &mut App, team_client: Arc<dy
     app.add_singleton_model(crate::ai::blocklist::QueuedQueryModel::new);
     app.add_singleton_model(|ctx| OrchestrationPillBarModel::new(Default::default(), ctx));
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // ConnPanelView reads this on construction, so a harness that builds a
+    // Workspace needs it registered as production does.
+    app.add_singleton_model(crate::conn::ConnModel::new);
     // The blocklist controller created during terminal bootstrap subscribes to
     // OrchestrationEventService and OrchestrationEventStreamer unconditionally,
     // so both singletons must be registered before bootstrap.
@@ -821,7 +824,7 @@ fn test_tools_panel_does_not_suppress_vertical_tab_bar_traffic_light_padding() {
             right: vec![
                 HeaderToolbarItemKind::TabsPanel,
                 HeaderToolbarItemKind::ToolsPanel,
-                HeaderToolbarItemKind::CodeReview,
+                HeaderToolbarItemKind::Conn,
                 HeaderToolbarItemKind::NotificationsMailbox,
             ],
         },
@@ -832,7 +835,7 @@ fn test_tools_panel_does_not_suppress_vertical_tab_bar_traffic_light_padding() {
                 HeaderToolbarItemKind::AgentManagement,
             ],
             right: vec![
-                HeaderToolbarItemKind::CodeReview,
+                HeaderToolbarItemKind::Conn,
                 HeaderToolbarItemKind::NotificationsMailbox,
             ],
         },

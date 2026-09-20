@@ -20,6 +20,7 @@ mod coding_entrypoints;
 mod coding_panel_enablement_state;
 mod command_palette;
 mod completer;
+mod conn;
 #[allow(dead_code)]
 mod context_chips;
 #[cfg(enable_crash_recovery)]
@@ -2328,6 +2329,8 @@ pub(crate) fn initialize_app(
     // loads metadata.
     ctx.add_singleton_model(|_| RestoredAgentConversations::new());
     ctx.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // Must follow CLIAgentSessionsModel: ConnModel subscribes to it on construction.
+    ctx.add_singleton_model(conn::ConnModel::new);
     // ActiveAgentViewsModel is used to track active agent conversations and notify listeners when they change.
     ctx.add_singleton_model(|_| ActiveAgentViewsModel::new());
     ctx.add_singleton_model(AgentNotificationsModel::new);

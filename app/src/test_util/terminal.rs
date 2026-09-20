@@ -114,6 +114,9 @@ pub fn initialize_app_for_terminal_view(app: &mut App) {
     // history model is in place.
     app.add_singleton_model(|ctx| OrchestrationPillBarModel::new(Default::default(), ctx));
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // ConnPanelView reads this on construction, so a harness that builds a
+    // Workspace needs it registered as production does.
+    app.add_singleton_model(crate::conn::ConnModel::new);
     app.add_singleton_model(OrchestrationEventService::new);
     app.add_singleton_model(LocalAgentTaskSyncModel::new);
     app.add_singleton_model(PendingCliHarnessPromptQueue::new);
