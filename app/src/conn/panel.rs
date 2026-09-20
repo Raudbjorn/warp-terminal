@@ -308,6 +308,24 @@ fn is_hook_only(session: &ConnSession) -> bool {
     session.story().is_none_or(|story| story.turns.is_empty()) && !session.entries().is_empty()
 }
 
+/// Live rows worth showing beside a story.
+///
+/// Tool activity drops out once there is a story. The transcript names each
+/// call in the agent's own words within a few seconds, and the hook entry
+/// coalesces every call in the turn into a single row whose time keeps moving,
+/// so it sits below the chapter restating the same work as `Bash ×18`.
+///
+/// What stays is what the story cannot say: a permission request or a question
+/// is the session waiting on *you*, which is the most important thing the
+/// panel can report, and the transcript records it as just another tool call.
+fn live_rows(session: &ConnSession) -> impl Iterator<Item = &ConnEntry> {
+    let told = session.story().is_some_and(|story| !story.turns.is_empty());
+    session
+        .in_flight()
+        .iter()
+        .filter(move |entry| !told || !matches!(entry.kind, ConnEntryKind::ToolCompleted { .. }))
+}
+
 /// Rows one turn occupies: its prompt, its steps, and its closing message if
 /// it has one yet.
 fn turn_rows(turn: &ConnTurn) -> usize {
@@ -318,7 +336,7 @@ fn row_count(session: &ConnSession) -> usize {
     let told = session
         .story()
         .map_or(0, |story| story.turns.iter().map(turn_rows).sum());
-    told + session.in_flight().len() + usize::from(is_hook_only(session))
+    told + live_rows(session).count() + usize::from(is_hook_only(session))
 }
 
 /// Walks the story to the row at `index`.
@@ -355,7 +373,7 @@ fn row_at(session: &ConnSession, index: usize) -> Option<ConnRow<'_>> {
             return turn.outcome.as_deref().map(ConnRow::Outcome);
         }
     }
-    session.in_flight().get(remaining).map(ConnRow::Live)
+    live_rows(session).nth(remaining).map(ConnRow::Live)
 }
 
 fn render_row(row: &ConnRow, app: &AppContext) -> Box<dyn Element> {

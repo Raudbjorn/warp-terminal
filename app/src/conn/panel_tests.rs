@@ -130,10 +130,8 @@ fn the_turn_in_flight_follows_the_chapters_already_told() {
         at(200),
     ));
     session.push(ConnEntry::new(
-        ConnEntryKind::ToolCompleted {
-            tool_name: Some("Bash".to_owned()),
-            target: None,
-            runs: 4,
+        ConnEntryKind::QuestionAsked {
+            summary: Some("which layer?".to_owned()),
         },
         at(210),
     ));
@@ -146,7 +144,7 @@ fn the_turn_in_flight_follows_the_chapters_already_told() {
         "the new instruction is live, not told: {}",
         rows[2]
     );
-    assert!(rows[3].starts_with("live: ToolCompleted"), "{}", rows[3]);
+    assert!(rows[3].starts_with("live: QuestionAsked"), "{}", rows[3]);
 }
 
 /// A turn that has not finished contributes no outcome row, so the panel does
@@ -282,4 +280,98 @@ fn a_session_with_a_story_shows_no_notice() {
 fn a_session_with_no_events_shows_no_notice() {
     let session = ConnSession::default();
     assert_eq!(row_count(&session), 0);
+}
+
+/// Hook tool entries coalesce into one row whose time keeps moving, so it
+/// always sits after the story boundary — restating as `Bash ×18` the same
+/// work the chapter above already names one call at a time.
+#[test]
+fn tool_noise_drops_out_once_the_story_tells_it() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "do the work".to_owned(),
+        },
+        at(10),
+    ));
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            turns: vec![turn(
+                10,
+                "do the work",
+                vec![step("Read the docs", 3)],
+                None,
+            )],
+        },
+        at(20),
+    );
+    session.push(ConnEntry::new(
+        ConnEntryKind::ToolCompleted {
+            tool_name: Some("Bash".to_owned()),
+            target: None,
+            runs: 18,
+        },
+        at(30),
+    ));
+
+    assert_eq!(
+        describe(&session),
+        vec!["you: do the work", "did: Read the docs ×3"],
+        "the chapter tells the work; the hook row would only repeat it"
+    );
+}
+
+/// A permission request is the session waiting on you, which is the most
+/// important thing the panel can report and is not something the story says.
+#[test]
+fn a_permission_request_survives_beside_the_story() {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            turns: vec![turn(10, "do the work", vec![], Some("done"))],
+        },
+        at(20),
+    );
+    session.push(ConnEntry::new(
+        ConnEntryKind::PermissionRequested {
+            summary: Some("Wants to run Bash: rm -rf build".to_owned()),
+            tool_name: Some("Bash".to_owned()),
+            target: Some("rm -rf build".to_owned()),
+        },
+        at(30),
+    ));
+
+    let rows = describe(&session);
+    assert_eq!(
+        rows.len(),
+        3,
+        "the chapter, its outcome, then what it waits on"
+    );
+    assert!(
+        rows[2].starts_with("live: PermissionRequested"),
+        "{}",
+        rows[2]
+    );
+}
+
+/// With no story, the hook entries are all there is and none are dropped.
+#[test]
+fn tool_rows_stay_when_there_is_no_story() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::ToolCompleted {
+            tool_name: Some("Bash".to_owned()),
+            target: None,
+            runs: 4,
+        },
+        at(30),
+    ));
+
+    let rows = describe(&session);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("live: ToolCompleted"))
+    );
 }
