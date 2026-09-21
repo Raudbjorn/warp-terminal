@@ -5,8 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ::conn::ConnSession;
-use ::conn::story::{ConnStory, ConnTurn};
+use ::conn::story::ConnTurn;
+use ::conn::{ConnEntryKind, ConnSession};
 use languages::language_by_local_filename;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
@@ -6934,25 +6934,41 @@ struct ConnStoryLines {
 
 /// Decides what the card says about a turn.
 ///
-/// A finished turn is told by its closing message. A running one has none yet,
-/// so its latest step is what the session is doing right now, which is the more
-/// useful of the two while you are still waiting on it.
-fn conn_story_lines(turn: &ConnTurn) -> Option<ConnStoryLines> {
+/// A finished turn is told by its closing message. A running one is told by
+/// what it is doing, which is its latest step, or — before it has taken one —
+/// whatever it said on its way into the work.
+///
+/// Running is the hooks' answer rather than the story's. A turn's `outcome` is
+/// only the latest thing the agent has said, and reading it as a conclusion
+/// puts "I'll look at the repo first" under `said` for the ten minutes that
+/// follow.
+fn conn_story_lines(turn: &ConnTurn, is_running: bool) -> Option<ConnStoryLines> {
     let prompt = conn_preview::head(&turn.prompt, DETAIL_SIDECAR_PROMPT_CHARS);
     if prompt.is_empty() {
         return None;
     }
-    let progress = match &turn.outcome {
-        Some(outcome) => Some((
-            "said",
-            conn_preview::tail(outcome, DETAIL_SIDECAR_BODY_CHARS),
-        )),
-        None => turn.steps.last().map(|step| {
+    let latest_step = || {
+        turn.steps.last().map(|step| {
             (
                 "now",
                 conn_preview::head(&step.description, DETAIL_SIDECAR_BODY_CHARS),
             )
-        }),
+        })
+    };
+    let progress = if is_running {
+        latest_step().or_else(|| {
+            turn.outcome
+                .as_ref()
+                .map(|said| ("now", conn_preview::head(said, DETAIL_SIDECAR_BODY_CHARS)))
+        })
+    } else {
+        match &turn.outcome {
+            Some(outcome) => Some((
+                "said",
+                conn_preview::tail(outcome, DETAIL_SIDECAR_BODY_CHARS),
+            )),
+            None => latest_step(),
+        }
     };
     Some(ConnStoryLines {
         prompt,
@@ -6973,8 +6989,14 @@ fn render_conn_story_section(
     appearance: &Appearance,
     app: &AppContext,
 ) -> Option<Box<dyn Element>> {
+    let is_running = matches!(
+        CLIAgentSessionsModel::as_ref(app)
+            .session(terminal_view.id())
+            .map(|session| &session.status),
+        Some(CLIAgentSessionStatus::InProgress)
+    );
     let session = ConnModel::as_ref(app).session(terminal_view.id())?;
-    let lines = conn_story_lines(session.story()?.latest_turn()?)?;
+    let lines = conn_story_lines(session.story()?.latest_turn()?, is_running)?;
 
     let mut section = Flex::column()
         .with_cross_axis_alignment(CrossAxisAlignment::Start)
@@ -7007,23 +7029,30 @@ const ROW_STEP_CHARS: usize = 100;
 
 /// What a pane is doing right this second, or `None` if it is not mid-turn.
 ///
-/// The status comes from the hooks and the step from the transcript, and both
-/// have to agree. The status alone cannot name the work; the story alone lags,
-/// because the transcript is re-read on a pace rather than on every event.
+/// Whether a turn is running is the hooks' answer, not the story's. A turn's
+/// `outcome` is only the latest thing the agent has said, and it says plenty
+/// on the way past — "I'll look at the repo first" is an outcome the moment
+/// it is written, with ten minutes of work still to come.
+///
+/// What the story can be wrong about is which turn it describes: it is re-read
+/// on a pace, so a prompt it does not yet cover means its last step belongs to
+/// the turn before this one.
 fn conn_running_step(
     status: Option<&CLIAgentSessionStatus>,
-    story: Option<&ConnStory>,
+    session: Option<&ConnSession>,
 ) -> Option<String> {
     if !matches!(status?, CLIAgentSessionStatus::InProgress) {
         return None;
     }
-    let turn = story?.latest_turn()?;
-    // A closed turn means the story is still the previous one: the read for the
-    // running turn has not landed. Its last step would claim the session is
-    // doing something it has already finished.
-    if turn.outcome.is_some() {
+    let session = session?;
+    if session
+        .in_flight()
+        .iter()
+        .any(|entry| matches!(entry.kind, ConnEntryKind::Prompt { .. }))
+    {
         return None;
     }
+    let turn = session.story()?.latest_turn()?;
     let step = conn_preview::head(&turn.steps.last()?.description, ROW_STEP_CHARS);
     (!step.is_empty()).then_some(step)
 }
@@ -7044,9 +7073,7 @@ fn render_conn_step_line(
         CLIAgentSessionsModel::as_ref(app)
             .session(terminal_view.id())
             .map(|session| &session.status),
-        ConnModel::as_ref(app)
-            .session(terminal_view.id())
-            .and_then(ConnSession::story),
+        ConnModel::as_ref(app).session(terminal_view.id()),
     )?;
 
     let theme = appearance.theme();
