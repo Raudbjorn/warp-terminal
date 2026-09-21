@@ -60,8 +60,17 @@ const READ_INTERVAL: TimeDelta = TimeDelta::seconds(3);
 /// no further event coming to correct it. One more read closes that window.
 const FLUSH_GRACE: Duration = Duration::from_millis(1500);
 
+/// Emitted whenever a pane's history changes.
+///
+/// The docked panel only needs a repaint and gets one from `notify`, but the
+/// tab list draws every pane in the window and only some of them belong to
+/// this workspace, so it needs to know which pane moved.
+pub enum ConnModelEvent {
+    SessionUpdated { terminal_view_id: EntityId },
+}
+
 impl Entity for ConnModel {
-    type Event = ();
+    type Event = ConnModelEvent;
 }
 
 impl SingletonEntity for ConnModel {}
@@ -141,6 +150,7 @@ impl ConnModel {
         if let Some(kind) = entry_kind(event) {
             session.push(ConnEntry::new(kind, at));
             ctx.notify();
+            ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
         }
 
         let locator = TranscriptLocator {
@@ -214,6 +224,7 @@ impl ConnModel {
             session.transcript_path = Some(path.to_string_lossy().into_owned());
             if session.adopt_story(story, through) {
                 ctx.notify();
+                ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
             }
         });
         self.reads_in_flight

@@ -267,6 +267,7 @@ use crate::code_review::diff_state::DiffStateModel;
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
 use crate::conn::panel::ConnPanelView;
+use crate::conn::{ConnModel, ConnModelEvent};
 use crate::context_chips::ChipRuntimeCapabilities;
 use crate::default_terminal::DefaultTerminal;
 use crate::drive::export::ExportManager;
@@ -3402,6 +3403,10 @@ impl Workspace {
             me.handle_cli_agent_sessions_event(event, ctx);
         });
 
+        ctx.subscribe_to_model(&ConnModel::handle(ctx), |me, _, event, ctx| {
+            me.handle_conn_event(event, ctx);
+        });
+
         ctx.subscribe_to_model(
             &AgentNotificationsModel::handle(ctx),
             Self::handle_agent_management_event,
@@ -3989,6 +3994,19 @@ impl Workspace {
                 | CLIAgentSessionsModelEvent::SessionUpdated { .. }
         ) && self.workspace_contains_terminal_view(event.terminal_view_id(), ctx)
         {
+            ctx.notify();
+        }
+    }
+
+    /// Redraws the tab list when a pane's Conn history moves.
+    ///
+    /// A pane row carries the step its agent is on, and that comes from the
+    /// transcript rather than from the hooks, so it changes at moments no
+    /// `CLIAgentSessionsModelEvent` marks. Scoped to this window's panes, as
+    /// the model records every pane in the app.
+    fn handle_conn_event(&mut self, event: &ConnModelEvent, ctx: &mut ViewContext<Self>) {
+        let ConnModelEvent::SessionUpdated { terminal_view_id } = event;
+        if self.workspace_contains_terminal_view(*terminal_view_id, ctx) {
             ctx.notify();
         }
     }

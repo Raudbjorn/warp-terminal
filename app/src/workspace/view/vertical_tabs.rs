@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ::conn::story::ConnTurn;
+use ::conn::ConnSession;
+use ::conn::story::{ConnStory, ConnTurn};
 use languages::language_by_local_filename;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
@@ -61,7 +62,7 @@ use crate::tab::{
     SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, reveals_tab_shortcut_hints,
     tab_activate_binding_name, tab_position_id,
 };
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModel};
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::view::TerminalViewState;
 use crate::terminal::{CLIAgent, TerminalView};
@@ -4664,6 +4665,9 @@ fn render_terminal_row_content(
         .with_cross_axis_alignment(CrossAxisAlignment::Start);
     content.add_child(first_line_element);
     content.add_child(Container::new(second_line).with_margin_top(2.).finish());
+    if let Some(step_line) = render_conn_step_line(terminal_view, 12., appearance, app) {
+        content.add_child(Container::new(step_line).with_margin_top(2.).finish());
+    }
     content.add_child(
         Container::new(render_terminal_metadata_line(
             terminal_view,
@@ -6994,6 +6998,87 @@ fn render_conn_story_section(
     Some(section.finish())
 }
 
+/// How much of a step a pane row shows.
+///
+/// Far tighter than the hover card's budget. The row is one clipped line in a
+/// sidebar that starts at 250px, so the clip does the real work and this only
+/// keeps a runaway description from being built at all.
+const ROW_STEP_CHARS: usize = 100;
+
+/// What a pane is doing right this second, or `None` if it is not mid-turn.
+///
+/// The status comes from the hooks and the step from the transcript, and both
+/// have to agree. The status alone cannot name the work; the story alone lags,
+/// because the transcript is re-read on a pace rather than on every event.
+fn conn_running_step(
+    status: Option<&CLIAgentSessionStatus>,
+    story: Option<&ConnStory>,
+) -> Option<String> {
+    if !matches!(status?, CLIAgentSessionStatus::InProgress) {
+        return None;
+    }
+    let turn = story?.latest_turn()?;
+    // A closed turn means the story is still the previous one: the read for the
+    // running turn has not landed. Its last step would claim the session is
+    // doing something it has already finished.
+    if turn.outcome.is_some() {
+        return None;
+    }
+    let step = conn_preview::head(&turn.steps.last()?.description, ROW_STEP_CHARS);
+    (!step.is_empty()).then_some(step)
+}
+
+/// The row's share of Conn: the step a running pane is on.
+///
+/// Only a running pane gets this line, so a list of eight panes does not grow
+/// eight rows taller for the sake of the one you are waiting on. The icon and
+/// its colour come from the same place as the hover card's status pill, so the
+/// two surfaces say "in progress" the same way.
+fn render_conn_step_line(
+    terminal_view: &TerminalView,
+    font_size: f32,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    let step = conn_running_step(
+        CLIAgentSessionsModel::as_ref(app)
+            .session(terminal_view.id())
+            .map(|session| &session.status),
+        ConnModel::as_ref(app)
+            .session(terminal_view.id())
+            .and_then(ConnSession::story),
+    )?;
+
+    let theme = appearance.theme();
+    let (icon, icon_color) =
+        ConversationStatus::InProgress.status_icon_and_color(theme, StatusColorStyle::Standard);
+    Some(
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.)
+            .with_child(
+                ConstrainedBox::new(
+                    icon.to_warpui_icon(WarpThemeFill::Solid(icon_color))
+                        .finish(),
+                )
+                .with_width(font_size - 2.)
+                .with_height(font_size - 2.)
+                .finish(),
+            )
+            .with_child(
+                Shrinkable::new(
+                    1.,
+                    Text::new_inline(step, appearance.ui_font_family(), font_size)
+                        .with_clip(ClipConfig::ellipsis())
+                        .with_color(theme.sub_text_color(theme.background()).into())
+                        .finish(),
+                )
+                .finish(),
+            )
+            .finish(),
+    )
+}
+
 fn render_terminal_detail_primary_line(
     primary_line: &TerminalPrimaryLineData,
     color: WarpThemeFill,
@@ -7665,9 +7750,21 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
         theme,
     );
 
+    // The step line only exists while the pane's agent is mid-turn, so a row
+    // grows by one line exactly when it has something new to say.
+    let step_element = match &props.typed {
+        TypedPane::Terminal(terminal_pane) => render_conn_step_line(
+            terminal_pane.terminal_view(app).as_ref(app),
+            10.,
+            appearance,
+            app,
+        ),
+        _ => None,
+    };
+
     // Assemble text column: title + optional subtitle
     // Top-align the icon when there are two lines of content; center for single-line rows.
-    let icon_alignment = if subtitle_element.is_some() {
+    let icon_alignment = if subtitle_element.is_some() || step_element.is_some() {
         CrossAxisAlignment::Start
     } else {
         CrossAxisAlignment::Center
@@ -7681,6 +7778,10 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
 
     if let Some(subtitle) = subtitle_element {
         text_col.add_child(subtitle);
+    }
+
+    if let Some(step) = step_element {
+        text_col.add_child(step);
     }
 
     let content = Flex::row()
