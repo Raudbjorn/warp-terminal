@@ -30,11 +30,10 @@ pub struct ConnModel {
     /// process-lifetime id, so it is deliberately not a persistence key; a
     /// durable store should key on the terminal's session UUID instead.
     ///
-    /// Entries are never removed. A session's history deliberately outlives
-    /// the session, because reading it afterwards is the point, but nothing
-    /// yet discards it when the *pane* is closed, so a long-lived window that
-    /// churns panes will accumulate history for panes that no longer exist.
-    /// Bounded per session by `conn::MAX_ENTRIES`, unbounded in pane count.
+    /// A session's history outlives the agent that made it, because reading it
+    /// afterwards is the point, and is discarded with the pane by
+    /// [`ConnModel::forget_pane`]. Per session the history is capped by
+    /// `conn::MAX_ENTRIES`; pane count is what that call bounds.
     sessions: HashMap<EntityId, ConnSession>,
     /// The transcript read currently in flight for each pane. Reading it is
     /// how tests await the read before asserting on the story.
@@ -117,6 +116,26 @@ impl ConnModel {
             | CLIAgentSessionsModelEvent::InputSessionChanged { .. }
             | CLIAgentSessionsModelEvent::Ended { .. }
             | CLIAgentSessionsModelEvent::SessionUpdated { .. } => {}
+        }
+    }
+
+    /// Discards a pane's history, on the pane being closed for good.
+    ///
+    /// Not when its agent exits: a finished session is exactly the one worth
+    /// reading, and its pane is still there to read it in. Warp removes the
+    /// `CLIAgentSession` at both moments, which is why this is wired to the
+    /// pane's own close rather than to that model's `Ended` event.
+    ///
+    /// A transcript read already in flight for this pane is left to land and
+    /// find nothing, which is what its callback does with a pane it cannot
+    /// find. Forgetting the id is enough; there is nothing to cancel.
+    pub fn forget_pane(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        self.reads_in_flight.remove(&terminal_view_id);
+        self.last_read.remove(&terminal_view_id);
+        if self.sessions.remove(&terminal_view_id).is_some() {
+            // No `ConnModelEvent`: it names a pane that no longer exists, and
+            // the panel it would reach repaints from this `notify` anyway.
+            ctx.notify();
         }
     }
 

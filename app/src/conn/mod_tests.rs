@@ -508,3 +508,43 @@ fn a_pasted_prompt_is_recorded_without_its_wrapper() {
         assert_eq!(spine, vec!["combine the two repos"]);
     });
 }
+
+#[test]
+fn a_closed_pane_is_forgotten() {
+    with_session(|app, view_id| {
+        send(app, view_id, prompt("combine the two repos"));
+
+        ConnModel::handle(&*app).update(app, |me, ctx| {
+            me.forget_pane(view_id, ctx);
+        });
+
+        let remembered = ConnModel::handle(&*app).read(app, |me, _| me.session(view_id).is_some());
+        assert!(
+            !remembered,
+            "history for a pane that no longer exists is unreachable and unbounded"
+        );
+    });
+}
+
+/// The agent exiting is not the pane closing, and Warp removes its
+/// `CLIAgentSession` at both moments. A session that has just finished is the
+/// one most worth reading, and its pane is still there to read it in.
+#[test]
+fn an_agent_that_exits_leaves_its_history_behind() {
+    with_session(|app, view_id| {
+        send(app, view_id, prompt("combine the two repos"));
+
+        CLIAgentSessionsModel::handle(&*app).update(app, |m, ctx| {
+            m.remove_session(view_id, ctx);
+        });
+
+        let spine = ConnModel::handle(&*app).read(app, |me, _| {
+            me.session(view_id)
+                .expect("history survives the agent")
+                .prompts()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(spine, vec!["combine the two repos"]);
+    });
+}

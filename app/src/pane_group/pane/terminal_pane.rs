@@ -46,6 +46,7 @@ use crate::ai::llms::LLMPreferences;
 use crate::ai::orchestration::{RemoteChildLaunchConfig, prepare_remote_child_launch};
 use crate::app_state::{AmbientAgentPaneSnapshot, LeafContents, TerminalPaneSnapshot};
 use crate::code::buffer_location::LocalOrRemotePath;
+use crate::conn::ConnModel;
 #[cfg(feature = "local_fs")]
 use crate::pane_group::CodeSource;
 use crate::pane_group::Event::OpenConversationHistory;
@@ -406,6 +407,12 @@ impl PaneContent for TerminalPane {
                 );
             });
             self.delete_blocks(ctx);
+
+            // Conn's history outlives the agent on purpose, but not the pane.
+            let terminal_view_id = self.terminal_view(ctx).id();
+            ConnModel::handle(ctx).update(ctx, |conn, ctx| {
+                conn.forget_pane(terminal_view_id, ctx);
+            });
         }
 
         // Unsubscribe from all views in the pane stack.
