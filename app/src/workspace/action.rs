@@ -383,6 +383,8 @@ pub enum WorkspaceAction {
     OpenWarpDrive,
     /// Toggles the right panel. This happens as an explicit action from the user.
     ToggleRightPanel,
+    /// Toggles the Conn panel. This happens as an explicit action from the user.
+    ToggleConnPanel,
     /// Opens the code review panel (right panel) without toggling. If already open,
     /// switches to the target pane's repo. Used by vertical tabs diff stats chip.
     OpenCodeReviewPanel(PaneViewLocator),
@@ -1100,6 +1102,7 @@ impl WorkspaceAction {
             | OpenWarpDrive
             | ClosePanel
             | ToggleRightPanel
+            | ToggleConnPanel
             | OpenCodeReviewPanel(..)
             | ToggleVerticalTabsSettingsPopup
             | SetVerticalTabsDisplayGranularity(_)

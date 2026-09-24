@@ -170,7 +170,7 @@ fn sync_show_hide_settings<V: View>(
 ) {
     let placed: Vec<&HeaderToolbarItemKind> = left.iter().chain(right.iter()).collect();
 
-    let code_review_placed = placed.contains(&&HeaderToolbarItemKind::Conn);
+    let code_review_placed = placed.contains(&&HeaderToolbarItemKind::CodeReview);
     if *TabSettings::as_ref(ctx).show_code_review_button.value() != code_review_placed {
         TabSettings::handle(ctx).update(ctx, |settings, ctx| {
             report_if_error!(
