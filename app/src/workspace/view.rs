@@ -25665,6 +25665,19 @@ impl TypedActionView for Workspace {
             OpenFilePath { path } => {
                 ctx.open_file_path(path);
             }
+            OpenConnPlan { path } => {
+                self.open_file_with_target(
+                    path.clone(),
+                    FileTarget::MarkdownViewer(EditorLayout::SplitPane),
+                    None,
+                    CodeSource::Link {
+                        path: path.clone(),
+                        range_start: None,
+                        range_end: None,
+                    },
+                    ctx,
+                );
+            }
             NewTabInAgentMode {
                 entrypoint,
                 zero_state_prompt_suggestion_type,

@@ -1511,6 +1511,7 @@ fn conn_session(turn: ConnTurn) -> ConnSession {
     session.adopt_story(
         ConnStory {
             title: None,
+            plan_file: None,
             turns: vec![turn],
         },
         Utc::now(),

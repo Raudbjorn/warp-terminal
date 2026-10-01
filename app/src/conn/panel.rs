@@ -9,18 +9,22 @@
 //! Read-only; it reflects state and never drives a session.
 
 use std::cell::Cell;
+use std::path::PathBuf;
 
 use ::conn::story::ConnTurn;
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
 use chrono::{DateTime, Datelike, Local, Utc};
+use markdown_parser::parse_markdown_with_gfm_tables;
 use warp_errors::report_error;
 use warpui::elements::new_scrollable::{NewScrollableElement, SingleAxisConfig};
 use warpui::elements::{
     Align, ConstrainedBox, Container, CrossAxisAlignment, DragBarSide, Element, Empty, Fill, Flex,
-    List, ListState, MainAxisSize, NewScrollable, ParentElement, Rect, Resizable,
+    FormattedTextElement, HeadingFontSizeMultipliers, HighlightedHyperlink, Hoverable, List,
+    ListState, MainAxisSize, MouseStateHandle, NewScrollable, ParentElement, Rect, Resizable,
     ResizableStateHandle, ScrollStateHandle, Shrinkable, Text, resizable_state_handle,
 };
 use warpui::fonts::{Properties, Weight};
+use warpui::platform::Cursor;
 use warpui::{
     AppContext, Entity, EntityId, SingletonEntity, View, ViewContext, ViewHandle, WeakViewHandle,
 };
@@ -30,6 +34,7 @@ use crate::appearance::Appearance;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
 use crate::pane_group::PaneGroup;
 use crate::terminal::resizable_data::{DEFAULT_RIGHT_PANEL_WIDTH, ModalType, ResizableData};
+use crate::workspace::WorkspaceAction;
 
 /// Truncation point for a prompt or a closing message. Long enough to
 /// recognise what you asked for, short enough that the chapters stay
@@ -38,6 +43,17 @@ const PREVIEW_CHARS: usize = 240;
 
 /// How far a step is indented under the prompt it belongs to.
 const STEP_INDENT: f32 = 22.;
+
+/// Heading sizes for a rendered answer. The panel is a narrow sidebar, so headings stay close to
+/// body size rather than taking the document-sized defaults.
+const ANSWER_HEADING_SIZES: HeadingFontSizeMultipliers = HeadingFontSizeMultipliers {
+    h1: 1.3,
+    h2: 1.2,
+    h3: 1.1,
+    h4: 1.,
+    h5: 1.,
+    h6: 1.,
+};
 
 pub struct ConnPanelView {
     /// The pane group whose focused pane this panel follows. Set by the
@@ -49,6 +65,9 @@ pub struct ConnPanelView {
     list_state: ListState<()>,
     scroll_state: ScrollStateHandle,
     resizable_state_handle: ResizableStateHandle,
+    /// Hover state for links in the latest answer, the only row that renders them.
+    answer_link: HighlightedHyperlink,
+    open_plan_link: MouseStateHandle,
     /// The pane, turn count and row count the list was last reconciled to.
     ///
     /// `ListState` owns its item count as mutable state, so it has to be told
@@ -106,6 +125,8 @@ impl ConnPanelView {
             list_state,
             scroll_state: ScrollStateHandle::default(),
             resizable_state_handle,
+            answer_link: HighlightedHyperlink::default(),
+            open_plan_link: MouseStateHandle::default(),
             synced: Cell::new(None),
         }
     }
@@ -194,7 +215,7 @@ impl ConnPanelView {
 
     fn render_row_at(&self, index: usize, app: &AppContext) -> Box<dyn Element> {
         self.with_session(app, |session| match row_at(session, index) {
-            Some(row) => render_row(&row, app),
+            Some(row) => render_row(&row, &self.answer_link, app),
             None => Empty::new().finish(),
         })
         .unwrap_or_else(|| Empty::new().finish())
@@ -212,6 +233,11 @@ impl ConnPanelView {
         let title = self
             .with_session(app, |session| {
                 session.story().and_then(|story| story.title.clone())
+            })
+            .flatten();
+        let plan_file = self
+            .with_session(app, |session| {
+                session.story().and_then(|story| story.plan_file.clone())
             })
             .flatten();
 
@@ -247,9 +273,43 @@ impl ConnPanelView {
             );
         }
 
+        if let Some(plan_file) = plan_file {
+            column = column.with_child(self.render_open_plan(plan_file, app));
+        }
+
         Container::new(column.finish())
             .with_uniform_padding(10.)
             .finish()
+    }
+
+    fn render_open_plan(&self, plan_file: PathBuf, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let font_family = appearance.ui_font_family();
+        let font_size = appearance.ui_font_size() - 1.;
+        let theme = appearance.theme();
+        let color = theme.accent().into_solid();
+        let hovered_color = theme.active_ui_text_color().into();
+
+        Hoverable::new(self.open_plan_link.clone(), move |state| {
+            Container::new(
+                Text::new_inline("Open plan", font_family, font_size)
+                    .with_color(if state.is_hovered() {
+                        hovered_color
+                    } else {
+                        color
+                    })
+                    .finish(),
+            )
+            .with_padding_top(4.)
+            .finish()
+        })
+        .on_click(move |ctx, _, _| {
+            ctx.dispatch_typed_action(WorkspaceAction::OpenConnPlan {
+                path: plan_file.clone(),
+            });
+        })
+        .with_cursor(Cursor::PointingHand)
+        .finish()
     }
 
     /// Shown before a session exists in the focused pane. Says what the panel
@@ -288,7 +348,12 @@ enum ConnRow<'a> {
     /// Something the agent did, in the words it used at the time.
     Step { description: &'a str, runs: usize },
     /// The agent's closing message for a turn.
-    Outcome(&'a str),
+    Outcome {
+        text: &'a str,
+        /// Whether this closes the story's last turn. That answer is the one being read, so it
+        /// is shown whole and formatted; earlier ones stay short so the chapters remain scannable.
+        latest: bool,
+    },
     /// A live hook event from the turn in flight. Thinner than a step — the
     /// plugin sends a tool's name and nothing about what it did — which is
     /// why the transcript is read at all.
@@ -352,7 +417,7 @@ fn row_at(session: &ConnSession, index: usize) -> Option<ConnRow<'_>> {
         remaining -= 1;
     }
     if let Some(story) = session.story() {
-        for turn in &story.turns {
+        for (turn_index, turn) in story.turns.iter().enumerate() {
             let rows = turn_rows(turn);
             if remaining >= rows {
                 remaining -= rows;
@@ -370,17 +435,33 @@ fn row_at(session: &ConnSession, index: usize) -> Option<ConnRow<'_>> {
                     runs: step.runs,
                 });
             }
-            return turn.outcome.as_deref().map(ConnRow::Outcome);
+            return turn.outcome.as_deref().map(|text| ConnRow::Outcome {
+                text,
+                latest: turn_index + 1 == story.turns.len(),
+            });
         }
     }
     live_rows(session).nth(remaining).map(ConnRow::Live)
 }
 
-fn render_row(row: &ConnRow, app: &AppContext) -> Box<dyn Element> {
+fn render_row(
+    row: &ConnRow,
+    answer_link: &HighlightedHyperlink,
+    app: &AppContext,
+) -> Box<dyn Element> {
     match row {
         ConnRow::Turn { at, prompt } => render_turn(*at, prompt, app),
         ConnRow::Step { description, runs } => render_step(description, *runs, app),
-        ConnRow::Outcome(text) => render_labelled("said", tail_preview(text), false, app),
+        ConnRow::Outcome { text, latest: true } => render_labelled(
+            "said",
+            markdown_body(text, Some(answer_link), app),
+            false,
+            app,
+        ),
+        ConnRow::Outcome {
+            text,
+            latest: false,
+        } => render_labelled("said", plain_body(tail_preview(text), app), false, app),
         // A new instruction opens a chapter whether the transcript has caught
         // up with it or not.
         ConnRow::NoTranscript => render_notice(
@@ -390,9 +471,14 @@ fn render_row(row: &ConnRow, app: &AppContext) -> Box<dyn Element> {
         ),
         ConnRow::Live(entry) => match &entry.kind {
             ConnEntryKind::Prompt { text } => render_turn(entry.at, text, app),
+            // A live answer is replaced by the story's outcome row once the transcript is
+            // read, so it does not get link hover state of its own.
+            ConnEntryKind::Responded { text: Some(text) } => {
+                render_labelled("said", markdown_body(text, None, app), false, app)
+            }
             kind => {
                 let (label, body, emphasised) = describe_live(kind);
-                render_labelled(label, body, emphasised, app)
+                render_labelled(label, plain_body(body, app), emphasised, app)
             }
         },
     }
@@ -437,7 +523,12 @@ fn render_turn(at: DateTime<Utc>, prompt: &str, app: &AppContext) -> Box<dyn Ele
         .with_main_axis_size(MainAxisSize::Min)
         .with_spacing(6.)
         .with_child(divider)
-        .with_child(labelled_body("you", truncate(prompt), true, app))
+        .with_child(labelled_body(
+            "you",
+            plain_body(truncate(prompt), app),
+            true,
+            app,
+        ))
         .finish();
 
     Container::new(column)
@@ -492,7 +583,7 @@ fn render_notice(message: &'static str, app: &AppContext) -> Box<dyn Element> {
 
 fn render_labelled(
     label: &'static str,
-    body: String,
+    body: Box<dyn Element>,
     emphasised: bool,
     app: &AppContext,
 ) -> Box<dyn Element> {
@@ -508,7 +599,7 @@ fn render_labelled(
 /// order, not the presentation.
 fn labelled_body(
     label: &'static str,
-    body: String,
+    body: Box<dyn Element>,
     emphasised: bool,
     app: &AppContext,
 ) -> Box<dyn Element> {
@@ -533,12 +624,44 @@ fn labelled_body(
             .with_color(label_color.into())
             .finish(),
         )
-        .with_child(
-            Text::new(body, appearance.ui_font_family(), appearance.ui_font_size())
-                .with_color(theme.active_ui_text_color().into())
-                .finish(),
-        )
+        .with_child(body)
         .finish()
+}
+
+fn plain_body(text: String, app: &AppContext) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    Text::new(text, appearance.ui_font_family(), appearance.ui_font_size())
+        .with_color(appearance.theme().active_ui_text_color().into())
+        .finish()
+}
+
+/// A whole message rendered as Markdown. With `link` its hyperlinks are clickable; without, the
+/// text ignores the mouse. Text the parser rejects is shown as written.
+fn markdown_body(
+    text: &str,
+    link: Option<&HighlightedHyperlink>,
+    app: &AppContext,
+) -> Box<dyn Element> {
+    let text = text.trim();
+    let Ok(parsed) = parse_markdown_with_gfm_tables(text) else {
+        return plain_body(text.to_owned(), app);
+    };
+    let appearance = Appearance::as_ref(app);
+    let element = FormattedTextElement::new(
+        parsed,
+        appearance.ui_font_size(),
+        appearance.ui_font_family(),
+        appearance.monospace_font_family(),
+        appearance.theme().active_ui_text_color().into(),
+        link.cloned().unwrap_or_default(),
+    )
+    .with_heading_to_font_size_multipliers(ANSWER_HEADING_SIZES);
+    match link {
+        Some(_) => element
+            .register_default_click_handlers(|url, _, app| app.open_url(&url.url))
+            .finish(),
+        None => element.disable_mouse_interaction().finish(),
+    }
 }
 
 /// A live hook event as a label and a line.

@@ -36,7 +36,7 @@ fn describe(session: &ConnSession) -> Vec<String> {
         .map(|index| match row_at(session, index) {
             Some(ConnRow::Turn { prompt, .. }) => format!("you: {prompt}"),
             Some(ConnRow::Step { description, runs }) => format!("did: {description} ×{runs}"),
-            Some(ConnRow::Outcome(text)) => format!("said: {text}"),
+            Some(ConnRow::Outcome { text, .. }) => format!("said: {text}"),
             Some(ConnRow::Live(entry)) => format!("live: {:?}", entry.kind),
             Some(ConnRow::NoTranscript) => "no transcript".to_owned(),
             None => "missing".to_owned(),
@@ -50,6 +50,7 @@ fn a_chapter_is_a_prompt_then_its_steps_then_its_outcome() {
     session.adopt_story(
         ConnStory {
             title: None,
+            plan_file: None,
             turns: vec![turn(
                 0,
                 "wire the ADRs in",
@@ -80,6 +81,7 @@ fn chapters_read_in_the_order_they_happened() {
     session.adopt_story(
         ConnStory {
             title: None,
+            plan_file: None,
             turns: vec![
                 turn(
                     0,
@@ -119,6 +121,7 @@ fn the_turn_in_flight_follows_the_chapters_already_told() {
     session.adopt_story(
         ConnStory {
             title: None,
+            plan_file: None,
             turns: vec![turn(10, "the told turn", vec![], Some("told"))],
         },
         at(100),
@@ -155,6 +158,7 @@ fn an_unfinished_chapter_has_no_outcome_row() {
     session.adopt_story(
         ConnStory {
             title: None,
+            plan_file: None,
             turns: vec![turn(
                 0,
                 "start something long",
@@ -187,6 +191,7 @@ fn an_index_past_the_end_is_no_row() {
     session.adopt_story(
         ConnStory {
             title: None,
+            plan_file: None,
             turns: vec![turn(0, "go", vec![], Some("done"))],
         },
         at(100),
@@ -267,6 +272,7 @@ fn a_session_with_a_story_shows_no_notice() {
     session.adopt_story(
         ConnStory {
             title: None,
+            plan_file: None,
             turns: vec![turn(10, "do the thing", vec![], Some("done"))],
         },
         at(100),
@@ -297,6 +303,7 @@ fn tool_noise_drops_out_once_the_story_tells_it() {
     session.adopt_story(
         ConnStory {
             title: None,
+            plan_file: None,
             turns: vec![turn(
                 10,
                 "do the work",
@@ -330,6 +337,7 @@ fn a_permission_request_survives_beside_the_story() {
     session.adopt_story(
         ConnStory {
             title: None,
+            plan_file: None,
             turns: vec![turn(10, "do the work", vec![], Some("done"))],
         },
         at(20),
@@ -442,4 +450,30 @@ fn an_unbroken_prompt_is_cut_where_it_must_be() {
     let prompt = "x".repeat(PREVIEW_CHARS + 50);
     let cut = truncate(&prompt);
     assert_eq!(cut.chars().count(), PREVIEW_CHARS + 1);
+}
+
+/// Only the answer being read is shown whole; marking an earlier one as latest would unfold
+/// every chapter.
+#[test]
+fn only_the_last_turns_outcome_is_the_latest() {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![
+                turn(0, "first", vec![], Some("## Plan\n\n- one")),
+                turn(100, "second", vec![], Some("Done.")),
+            ],
+        },
+        at(200),
+    );
+
+    let latest: Vec<bool> = (0..row_count(&session))
+        .filter_map(|index| match row_at(&session, index) {
+            Some(ConnRow::Outcome { latest, .. }) => Some(latest),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(latest, vec![false, true]);
 }

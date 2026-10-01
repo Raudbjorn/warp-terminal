@@ -15,6 +15,8 @@
 //! Claude Code changes. Anything that fails to parse is skipped rather than
 //! failing the read.
 
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +56,9 @@ pub struct ConnStep {
 pub struct ConnStory {
     /// Claude Code's own generated session title, when it has one.
     pub title: Option<String>,
+    /// The Markdown file holding the plan the agent last presented, when it has presented one.
+    #[serde(default)]
+    pub plan_file: Option<PathBuf>,
     pub turns: Vec<ConnTurn>,
 }
 
@@ -92,6 +97,8 @@ pub fn parse_transcript(jsonl: &str) -> ConnStory {
     });
     records.sort_by_key(|record| record.timestamp);
 
+    let plan_file = records.iter().rev().find_map(Record::plan_file);
+
     let mut turns: Vec<ConnTurn> = Vec::new();
     for record in &records {
         if let Some(prompt) = record.typed_prompt() {
@@ -121,7 +128,11 @@ pub fn parse_transcript(jsonl: &str) -> ConnStory {
         }
     }
 
-    ConnStory { title, turns }
+    ConnStory {
+        title,
+        plan_file,
+        turns,
+    }
 }
 
 /// Appends a step, folding it into the previous one when identical.
@@ -194,6 +205,22 @@ impl Record {
                     .or_else(|| block.name.clone())
             })
             .collect()
+    }
+
+    /// The plan file named by this record's `ExitPlanMode` call, the tool Claude Code uses to
+    /// present a plan for approval.
+    fn plan_file(&self) -> Option<PathBuf> {
+        let Content::Blocks(blocks) = self.message.as_ref()?.content.as_ref()? else {
+            return None;
+        };
+        blocks
+            .iter()
+            .rev()
+            .filter(|block| {
+                block.kind == "tool_use" && block.name.as_deref() == Some("ExitPlanMode")
+            })
+            .find_map(|block| block.input.as_ref()?.get("planFilePath")?.as_str())
+            .map(PathBuf::from)
     }
 
     /// The assistant's prose for this record, ignoring `thinking` blocks.

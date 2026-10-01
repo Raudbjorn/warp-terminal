@@ -181,11 +181,24 @@ impl ConnModel {
             event.event,
             CLIAgentEventType::Stop | CLIAgentEventType::StopFailure
         );
+        // The session now waits on the user and sends nothing more until they answer, so this
+        // is the last event that can bring the story up to date, plan included.
+        let waiting = matches!(
+            event.event,
+            CLIAgentEventType::PermissionRequest | CLIAgentEventType::QuestionAsked
+        );
+        // The story covers what led up to the request. The request itself is told only by its
+        // live entry, so the boundary stops just short of it.
+        let through = if waiting {
+            at - TimeDelta::milliseconds(1)
+        } else {
+            at
+        };
         if self.should_read(terminal_view_id, event, at) {
-            self.read_transcript(terminal_view_id, locator.clone(), at, None, ctx);
+            self.read_transcript(terminal_view_id, locator.clone(), through, None, ctx);
         }
-        if finished {
-            self.read_transcript(terminal_view_id, locator, at, Some(FLUSH_GRACE), ctx);
+        if finished || waiting {
+            self.read_transcript(terminal_view_id, locator, through, Some(FLUSH_GRACE), ctx);
         }
     }
 

@@ -488,6 +488,10 @@ pub enum WorkspaceAction {
     OpenFilePath {
         path: PathBuf,
     },
+    /// Open an agent session's plan file, rendered, in a pane beside the session.
+    OpenConnPlan {
+        path: PathBuf,
+    },
     TerminateApp,
     CloseWindow,
     /// Help the user call the Warp executable with the [`crate::args::DEBUG_DUMP_FLAG`].
@@ -1167,6 +1171,7 @@ impl WorkspaceAction {
             | OpenFilePath { .. }
             | ViewObjectInWarpDrive(_)
             | OpenObjectSharingSettings { .. }
+            | OpenConnPlan { .. }
             | TerminateApp
             | SignInAnonymousWebUser
             | TabHoverWidthStart { .. }

@@ -195,7 +195,11 @@ fn turn(started: i64, ended: Option<i64>, outcome: Option<&str>) -> ConnTurn {
 }
 
 fn story(turns: Vec<ConnTurn>) -> ConnStory {
-    ConnStory { title: None, turns }
+    ConnStory {
+        title: None,
+        plan_file: None,
+        turns,
+    }
 }
 
 /// Until a story has been read, the hook entries are all there is.

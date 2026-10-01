@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::{ConnStep, parse_transcript};
 
 /// Shapes match a real Claude Code transcript: assistant records carry no
@@ -260,4 +262,34 @@ fn a_turn_with_no_activity_ends_nowhere() {
     let story = parse_transcript(&jsonl);
     assert_eq!(story.turns[0].ended_at, None);
     assert_eq!(story.turns[0].last_activity(), story.turns[0].started_at);
+}
+
+fn presents_plan(ts: &str, path: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","name":"ExitPlanMode","input":{{"plan":"Plan","planFilePath":"{path}"}}}}]}}}}"#
+    )
+}
+
+#[test]
+fn the_plan_file_is_the_last_one_presented() {
+    let jsonl = transcript(&[
+        &typed("2026-09-20T10:00:00Z", "plan the migration"),
+        &presents_plan("2026-09-20T10:00:05Z", "/plans/first.md"),
+        &typed("2026-09-20T10:05:00Z", "revise it"),
+        &presents_plan("2026-09-20T10:05:05Z", "/plans/second.md"),
+    ]);
+
+    let story = parse_transcript(&jsonl);
+
+    assert_eq!(story.plan_file, Some(PathBuf::from("/plans/second.md")));
+}
+
+#[test]
+fn a_session_that_never_planned_has_no_plan_file() {
+    let jsonl = transcript(&[
+        &typed("2026-09-20T10:00:00Z", "fix the test"),
+        &tool("2026-09-20T10:00:05Z", "Bash", "Run the tests"),
+    ]);
+
+    assert_eq!(parse_transcript(&jsonl).plan_file, None);
 }

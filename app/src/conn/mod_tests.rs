@@ -548,3 +548,52 @@ fn an_agent_that_exits_leaves_its_history_behind() {
         assert_eq!(spine, vec!["combine the two repos"]);
     });
 }
+
+/// A session waiting on an answer sends no further events, so the request is the last chance to
+/// read what led up to it. The request itself must stay visible beside that story.
+#[test]
+fn a_permission_request_reads_the_story_and_stays_in_flight() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, transcript_jsonl()).expect("write transcript");
+
+        send(
+            &mut app,
+            view_id,
+            event(
+                CLIAgentEventType::PermissionRequest,
+                CLIAgentEventPayload {
+                    summary: Some("Wants to run ExitPlanMode".to_owned()),
+                    transcript_path: path.to_str().map(str::to_owned),
+                    ..Default::default()
+                },
+            ),
+        );
+        await_read(&mut app, view_id).await;
+
+        ConnModel::handle(&app).read(&app, |me, _| {
+            let session = me.session(view_id).expect("session");
+            assert!(
+                session
+                    .story()
+                    .and_then(|story| story.latest_turn())
+                    .is_some_and(|turn| turn.outcome.is_some()),
+                "the story is read up to the request"
+            );
+            assert!(
+                matches!(
+                    session
+                        .in_flight()
+                        .iter()
+                        .map(|entry| &entry.kind)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    [ConnEntryKind::PermissionRequested { .. }]
+                ),
+                "the request is still shown"
+            );
+        });
+    });
+}
