@@ -9,6 +9,7 @@
 //! Read-only; it reflects state and never drives a session.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ::conn::story::ConnTurn;
@@ -18,20 +19,22 @@ use markdown_parser::parse_markdown_with_gfm_tables;
 use warp_errors::report_error;
 use warpui::elements::new_scrollable::{NewScrollableElement, SingleAxisConfig};
 use warpui::elements::{
-    Align, ConstrainedBox, Container, CrossAxisAlignment, DragBarSide, Element, Empty, Fill, Flex,
-    FormattedTextElement, HeadingFontSizeMultipliers, HighlightedHyperlink, Hoverable, List,
-    ListState, MainAxisSize, MouseStateHandle, NewScrollable, ParentElement, Rect, Resizable,
+    Align, ChildView, ConstrainedBox, Container, CrossAxisAlignment, DragBarSide, Element, Empty,
+    Fill, Flex, FormattedTextElement, HeadingFontSizeMultipliers, HighlightedHyperlink, Hoverable,
+    List, ListState, MainAxisSize, MouseStateHandle, NewScrollable, ParentElement, Rect, Resizable,
     ResizableStateHandle, ScrollStateHandle, Shrinkable, Text, resizable_state_handle,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
 use warpui::{
-    AppContext, Entity, EntityId, SingletonEntity, View, ViewContext, ViewHandle, WeakViewHandle,
+    Action, AppContext, Entity, EntityId, SingletonEntity, TypedActionView, View, ViewContext,
+    ViewHandle, WeakViewHandle,
 };
 
 use super::{ConnModel, preview};
 use crate::appearance::Appearance;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
+use crate::notebooks::file::FileNotebookView;
 use crate::pane_group::PaneGroup;
 use crate::terminal::resizable_data::{DEFAULT_RIGHT_PANEL_WIDTH, ModalType, ResizableData};
 use crate::workspace::WorkspaceAction;
@@ -67,7 +70,12 @@ pub struct ConnPanelView {
     resizable_state_handle: ResizableStateHandle,
     /// Hover state for links in the latest answer, the only row that renders them.
     answer_link: HighlightedHyperlink,
-    open_plan_link: MouseStateHandle,
+    /// The plan each pane is reading in place of its story, keyed by terminal view. A pane keeps
+    /// its entry while focus is elsewhere, so coming back to it shows the plan again.
+    plans: HashMap<EntityId, OpenPlan>,
+    show_plan_link: MouseStateHandle,
+    show_story_link: MouseStateHandle,
+    open_in_pane_link: MouseStateHandle,
     /// The pane, turn count and row count the list was last reconciled to.
     ///
     /// `ListState` owns its item count as mutable state, so it has to be told
@@ -116,7 +124,8 @@ impl ConnPanelView {
 
         // The story grows while the panel is open, so it has to follow the
         // model rather than only redraw on focus changes.
-        ctx.observe(&ConnModel::handle(ctx), |_, _, ctx| {
+        ctx.observe(&ConnModel::handle(ctx), |me, _, ctx| {
+            me.sync_plans(ctx);
             ctx.notify();
         });
 
@@ -126,7 +135,10 @@ impl ConnPanelView {
             scroll_state: ScrollStateHandle::default(),
             resizable_state_handle,
             answer_link: HighlightedHyperlink::default(),
-            open_plan_link: MouseStateHandle::default(),
+            plans: HashMap::new(),
+            show_plan_link: MouseStateHandle::default(),
+            show_story_link: MouseStateHandle::default(),
+            open_in_pane_link: MouseStateHandle::default(),
             synced: Cell::new(None),
         }
     }
@@ -138,6 +150,72 @@ impl ConnPanelView {
     ) {
         self.active_pane_group = Some(pane_group.downgrade());
         ctx.notify();
+    }
+
+    /// Keeps each open plan on its session's current plan file, and drops the plans of sessions
+    /// that are gone or no longer have one.
+    fn sync_plans(&mut self, ctx: &mut ViewContext<Self>) {
+        let model = ConnModel::as_ref(ctx);
+        let current: Vec<(EntityId, Option<PathBuf>)> = self
+            .plans
+            .keys()
+            .map(|pane| {
+                let plan_file = model
+                    .session(*pane)
+                    .and_then(|session| session.story())
+                    .and_then(|story| story.plan_file.clone());
+                (*pane, plan_file)
+            })
+            .collect();
+        for (pane, plan_file) in current {
+            match (plan_file, self.plans.get_mut(&pane)) {
+                (Some(plan_file), Some(open)) if open.path != plan_file => {
+                    open.path = plan_file.clone();
+                    open.view
+                        .update(ctx, |view, ctx| view.open_local(plan_file, None, ctx));
+                }
+                (Some(_), _) => {}
+                (None, _) => {
+                    self.plans.remove(&pane);
+                }
+            }
+        }
+    }
+
+    fn show_plan(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(pane) = self.focused_terminal_id(ctx) else {
+            return;
+        };
+        let Some(path) = self.plan_file(ctx) else {
+            return;
+        };
+        let view = ctx.add_typed_action_view(|ctx| {
+            let mut view = FileNotebookView::new(ctx);
+            view.open_local(path.clone(), None, ctx);
+            view
+        });
+        self.plans.insert(pane, OpenPlan { path, view });
+        ctx.notify();
+    }
+
+    fn show_story(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(pane) = self.focused_terminal_id(ctx) {
+            self.plans.remove(&pane);
+            ctx.notify();
+        }
+    }
+
+    /// The plan file of the focused pane's session, when it has presented a plan.
+    fn plan_file(&self, app: &AppContext) -> Option<PathBuf> {
+        self.with_session(app, |session| {
+            session.story().and_then(|story| story.plan_file.clone())
+        })
+        .flatten()
+    }
+
+    /// The plan the focused pane is reading in place of its story.
+    fn open_plan(&self, app: &AppContext) -> Option<&OpenPlan> {
+        self.plans.get(&self.focused_terminal_id(app)?)
     }
 
     /// The terminal view the panel is currently reporting on.
@@ -235,12 +313,6 @@ impl ConnPanelView {
                 session.story().and_then(|story| story.title.clone())
             })
             .flatten();
-        let plan_file = self
-            .with_session(app, |session| {
-                session.story().and_then(|story| story.plan_file.clone())
-            })
-            .flatten();
-
         let heading = match project {
             Some(project) => format!("Conn — {project}"),
             None => "Conn".to_owned(),
@@ -273,8 +345,32 @@ impl ConnPanelView {
             );
         }
 
-        if let Some(plan_file) = plan_file {
-            column = column.with_child(self.render_open_plan(plan_file, app));
+        if let Some(open) = self.open_plan(app) {
+            let path = open.path.clone();
+            column = column.with_child(
+                Flex::row()
+                    .with_spacing(12.)
+                    .with_child(self.render_link(
+                        "Back to story",
+                        &self.show_story_link,
+                        ConnPanelAction::ShowStory,
+                        app,
+                    ))
+                    .with_child(self.render_link(
+                        "Open in pane",
+                        &self.open_in_pane_link,
+                        WorkspaceAction::OpenConnPlan { path },
+                        app,
+                    ))
+                    .finish(),
+            );
+        } else if self.plan_file(app).is_some() {
+            column = column.with_child(self.render_link(
+                "Open plan",
+                &self.show_plan_link,
+                ConnPanelAction::ShowPlan,
+                app,
+            ));
         }
 
         Container::new(column.finish())
@@ -282,7 +378,13 @@ impl ConnPanelView {
             .finish()
     }
 
-    fn render_open_plan(&self, plan_file: PathBuf, app: &AppContext) -> Box<dyn Element> {
+    fn render_link<A: Action + Clone>(
+        &self,
+        label: &'static str,
+        mouse_state: &MouseStateHandle,
+        action: A,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
         let font_family = appearance.ui_font_family();
         let font_size = appearance.ui_font_size() - 1.;
@@ -290,9 +392,9 @@ impl ConnPanelView {
         let color = theme.accent().into_solid();
         let hovered_color = theme.active_ui_text_color().into();
 
-        Hoverable::new(self.open_plan_link.clone(), move |state| {
+        Hoverable::new(mouse_state.clone(), move |state| {
             Container::new(
-                Text::new_inline("Open plan", font_family, font_size)
+                Text::new_inline(label, font_family, font_size)
                     .with_color(if state.is_hovered() {
                         hovered_color
                     } else {
@@ -304,9 +406,7 @@ impl ConnPanelView {
             .finish()
         })
         .on_click(move |ctx, _, _| {
-            ctx.dispatch_typed_action(WorkspaceAction::OpenConnPlan {
-                path: plan_file.clone(),
-            });
+            ctx.dispatch_typed_action(action.clone());
         })
         .with_cursor(Cursor::PointingHand)
         .finish()
@@ -336,6 +436,20 @@ impl ConnPanelView {
         )
         .finish()
     }
+}
+
+/// A plan shown in the panel in place of a pane's story.
+struct OpenPlan {
+    path: PathBuf,
+    view: ViewHandle<FileNotebookView>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConnPanelAction {
+    /// Show the focused pane's plan in place of its story.
+    ShowPlan,
+    /// Return the focused pane to its story.
+    ShowStory,
 }
 
 /// One line of the story.
@@ -788,7 +902,9 @@ impl View for ConnPanelView {
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let rows = self.reconcile(app);
 
-        let content: Box<dyn Element> = if rows > 0 {
+        let content: Box<dyn Element> = if let Some(open) = self.open_plan(app) {
+            Shrinkable::new(1.0, ChildView::new(&open.view).finish()).finish()
+        } else if rows > 0 {
             Shrinkable::new(
                 1.0,
                 NewScrollable::vertical(
@@ -831,6 +947,17 @@ impl View for ConnPanelView {
                 (min_width, max_width.max(min_width))
             }))
             .finish()
+    }
+}
+
+impl TypedActionView for ConnPanelView {
+    type Action = ConnPanelAction;
+
+    fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
+        match action {
+            ConnPanelAction::ShowPlan => self.show_plan(ctx),
+            ConnPanelAction::ShowStory => self.show_story(ctx),
+        }
     }
 }
 

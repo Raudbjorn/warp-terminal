@@ -1222,6 +1222,9 @@ pub struct Workspace {
     /// content but not the layout. Code review's open state also lives on each pane group, which
     /// `reconcile_right_panel_for_active_tab` keeps in line with this.
     right_panel_content: Option<RightPanelContent>,
+    /// The right panel content each terminal pane was last left with, keyed by terminal view and
+    /// restored when that pane takes focus. A pane with no entry keeps whatever is showing.
+    right_panel_by_pane: HashMap<EntityId, Option<RightPanelContent>>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
     agent_management_view: ViewHandle<AgentManagementView>,
     notification_mailbox_view: Option<ViewHandle<NotificationMailboxView>>,
@@ -3331,8 +3334,7 @@ impl Workspace {
             me.handle_right_panel_event(event.clone(), ctx);
         });
 
-        // Read-only panel with no actions of its own, so a plain view.
-        let conn_panel_view = ctx.add_view(ConnPanelView::new);
+        let conn_panel_view = ctx.add_typed_action_view(ConnPanelView::new);
 
         // Get persisted filters from window snapshot if restoring.
         let agent_management_filters = match workspace_setting {
@@ -3747,6 +3749,7 @@ impl Workspace {
             right_panel_view,
             conn_panel_view,
             right_panel_content: Some(RightPanelContent::Conn),
+            right_panel_by_pane: HashMap::new(),
             working_directories_model,
             shown_staging_banner_count: 0,
 
@@ -5821,6 +5824,37 @@ impl Workspace {
             }
             self.right_panel_content = Some(RightPanelContent::Conn);
         }
+        self.remember_right_panel_for_focused_pane(ctx);
+        ctx.notify();
+    }
+
+    fn focused_terminal_id(&self, ctx: &AppContext) -> Option<EntityId> {
+        self.active_tab_pane_group()
+            .as_ref(ctx)
+            .focused_session_view(ctx)
+            .map(|terminal| terminal.id())
+    }
+
+    fn remember_right_panel_for_focused_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(pane) = self.focused_terminal_id(ctx) {
+            self.right_panel_by_pane
+                .insert(pane, self.right_panel_content);
+        }
+    }
+
+    /// Shows the right panel content the focused terminal pane was last left with.
+    fn restore_right_panel_for_focused_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(wanted) = self
+            .focused_terminal_id(ctx)
+            .and_then(|pane| self.right_panel_by_pane.get(&pane).copied())
+        else {
+            return;
+        };
+        if wanted == self.right_panel_content {
+            return;
+        }
+        self.right_panel_content = wanted;
+        self.reconcile_right_panel_for_active_tab(ctx);
         ctx.notify();
     }
 
@@ -5884,6 +5918,7 @@ impl Workspace {
         self.conn_panel_view.update(ctx, |panel, ctx| {
             panel.set_active_pane_group(conn_active_pane_group, ctx);
         });
+        self.restore_right_panel_for_focused_pane(ctx);
         self.reconcile_right_panel_for_active_tab(ctx);
 
         let pane_group = self.active_tab_pane_group();
@@ -10138,6 +10173,7 @@ impl Workspace {
             self.focus_active_tab(ctx);
         }
 
+        self.remember_right_panel_for_focused_pane(ctx);
         ctx.notify();
     }
 
@@ -16928,6 +16964,9 @@ impl Workspace {
             // If focused pane contains an object, then set selected state in WD to that object
             pane_group::Event::PaneFocused => {
                 self.current_workspace_state.close_all_modals();
+                if pane_group.id() == self.active_tab_pane_group().id() {
+                    self.restore_right_panel_for_focused_pane(ctx);
+                }
 
                 // Re-evaluate which region is focused and update pane dimming accordingly.
                 self.update_pane_dimming_for_current_focus_region(ctx);
