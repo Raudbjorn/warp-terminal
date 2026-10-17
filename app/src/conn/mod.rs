@@ -229,12 +229,13 @@ impl ConnModel {
             CLIAgentSessionsModelEvent::Ended {
                 terminal_view_id, ..
             } => self.set_status(*terminal_view_id, ConnStatus::Ended, ctx),
-            // A pane running an agent has a session even before its first hook event.
+            // A pane running an agent has a session even before its first hook event. The agent
+            // waits at its prompt until asked something, which Warp reports as in progress.
             CLIAgentSessionsModelEvent::Started {
                 terminal_view_id, ..
             } => {
                 self.sessions.entry(*terminal_view_id).or_default();
-                self.set_status(*terminal_view_id, ConnStatus::Working, ctx);
+                self.set_status(*terminal_view_id, ConnStatus::Done, ctx);
             }
             CLIAgentSessionsModelEvent::InputSessionChanged { .. }
             | CLIAgentSessionsModelEvent::SessionUpdated { .. } => {}

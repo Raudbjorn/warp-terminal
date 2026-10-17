@@ -658,14 +658,25 @@ fn an_agent_that_exits_has_ended() {
     });
 }
 
+/// A started or resumed agent sits at its prompt until it is asked something. Warp reports that as
+/// in progress, which would show a session waiting on the reader as busy.
 #[test]
-fn a_new_agent_in_the_pane_is_working() {
+fn a_new_agent_in_the_pane_waits_as_done() {
     with_session(|app, view_id| {
         send(app, view_id, prompt("combine the two repos"));
         CLIAgentSessionsModel::handle(&*app).update(app, |m, ctx| {
             m.remove_session(view_id, ctx);
             m.set_session(view_id, tracked_session(), ctx);
         });
+
+        assert_eq!(status(app, view_id), Some(ConnStatus::Done));
+    });
+}
+
+#[test]
+fn a_prompt_to_a_new_agent_is_working() {
+    with_session(|app, view_id| {
+        send(app, view_id, prompt("combine the two repos"));
 
         assert_eq!(status(app, view_id), Some(ConnStatus::Working));
     });
