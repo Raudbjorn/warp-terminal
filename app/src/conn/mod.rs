@@ -9,19 +9,22 @@
 
 pub mod panel;
 pub(crate) mod preview;
+mod project;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use ::conn::story::{ConnStory, parse_transcript};
-use ::conn::{ConnEntry, ConnEntryKind, ConnSession, is_harness_prompt, tidy_prompt};
+use ::conn::{ConnEntry, ConnEntryKind, ConnSession, ConnStatus, is_harness_prompt, tidy_prompt};
 use chrono::{DateTime, TimeDelta, Utc};
 use warpui::r#async::{FutureId, Timer};
 use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
 
 use crate::terminal::cli_agent_sessions::event::{CLIAgentEvent, CLIAgentEventType};
-use crate::terminal::cli_agent_sessions::{CLIAgentSessionsModel, CLIAgentSessionsModelEvent};
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentSessionStatus, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
+};
 
 /// Per-pane session history.
 #[derive(Default)]
@@ -41,6 +44,12 @@ pub struct ConnModel {
     /// When a read was last dispatched for each pane, so a busy turn re-reads
     /// at a steady rate instead of once per tool call.
     last_read: HashMap<EntityId, DateTime<Utc>>,
+    /// Project names by working directory. Resolving one runs git, so each directory is resolved
+    /// once per process.
+    /// `None` when the directory names nothing, which leaves the plugin's name in place.
+    projects: HashMap<String, Option<String>>,
+    /// Project resolutions in flight, by working directory.
+    resolving_projects: HashMap<String, FutureId>,
 }
 
 /// How often the transcript is re-read while a turn is running.
@@ -107,16 +116,45 @@ impl ConnModel {
                 terminal_view_id,
                 event,
             } => self.record(*terminal_view_id, event, ctx),
+            CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                status,
+                ..
+            } => self.set_status(*terminal_view_id, conn_status(status), ctx),
             // A pane's history outlives the session that produced it: the
             // point of Conn is to still be readable after a session ends.
             // Only the pane going away discards it, which the workspace
             // reports separately.
-            CLIAgentSessionsModelEvent::Started { .. }
-            | CLIAgentSessionsModelEvent::StatusChanged { .. }
-            | CLIAgentSessionsModelEvent::InputSessionChanged { .. }
-            | CLIAgentSessionsModelEvent::Ended { .. }
+            CLIAgentSessionsModelEvent::Ended {
+                terminal_view_id, ..
+            } => self.set_status(*terminal_view_id, ConnStatus::Ended, ctx),
+            // A pane running an agent has a session even before its first hook event.
+            CLIAgentSessionsModelEvent::Started {
+                terminal_view_id, ..
+            } => {
+                self.sessions.entry(*terminal_view_id).or_default();
+                self.set_status(*terminal_view_id, ConnStatus::Working, ctx);
+            }
+            CLIAgentSessionsModelEvent::InputSessionChanged { .. }
             | CLIAgentSessionsModelEvent::SessionUpdated { .. } => {}
         }
+    }
+
+    fn set_status(
+        &mut self,
+        terminal_view_id: EntityId,
+        status: ConnStatus,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        if session.status == status {
+            return;
+        }
+        session.status = status;
+        ctx.notify();
+        ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
     }
 
     /// Discards a pane's history, on the pane being closed for good.
@@ -156,9 +194,18 @@ impl ConnModel {
         if event.cwd.is_some() {
             session.cwd = event.cwd.clone();
         }
-        if event.project.is_some() {
+        // The plugin names the project after the working directory, which splits one repository
+        // into several projects. Its name stands in until the repository's own is known.
+        let resolved = session
+            .cwd
+            .as_deref()
+            .and_then(|cwd| self.projects.get(cwd));
+        if let Some(Some(project)) = resolved {
+            session.project = Some(project.clone());
+        } else if event.project.is_some() {
             session.project = event.project.clone();
         }
+        let unresolved_cwd = session.cwd.clone().filter(|_| resolved.is_none());
 
         // The plugin only sends the path on `stop`, so it is kept once known.
         if let Some(path) = event.payload.transcript_path.as_deref() {
@@ -200,6 +247,43 @@ impl ConnModel {
         if finished || waiting {
             self.read_transcript(terminal_view_id, locator, through, Some(FLUSH_GRACE), ctx);
         }
+        if let Some(cwd) = unresolved_cwd {
+            self.resolve_project(cwd, ctx);
+        }
+    }
+
+    #[cfg(test)]
+    pub fn project_resolution_in_flight(&self, cwd: &str) -> Option<FutureId> {
+        self.resolving_projects.get(cwd).copied()
+    }
+
+    fn resolve_project(&mut self, cwd: String, ctx: &mut ModelContext<Self>) {
+        if self.resolving_projects.contains_key(&cwd) {
+            return;
+        }
+        let path = PathBuf::from(&cwd);
+        let key = cwd.clone();
+        let handle = ctx.spawn(
+            async move { project::resolve_project(&path).await },
+            move |me, project, ctx| {
+                me.resolving_projects.remove(&cwd);
+                if let Some(project) = &project {
+                    for (terminal_view_id, session) in &mut me.sessions {
+                        if session.cwd.as_deref() == Some(cwd.as_str())
+                            && session.project.as_ref() != Some(project)
+                        {
+                            session.project = Some(project.clone());
+                            ctx.emit(ConnModelEvent::SessionUpdated {
+                                terminal_view_id: *terminal_view_id,
+                            });
+                        }
+                    }
+                    ctx.notify();
+                }
+                me.projects.insert(cwd, project);
+            },
+        );
+        self.resolving_projects.insert(key, handle.future_id());
     }
 
     /// Whether this event should trigger a transcript read.
@@ -336,6 +420,15 @@ fn claude_projects_dir() -> Option<PathBuf> {
 /// in, with the path separators flattened.
 fn mangle_project_dir(cwd: &str) -> String {
     cwd.replace(['/', '.'], "-")
+}
+
+fn conn_status(status: &CLIAgentSessionStatus) -> ConnStatus {
+    match status {
+        CLIAgentSessionStatus::InProgress => ConnStatus::Working,
+        CLIAgentSessionStatus::Blocked { .. } => ConnStatus::NeedsYou,
+        CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Cancelled => ConnStatus::Done,
+        CLIAgentSessionStatus::Failed { .. } => ConnStatus::Failed,
+    }
 }
 
 /// Translates a plugin event into a history entry, or `None` for events that

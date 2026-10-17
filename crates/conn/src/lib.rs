@@ -131,14 +131,41 @@ impl ConnEntry {
     }
 }
 
+/// Where a session stands, in the terms a returning reader acts on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnStatus {
+    #[default]
+    Working,
+    /// Waiting on a permission, a question or plan approval.
+    NeedsYou,
+    /// Stopped, including a turn the user cancelled.
+    Done,
+    Failed,
+    /// The agent process has exited.
+    Ended,
+}
+
+impl ConnStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            ConnStatus::Working => "Working",
+            ConnStatus::NeedsYou => "Needs you",
+            ConnStatus::Done => "Done",
+            ConnStatus::Failed => "Failed",
+            ConnStatus::Ended => "Ended",
+        }
+    }
+}
+
 /// Everything Conn knows about one CLI agent session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ConnSession {
     /// The agent's own session identifier, once it reports one.
     pub session_id: Option<String>,
     pub cwd: Option<String>,
-    /// Project name, as the plugin derives it from `cwd`.
+    /// The repository the session runs in, or its working directory outside git.
     pub project: Option<String>,
+    pub status: ConnStatus,
     /// Where the agent writes its transcript, once it reports one. The hook
     /// events are truncated; this file is not.
     pub transcript_path: Option<String>,

@@ -13,10 +13,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use ::conn::story::ConnTurn;
-use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
+use ::conn::{ConnEntry, ConnEntryKind, ConnSession, ConnStatus};
 use chrono::{DateTime, Datelike, Local, Utc};
 use markdown_parser::parse_markdown_with_gfm_tables;
+use warp_core::ui::theme::WarpTheme;
+use warp_core::ui::theme::color::internal_colors;
 use warp_errors::report_error;
+use warpui::color::ColorU;
 use warpui::elements::new_scrollable::{NewScrollableElement, SingleAxisConfig};
 use warpui::elements::{
     Align, ChildView, ConstrainedBox, Container, CrossAxisAlignment, DragBarSide, Element, Empty,
@@ -313,25 +316,39 @@ impl ConnPanelView {
                 session.story().and_then(|story| story.title.clone())
             })
             .flatten();
+        let status = self.with_session(app, |session| session.status);
         let heading = match project {
             Some(project) => format!("Conn — {project}"),
             None => "Conn".to_owned(),
         };
 
+        let mut heading_row = Flex::row().with_spacing(8.).with_child(
+            Text::new_inline(
+                heading,
+                appearance.ui_font_family(),
+                appearance.ui_font_size(),
+            )
+            .with_style(Properties::default().weight(Weight::Semibold))
+            .with_color(theme.active_ui_text_color().into())
+            .finish(),
+        );
+        if let Some(status) = status {
+            heading_row = heading_row.with_child(
+                Text::new_inline(
+                    status.label(),
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size(),
+                )
+                .with_color(status_color(status, theme))
+                .finish(),
+            );
+        }
+
         let mut column = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Start)
             .with_main_axis_size(MainAxisSize::Min)
             .with_spacing(2.)
-            .with_child(
-                Text::new_inline(
-                    heading,
-                    appearance.ui_font_family(),
-                    appearance.ui_font_size(),
-                )
-                .with_style(Properties::default().weight(Weight::Semibold))
-                .with_color(theme.active_ui_text_color().into())
-                .finish(),
-            );
+            .with_child(heading_row.finish());
 
         if let Some(title) = title {
             column = column.with_child(
@@ -475,6 +492,17 @@ enum ConnRow<'a> {
     /// No transcript was found, so there is no account to tell and the rows
     /// below are bare tool names.
     NoTranscript,
+}
+
+/// Matches the colors Warp gives the same states on tabs and pane headers.
+fn status_color(status: ConnStatus, theme: &WarpTheme) -> ColorU {
+    match status {
+        ConnStatus::Working => theme.ansi_fg_magenta(),
+        ConnStatus::NeedsYou => theme.ansi_fg_yellow(),
+        ConnStatus::Done => theme.ansi_fg_green(),
+        ConnStatus::Failed => theme.ansi_fg_red(),
+        ConnStatus::Ended => internal_colors::neutral_5(theme),
+    }
 }
 
 /// Whether the panel is running on hook events alone.

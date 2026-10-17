@@ -1,7 +1,8 @@
-use ::conn::ConnEntryKind;
+use ::conn::{ConnEntryKind, ConnStatus};
+use warp_util::git::run_git_command;
 use warpui::{App, EntityId, SingletonEntity};
 
-use super::ConnModel;
+use super::{ConnModel, conn_status};
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::event::{
     CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventSource, CLIAgentEventType,
@@ -595,5 +596,118 @@ fn a_permission_request_reads_the_story_and_stays_in_flight() {
                 "the request is still shown"
             );
         });
+    });
+}
+
+#[test]
+fn warp_statuses_collapse_into_what_the_reader_acts_on() {
+    let cases = [
+        (CLIAgentSessionStatus::InProgress, ConnStatus::Working),
+        (
+            CLIAgentSessionStatus::Blocked { message: None },
+            ConnStatus::NeedsYou,
+        ),
+        (CLIAgentSessionStatus::Success, ConnStatus::Done),
+        (CLIAgentSessionStatus::Cancelled, ConnStatus::Done),
+        (
+            CLIAgentSessionStatus::Failed {
+                error_type: None,
+                message: None,
+            },
+            ConnStatus::Failed,
+        ),
+    ];
+    for (warp, expected) in cases {
+        assert_eq!(conn_status(&warp), expected, "{warp:?}");
+    }
+}
+
+fn status(app: &App, view_id: EntityId) -> Option<ConnStatus> {
+    ConnModel::handle(app).read(app, |me, _| {
+        me.session(view_id).map(|session| session.status)
+    })
+}
+
+#[test]
+fn a_permission_request_needs_you() {
+    with_session(|app, view_id| {
+        send(app, view_id, prompt("delete the build dir"));
+        send(
+            app,
+            view_id,
+            event(
+                CLIAgentEventType::PermissionRequest,
+                CLIAgentEventPayload::default(),
+            ),
+        );
+
+        assert_eq!(status(app, view_id), Some(ConnStatus::NeedsYou));
+    });
+}
+
+#[test]
+fn an_agent_that_exits_has_ended() {
+    with_session(|app, view_id| {
+        send(app, view_id, prompt("combine the two repos"));
+
+        CLIAgentSessionsModel::handle(&*app).update(app, |m, ctx| {
+            m.remove_session(view_id, ctx);
+        });
+
+        assert_eq!(status(app, view_id), Some(ConnStatus::Ended));
+    });
+}
+
+#[test]
+fn a_new_agent_in_the_pane_is_working() {
+    with_session(|app, view_id| {
+        send(app, view_id, prompt("combine the two repos"));
+        CLIAgentSessionsModel::handle(&*app).update(app, |m, ctx| {
+            m.remove_session(view_id, ctx);
+            m.set_session(view_id, tracked_session(), ctx);
+        });
+
+        assert_eq!(status(app, view_id), Some(ConnStatus::Working));
+    });
+}
+
+#[test]
+fn a_session_in_a_subdirectory_is_named_after_its_repository() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("checkout");
+        let subdir = root.join("app");
+        std::fs::create_dir_all(&subdir).expect("mkdir");
+        run_git_command(&root, &["init"]).await.expect("git init");
+        let cwd = subdir.to_str().expect("utf-8 path").to_owned();
+
+        let mut submitted = prompt("tidy the app crate");
+        submitted.cwd = Some(cwd.clone());
+        submitted.project = Some("app".to_owned());
+        send(&mut app, view_id, submitted);
+        let resolving = ConnModel::handle(&app).update(&mut app, |me, ctx| {
+            let future_id = me
+                .project_resolution_in_flight(&cwd)
+                .expect("a new working directory is resolved to its project");
+            ctx.await_spawned_future(future_id)
+        });
+        resolving.await;
+
+        let project = ConnModel::handle(&app).read(&app, |me, _| {
+            me.session(view_id)
+                .and_then(|session| session.project.clone())
+        });
+        assert_eq!(project.as_deref(), Some("checkout"));
+    });
+}
+
+#[test]
+fn a_finished_turn_is_done() {
+    with_session(|app, view_id| {
+        send(app, view_id, prompt("rename the crate"));
+        send(app, view_id, stop("Renamed.", None));
+
+        assert_eq!(status(app, view_id), Some(ConnStatus::Done));
     });
 }
