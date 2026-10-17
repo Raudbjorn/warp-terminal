@@ -595,6 +595,8 @@ pub enum Event {
         space: Space,
     },
     PaneFocused,
+    /// A pane was clicked, whether or not that moved focus.
+    PaneClicked,
     DroppedOnTabBar {
         origin: ActionOrigin,
         pane_id: PaneId,
@@ -5943,6 +5945,9 @@ impl PaneGroup {
         }
 
         self.focus_pane_by_id(id, ctx);
+        if matches!(reason, ActivationReason::Click) {
+            ctx.emit(Event::PaneClicked);
+        }
     }
 
     pub fn focus_pane_by_id(&mut self, id: PaneId, ctx: &mut ViewContext<Self>) {

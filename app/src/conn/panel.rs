@@ -257,11 +257,16 @@ impl ConnPanelView {
         group_by_project(items)
     }
 
-    /// Focuses a pane in whichever window holds it and shows its story, even when it was already
-    /// focused. The root view raises the window.
-    fn jump_to(&self, terminal_view_id: EntityId, ctx: &mut ViewContext<Self>) {
+    /// Drops a manual mode choice, for a pane picked explicitly even if it was already focused.
+    pub fn follow_focused_pane(&mut self, ctx: &mut ViewContext<Self>) {
         self.mode_choice.set(None);
         ctx.notify();
+    }
+
+    /// Focuses a pane in whichever window holds it and shows its story, even when it was already
+    /// focused. The root view raises the window.
+    fn jump_to(&mut self, terminal_view_id: EntityId, ctx: &mut ViewContext<Self>) {
+        self.follow_focused_pane(ctx);
         let Some((window_id, locator, _)) = open_terminal_panes_in_all_windows(ctx)
             .into_iter()
             .find(|(_, _, pane)| *pane == terminal_view_id)

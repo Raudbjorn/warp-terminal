@@ -17092,6 +17092,12 @@ impl Workspace {
                     ctx,
                 );
             }
+            pane_group::Event::PaneClicked => {
+                if pane_group.id() == self.active_tab_pane_group().id() {
+                    self.conn_panel_view
+                        .update(ctx, |panel, ctx| panel.follow_focused_pane(ctx));
+                }
+            }
             pane_group::Event::RepoChanged => {
                 self.refresh_working_directories_for_pane_group(&pane_group, ctx);
                 // Code review panel setup is handled by the RepositoriesChanged
@@ -26212,6 +26218,8 @@ impl TypedActionView for Workspace {
             }
             FocusPane(locator) => {
                 self.focus_pane(*locator, ctx);
+                self.conn_panel_view
+                    .update(ctx, |panel, ctx| panel.follow_focused_pane(ctx));
             }
             StartNewConversation { terminal_view_id } => {
                 Self::set_pending_query_state_for_terminal_view(
