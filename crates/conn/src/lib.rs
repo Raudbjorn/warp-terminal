@@ -10,12 +10,13 @@
 //! stays portable if the store ever moves out of the client process.
 
 pub mod overview;
+pub mod seen;
 pub mod story;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::story::ConnStory;
+use crate::story::{ConnStory, ConnTurn};
 
 /// Strips the wrapper Claude Code puts around pasted text.
 ///
@@ -156,17 +157,6 @@ impl ConnStatus {
             ConnStatus::Ended => "Ended",
         }
     }
-
-    /// Lower is more urgent: what waits on the reader before what is still running.
-    pub fn urgency(self) -> u8 {
-        match self {
-            ConnStatus::NeedsYou => 0,
-            ConnStatus::Failed => 1,
-            ConnStatus::Done => 2,
-            ConnStatus::Working => 3,
-            ConnStatus::Ended => 4,
-        }
-    }
 }
 
 /// Everything Conn knows about one CLI agent session.
@@ -181,6 +171,8 @@ pub struct ConnSession {
     /// Where the agent writes its transcript, once it reports one. The hook
     /// events are truncated; this file is not.
     pub transcript_path: Option<String>,
+    /// The time of the latest activity the reader has seen in this pane.
+    pub watermark: Option<DateTime<Utc>>,
     /// The narrative account read from the transcript, covering everything up
     /// to [`Self::story_through`].
     story: Option<ConnStory>,
@@ -244,6 +236,36 @@ impl ConnSession {
         };
         let start = self.entries.partition_point(|entry| entry.at <= through);
         &self.entries[start..]
+    }
+
+    /// The time of the latest thing that happened, told by the story or still in flight.
+    pub fn latest_activity(&self) -> Option<DateTime<Utc>> {
+        let told = self
+            .story
+            .as_ref()
+            .and_then(|story| story.latest_turn())
+            .map(ConnTurn::last_activity);
+        told.max(self.entries.last().map(|entry| entry.at))
+    }
+
+    /// Answered turns the reader has not seen. See [`seen::unseen_turns`].
+    pub fn unseen_turns(&self) -> usize {
+        self.story.as_ref().map_or(0, |story| {
+            seen::unseen_turns(story, self.watermark, self.turn_finished())
+        })
+    }
+
+    /// The first turn the reader has not seen the answer of.
+    pub fn first_unseen_turn(&self) -> Option<&ConnTurn> {
+        seen::first_unseen_turn(self.story.as_ref()?, self.watermark, self.turn_finished())
+    }
+
+    /// Whether the latest turn has finished, so that its last words are its answer.
+    fn turn_finished(&self) -> bool {
+        match self.status {
+            ConnStatus::Working | ConnStatus::NeedsYou => false,
+            ConnStatus::Done | ConnStatus::Failed | ConnStatus::Ended => true,
+        }
     }
 
     /// Number of entries evicted from the front of the history.

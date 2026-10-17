@@ -4009,6 +4009,22 @@ impl Workspace {
         }
     }
 
+    /// Tells Conn which pane the reader is looking at, while this window is the key window.
+    fn report_focus_to_conn(&self, ctx: &mut ViewContext<Self>) {
+        if WindowManager::as_ref(ctx).active_window() != Some(self.window_id) {
+            return;
+        }
+        let window_id = self.window_id;
+        let pane = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .focused_session_view(ctx)
+            .map(|terminal| terminal.id());
+        ConnModel::handle(ctx).update(ctx, |conn, ctx| {
+            conn.key_window_focused(window_id, pane, ctx);
+        });
+    }
+
     /// Redraws the tab list when a pane's Conn history moves.
     ///
     /// A pane row carries the step its agent is on, and that comes from the
@@ -5918,6 +5934,7 @@ impl Workspace {
         self.conn_panel_view.update(ctx, |panel, ctx| {
             panel.set_active_pane_group(conn_active_pane_group, ctx);
         });
+        self.report_focus_to_conn(ctx);
         self.restore_right_panel_for_focused_pane(ctx);
         self.reconcile_right_panel_for_active_tab(ctx);
 
@@ -16969,6 +16986,7 @@ impl Workspace {
                     // The Conn panel decides what to show from the focused pane at render time,
                     // and a click into a pane changes nothing else it observes.
                     self.conn_panel_view.update(ctx, |_, ctx| ctx.notify());
+                    self.report_focus_to_conn(ctx);
                 }
 
                 // Re-evaluate which region is focused and update pane dimming accordingly.
@@ -19629,6 +19647,17 @@ impl Workspace {
                     // Re-render if the app's focus state has changed (Active/Inactive)
                     // This ensures dimming updates properly when the app gains/loses focus
                     ctx.notify();
+                }
+
+                if did_window_change_focus {
+                    if current.active_window == Some(self.window_id) {
+                        self.report_focus_to_conn(ctx);
+                    } else {
+                        let window_id = self.window_id;
+                        ConnModel::handle(ctx).update(ctx, |conn, ctx| {
+                            conn.window_resigned_key(window_id, ctx);
+                        });
+                    }
                 }
             }
         };

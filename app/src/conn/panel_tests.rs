@@ -6,7 +6,7 @@ use ::conn::story::{ConnStep, ConnStory, ConnTurn};
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
 use chrono::{DateTime, TimeZone, Utc};
 
-use super::{ConnRow, PREVIEW_CHARS, row_at, row_count, truncate};
+use super::{ConnRow, PREVIEW_CHARS, row_at, row_count, scroll_target, truncate};
 
 fn at(seconds: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().expect("valid time")
@@ -32,13 +32,18 @@ fn turn(started: i64, prompt: &str, steps: Vec<ConnStep>, outcome: Option<&str>)
 /// `describe` collapses a row to something comparable, so a test can assert on
 /// the shape of a whole chapter rather than one row at a time.
 fn describe(session: &ConnSession) -> Vec<String> {
-    (0..row_count(session))
-        .map(|index| match row_at(session, index) {
+    describe_with_divider(session, None)
+}
+
+fn describe_with_divider(session: &ConnSession, divider: Option<DateTime<Utc>>) -> Vec<String> {
+    (0..row_count(session, divider))
+        .map(|index| match row_at(session, divider, index) {
             Some(ConnRow::Turn { prompt, .. }) => format!("you: {prompt}"),
             Some(ConnRow::Step { description, runs }) => format!("did: {description} ×{runs}"),
             Some(ConnRow::Outcome { text, .. }) => format!("said: {text}"),
             Some(ConnRow::Live(entry)) => format!("live: {:?}", entry.kind),
             Some(ConnRow::NoTranscript) => "no transcript".to_owned(),
+            Some(ConnRow::SinceYouLooked) => "since you looked".to_owned(),
             None => "missing".to_owned(),
         })
         .collect()
@@ -178,8 +183,8 @@ fn an_unfinished_chapter_has_no_outcome_row() {
 #[test]
 fn a_session_with_nothing_in_it_has_no_rows() {
     let session = ConnSession::default();
-    assert_eq!(row_count(&session), 0);
-    assert!(row_at(&session, 0).is_none());
+    assert_eq!(row_count(&session, None), 0);
+    assert!(row_at(&session, None, 0).is_none());
 }
 
 /// The list asks for indices it has already allocated, and the story can
@@ -197,9 +202,9 @@ fn an_index_past_the_end_is_no_row() {
         at(100),
     );
 
-    assert_eq!(row_count(&session), 2);
-    assert!(row_at(&session, 2).is_none());
-    assert!(row_at(&session, 99).is_none());
+    assert_eq!(row_count(&session, None), 2);
+    assert!(row_at(&session, None, 2).is_none());
+    assert!(row_at(&session, None, 99).is_none());
 }
 
 #[test]
@@ -254,8 +259,15 @@ fn a_session_with_no_transcript_says_so() {
         at(10),
     ));
 
-    assert!(matches!(row_at(&session, 0), Some(ConnRow::NoTranscript)));
-    assert_eq!(row_count(&session), 2, "the notice sits above the events");
+    assert!(matches!(
+        row_at(&session, None, 0),
+        Some(ConnRow::NoTranscript)
+    ));
+    assert_eq!(
+        row_count(&session, None),
+        2,
+        "the notice sits above the events"
+    );
 }
 
 /// Once there is a story the notice goes away, rather than sitting above every
@@ -278,14 +290,17 @@ fn a_session_with_a_story_shows_no_notice() {
         at(100),
     );
 
-    assert!(matches!(row_at(&session, 0), Some(ConnRow::Turn { .. })));
+    assert!(matches!(
+        row_at(&session, None, 0),
+        Some(ConnRow::Turn { .. })
+    ));
 }
 
 /// An empty session shows its empty state, not a complaint about transcripts.
 #[test]
 fn a_session_with_no_events_shows_no_notice() {
     let session = ConnSession::default();
-    assert_eq!(row_count(&session), 0);
+    assert_eq!(row_count(&session, None), 0);
 }
 
 /// Hook tool entries coalesce into one row whose time keeps moving, so it
@@ -469,13 +484,80 @@ fn only_the_last_turns_outcome_is_the_latest() {
         at(200),
     );
 
-    let latest: Vec<bool> = (0..row_count(&session))
-        .filter_map(|index| match row_at(&session, index) {
+    let latest: Vec<bool> = (0..row_count(&session, None))
+        .filter_map(|index| match row_at(&session, None, index) {
             Some(ConnRow::Outcome { latest, .. }) => Some(latest),
             _ => None,
         })
         .collect();
     assert_eq!(latest, vec![false, true]);
+}
+
+fn three_answered_turns() -> ConnSession {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![
+                turn(0, "first", vec![], Some("first done")),
+                turn(100, "second", vec![step("work", 1)], Some("second done")),
+                turn(200, "third", vec![], Some("third done")),
+            ],
+        },
+        at(300),
+    );
+    session
+}
+
+#[test]
+fn the_divider_opens_the_first_unseen_turn() {
+    let session = three_answered_turns();
+
+    assert_eq!(
+        describe_with_divider(&session, Some(at(100))),
+        vec![
+            "you: first",
+            "said: first done",
+            "since you looked",
+            "you: second",
+            "did: work ×1",
+            "said: second done",
+            "you: third",
+            "said: third done",
+        ]
+    );
+}
+
+#[test]
+fn a_story_with_nothing_unseen_has_no_divider() {
+    let session = three_answered_turns();
+
+    assert!(
+        !describe(&session)
+            .iter()
+            .any(|row| row == "since you looked")
+    );
+}
+
+/// The reader comes back to what they missed, not to the end of it.
+#[test]
+fn the_story_opens_at_the_divider_when_turns_are_unseen() {
+    let session = three_answered_turns();
+
+    assert_eq!(scroll_target(&session, Some(at(100))), Some(2));
+}
+
+#[test]
+fn the_story_opens_at_its_tail_when_nothing_is_unseen() {
+    let session = three_answered_turns();
+
+    assert_eq!(scroll_target(&session, None), Some(6));
+}
+
+#[test]
+fn an_empty_story_has_nowhere_to_open() {
+    assert_eq!(scroll_target(&ConnSession::default(), None), None);
 }
 
 mod mode {

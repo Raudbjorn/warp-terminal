@@ -8,6 +8,22 @@ pub struct OverviewItem<P> {
     pub project: String,
     pub title: Option<String>,
     pub status: ConnStatus,
+    /// Answered turns the reader has not seen.
+    pub unseen: usize,
+}
+
+impl<P> OverviewItem<P> {
+    /// Lower is more urgent: what waits on the reader before what is still running.
+    fn urgency(&self) -> u8 {
+        match self.status {
+            ConnStatus::NeedsYou => 0,
+            ConnStatus::Failed => 1,
+            ConnStatus::Done if self.unseen > 0 => 2,
+            ConnStatus::Working => 3,
+            ConnStatus::Done => 4,
+            ConnStatus::Ended => 5,
+        }
+    }
 }
 
 /// The sessions of one project, most urgent first.
@@ -19,7 +35,7 @@ pub struct ProjectGroup<P> {
 /// Groups items by project. Projects are ordered by their most urgent session and sessions within
 /// a project by urgency; ties keep project-name order and then input order.
 pub fn group_by_project<P>(mut items: Vec<OverviewItem<P>>) -> Vec<ProjectGroup<P>> {
-    items.sort_by_key(|item| item.status.urgency());
+    items.sort_by_key(OverviewItem::urgency);
     let mut groups: Vec<ProjectGroup<P>> = Vec::new();
     for item in items {
         match groups
@@ -34,7 +50,7 @@ pub fn group_by_project<P>(mut items: Vec<OverviewItem<P>>) -> Vec<ProjectGroup<
         }
     }
     groups.sort_by(|a, b| {
-        (a.items[0].status.urgency(), &a.project).cmp(&(b.items[0].status.urgency(), &b.project))
+        (a.items[0].urgency(), &a.project).cmp(&(b.items[0].urgency(), &b.project))
     });
     groups
 }

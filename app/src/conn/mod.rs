@@ -15,11 +15,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use ::conn::seen::{SEEN_AFTER, advance_watermark};
 use ::conn::story::{ConnStory, parse_transcript};
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession, ConnStatus, is_harness_prompt, tidy_prompt};
 use chrono::{DateTime, TimeDelta, Utc};
 use warpui::r#async::{FutureId, Timer};
-use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
+use warpui::{Entity, EntityId, ModelContext, SingletonEntity, WindowId};
 
 use crate::terminal::cli_agent_sessions::event::{CLIAgentEvent, CLIAgentEventType};
 use crate::terminal::cli_agent_sessions::{
@@ -50,6 +51,18 @@ pub struct ConnModel {
     projects: HashMap<String, Option<String>>,
     /// Project resolutions in flight, by working directory.
     resolving_projects: HashMap<String, FutureId>,
+    /// The pane focused in the key window, if any.
+    visit: Option<Visit>,
+}
+
+/// The reader's time in one pane of the key window.
+struct Visit {
+    window: WindowId,
+    pane: EntityId,
+    since: DateTime<Utc>,
+    /// Where the "since you looked" divider sits for this visit: the start of the first turn
+    /// unseen on arrival. Held, so the divider stays put while the reader catches up.
+    divider: Option<DateTime<Utc>>,
 }
 
 /// How often the transcript is re-read while a turn is running.
@@ -100,6 +113,91 @@ impl ConnModel {
     /// The terminal views that have a session.
     pub fn panes(&self) -> impl Iterator<Item = EntityId> + '_ {
         self.sessions.keys().copied()
+    }
+
+    /// Where a pane's "since you looked" divider sits: at the start of the first unseen turn.
+    pub fn divider(&self, terminal_view_id: EntityId) -> Option<DateTime<Utc>> {
+        match &self.visit {
+            Some(visit) if visit.pane == terminal_view_id => visit.divider,
+            _ => self.divider_now(terminal_view_id),
+        }
+    }
+
+    /// When the reader started looking at a pane, while they still are.
+    pub fn visit_since(&self, terminal_view_id: EntityId) -> Option<DateTime<Utc>> {
+        self.visit
+            .as_ref()
+            .filter(|visit| visit.pane == terminal_view_id)
+            .map(|visit| visit.since)
+    }
+
+    /// Records the pane focused in `window`, which is the key window. `None` when no terminal
+    /// pane is focused there.
+    pub fn key_window_focused(
+        &mut self,
+        window: WindowId,
+        pane: Option<EntityId>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.visit.as_ref().map(|visit| (visit.window, visit.pane)) == pane.map(|p| (window, p))
+        {
+            return;
+        }
+        self.visit = pane.map(|pane| Visit {
+            window,
+            pane,
+            since: Utc::now(),
+            divider: self.divider_now(pane),
+        });
+        ctx.notify();
+        if self.visit.is_some() {
+            // The timer's clock is monotonic and the seen rule's is the wall clock, so the
+            // margin keeps the check from landing a hair short of the threshold.
+            let after = (SEEN_AFTER + TimeDelta::milliseconds(100))
+                .to_std()
+                .expect("a positive duration");
+            ctx.spawn(Timer::after(after), |me, _, ctx| me.mark_seen(ctx));
+        }
+    }
+
+    /// `window` stopped being the key window.
+    pub fn window_resigned_key(&mut self, window: WindowId, ctx: &mut ModelContext<Self>) {
+        if self
+            .visit
+            .as_ref()
+            .is_some_and(|visit| visit.window == window)
+        {
+            self.visit = None;
+            ctx.notify();
+        }
+    }
+
+    fn divider_now(&self, terminal_view_id: EntityId) -> Option<DateTime<Utc>> {
+        self.session(terminal_view_id)?
+            .first_unseen_turn()
+            .map(|turn| turn.started_at)
+    }
+
+    /// Advances the visited pane's watermark once the seen rule allows it.
+    fn mark_seen(&mut self, ctx: &mut ModelContext<Self>) {
+        let Some(visit) = &self.visit else {
+            return;
+        };
+        let terminal_view_id = visit.pane;
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        let watermark = advance_watermark(
+            session.watermark,
+            session.latest_activity(),
+            visit.since,
+            Utc::now(),
+        );
+        if watermark != session.watermark {
+            session.watermark = watermark;
+            ctx.notify();
+            ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+        }
     }
 
     /// The transcript read in flight for a pane, if any. Tests await it before
@@ -173,6 +271,13 @@ impl ConnModel {
     pub fn forget_pane(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
         self.reads_in_flight.remove(&terminal_view_id);
         self.last_read.remove(&terminal_view_id);
+        if self
+            .visit
+            .as_ref()
+            .is_some_and(|visit| visit.pane == terminal_view_id)
+        {
+            self.visit = None;
+        }
         if self.sessions.remove(&terminal_view_id).is_some() {
             // No `ConnModelEvent`: it names a pane that no longer exists, and
             // the panel it would reach repaints from this `notify` anyway.
@@ -253,6 +358,7 @@ impl ConnModel {
         if let Some(cwd) = unresolved_cwd {
             self.resolve_project(cwd, ctx);
         }
+        self.mark_seen(ctx);
     }
 
     #[cfg(test)]
@@ -344,6 +450,7 @@ impl ConnModel {
             if session.adopt_story(story, through) {
                 ctx.notify();
                 ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+                me.mark_seen(ctx);
             }
         });
         self.reads_in_flight

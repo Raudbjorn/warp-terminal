@@ -7,6 +7,14 @@ fn item(pane: u32, project: &str, status: ConnStatus) -> OverviewItem<u32> {
         project: project.to_owned(),
         title: None,
         status,
+        unseen: 0,
+    }
+}
+
+fn unseen(pane: u32, project: &str, status: ConnStatus, unseen: usize) -> OverviewItem<u32> {
+    OverviewItem {
+        unseen,
+        ..item(pane, project, status)
     }
 }
 
@@ -33,7 +41,7 @@ fn the_project_with_the_most_urgent_session_comes_first() {
     ]);
 
     let order: Vec<&str> = groups.iter().map(|(project, _)| project.as_str()).collect();
-    assert_eq!(order, ["gamma", "epsilon", "beta", "alpha", "delta"]);
+    assert_eq!(order, ["gamma", "epsilon", "alpha", "beta", "delta"]);
 }
 
 #[test]
@@ -63,4 +71,30 @@ fn equally_urgent_projects_are_ordered_by_name() {
 
     let order: Vec<&str> = groups.iter().map(|(project, _)| project.as_str()).collect();
     assert_eq!(order, ["alpha", "zeta"]);
+}
+
+/// A finished session with answers nobody has read waits on the reader; one already read does not.
+#[test]
+fn done_with_unseen_answers_ranks_above_working() {
+    let groups = shape(vec![
+        item(1, "warp", ConnStatus::Working),
+        item(2, "warp", ConnStatus::Done),
+        unseen(3, "warp", ConnStatus::Done, 2),
+        item(4, "warp", ConnStatus::Failed),
+        item(5, "warp", ConnStatus::Ended),
+        item(6, "warp", ConnStatus::NeedsYou),
+    ]);
+
+    assert_eq!(groups, [("warp".to_owned(), vec![6, 4, 3, 1, 2, 5])]);
+}
+
+#[test]
+fn a_project_ranks_by_its_unseen_done_session() {
+    let groups = shape(vec![
+        item(1, "alpha", ConnStatus::Working),
+        unseen(2, "beta", ConnStatus::Done, 1),
+    ]);
+
+    let order: Vec<&str> = groups.iter().map(|(project, _)| project.as_str()).collect();
+    assert_eq!(order, ["beta", "alpha"]);
 }

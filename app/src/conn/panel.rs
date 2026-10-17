@@ -106,6 +106,9 @@ struct Sync {
     pane: EntityId,
     turns: usize,
     rows: usize,
+    divider: Option<DateTime<Utc>>,
+    /// When the reader's current visit to the pane began, if they are on one.
+    visit: Option<DateTime<Utc>>,
 }
 
 impl Entity for ConnPanelView {
@@ -251,6 +254,7 @@ impl ConnPanelView {
                         .unwrap_or_else(|| "Unknown project".to_owned()),
                     title: session_title(session),
                     status: session.status,
+                    unseen: session.unseen_turns(),
                 })
             })
             .collect();
@@ -348,36 +352,61 @@ impl ConnPanelView {
             self.synced.set(None);
             return 0;
         };
+        let model = ConnModel::as_ref(app);
+        let divider = model.divider(pane);
         let (turns, rows) = self
             .with_session(app, |session| {
                 (
                     session.story().map_or(0, |story| story.turns.len()),
-                    row_count(session),
+                    row_count(session, divider),
                 )
             })
             .unwrap_or((0, 0));
-        let target = Sync { pane, turns, rows };
+        let target = Sync {
+            pane,
+            turns,
+            rows,
+            divider,
+            visit: model.visit_since(pane),
+        };
 
-        match self.synced.get() {
+        let arrived = match self.synced.get() {
             Some(synced) if synced == target => return rows,
             // Same pane and the same story, with more of it: extend and follow
             // the tail, which is where "what has it done since?" lives.
-            Some(synced) if synced.pane == pane && synced.turns == turns && rows > synced.rows => {
+            Some(synced)
+                if synced.pane == pane
+                    && synced.turns == turns
+                    && synced.divider == divider
+                    && rows > synced.rows =>
+            {
                 for _ in synced.rows..rows {
                     self.list_state.add_item();
                 }
+                false
             }
             // A different pane, or the story was re-read and the rows moved.
-            _ => {
+            synced => {
                 self.clear_list();
                 for _ in 0..rows {
                     self.list_state.add_item();
                 }
+                synced.is_none_or(|synced| {
+                    synced.pane != pane || (target.visit.is_some() && synced.visit != target.visit)
+                })
             }
-        }
+        };
 
-        if rows > 0 {
-            self.list_state.scroll_to(rows - 1);
+        // Only arriving opens at the divider. Later changes follow the tail, so a story re-read
+        // mid-turn does not pull the reader back.
+        let scroll_to = if arrived {
+            self.with_session(app, |session| scroll_target(session, divider))
+                .flatten()
+        } else {
+            rows.checked_sub(1)
+        };
+        if let Some(index) = scroll_to {
+            self.list_state.scroll_to(index);
         }
         self.synced.set(Some(target));
         rows
@@ -393,7 +422,8 @@ impl ConnPanelView {
     }
 
     fn render_row_at(&self, index: usize, app: &AppContext) -> Box<dyn Element> {
-        self.with_session(app, |session| match row_at(session, index) {
+        let divider = self.synced.get().and_then(|synced| synced.divider);
+        self.with_session(app, |session| match row_at(session, divider, index) {
             Some(row) => render_row(&row, &self.answer_link, app),
             None => Empty::new().finish(),
         })
@@ -592,28 +622,34 @@ impl ConnPanelView {
                 };
                 let title = item.title.unwrap_or_else(|| "New session".to_owned());
                 let status = item.status;
+                let unseen = (item.unseen > 0).then(|| format!("{} new", item.unseen));
                 let pane = item.pane;
                 let text_color = theme.active_ui_text_color().into();
                 let hover_color = theme.surface_2().into_solid();
                 let row = Hoverable::new(mouse_state.clone(), move |state| {
-                    let mut container = Container::new(
-                        Flex::row()
-                            .with_spacing(8.)
-                            .with_child(
-                                Shrinkable::new(
-                                    1.,
-                                    Text::new_inline(title.clone(), font_family, font_size)
-                                        .with_color(text_color)
-                                        .finish(),
-                                )
+                    let mut row = Flex::row().with_spacing(8.).with_child(
+                        Shrinkable::new(
+                            1.,
+                            Text::new_inline(title.clone(), font_family, font_size)
+                                .with_color(text_color)
                                 .finish(),
-                            )
-                            .with_child(
-                                Text::new_inline(status.label(), font_family, font_size - 1.)
-                                    .with_color(status_color(status, theme))
-                                    .finish(),
-                            )
-                            .finish(),
+                        )
+                        .finish(),
+                    );
+                    if let Some(unseen) = &unseen {
+                        row = row.with_child(
+                            Text::new_inline(unseen.clone(), font_family, font_size - 1.)
+                                .with_color(text_color)
+                                .finish(),
+                        );
+                    }
+                    let mut container = Container::new(
+                        row.with_child(
+                            Text::new_inline(status.label(), font_family, font_size - 1.)
+                                .with_color(status_color(status, theme))
+                                .finish(),
+                        )
+                        .finish(),
                     )
                     .with_vertical_padding(4.)
                     .with_horizontal_padding(6.);
@@ -743,6 +779,8 @@ enum ConnRow<'a> {
     /// No transcript was found, so there is no account to tell and the rows
     /// below are bare tool names.
     NoTranscript,
+    /// Where the reader's unseen turns begin.
+    SinceYouLooked,
 }
 
 /// How much of a prompt an overview row shows when the session has no title yet.
@@ -825,18 +863,50 @@ fn turn_rows(turn: &ConnTurn) -> usize {
     1 + turn.steps.len() + usize::from(turn.outcome.is_some())
 }
 
-fn row_count(session: &ConnSession) -> usize {
+fn row_count(session: &ConnSession, divider: Option<DateTime<Utc>>) -> usize {
     let told = session
         .story()
         .map_or(0, |story| story.turns.iter().map(turn_rows).sum());
-    told + live_rows(session).count() + usize::from(is_hook_only(session))
+    told + live_rows(session).count()
+        + usize::from(is_hook_only(session))
+        + usize::from(divider_turn(session, divider).is_some())
+}
+
+/// The turn the "since you looked" divider opens: the first to start at or after `divider`.
+fn divider_turn(session: &ConnSession, divider: Option<DateTime<Utc>>) -> Option<usize> {
+    let divider = divider?;
+    session
+        .story()?
+        .turns
+        .iter()
+        .position(|turn| turn.started_at >= divider)
+}
+
+/// The row a story opens at: the divider when there is one, otherwise the tail, where "what has it
+/// done since?" lives.
+fn scroll_target(session: &ConnSession, divider: Option<DateTime<Utc>>) -> Option<usize> {
+    let (Some(divider_turn), Some(story)) = (divider_turn(session, divider), session.story())
+    else {
+        return row_count(session, divider).checked_sub(1);
+    };
+    Some(
+        usize::from(is_hook_only(session))
+            + story.turns[..divider_turn]
+                .iter()
+                .map(turn_rows)
+                .sum::<usize>(),
+    )
 }
 
 /// Walks the story to the row at `index`.
 ///
 /// Linear in the number of rows, which costs nothing because the list only
 /// asks for the rows in view.
-fn row_at(session: &ConnSession, index: usize) -> Option<ConnRow<'_>> {
+fn row_at(
+    session: &ConnSession,
+    divider: Option<DateTime<Utc>>,
+    index: usize,
+) -> Option<ConnRow<'_>> {
     let mut remaining = index;
     if is_hook_only(session) {
         if remaining == 0 {
@@ -845,7 +915,14 @@ fn row_at(session: &ConnSession, index: usize) -> Option<ConnRow<'_>> {
         remaining -= 1;
     }
     if let Some(story) = session.story() {
+        let divider_turn = divider_turn(session, divider);
         for (turn_index, turn) in story.turns.iter().enumerate() {
+            if divider_turn == Some(turn_index) {
+                if remaining == 0 {
+                    return Some(ConnRow::SinceYouLooked);
+                }
+                remaining -= 1;
+            }
             let rows = turn_rows(turn);
             if remaining >= rows {
                 remaining -= rows;
@@ -890,6 +967,7 @@ fn render_row(
             text,
             latest: false,
         } => render_labelled("said", plain_body(tail_preview(text), app), false, app),
+        ConnRow::SinceYouLooked => render_since_you_looked(app),
         // A new instruction opens a chapter whether the transcript has caught
         // up with it or not.
         ConnRow::NoTranscript => render_notice(
@@ -965,6 +1043,39 @@ fn render_turn(at: DateTime<Utc>, prompt: &str, app: &AppContext) -> Box<dyn Ele
         .with_padding_top(14.)
         .with_padding_bottom(6.)
         .finish()
+}
+
+fn render_since_you_looked(app: &AppContext) -> Box<dyn Element> {
+    let appearance = Appearance::as_ref(app);
+    let theme = appearance.theme();
+    Container::new(
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_spacing(8.)
+            .with_child(
+                Text::new_inline(
+                    "since you looked",
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size() - 2.,
+                )
+                .with_color(theme.accent().into_solid())
+                .finish(),
+            )
+            .with_child(
+                Shrinkable::new(
+                    1.,
+                    ConstrainedBox::new(Rect::new().with_background(theme.accent()).finish())
+                        .with_height(1.)
+                        .finish(),
+                )
+                .finish(),
+            )
+            .finish(),
+    )
+    .with_horizontal_padding(10.)
+    .with_padding_top(14.)
+    .finish()
 }
 
 /// A step under the prompt it belongs to. No label: the words are the model's
