@@ -26244,6 +26244,8 @@ impl TypedActionView for Workspace {
                 if !self.focus_terminal_view_locally(*terminal_view_id, ctx) {
                     self.focus_terminal_view_in_other_window(*terminal_view_id, ctx);
                 }
+                self.conn_panel_view
+                    .update(ctx, |panel, ctx| panel.follow_focused_pane(ctx));
             }
             FocusPane(locator) => {
                 self.focus_pane(*locator, ctx);

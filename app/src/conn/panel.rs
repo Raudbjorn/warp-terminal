@@ -33,7 +33,7 @@ use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
 use warpui::{
     Action, AppContext, Entity, EntityId, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle, WeakViewHandle, WindowId,
+    ViewHandle, WeakViewHandle,
 };
 
 use super::{ConnModel, preview};
@@ -42,7 +42,6 @@ use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
 use crate::notebooks::file::FileNotebookView;
 use crate::pane_group::PaneGroup;
 use crate::terminal::resizable_data::{DEFAULT_RIGHT_PANEL_WIDTH, ModalType, ResizableData};
-use crate::workspace::util::PaneViewLocator;
 use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
 
 /// Truncation point for a prompt or a closing message. Long enough to
@@ -244,7 +243,7 @@ impl ConnPanelView {
         let model = ConnModel::as_ref(app);
         let items = open_terminal_panes_in_all_windows(app)
             .into_iter()
-            .filter_map(|(_, _, pane)| {
+            .filter_map(|pane| {
                 let session = model.session(pane)?;
                 Some(OverviewItem {
                     pane,
@@ -265,26 +264,6 @@ impl ConnPanelView {
     pub fn follow_focused_pane(&mut self, ctx: &mut ViewContext<Self>) {
         self.mode_choice.set(None);
         ctx.notify();
-    }
-
-    /// Focuses a pane in whichever window holds it and shows its story, even when it was already
-    /// focused. The root view raises the window.
-    fn jump_to(&mut self, terminal_view_id: EntityId, ctx: &mut ViewContext<Self>) {
-        self.follow_focused_pane(ctx);
-        let Some((window_id, locator, _)) = open_terminal_panes_in_all_windows(ctx)
-            .into_iter()
-            .find(|(_, _, pane)| *pane == terminal_view_id)
-        else {
-            return;
-        };
-        if let Some(root_view_id) = ctx.root_view_id(window_id) {
-            ctx.dispatch_action_for_view(
-                window_id,
-                root_view_id,
-                "root_view:handle_pane_navigation_event",
-                &locator,
-            );
-        }
     }
 
     fn show_plan(&mut self, ctx: &mut ViewContext<Self>) {
@@ -659,7 +638,11 @@ impl ConnPanelView {
                     container.finish()
                 })
                 .on_click(move |ctx, _, _| {
-                    ctx.dispatch_typed_action(ConnPanelAction::JumpTo(pane));
+                    // Handled by the workspace rather than this view: focusing a pane in another
+                    // tab updates this panel, which cannot happen inside its own update.
+                    ctx.dispatch_typed_action(WorkspaceAction::FocusTerminalViewInWorkspace {
+                        terminal_view_id: pane,
+                    });
                 })
                 .with_cursor(Cursor::PointingHand)
                 .finish();
@@ -752,8 +735,6 @@ pub enum ConnPanelAction {
     ShowStory,
     /// Switch between the focused pane's story and every session.
     ToggleMode,
-    /// Focus the pane running this terminal view, in whichever window holds it.
-    JumpTo(EntityId),
 }
 
 /// One line of the story.
@@ -799,23 +780,20 @@ fn session_title(session: &ConnSession) -> Option<String> {
         })
 }
 
-/// Every open terminal pane in every window, with what it takes to focus it.
-fn open_terminal_panes_in_all_windows(
-    app: &AppContext,
-) -> Vec<(WindowId, PaneViewLocator, EntityId)> {
-    let mut panes = Vec::new();
-    for (window_id, workspace) in WorkspaceRegistry::as_ref(app).all_workspaces(app) {
-        for pane_group in workspace.as_ref(app).tab_views() {
-            for (pane_id, terminal_view_id) in pane_group.as_ref(app).open_terminal_panes(app) {
-                let locator = PaneViewLocator {
-                    pane_group_id: pane_group.id(),
-                    pane_id,
-                };
-                panes.push((window_id, locator, terminal_view_id));
-            }
-        }
-    }
-    panes
+/// Every open terminal pane in every window.
+fn open_terminal_panes_in_all_windows(app: &AppContext) -> Vec<EntityId> {
+    WorkspaceRegistry::as_ref(app)
+        .all_workspaces(app)
+        .into_iter()
+        .flat_map(|(_, workspace)| {
+            workspace
+                .as_ref(app)
+                .tab_views()
+                .flat_map(|pane_group| pane_group.as_ref(app).open_terminal_panes(app))
+                .map(|(_, terminal_view_id)| terminal_view_id)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Matches the colors Warp gives the same states on tabs and pane headers.
@@ -1386,7 +1364,6 @@ impl TypedActionView for ConnPanelView {
             ConnPanelAction::ShowPlan => self.show_plan(ctx),
             ConnPanelAction::ShowStory => self.show_story(ctx),
             ConnPanelAction::ToggleMode => self.toggle_mode(ctx),
-            ConnPanelAction::JumpTo(pane) => self.jump_to(*pane, ctx),
         }
     }
 }
