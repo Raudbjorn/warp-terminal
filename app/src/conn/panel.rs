@@ -257,8 +257,11 @@ impl ConnPanelView {
         group_by_project(items)
     }
 
-    /// Focuses a pane in whichever window holds it. The root view raises the window.
+    /// Focuses a pane in whichever window holds it and shows its story, even when it was already
+    /// focused. The root view raises the window.
     fn jump_to(&self, terminal_view_id: EntityId, ctx: &mut ViewContext<Self>) {
+        self.mode_choice.set(None);
+        ctx.notify();
         let Some((window_id, locator, _)) = open_terminal_panes_in_all_windows(ctx)
             .into_iter()
             .find(|(_, _, pane)| *pane == terminal_view_id)

@@ -16966,6 +16966,9 @@ impl Workspace {
                 self.current_workspace_state.close_all_modals();
                 if pane_group.id() == self.active_tab_pane_group().id() {
                     self.restore_right_panel_for_focused_pane(ctx);
+                    // The Conn panel decides what to show from the focused pane at render time,
+                    // and a click into a pane changes nothing else it observes.
+                    self.conn_panel_view.update(ctx, |_, ctx| ctx.notify());
                 }
 
                 // Re-evaluate which region is focused and update pane dimming accordingly.
