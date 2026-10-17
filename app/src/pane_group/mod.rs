@@ -284,6 +284,8 @@ pub enum PaneGroupAction {
     Remove(PaneId),
     RemoveActive,
     Activate(PaneId, ActivationReason),
+    /// Any click inside a pane, including one its content handles itself.
+    Clicked,
     ResizeMove(Vector2F),
     StartResizing(DraggedBorder),
     ResetPaneSizes(EntityId),
@@ -5945,9 +5947,6 @@ impl PaneGroup {
         }
 
         self.focus_pane_by_id(id, ctx);
-        if matches!(reason, ActivationReason::Click) {
-            ctx.emit(Event::PaneClicked);
-        }
     }
 
     pub fn focus_pane_by_id(&mut self, id: PaneId, ctx: &mut ViewContext<Self>) {
@@ -8269,6 +8268,7 @@ impl TypedActionView for PaneGroup {
             Remove(view_id) => self.close_pane_with_confirmation(*view_id, ctx),
             RemoveActive => self.close_active_pane_with_confirmation(ctx),
             Activate(view_id, reason) => self.focus_pane_on_mouse_event(*view_id, *reason, ctx),
+            Clicked => ctx.emit(Event::PaneClicked),
             ResizeMove(position) => self.maybe_resize_pane(*position, ctx),
             StartResizing(border) => self.start_resizing(*border, ctx),
             ResetPaneSizes(border_id) => self.reset_pane_sizes(*border_id, ctx),
