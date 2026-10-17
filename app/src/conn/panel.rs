@@ -12,6 +12,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use ::conn::overview::{OverviewItem, ProjectGroup, group_by_project};
 use ::conn::story::ConnTurn;
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession, ConnStatus};
 use chrono::{DateTime, Datelike, Local, Utc};
@@ -22,16 +23,17 @@ use warp_errors::report_error;
 use warpui::color::ColorU;
 use warpui::elements::new_scrollable::{NewScrollableElement, SingleAxisConfig};
 use warpui::elements::{
-    Align, ChildView, ConstrainedBox, Container, CrossAxisAlignment, DragBarSide, Element, Empty,
-    Fill, Flex, FormattedTextElement, HeadingFontSizeMultipliers, HighlightedHyperlink, Hoverable,
-    List, ListState, MainAxisSize, MouseStateHandle, NewScrollable, ParentElement, Rect, Resizable,
-    ResizableStateHandle, ScrollStateHandle, Shrinkable, Text, resizable_state_handle,
+    Align, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox, Container,
+    CrossAxisAlignment, DragBarSide, Element, Empty, Fill, Flex, FormattedTextElement,
+    HeadingFontSizeMultipliers, HighlightedHyperlink, Hoverable, List, ListState, MainAxisSize,
+    MouseStateHandle, NewScrollable, ParentElement, Rect, Resizable, ResizableStateHandle,
+    ScrollStateHandle, ScrollbarWidth, Shrinkable, Text, resizable_state_handle,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::platform::Cursor;
 use warpui::{
     Action, AppContext, Entity, EntityId, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle, WeakViewHandle,
+    ViewHandle, WeakViewHandle, WindowId,
 };
 
 use super::{ConnModel, preview};
@@ -40,7 +42,8 @@ use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
 use crate::notebooks::file::FileNotebookView;
 use crate::pane_group::PaneGroup;
 use crate::terminal::resizable_data::{DEFAULT_RIGHT_PANEL_WIDTH, ModalType, ResizableData};
-use crate::workspace::WorkspaceAction;
+use crate::workspace::util::PaneViewLocator;
+use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
 
 /// Truncation point for a prompt or a closing message. Long enough to
 /// recognise what you asked for, short enough that the chapters stay
@@ -79,6 +82,13 @@ pub struct ConnPanelView {
     show_plan_link: MouseStateHandle,
     show_story_link: MouseStateHandle,
     open_in_pane_link: MouseStateHandle,
+    mode_link: MouseStateHandle,
+    /// Cleared on render once focus has moved, so returning to the pane does not revive it.
+    mode_choice: Cell<Option<ModeChoice>>,
+    overview_scroll: ClippedScrollStateHandle,
+    /// Click state for each overview row, keyed by terminal view. Kept in step with the model's
+    /// panes, because a handle made during render would never register a click.
+    overview_links: HashMap<EntityId, MouseStateHandle>,
     /// The pane, turn count and row count the list was last reconciled to.
     ///
     /// `ListState` owns its item count as mutable state, so it has to be told
@@ -129,10 +139,11 @@ impl ConnPanelView {
         // model rather than only redraw on focus changes.
         ctx.observe(&ConnModel::handle(ctx), |me, _, ctx| {
             me.sync_plans(ctx);
+            me.sync_overview_links(ctx);
             ctx.notify();
         });
 
-        Self {
+        let mut panel = Self {
             active_pane_group: None,
             list_state,
             scroll_state: ScrollStateHandle::default(),
@@ -142,8 +153,15 @@ impl ConnPanelView {
             show_plan_link: MouseStateHandle::default(),
             show_story_link: MouseStateHandle::default(),
             open_in_pane_link: MouseStateHandle::default(),
+            mode_link: MouseStateHandle::default(),
+            mode_choice: Cell::new(None),
+            overview_scroll: ClippedScrollStateHandle::default(),
+            overview_links: HashMap::new(),
             synced: Cell::new(None),
-        }
+        };
+        // A window opened after sessions exist sees no model change until the next event.
+        panel.sync_overview_links(ctx);
+        panel
     }
 
     pub fn set_active_pane_group(
@@ -182,6 +200,78 @@ impl ConnPanelView {
                     self.plans.remove(&pane);
                 }
             }
+        }
+    }
+
+    fn sync_overview_links(&mut self, ctx: &mut ViewContext<Self>) {
+        let model = ConnModel::as_ref(ctx);
+        self.overview_links
+            .retain(|pane, _| model.session(*pane).is_some());
+        for pane in model.panes() {
+            self.overview_links.entry(pane).or_default();
+        }
+    }
+
+    fn mode(&self, app: &AppContext) -> PanelMode {
+        let focused = self.focused_terminal_id(app);
+        let choice = self
+            .mode_choice
+            .get()
+            .filter(|choice| choice.pane == focused);
+        self.mode_choice.set(choice);
+        let has_session =
+            focused.is_some_and(|pane| ConnModel::as_ref(app).session(pane).is_some());
+        panel_mode(focused, has_session, choice)
+    }
+
+    fn toggle_mode(&mut self, ctx: &mut ViewContext<Self>) {
+        let mode = match self.mode(ctx) {
+            PanelMode::ThisPane => PanelMode::All,
+            PanelMode::All => PanelMode::ThisPane,
+        };
+        self.mode_choice.set(Some(ModeChoice {
+            pane: self.focused_terminal_id(ctx),
+            mode,
+        }));
+        ctx.notify();
+    }
+
+    /// Every pane with a session in every window, as the overview lists them.
+    fn overview(&self, app: &AppContext) -> Vec<ProjectGroup<EntityId>> {
+        let model = ConnModel::as_ref(app);
+        let items = open_terminal_panes_in_all_windows(app)
+            .into_iter()
+            .filter_map(|(_, _, pane)| {
+                let session = model.session(pane)?;
+                Some(OverviewItem {
+                    pane,
+                    project: session
+                        .project
+                        .clone()
+                        .unwrap_or_else(|| "Unknown project".to_owned()),
+                    title: session_title(session),
+                    status: session.status,
+                })
+            })
+            .collect();
+        group_by_project(items)
+    }
+
+    /// Focuses a pane in whichever window holds it. The root view raises the window.
+    fn jump_to(&self, terminal_view_id: EntityId, ctx: &mut ViewContext<Self>) {
+        let Some((window_id, locator, _)) = open_terminal_panes_in_all_windows(ctx)
+            .into_iter()
+            .find(|(_, _, pane)| *pane == terminal_view_id)
+        else {
+            return;
+        };
+        if let Some(root_view_id) = ctx.root_view_id(window_id) {
+            ctx.dispatch_action_for_view(
+                window_id,
+                root_view_id,
+                "root_view:handle_pane_navigation_event",
+                &locator,
+            );
         }
     }
 
@@ -305,7 +395,10 @@ impl ConnPanelView {
     /// The project, and the session's own generated title when it has one.
     /// Between them they answer "which of my sessions is this?" before any
     /// scrolling.
-    fn render_header(&self, app: &AppContext) -> Box<dyn Element> {
+    fn render_header(&self, mode: PanelMode, app: &AppContext) -> Box<dyn Element> {
+        if mode == PanelMode::All {
+            return self.render_overview_header(app);
+        }
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
         let project = self
@@ -343,6 +436,13 @@ impl ConnPanelView {
                 .finish(),
             );
         }
+
+        heading_row = heading_row.with_child(self.render_link(
+            "All sessions",
+            &self.mode_link,
+            ConnPanelAction::ToggleMode,
+            app,
+        ));
 
         let mut column = Flex::column()
             .with_cross_axis_alignment(CrossAxisAlignment::Start)
@@ -429,15 +529,125 @@ impl ConnPanelView {
         .finish()
     }
 
+    fn render_overview_header(&self, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
+        let mut row = Flex::row().with_spacing(8.).with_child(
+            Text::new_inline(
+                "Conn — all sessions",
+                appearance.ui_font_family(),
+                appearance.ui_font_size(),
+            )
+            .with_style(Properties::default().weight(Weight::Semibold))
+            .with_color(appearance.theme().active_ui_text_color().into())
+            .finish(),
+        );
+        if self.focused_terminal_id(app).is_some() {
+            row = row.with_child(self.render_link(
+                "This pane",
+                &self.mode_link,
+                ConnPanelAction::ToggleMode,
+                app,
+            ));
+        }
+        Container::new(row.finish())
+            .with_uniform_padding(10.)
+            .finish()
+    }
+
+    fn render_overview(&self, app: &AppContext) -> Box<dyn Element> {
+        let groups = self.overview(app);
+        if groups.is_empty() {
+            return self.render_message("No agent sessions in any window.", app);
+        }
+        let appearance = Appearance::as_ref(app);
+        let theme = appearance.theme();
+        let font_family = appearance.ui_font_family();
+        let font_size = appearance.ui_font_size();
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Start)
+            .with_main_axis_size(MainAxisSize::Min);
+        for group in groups {
+            column = column.with_child(
+                Container::new(
+                    Text::new_inline(group.project, font_family, font_size - 1.)
+                        .with_style(Properties::default().weight(Weight::Semibold))
+                        .with_color(theme.nonactive_ui_text_color().into())
+                        .finish(),
+                )
+                .with_padding_top(10.)
+                .with_padding_bottom(2.)
+                .finish(),
+            );
+            for item in group.items {
+                let Some(mouse_state) = self.overview_links.get(&item.pane) else {
+                    continue;
+                };
+                let title = item.title.unwrap_or_else(|| "New session".to_owned());
+                let status = item.status;
+                let pane = item.pane;
+                let text_color = theme.active_ui_text_color().into();
+                let hover_color = theme.surface_2().into_solid();
+                let row = Hoverable::new(mouse_state.clone(), move |state| {
+                    let mut container = Container::new(
+                        Flex::row()
+                            .with_spacing(8.)
+                            .with_child(
+                                Shrinkable::new(
+                                    1.,
+                                    Text::new_inline(title.clone(), font_family, font_size)
+                                        .with_color(text_color)
+                                        .finish(),
+                                )
+                                .finish(),
+                            )
+                            .with_child(
+                                Text::new_inline(status.label(), font_family, font_size - 1.)
+                                    .with_color(status_color(status, theme))
+                                    .finish(),
+                            )
+                            .finish(),
+                    )
+                    .with_vertical_padding(4.)
+                    .with_horizontal_padding(6.);
+                    if state.is_hovered() {
+                        container = container.with_background_color(hover_color);
+                    }
+                    container.finish()
+                })
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(ConnPanelAction::JumpTo(pane));
+                })
+                .with_cursor(Cursor::PointingHand)
+                .finish();
+                column = column.with_child(row);
+            }
+        }
+        ClippedScrollable::vertical(
+            self.overview_scroll.clone(),
+            Container::new(column.finish())
+                .with_horizontal_padding(10.)
+                .with_padding_bottom(10.)
+                .finish(),
+            ScrollbarWidth::Auto,
+            theme.nonactive_ui_detail().into(),
+            theme.active_ui_detail().into(),
+            Fill::None,
+        )
+        .finish()
+    }
+
     /// Shown before a session exists in the focused pane. Says what the panel
     /// is waiting for rather than appearing broken.
     fn render_empty_state(&self, app: &AppContext) -> Box<dyn Element> {
-        let appearance = Appearance::as_ref(app);
         let message = match self.focused_terminal_id(app) {
             Some(_) => "No agent session in this pane yet.",
             None => "No pane focused.",
         };
+        self.render_message(message, app)
+    }
 
+    fn render_message(&self, message: &'static str, app: &AppContext) -> Box<dyn Element> {
+        let appearance = Appearance::as_ref(app);
         Align::new(
             Container::new(
                 Text::new_inline(
@@ -455,6 +665,35 @@ impl ConnPanelView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanelMode {
+    ThisPane,
+    All,
+}
+
+/// A mode picked by hand, and the pane that was focused when it was picked.
+#[derive(Debug, Clone, Copy)]
+struct ModeChoice {
+    pane: Option<EntityId>,
+    mode: PanelMode,
+}
+
+/// The panel tells the focused pane's story when there is one and lists every session otherwise.
+/// A choice made by hand wins until focus moves to another pane.
+fn panel_mode(
+    focused: Option<EntityId>,
+    focused_has_session: bool,
+    choice: Option<ModeChoice>,
+) -> PanelMode {
+    if let Some(choice) = choice.filter(|choice| choice.pane == focused) {
+        choice.mode
+    } else if focused_has_session {
+        PanelMode::ThisPane
+    } else {
+        PanelMode::All
+    }
+}
+
 /// A plan shown in the panel in place of a pane's story.
 struct OpenPlan {
     path: PathBuf,
@@ -467,6 +706,10 @@ pub enum ConnPanelAction {
     ShowPlan,
     /// Return the focused pane to its story.
     ShowStory,
+    /// Switch between the focused pane's story and every session.
+    ToggleMode,
+    /// Focus the pane running this terminal view, in whichever window holds it.
+    JumpTo(EntityId),
 }
 
 /// One line of the story.
@@ -492,6 +735,41 @@ enum ConnRow<'a> {
     /// No transcript was found, so there is no account to tell and the rows
     /// below are bare tool names.
     NoTranscript,
+}
+
+/// How much of a prompt an overview row shows when the session has no title yet.
+const TITLE_CHARS: usize = 80;
+
+/// Claude Code's own title for the session, or failing that the last thing asked of it.
+fn session_title(session: &ConnSession) -> Option<String> {
+    session
+        .story()
+        .and_then(|story| story.title.clone())
+        .or_else(|| {
+            session
+                .prompts()
+                .last()
+                .map(|prompt| preview::head(prompt, TITLE_CHARS))
+        })
+}
+
+/// Every open terminal pane in every window, with what it takes to focus it.
+fn open_terminal_panes_in_all_windows(
+    app: &AppContext,
+) -> Vec<(WindowId, PaneViewLocator, EntityId)> {
+    let mut panes = Vec::new();
+    for (window_id, workspace) in WorkspaceRegistry::as_ref(app).all_workspaces(app) {
+        for pane_group in workspace.as_ref(app).tab_views() {
+            for (pane_id, terminal_view_id) in pane_group.as_ref(app).open_terminal_panes(app) {
+                let locator = PaneViewLocator {
+                    pane_group_id: pane_group.id(),
+                    pane_id,
+                };
+                panes.push((window_id, locator, terminal_view_id));
+            }
+        }
+    }
+    panes
 }
 
 /// Matches the colors Warp gives the same states on tabs and pane headers.
@@ -929,8 +1207,11 @@ impl View for ConnPanelView {
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let rows = self.reconcile(app);
+        let mode = self.mode(app);
 
-        let content: Box<dyn Element> = if let Some(open) = self.open_plan(app) {
+        let content: Box<dyn Element> = if mode == PanelMode::All {
+            Shrinkable::new(1.0, self.render_overview(app)).finish()
+        } else if let Some(open) = self.open_plan(app) {
             Shrinkable::new(1.0, ChildView::new(&open.view).finish()).finish()
         } else if rows > 0 {
             Shrinkable::new(
@@ -955,7 +1236,7 @@ impl View for ConnPanelView {
 
         let panel = Flex::column()
             .with_main_axis_size(MainAxisSize::Max)
-            .with_child(self.render_header(app))
+            .with_child(self.render_header(mode, app))
             .with_child(content)
             .finish();
 
@@ -985,6 +1266,8 @@ impl TypedActionView for ConnPanelView {
         match action {
             ConnPanelAction::ShowPlan => self.show_plan(ctx),
             ConnPanelAction::ShowStory => self.show_story(ctx),
+            ConnPanelAction::ToggleMode => self.toggle_mode(ctx),
+            ConnPanelAction::JumpTo(pane) => self.jump_to(*pane, ctx),
         }
     }
 }

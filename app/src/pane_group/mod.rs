@@ -2286,6 +2286,17 @@ impl PaneGroup {
             .any(|pane| pane.terminal_view(ctx).id() == terminal_view_id)
     }
 
+    /// The terminal panes still open in this group, with their terminal view ids. A pane hidden
+    /// pending close is left out.
+    pub fn open_terminal_panes<'a>(
+        &'a self,
+        ctx: &'a AppContext,
+    ) -> impl Iterator<Item = (PaneId, EntityId)> + 'a {
+        self.panes_of::<TerminalPane>()
+            .filter(|pane| !self.is_pane_hidden_for_close(pane.id()))
+            .map(move |pane| (pane.id(), pane.terminal_view(ctx).id()))
+    }
+
     /// Returns the [`PaneId`] of the terminal pane whose persistent UUID matches
     /// the given bytes, or `None` if no such pane exists in this group.
     pub fn find_terminal_pane_by_session_uuid(&self, uuid: &[u8]) -> Option<PaneId> {

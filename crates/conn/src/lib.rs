@@ -9,6 +9,7 @@
 //! This crate is deliberately free of Warp dependencies so the history model
 //! stays portable if the store ever moves out of the client process.
 
+pub mod overview;
 pub mod story;
 
 use chrono::{DateTime, Utc};
@@ -153,6 +154,17 @@ impl ConnStatus {
             ConnStatus::Done => "Done",
             ConnStatus::Failed => "Failed",
             ConnStatus::Ended => "Ended",
+        }
+    }
+
+    /// Lower is more urgent: what waits on the reader before what is still running.
+    pub fn urgency(self) -> u8 {
+        match self {
+            ConnStatus::NeedsYou => 0,
+            ConnStatus::Failed => 1,
+            ConnStatus::Done => 2,
+            ConnStatus::Working => 3,
+            ConnStatus::Ended => 4,
         }
     }
 }

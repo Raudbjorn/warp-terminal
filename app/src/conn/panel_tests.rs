@@ -477,3 +477,46 @@ fn only_the_last_turns_outcome_is_the_latest() {
         .collect();
     assert_eq!(latest, vec![false, true]);
 }
+
+mod mode {
+    use warpui::EntityId;
+
+    use super::super::{ModeChoice, PanelMode, panel_mode};
+
+    #[test]
+    fn a_pane_with_a_session_shows_its_story() {
+        let pane = EntityId::new();
+        assert_eq!(panel_mode(Some(pane), true, None), PanelMode::ThisPane);
+    }
+
+    #[test]
+    fn a_pane_without_a_session_shows_the_overview() {
+        assert_eq!(
+            panel_mode(Some(EntityId::new()), false, None),
+            PanelMode::All
+        );
+        assert_eq!(panel_mode(None, false, None), PanelMode::All);
+    }
+
+    #[test]
+    fn a_manual_choice_holds_while_focus_stays() {
+        let pane = EntityId::new();
+        let choice = ModeChoice {
+            pane: Some(pane),
+            mode: PanelMode::All,
+        };
+        assert_eq!(panel_mode(Some(pane), true, Some(choice)), PanelMode::All);
+    }
+
+    #[test]
+    fn a_manual_choice_lapses_when_focus_moves() {
+        let choice = ModeChoice {
+            pane: Some(EntityId::new()),
+            mode: PanelMode::All,
+        };
+        assert_eq!(
+            panel_mode(Some(EntityId::new()), true, Some(choice)),
+            PanelMode::ThisPane
+        );
+    }
+}

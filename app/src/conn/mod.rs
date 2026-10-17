@@ -93,10 +93,13 @@ impl ConnModel {
         Self::default()
     }
 
-    // Consumed by the panel; nothing reads it until that lands.
-    #[allow(dead_code)]
     pub fn session(&self, terminal_view_id: EntityId) -> Option<&ConnSession> {
         self.sessions.get(&terminal_view_id)
+    }
+
+    /// The terminal views that have a session.
+    pub fn panes(&self) -> impl Iterator<Item = EntityId> + '_ {
+        self.sessions.keys().copied()
     }
 
     /// The transcript read in flight for a pane, if any. Tests await it before
