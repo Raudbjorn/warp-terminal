@@ -1,4 +1,6 @@
-use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
+use rquickjs::function::Opt;
+use rquickjs::prelude::MutFn;
+use rquickjs::{Ctx, Function, Object};
 
 use super::manifest::Manifest;
 use super::plugin::PluginHandle;
@@ -6,8 +8,8 @@ use crate::context_chips::plugin_prompt::{PromptKind, PromptSegment, PromptSide}
 use crate::plugin::ai_tools::ToolOutput;
 use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
 use crate::plugin::events::{
-    CommandFinishedEvent, CommandStartedEvent, OptionalToast, EVENT_COMMAND_FINISHED,
-    EVENT_COMMAND_STARTED,
+    CommandFinishedEvent, CommandStartedEvent, EVENT_COMMAND_FINISHED, EVENT_COMMAND_STARTED,
+    OptionalToast,
 };
 use crate::workspace::plugin_status_items::{StatusItem, StatusItemKind};
 
@@ -15,14 +17,6 @@ use crate::workspace::plugin_status_items::{StatusItem, StatusItemKind};
 /// they target via `engines.warp` in their manifest; the surface evolves additively
 /// within a major version. See PLUGIN_SPEC.md.
 pub const PLUGIN_API_VERSION: &str = "1.0.0";
-
-cfg_if::cfg_if! {
-    if #[cfg(feature = "completions_v2")] {
-        use rquickjs::Value;
-        use warp_completer::signatures::CommandSignature;
-        use warp_js::FromWarpJs;
-    }
-}
 
 /// Returns a JS object representing the Warp Plugin API exposed to external JavaScript plugins.
 ///
@@ -35,8 +29,7 @@ cfg_if::cfg_if! {
 /// * `warp.terminal.onCommandStart(cb)` / `onCommandFinished(cb)` — register callbacks invoked
 ///   when a shell command starts/finishes; a callback that returns a string shows it as a toast.
 ///
-/// Additional namespaces are added behind feature flags (e.g. `completions` under
-/// `completions_v2`). See PLUGIN_SPEC.md for the planned surface.
+/// Additional namespaces are gated by the plugin manifest capabilities.
 pub fn warp<'js>(
     plugin: PluginHandle,
     manifest: &Manifest,
@@ -101,11 +94,6 @@ pub fn warp<'js>(
     }
     if manifest.permits("network") {
         api.set("network", network_api(ctx)?)?;
-    }
-
-    #[cfg(feature = "completions_v2")]
-    if manifest.permits("completions") {
-        api.set("completions", completions(plugin, ctx)?)?;
     }
 
     Ok(api)
@@ -266,6 +254,7 @@ fn network_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
             Ok(result)
         }),
     )?;
+    Ok(network)
 }
 
 /// Returns a JS object representing the UI namespace for the Warp Plugin API.
@@ -368,36 +357,39 @@ fn install_set_status_item<'js>(
         // before the `Opt` wrapper can see the missing value. We catch the conversion *outside*
         // `Opt` and then ask the `Value` for its inner object — `None` for primitives, `Some(obj)`
         // for objects, and `None` for the documented `null`/non-object "remove" path.
-        Function::new(ctx, move |item_id: String, item: Opt<rquickjs::Value<'js>>| {
-            let item = item.0.and_then(|val| val.into_object()).and_then(|obj| {
-                let text: String = obj.get("text").ok()?;
-                if text.is_empty() {
-                    // Empty text is treated as a remove, so plugins don't need separate clear
-                    // call sites (`setStatusItem("ci", { text: "" })` is fine).
-                    return None;
-                }
-                let kind = match obj.get::<_, String>("kind").ok().as_deref() {
-                    Some("success") => StatusItemKind::Success,
-                    Some("warn") => StatusItemKind::Warn,
-                    Some("error") => StatusItemKind::Error,
-                    Some("accent") => StatusItemKind::Accent,
-                    _ => StatusItemKind::Info,
-                };
-                let tooltip: Option<String> = obj.get("tooltip").ok();
-                let command_id: Option<String> = obj.get("command").ok();
-                Some(StatusItem {
-                    text,
-                    kind,
-                    tooltip,
-                    command_id,
-                })
-            });
-            super::app_request::send_app_request(PluginAppRequest::SetStatusItem {
-                plugin_id: plugin_id.clone(),
-                item_id,
-                item,
-            });
-        }),
+        Function::new(
+            ctx,
+            move |item_id: String, item: Opt<rquickjs::Value<'js>>| {
+                let item = item.0.and_then(|val| val.into_object()).and_then(|obj| {
+                    let text: String = obj.get("text").ok()?;
+                    if text.is_empty() {
+                        // Empty text is treated as a remove, so plugins don't need separate clear
+                        // call sites (`setStatusItem("ci", { text: "" })` is fine).
+                        return None;
+                    }
+                    let kind = match obj.get::<_, String>("kind").ok().as_deref() {
+                        Some("success") => StatusItemKind::Success,
+                        Some("warn") => StatusItemKind::Warn,
+                        Some("error") => StatusItemKind::Error,
+                        Some("accent") => StatusItemKind::Accent,
+                        _ => StatusItemKind::Info,
+                    };
+                    let tooltip: Option<String> = obj.get("tooltip").ok();
+                    let command_id: Option<String> = obj.get("command").ok();
+                    Some(StatusItem {
+                        text,
+                        kind,
+                        tooltip,
+                        command_id,
+                    })
+                });
+                super::app_request::send_app_request(PluginAppRequest::SetStatusItem {
+                    plugin_id: plugin_id.clone(),
+                    item_id,
+                    item,
+                });
+            },
+        ),
     )?;
     Ok(())
 }
@@ -572,51 +564,4 @@ pub fn console(ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> {
         }),
     )?;
     Ok(console)
-}
-
-/// Returns a JS object representing the Completions namespace for the Warp Plugin API.
-///
-/// API methods:
-///
-/// `registerCommandSignature(signature: CommandSignature[] | CommandSignature)`: Registers
-///     the given command signature(s) to be used for completions.
-#[cfg(feature = "completions_v2")]
-fn completions<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
-    let completions = Object::new(ctx)?;
-    completions.set(
-        "registerCommandSignature",
-        Function::new(
-            ctx,
-            MutFn::from(move |val: Value<'js>| {
-                if val.is_array() {
-                    let mut plugin = plugin.get_mut();
-                    match Vec::<CommandSignature>::from_warp_js(
-                        ctx,
-                        val,
-                        plugin.js_function_registry_mut(),
-                    ) {
-                        Ok(signatures) => plugin.register_command_signatures(signatures),
-                        Err(e) => {
-                            log::warn!("Attempted to register invalid JS CommandSignatures {e:?}")
-                        }
-                    }
-                } else if val.is_object() {
-                    let mut plugin = plugin.get_mut();
-                    match CommandSignature::from_warp_js(
-                        ctx,
-                        val,
-                        plugin.js_function_registry_mut(),
-                    ) {
-                        Ok(signature) => {
-                            plugin.register_command_signatures(vec![signature]);
-                        }
-                        Err(e) => {
-                            log::warn!("Attempted to register invalid JS CommandSignature {e:?}")
-                        }
-                    }
-                }
-            }),
-        ),
-    )?;
-    Ok(completions)
 }

@@ -1,4 +1,3 @@
-use warp_core::channel::ChannelState;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -10,6 +9,7 @@ use remote_server::setup::{
 use remote_server::transport::{BinaryCheckStatus, Error};
 use settings::Setting;
 use warp_core::SessionId;
+use warp_core::channel::ChannelState;
 use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity, WeakModelHandle};
 
 use super::pty_controller::{EventLoopSender, PtyController};
@@ -22,7 +22,7 @@ use crate::settings::PrivacySettings;
 use crate::terminal::model::session::{IsSSHWrapperSession, SessionInfo};
 use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::terminal::warpify::settings::{SshExtensionInstallMode, WarpifySettings};
-use crate::{send_telemetry_from_ctx, TelemetryEvent};
+use crate::{TelemetryEvent, send_telemetry_from_ctx};
 
 /// Per-SSH-init state machine. Encoding the state as an enum makes invalid
 /// transitions unrepresentable and ensures the `SessionInfo` stash cannot be
@@ -93,7 +93,7 @@ impl<T: EventLoopSender> RemoteServerController<T> {
         model_event_dispatcher: ModelHandle<ModelEventDispatcher>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
-        ctx.subscribe_to_model(&model_event_dispatcher, |me, event, ctx| {
+        ctx.subscribe_to_model(&model_event_dispatcher, |me, _, event, ctx| {
             if let ModelEvent::SshInitShell {
                 pending_session_info,
             } = event
@@ -103,7 +103,7 @@ impl<T: EventLoopSender> RemoteServerController<T> {
         });
 
         let mgr = RemoteServerManager::handle(ctx);
-        ctx.subscribe_to_model(&mgr, |me, event, ctx| match event {
+        ctx.subscribe_to_model(&mgr, |me, _, event, ctx| match event {
             RemoteServerManagerEvent::BinaryCheckComplete {
                 session_id,
                 result,
@@ -140,7 +140,7 @@ impl<T: EventLoopSender> RemoteServerController<T> {
             | RemoteServerManagerEvent::SessionDeregistered { .. }
             | RemoteServerManagerEvent::HostConnected { .. }
             | RemoteServerManagerEvent::HostDisconnected { .. }
-            | RemoteServerManagerEvent::BundledSkillsSnapshot { .. }
+            | RemoteServerManagerEvent::RemoteAgentContextSnapshot { .. }
             | RemoteServerManagerEvent::NavigatedToDirectory { .. }
             | RemoteServerManagerEvent::RepoMetadataSnapshot { .. }
             | RemoteServerManagerEvent::RepoMetadataUpdated { .. }
@@ -180,12 +180,15 @@ impl<T: EventLoopSender> RemoteServerController<T> {
     /// Extracts the `SessionInfo` from the stash and writes the bootstrap
     /// script to the PTY via `PtyController::initialize_shell`.
     fn flush_stashed_bootstrap(&mut self, session_info: SessionInfo, ctx: &mut ModelContext<Self>) {
-        if let Some(pty) = self.pty_controller.upgrade(ctx) {
-            pty.update(ctx, |pty, ctx| {
-                pty.initialize_shell(&session_info, ctx);
-            });
-        } else {
-            log::warn!("Remote server PtyController dropped before bootstrap could be flushed");
+        match self.pty_controller.upgrade(ctx) {
+            Some(pty) => {
+                pty.update(ctx, |pty, ctx| {
+                    pty.initialize_shell(&session_info, ctx);
+                });
+            }
+            _ => {
+                log::warn!("Remote server PtyController dropped before bootstrap could be flushed");
+            }
         }
     }
 
@@ -227,6 +230,7 @@ impl<T: EventLoopSender> RemoteServerController<T> {
             socket_path,
             self.build_auth_context(ctx),
             warp_owns_control_master,
+            WarpifySettings::as_ref(ctx).ssh_extension_install_options(),
         );
         self.did_install = false;
         self.remote_platform = None;
@@ -369,9 +373,6 @@ impl<T: EventLoopSender> RemoteServerController<T> {
                 });
             }
             SshExtensionInstallMode::NeverInstall => {
-                RemoteServerManager::handle(ctx).update(ctx, |mgr, ctx| {
-                    mgr.mark_setup_skipped(session_id, ctx);
-                });
                 self.flush_stashed_bootstrap(session_info, ctx);
             }
         }
@@ -546,6 +547,7 @@ impl<T: EventLoopSender> RemoteServerController<T> {
             } => match result {
                 Ok(()) => {
                     let socket_path = transport.socket_path().clone();
+                    let warp_owns_control_master = transport.warp_owns_control_master();
                     let connection_label = connection_label_for_session_info(&session_info);
                     self.state = SshInitState::AwaitingConnect {
                         session_id,
@@ -555,6 +557,7 @@ impl<T: EventLoopSender> RemoteServerController<T> {
                     self.connect_session_for_current_identity(
                         session_id,
                         socket_path,
+                        warp_owns_control_master,
                         connection_label,
                         true,
                         ctx,
@@ -565,31 +568,6 @@ impl<T: EventLoopSender> RemoteServerController<T> {
                         "Remote server binary install failed: session={session_id:?} error={err}"
                     );
                     self.flush_stashed_bootstrap(session_info, ctx);
-                }
-            },
-            SshInitState::RetryingInstall {
-                transport,
-                setup_start,
-                ..
-            } => match result {
-                Ok(()) => {
-                    let socket_path = transport.socket_path().clone();
-                    self.state = SshInitState::RetryingConnect {
-                        session_id,
-                        setup_start,
-                    };
-                    self.connect_session_for_current_identity(
-                        session_id,
-                        socket_path,
-                        connection_label_from_user_and_host("", None),
-                        true,
-                        ctx,
-                    );
-                }
-                Err(err) => {
-                    log::warn!(
-                        "Remote server retry install failed: session={session_id:?} error={err}"
-                    );
                 }
             },
             _ => {
@@ -626,7 +604,12 @@ impl<T: EventLoopSender> RemoteServerController<T> {
     ) {
         let auth_context = self.build_auth_context(ctx);
         let install_options = WarpifySettings::as_ref(ctx).ssh_extension_install_options();
-        let mut transport = SshTransport::new(socket_path, auth_context.clone(), install_options);
+        let mut transport = SshTransport::new(
+            socket_path,
+            auth_context.clone(),
+            warp_owns_control_master,
+            install_options,
+        );
         if allow_tagged_server_with_untagged_client {
             transport = transport.with_tagged_server_untagged_client_trust();
         }

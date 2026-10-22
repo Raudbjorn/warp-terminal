@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
+use warp_cli::GlobalOptions;
 use warp_cli::agent::OutputFormat;
 use warp_cli::artifact::{
     ArtifactCommand, DownloadArtifactArgs, GetArtifactArgs, UploadArtifactArgs,
 };
-use warp_cli::GlobalOptions;
 use warpui::platform::TerminationMode;
 use warpui::{AppContext, ModelContext, SingletonEntity};
 
@@ -153,7 +153,7 @@ async fn download_artifact(
 ) -> Result<DownloadArtifactOutput> {
     let artifact = get_artifact(ai_client, &args.artifact_uid).await?;
     let path = download_destination(&artifact, args.out);
-    download_artifact_bytes(server_api.http_client(), &artifact, &path).await?;
+    download_artifact_bytes(server_api.external_http_client(), &artifact, &path).await?;
     let path = std::path::absolute(&path).unwrap_or(path);
     Ok(DownloadArtifactOutput::new(&artifact, path))
 }

@@ -1,34 +1,28 @@
-use crate::{
-    appearance::Appearance,
-    editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextColors, TextOptions},
-    report_if_error,
-    settings::{AISettings, LocalOpenAIEnabled},
-};
-use settings::{Setting, ToggleableSetting};
 use std::cell::RefCell;
 use std::collections::HashMap;
+
+use settings::{Setting, ToggleableSetting};
 use warp_core::channel::ChannelState;
-
-use warpui::{
-    elements::{
-        Container, CrossAxisAlignment, Element, Flex, MouseStateHandle, ParentElement, Text,
-    },
-    fonts::{Properties, Weight},
-    ui_components::{
-        components::{Coords, UiComponent, UiComponentStyles},
-        switch::SwitchStateHandle,
-    },
-    AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
+use warpui::elements::{
+    Container, CrossAxisAlignment, Element, Flex, MouseStateHandle, ParentElement, Text,
 };
+use warpui::fonts::{Properties, Weight};
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+use warpui::ui_components::switch::SwitchStateHandle;
+use warpui::{AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle};
 
-use super::{
-    settings_page::{
-        build_toggle_element, render_body_item_label, LocalOnlyIconState, MatchData, PageType,
-        SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, ToggleState, CONTENT_FONT_SIZE,
-        HEADER_PADDING,
-    },
-    SettingsSection,
+use super::SettingsSection;
+use super::settings_page::{
+    CONTENT_FONT_SIZE, HEADER_PADDING, LocalOnlyIconState, MatchData, PageTitle, PageType,
+    SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, ToggleState, build_toggle_element,
+    render_body_item_label,
 };
+use crate::appearance::Appearance;
+use crate::editor::{
+    EditorView, Event as EditorEvent, SingleLineEditorOptions, TextColors, TextOptions,
+};
+use crate::report_if_error;
+use crate::settings::{AISettings, LocalOpenAIEnabled};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalAISettingsPageAction {
@@ -45,7 +39,7 @@ impl LocalAISettingsPageView {
         Self {
             page: PageType::new_uncategorized(
                 vec![Box::new(LocalAIProviderWidget::new(ctx))],
-                Some("Local AI"),
+                Some(PageTitle::new("Local AI")),
             ),
             local_only_icon_tooltip_states: Default::default(),
         }
@@ -141,10 +135,7 @@ impl LocalAIProviderWidget {
                 ai_settings.local_openai_prediction_model.value().clone(),
                 ai_settings.local_openai_timeout_ms.value().to_string(),
                 ai_settings.local_openai_opencode_command.value().clone(),
-                ai_settings
-                    .local_openai_opencode_args
-                    .value()
-                    .join(" "),
+                ai_settings.local_openai_opencode_args.value().join(" "),
             )
         };
         let base_url_editor = Self::create_editor(ctx, base_url, "http://127.0.0.1:1234/v1", false);
@@ -202,7 +193,8 @@ impl LocalAIProviderWidget {
                     // Clamp overly-large (but otherwise valid) inputs to the 1-hour
                     // cap rather than reverting them; reject non-positive/invalid input.
                     Ok(value) if value > 0 => {
-                        let clamped = value.min(crate::ai::local_openai::MAX_LOCAL_OPENAI_TIMEOUT_MS);
+                        let clamped =
+                            value.min(crate::ai::local_openai::MAX_LOCAL_OPENAI_TIMEOUT_MS);
                         // When we clamped the input, the persisted value no longer matches
                         // what the user typed. Sync the editor buffer to the clamped value
                         // so the UI does not mislead users into thinking the larger value
@@ -215,10 +207,7 @@ impl LocalAIProviderWidget {
                         clamped
                     }
                     _ => {
-                        log::warn!(
-                            "Invalid local OpenAI timeout: {:?}",
-                            buffer_text.trim()
-                        );
+                        log::warn!("Invalid local OpenAI timeout: {:?}", buffer_text.trim());
                         let current = AISettings::as_ref(ctx)
                             .local_openai_timeout_ms
                             .value()
@@ -234,8 +223,7 @@ impl LocalAIProviderWidget {
                 });
             }
         });
-        let opencode_command_editor =
-            Self::create_editor(ctx, opencode_command, "opencode", false);
+        let opencode_command_editor = Self::create_editor(ctx, opencode_command, "opencode", false);
         ctx.subscribe_to_view(&opencode_command_editor, |_, editor, event, ctx| {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let value = editor.as_ref(ctx).buffer_text(ctx).trim().to_string();
@@ -245,8 +233,7 @@ impl LocalAIProviderWidget {
             }
         });
 
-        let opencode_args_editor =
-            Self::create_editor(ctx, opencode_args, "serve --port 0", false);
+        let opencode_args_editor = Self::create_editor(ctx, opencode_args, "serve --port 0", false);
         ctx.subscribe_to_view(&opencode_args_editor, |_, editor, event, ctx| {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
@@ -257,9 +244,7 @@ impl LocalAIProviderWidget {
                     .map(|s| s.to_string())
                     .collect();
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                    report_if_error!(
-                        settings.local_openai_opencode_args.set_value(value, ctx)
-                    );
+                    report_if_error!(settings.local_openai_opencode_args.set_value(value, ctx));
                 });
             }
         });
@@ -458,5 +443,5 @@ impl SettingsWidget for LocalAIProviderWidget {
         )
         .with_margin_bottom(HEADER_PADDING)
         .finish()
-}
+    }
 }

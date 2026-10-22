@@ -114,8 +114,7 @@ if [[ ",$FEATURES," =~ ",cocoa_sentry," ]]; then
   mkdir -p "$WARP_APP_PATH/Contents/Frameworks"
   cp -a "$SENTRY_FRAMEWORK" "$WARP_APP_PATH/Contents/Frameworks/"
 fi
-echo "Adding rpath to support mac frameworks (e.g. Sentry)"
-install_name_tool -add_rpath "@executable_path/../Frameworks" "$WARP_APP_PATH/Contents/MacOS/$WARP_BIN_NAME"
+"${REPO_ROOT}/script/macos/add_framework_rpath" "$WARP_APP_PATH/Contents/MacOS/$WARP_BIN_NAME"
 
 export WARP_SCHEME_NAME
 export WARP_PLIST_PATH="$WARP_APP_PATH/Contents/Info.plist"
@@ -124,6 +123,8 @@ export WARP_PLIST_PATH="$WARP_APP_PATH/Contents/Info.plist"
 echo "Preparing bundled resources..."
 if [ "${GENERATE_SCHEMA:-false}" != "true" ]; then
   export SKIP_SETTINGS_SCHEMA=1
+else
+  export SETTINGS_SCHEMA_EXECUTABLE="$WARP_APP_PATH/Contents/MacOS/$WARP_BIN_NAME"
 fi
 NO_LICENSES=1 "${REPO_ROOT}/script/prepare_bundled_resources" "$WARP_APP_PATH/Contents/Resources" "$WARP_CHANNEL"
 
@@ -133,6 +134,14 @@ if [[ ",$FEATURES," =~ ",heap_usage_tracking," ]]; then
   echo "Bundling pprof..."
   HELPERS_DIR="$WARP_APP_PATH/Contents/Helpers"
   "${REPO_ROOT}/script/prepare_bundled_pprof" "$HELPERS_DIR"
+fi
+
+if [[ ",$FEATURES," =~ ",warp_control_cli," ]]; then
+  WARPCTRL_SCRIPT_PATH="$WARP_APP_PATH/Contents/Resources/bin/warpctrl-$WARP_CHANNEL"
+  echo "Creating warpctrl wrapper script at $WARPCTRL_SCRIPT_PATH..."
+  "${REPO_ROOT}/script/macos/create_warpctrl_wrapper" \
+    "$WARPCTRL_SCRIPT_PATH" \
+    "../../MacOS/$WARP_BIN_NAME"
 fi
 
 echo "Codesigning app..."

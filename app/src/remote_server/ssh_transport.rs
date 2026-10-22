@@ -15,11 +15,13 @@ use remote_server::client::RemoteServerClient;
 use remote_server::manager::RemoteServerExitStatus;
 use remote_server::protocol::REMOTE_SERVER_PROTOCOL_VERSION;
 use remote_server::setup::{
-    parse_uname_output, remote_server_daemon_dir, PreinstallCheckResult, RemotePlatform,
+    InstallScriptOptions, PreinstallCheckResult, RemotePlatform, parse_uname_output,
+    remote_server_daemon_dir,
 };
 use remote_server::ssh::{run_ssh_command, ssh_args};
 use remote_server::transport::{
-    BinaryCheckStatus, BinaryUpdateReason, Connection, Error, InstallOutcome, RemoteTransport,
+    BinaryCheckStatus, BinaryUpdateReason, Connection, ControlPath, Error, InstallOutcome,
+    RemoteTransport,
 };
 use warp_core::channel::ChannelState;
 use warpui::r#async::executor;
@@ -38,6 +40,7 @@ pub struct SshTransport {
     socket_path: PathBuf,
     auth_context: Arc<RemoteServerAuthContext>,
     install_options: InstallScriptOptions,
+    warp_owns_control_master: bool,
     allow_tagged_server_with_untagged_client: bool,
 }
 
@@ -55,11 +58,13 @@ impl SshTransport {
         socket_path: PathBuf,
         auth_context: Arc<RemoteServerAuthContext>,
         warp_owns_control_master: bool,
+        install_options: InstallScriptOptions,
     ) -> Self {
         Self {
             socket_path,
             auth_context,
             install_options,
+            warp_owns_control_master,
             allow_tagged_server_with_untagged_client: false,
         }
     }

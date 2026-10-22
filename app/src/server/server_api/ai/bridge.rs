@@ -14,12 +14,16 @@
 //! Lives as a child module of `ai` so `use super::*` pulls in the `AIClient` trait
 //! and every request/response type without re-importing them.
 
+use std::sync::Arc;
+
+use warp_agent_grpc::pb::agent_service_client::AgentServiceClient;
+use warp_agent_grpc::pb::{self};
+use warp_agent_grpc::tonic::transport::Channel;
+use warp_agent_grpc::tonic::{self};
+
 use super::*;
 use crate::ai::ambient_agents::task::AmbientAgentTaskState;
 use crate::util::agent_backends::GrpcTarget;
-use std::sync::Arc;
-use warp_agent_grpc::pb::{self, agent_service_client::AgentServiceClient};
-use warp_agent_grpc::tonic::{self, transport::Channel};
 
 /// Decorator over the real [`AIClient`]. The agent control ops are routed to the
 /// gRPC harness host; every other method forwards to `inner`.
@@ -53,10 +57,7 @@ impl GrpcBridgeAIClient {
                     .connect()
                     .await
                     .map_err(|e| {
-                        anyhow::anyhow!(
-                            "gRPC connect to '{}' failed: {e}",
-                            self.target.endpoint
-                        )
+                        anyhow::anyhow!("gRPC connect to '{}' failed: {e}", self.target.endpoint)
                     })
             })
             .await
@@ -159,8 +160,11 @@ impl AIClient for GrpcBridgeAIClient {
 
     async fn list_connected_self_hosted_workers(
         &self,
+        team_scope: RequestTeamScope,
     ) -> Result<ListConnectedSelfHostedWorkersResponse, anyhow::Error> {
-        self.inner.list_connected_self_hosted_workers().await
+        self.inner
+            .list_connected_self_hosted_workers(team_scope)
+            .await
     }
 
     async fn get_free_available_models(
@@ -206,9 +210,18 @@ impl AIClient for GrpcBridgeAIClient {
         environment_uid: Option<String>,
         parent_run_id: Option<String>,
         config: Option<AgentConfigSnapshot>,
+        metadata: HashMap<String, String>,
+        team_scope: RequestTeamScope,
     ) -> anyhow::Result<AmbientAgentTaskId, anyhow::Error> {
         self.inner
-            .create_agent_task(prompt, environment_uid, parent_run_id, config)
+            .create_agent_task(
+                prompt,
+                environment_uid,
+                parent_run_id,
+                config,
+                metadata,
+                team_scope,
+            )
             .await
     }
 
@@ -219,6 +232,8 @@ impl AIClient for GrpcBridgeAIClient {
         session_id: Option<session_sharing_protocol::common::SessionId>,
         conversation_id: Option<String>,
         status_message: Option<TaskStatusUpdate>,
+        session_debug_until: Option<DateTime<Utc>>,
+        debug_agent_active: Option<bool>,
     ) -> anyhow::Result<(), anyhow::Error> {
         self.inner
             .update_agent_task(
@@ -227,6 +242,8 @@ impl AIClient for GrpcBridgeAIClient {
                 session_id,
                 conversation_id,
                 status_message,
+                session_debug_until,
+                debug_agent_active,
             )
             .await
     }
@@ -234,8 +251,10 @@ impl AIClient for GrpcBridgeAIClient {
     async fn spawn_agent(
         &self,
         request: SpawnAgentRequest,
+        team_scope: RequestTeamScope,
     ) -> anyhow::Result<SpawnAgentResponse, anyhow::Error> {
         let mut client = self.client(self.channel().await?);
+        let _ = team_scope;
         let mode = match request.mode {
             UserQueryMode::Normal => pb::AgentMode::Normal,
             UserQueryMode::Plan => pb::AgentMode::Plan,
@@ -286,16 +305,22 @@ impl AIClient for GrpcBridgeAIClient {
         &self,
         limit: i32,
         filter: TaskListFilter,
+        request_team_scope: Option<RequestTeamScope>,
     ) -> anyhow::Result<Vec<AmbientAgentTask>, anyhow::Error> {
-        self.inner.list_ambient_agent_tasks(limit, filter).await
+        self.inner
+            .list_ambient_agent_tasks(limit, filter, request_team_scope)
+            .await
     }
 
     async fn list_agent_runs_raw(
         &self,
         limit: i32,
         filter: TaskListFilter,
+        request_team_scope: Option<RequestTeamScope>,
     ) -> anyhow::Result<serde_json::Value, anyhow::Error> {
-        self.inner.list_agent_runs_raw(limit, filter).await
+        self.inner
+            .list_agent_runs_raw(limit, filter, request_team_scope)
+            .await
     }
 
     async fn get_ambient_agent_task(
@@ -318,6 +343,9 @@ impl AIClient for GrpcBridgeAIClient {
             updated_at: now,
             status_message: None,
             source: None,
+            execution_location: None,
+            debug_agent_available: false,
+            scope: None,
             session_id: None,
             session_link: None,
             creator: None,
@@ -401,12 +429,18 @@ impl AIClient for GrpcBridgeAIClient {
             .await
     }
 
-    async fn list_agents(&self) -> anyhow::Result<Vec<AgentResponse>, anyhow::Error> {
-        self.inner.list_agents().await
+    async fn list_agents(
+        &self,
+        team_scope: RequestTeamScope,
+    ) -> anyhow::Result<Vec<AgentResponse>, anyhow::Error> {
+        self.inner.list_agents(team_scope).await
     }
 
-    async fn list_agents_raw(&self) -> anyhow::Result<serde_json::Value, anyhow::Error> {
-        self.inner.list_agents_raw().await
+    async fn list_agents_raw(
+        &self,
+        team_scope: RequestTeamScope,
+    ) -> anyhow::Result<serde_json::Value, anyhow::Error> {
+        self.inner.list_agents_raw(team_scope).await
     }
 
     async fn get_agent(&self, uid: &str) -> anyhow::Result<AgentResponse, anyhow::Error> {
@@ -420,15 +454,17 @@ impl AIClient for GrpcBridgeAIClient {
     async fn create_agent(
         &self,
         request: CreateAgentRequest,
+        team_scope: RequestTeamScope,
     ) -> anyhow::Result<AgentResponse, anyhow::Error> {
-        self.inner.create_agent(request).await
+        self.inner.create_agent(request, team_scope).await
     }
 
     async fn create_agent_raw(
         &self,
         request: CreateAgentRequest,
+        team_scope: RequestTeamScope,
     ) -> anyhow::Result<serde_json::Value, anyhow::Error> {
-        self.inner.create_agent_raw(request).await
+        self.inner.create_agent_raw(request, team_scope).await
     }
 
     async fn update_agent(
@@ -454,8 +490,9 @@ impl AIClient for GrpcBridgeAIClient {
     async fn list_skills(
         &self,
         repo: Option<String>,
+        team_scope: RequestTeamScope,
     ) -> anyhow::Result<Vec<AgentSkillItem>, anyhow::Error> {
-        self.inner.list_skills(repo).await
+        self.inner.list_skills(repo, team_scope).await
     }
 
     async fn get_conversation_usage_history(
@@ -490,9 +527,16 @@ impl AIClient for GrpcBridgeAIClient {
         &self,
         task_id: String,
         workload_token: String,
-    ) -> anyhow::Result<Vec<GitCredential>, anyhow::Error> {
+        accepts_partial_refresh: bool,
+        use_factory_repositories: bool,
+    ) -> Result<TaskGitCredentialsResponse, TaskGitCredentialsError> {
         self.inner
-            .get_task_git_credentials(task_id, workload_token)
+            .get_task_git_credentials(
+                task_id,
+                workload_token,
+                accepts_partial_refresh,
+                use_factory_repositories,
+            )
             .await
     }
 
@@ -687,5 +731,163 @@ impl AIClient for GrpcBridgeAIClient {
         request: GenerateCodeReviewContentRequest,
     ) -> Result<GenerateCodeReviewContentResponse, anyhow::Error> {
         self.inner.generate_code_review_content(request).await
+    }
+
+    async fn get_ai_credit_availability(&self) -> Result<AICreditAvailability, anyhow::Error> {
+        self.inner.get_ai_credit_availability().await
+    }
+
+    async fn get_chatgpt_connection(&self) -> Result<ChatGPTConnectionStatus, anyhow::Error> {
+        self.inner.get_chatgpt_connection().await
+    }
+
+    async fn disconnect_chatgpt(&self) -> Result<(), anyhow::Error> {
+        self.inner.disconnect_chatgpt().await
+    }
+
+    async fn start_chatgpt_link(&self, continue_url: String) -> Result<String, anyhow::Error> {
+        self.inner.start_chatgpt_link(continue_url).await
+    }
+
+    async fn download_run_transcript(
+        &self,
+        run_id: &AmbientAgentTaskId,
+    ) -> anyhow::Result<Bytes, anyhow::Error> {
+        self.inner.download_run_transcript(run_id).await
+    }
+
+    async fn download_run_transcript_to_path(
+        &self,
+        run_id: &AmbientAgentTaskId,
+        destination: &Path,
+    ) -> anyhow::Result<(), anyhow::Error> {
+        self.inner
+            .download_run_transcript_to_path(run_id, destination)
+            .await
+    }
+
+    async fn download_conversation_transcript(
+        &self,
+        conversation_id: &str,
+    ) -> anyhow::Result<Bytes, anyhow::Error> {
+        self.inner
+            .download_conversation_transcript(conversation_id)
+            .await
+    }
+
+    async fn download_conversation_transcript_to_path(
+        &self,
+        conversation_id: &str,
+        destination: &Path,
+    ) -> anyhow::Result<(), anyhow::Error> {
+        self.inner
+            .download_conversation_transcript_to_path(conversation_id, destination)
+            .await
+    }
+
+    async fn list_memory_stores(
+        &self,
+        team_scope: RequestTeamScope,
+    ) -> anyhow::Result<Vec<MemoryStoreItem>, anyhow::Error> {
+        self.inner.list_memory_stores(team_scope).await
+    }
+
+    async fn list_memory_store_memories(
+        &self,
+        store_uid: &str,
+    ) -> anyhow::Result<Vec<MemoryItem>, anyhow::Error> {
+        self.inner.list_memory_store_memories(store_uid).await
+    }
+
+    async fn create_memory_store_memory(
+        &self,
+        store_uid: &str,
+        request: CreateMemoryRequest,
+    ) -> anyhow::Result<CreateMemoryResponse, anyhow::Error> {
+        self.inner
+            .create_memory_store_memory(store_uid, request)
+            .await
+    }
+
+    async fn update_memory_store_memory(
+        &self,
+        store_uid: &str,
+        memory_uid: &str,
+        request: UpdateMemoryRequest,
+    ) -> anyhow::Result<UpdateMemoryResponse, anyhow::Error> {
+        self.inner
+            .update_memory_store_memory(store_uid, memory_uid, request)
+            .await
+    }
+
+    async fn delete_memory_store_memory(
+        &self,
+        store_uid: &str,
+        memory_uid: &str,
+    ) -> anyhow::Result<(), anyhow::Error> {
+        self.inner
+            .delete_memory_store_memory(store_uid, memory_uid)
+            .await
+    }
+
+    async fn get_memory_store(
+        &self,
+        store_uid: &str,
+    ) -> anyhow::Result<MemoryStoreItem, anyhow::Error> {
+        self.inner.get_memory_store(store_uid).await
+    }
+
+    async fn update_memory_store(
+        &self,
+        store_uid: &str,
+        request: UpdateMemoryStoreRequest,
+    ) -> anyhow::Result<MemoryStoreItem, anyhow::Error> {
+        self.inner.update_memory_store(store_uid, request).await
+    }
+
+    async fn list_memory_store_agents(
+        &self,
+        store_uid: &str,
+    ) -> anyhow::Result<Vec<AgentAttachmentItem>, anyhow::Error> {
+        self.inner.list_memory_store_agents(store_uid).await
+    }
+
+    async fn list_memory_versions(
+        &self,
+        store_uid: &str,
+        memory_uid: &str,
+    ) -> anyhow::Result<Vec<MemoryVersionItem>, anyhow::Error> {
+        self.inner.list_memory_versions(store_uid, memory_uid).await
+    }
+
+    async fn setup_failure_debug_authorization(
+        &self,
+        task_id: AmbientAgentTaskId,
+        workload_token: String,
+        participant_firebase_uid: String,
+    ) -> anyhow::Result<bool, anyhow::Error> {
+        self.inner
+            .setup_failure_debug_authorization(task_id, workload_token, participant_firebase_uid)
+            .await
+    }
+
+    async fn download_stored_screenshot(
+        &self,
+        conversation_id: &str,
+        screenshot_uid: &str,
+    ) -> anyhow::Result<Bytes, anyhow::Error> {
+        self.inner
+            .download_stored_screenshot(conversation_id, screenshot_uid)
+            .await
+    }
+
+    async fn post_agent_run_environment_snapshot(
+        &self,
+        run_id: &AmbientAgentTaskId,
+        request: AgentRunEnvironmentSnapshotRequest,
+    ) -> anyhow::Result<(), anyhow::Error> {
+        self.inner
+            .post_agent_run_environment_snapshot(run_id, request)
+            .await
     }
 }

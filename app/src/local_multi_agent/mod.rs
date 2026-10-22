@@ -1,14 +1,12 @@
 #![cfg(not(target_family = "wasm"))]
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    net::TcpListener,
-    path::{Path, PathBuf},
-    sync::LazyLock,
-    time::Duration,
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::TcpListener;
+use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::time::Duration;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use async_process::{Child, Stdio};
 use command::r#async::Command;
 use futures::stream::AbortHandle;
@@ -16,13 +14,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 use warp_core::user_preferences::GetUserPreferences;
-use warpui::{r#async::Timer, AppContext, Entity, ModelContext, SingletonEntity};
+use warpui::r#async::Timer;
+use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
-use crate::{
-    ai::llms::LLMPreferences,
-    server::server_api::{no_cloud_mode_enabled, LOCAL_NO_CLOUD_SERVER_ROOT_URL},
-    ChannelState,
-};
+use crate::ChannelState;
+use crate::ai::llms::LLMPreferences;
 
 const PREF_KEY: &str = "LocalMultiAgentConfig";
 const BUNDLED_SERVICE_DIR: &str = "bundled/local-multi-agent";
@@ -426,14 +422,14 @@ pub struct LocalMultiAgentManager {
 impl LocalMultiAgentManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
         let config = load_config_with_legacy_migration(ctx);
-        let status = if no_cloud_mode_enabled() {
+        let status = if ChannelState::is_local_only() {
             LocalMultiAgentStatus::Starting
         } else {
             LocalMultiAgentStatus::Disabled
         };
         if let Ok(root_url) = config.root_url() {
             set_global_root_url(Some(root_url.clone()));
-            if no_cloud_mode_enabled() {
+            if ChannelState::is_local_only() {
                 let _ = ChannelState::override_server_root_url(root_url.to_string());
             }
         }
@@ -447,7 +443,7 @@ impl LocalMultiAgentManager {
             restart_debounce: None,
             openai_api_key: None,
         };
-        if no_cloud_mode_enabled() {
+        if ChannelState::is_local_only() {
             manager.schedule_restart(ctx);
         }
         manager
@@ -504,7 +500,7 @@ impl LocalMultiAgentManager {
         self.test_status = LocalMultiAgentTestStatus::NotRun;
         if let Ok(root_url) = self.config.root_url() {
             set_global_root_url(Some(root_url.clone()));
-            if no_cloud_mode_enabled() {
+            if ChannelState::is_local_only() {
                 let _ = ChannelState::override_server_root_url(root_url.to_string());
             }
         }
@@ -759,7 +755,7 @@ impl LocalMultiAgentManager {
     }
 
     fn schedule_restart(&mut self, ctx: &mut ModelContext<Self>) {
-        if !no_cloud_mode_enabled() {
+        if !ChannelState::is_local_only() {
             self.stop_child();
             self.status = LocalMultiAgentStatus::Disabled;
             set_global_root_url(None);
@@ -1276,7 +1272,7 @@ fn validate_context_tokens(value: &str) -> Result<(), LocalMultiAgentConfigError
 
 pub fn local_no_cloud_root_url() -> Option<Url> {
     LocalMultiAgentManager::global_root_url()
-        .or_else(|| Url::parse(LOCAL_NO_CLOUD_SERVER_ROOT_URL).ok())
+        .or_else(|| LocalMultiAgentConfig::default().root_url().ok())
 }
 
 #[cfg(test)]
@@ -1332,12 +1328,14 @@ mod tests {
             env.get("LOCAL_MAX_COMPLETION_TOKENS").map(String::as_str),
             Some("2048")
         );
-        assert!(env
-            .get("LOCAL_GRAPHQL_DB_PATH")
-            .is_some_and(|v| v.ends_with(".sqlite")));
-        assert!(env
-            .get("LOCAL_SERVICE_LOG_PATH")
-            .is_some_and(|v| v.ends_with(".log")));
+        assert!(
+            env.get("LOCAL_GRAPHQL_DB_PATH")
+                .is_some_and(|v| v.ends_with(".sqlite"))
+        );
+        assert!(
+            env.get("LOCAL_SERVICE_LOG_PATH")
+                .is_some_and(|v| v.ends_with(".log"))
+        );
     }
 
     #[test]

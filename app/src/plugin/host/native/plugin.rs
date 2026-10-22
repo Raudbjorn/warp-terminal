@@ -11,16 +11,6 @@ use crate::plugin::service::{
     RegisterEventHandlerService, RegisterToolRequest, RegisterToolService,
 };
 
-cfg_if::cfg_if! {
-    if #[cfg(feature = "completions_v2")] {
-        use warp_completer::signatures::CommandSignature;
-
-        use crate::plugin::service::{
-            RegisterCommandSignatureRequest, RegisterCommandSignatureService,
-        };
-    }
-}
-
 /// A handle on a single JS plugin.
 ///
 /// We use a `Rc<RefCell<_>>` to make it possible for the plugin "API" (JS functions implemented in
@@ -51,9 +41,6 @@ pub(super) struct AppServiceCallers {
     register_command_caller: Box<dyn ipc::ServiceCaller<RegisterCommandService>>,
     register_event_handler_caller: Box<dyn ipc::ServiceCaller<RegisterEventHandlerService>>,
     register_tool_caller: Box<dyn ipc::ServiceCaller<RegisterToolService>>,
-    #[cfg(feature = "completions_v2")]
-    register_command_signatures_caller:
-        Box<dyn ipc::ServiceCaller<RegisterCommandSignatureService>>,
 }
 
 impl AppServiceCallers {
@@ -66,10 +53,6 @@ impl AppServiceCallers {
                 app_client.clone(),
             ),
             register_tool_caller: ipc::service_caller::<RegisterToolService>(app_client.clone()),
-            #[cfg(feature = "completions_v2")]
-            register_command_signatures_caller: ipc::service_caller::<
-                RegisterCommandSignatureService,
-            >(app_client),
         }
     }
 }
@@ -103,18 +86,6 @@ impl Plugin {
                 .map(|serialized_value| PluginResponse::CallJsFunctionResult {
                     output: serialized_value,
                 }),
-        }
-    }
-
-    /// Registers the given command signatures.
-    #[cfg(feature = "completions_v2")]
-    pub(super) fn register_command_signatures(&mut self, signatures: Vec<CommandSignature>) {
-        if let Err(e) = warpui::r#async::block_on(
-            self.app_services
-                .register_command_signatures_caller
-                .call(RegisterCommandSignatureRequest { signatures }),
-        ) {
-            log::warn!("Failed to register command signature: {e:?}");
         }
     }
 

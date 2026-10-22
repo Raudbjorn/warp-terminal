@@ -18,6 +18,7 @@
 //! deregistered) is the parent's responsibility.
 use settings::Setting;
 use warp_core::ui::theme::color::internal_colors;
+use warp_errors::report_error;
 use warpui::elements::{
     Border, ChildView, Container, CornerRadius, CrossAxisAlignment, Flex, Hoverable,
     MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
@@ -30,7 +31,7 @@ use warpui::{
 };
 
 use crate::ai::blocklist::block::keyboard_navigable_buttons::{
-    rich_navigation_button, KeyboardNavigableButtons,
+    KeyboardNavigableButtons, rich_navigation_button,
 };
 use crate::ai::blocklist::inline_action::inline_action_header::{
     HeaderConfig, INLINE_ACTION_HORIZONTAL_PADDING,
@@ -39,7 +40,7 @@ use crate::server::telemetry::TelemetryEvent;
 use crate::terminal::model::session::SessionId;
 use crate::terminal::warpify::settings::{SshExtensionInstallMode, WarpifySettings};
 use crate::ui_components::blended_colors;
-use crate::{send_telemetry_from_ctx, Appearance};
+use crate::{Appearance, send_telemetry_from_ctx};
 
 const PROMPT_BORDER_RADIUS: f32 = 8.;
 
@@ -69,6 +70,7 @@ pub enum SshRemoteServerChoiceViewMode {
 /// Choice block prompting the user to install the remote-server binary on the remote host or skip.
 pub struct SshRemoteServerChoiceView {
     session_id: SessionId,
+    mode: SshRemoteServerChoiceViewMode,
     buttons: ViewHandle<KeyboardNavigableButtons>,
     do_not_ask_again_mouse_state: MouseStateHandle,
     do_not_ask_again_label_mouse_state: MouseStateHandle,
@@ -125,23 +127,15 @@ impl SshRemoteServerChoiceView {
         let buttons = ctx.add_typed_action_view(|_| {
             KeyboardNavigableButtons::new(vec![
                 rich_navigation_button(
-                    "Install Warp's SSH extension".to_string(),
-                    Some(
-                        "Install Warp's extension to enable agent features like file browsing, \
-                         code review, and intelligent command completions in this session."
-                            .to_string(),
-                    ),
+                    install_title.to_string(),
+                    Some(install_description.to_string()),
                     /* recommended */ true,
                     MouseStateHandle::default(),
                     SshRemoteServerChoiceViewAction::Install,
                 ),
                 rich_navigation_button(
-                    "Continue without installing".to_string(),
-                    Some(
-                        "You'll still get a Warpified experience just without the coding \
-                         features."
-                            .to_string(),
-                    ),
+                    skip_title.to_string(),
+                    Some(skip_description.to_string()),
                     /* recommended */ false,
                     MouseStateHandle::default(),
                     SshRemoteServerChoiceViewAction::Skip,
@@ -151,6 +145,7 @@ impl SshRemoteServerChoiceView {
 
         Self {
             session_id,
+            mode,
             buttons,
             do_not_ask_again_mouse_state: MouseStateHandle::default(),
             do_not_ask_again_label_mouse_state: MouseStateHandle::default(),
@@ -331,7 +326,9 @@ impl TypedActionView for SshRemoteServerChoiceView {
                     let mode = SshExtensionInstallMode::AlwaysInstall;
                     WarpifySettings::handle(ctx).update(ctx, |settings, ctx| {
                         if let Err(e) = settings.ssh_extension_install_mode.set_value(mode, ctx) {
-                            log::error!("Failed to persist ssh_extension_install_mode: {e}");
+                            report_error!(
+                                e.context("Failed to persist ssh_extension_install_mode")
+                            );
                         }
                     });
                     send_telemetry_from_ctx!(
@@ -348,7 +345,9 @@ impl TypedActionView for SshRemoteServerChoiceView {
                     let mode = SshExtensionInstallMode::NeverInstall;
                     WarpifySettings::handle(ctx).update(ctx, |settings, ctx| {
                         if let Err(e) = settings.ssh_extension_install_mode.set_value(mode, ctx) {
-                            log::error!("Failed to persist ssh_extension_install_mode: {e}");
+                            report_error!(
+                                e.context("Failed to persist ssh_extension_install_mode")
+                            );
                         }
                     });
                     send_telemetry_from_ctx!(

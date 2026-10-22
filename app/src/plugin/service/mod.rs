@@ -1,9 +1,3 @@
-cfg_if::cfg_if! {
-    if #[cfg(feature = "completions_v2")] {
-        mod completions;
-        pub use completions::*;
-    }
-}
 mod app_requests;
 mod call_js_function;
 mod commands;

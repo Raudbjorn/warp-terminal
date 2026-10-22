@@ -2,10 +2,6 @@ mod service_impl;
 
 use std::sync::Arc;
 
-use crate::context_chips::plugin_prompt::PromptSegment;
-use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
-use crate::view_components::{DismissibleToast, ToastFlavor};
-use crate::workspace::{ToastStack, WorkspaceAction};
 use anyhow::{Context, Result};
 use command::blocking::Command;
 use service_impl::{
@@ -16,6 +12,10 @@ use warpui::keymap::EditableBinding;
 use warpui::{Entity, ModelContext, SingletonEntity};
 
 use super::{PLUGIN_HOST_ADDRESS_ENV_VAR, PLUGIN_HOST_FLAG};
+use crate::context_chips::plugin_prompt::PromptSegment;
+use crate::plugin::app_requests::{PalettePluginItem, PluginAppRequest, ToastKind};
+use crate::view_components::{DismissibleToast, ToastFlavor};
+use crate::workspace::{ToastStack, WorkspaceAction};
 
 /// Singleton model responsible for spawning the plugin host child process and initializing IPC
 /// server and clients for communication between the app and plugin host processes.
@@ -89,12 +89,6 @@ impl PluginHost {
             .with_service(RegisterToolServiceImpl::new())
             .with_service(PluginAppRequestServiceImpl::new());
 
-        #[cfg(feature = "completions_v2")]
-        let server_builder =
-            server_builder.with_service(service_impl::RegisterCommandSignatureServiceImpl::new(
-                warp_completer::signatures::CommandRegistry::global_instance(),
-            ));
-
         let (server, plugin_host_process) =
             match server_builder.build_and_run(ctx.background_executor()) {
                 Ok((server, connection_address)) => {
@@ -130,7 +124,7 @@ impl PluginHost {
     ///
     /// `S` is assumed to be served by the plugin host process; the returned service caller directs
     /// requests over the IPC connection to the plugin host process.
-    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn plugin_service_caller<S: ipc::Service>(&self) -> Option<Box<dyn ipc::ServiceCaller<S>>> {
         self.host_client.clone().map(ipc::service_caller::<S>)
     }

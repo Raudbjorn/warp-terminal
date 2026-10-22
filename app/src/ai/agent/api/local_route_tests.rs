@@ -8,10 +8,12 @@ fn custom_providers() -> api::request::settings::CustomModelProviders {
             api::request::settings::custom_model_providers::CustomModelProvider {
                 base_url: "https://llm.example.com/v1".to_string(),
                 api_key: "sk-test".to_string(),
+                schema: api::request::settings::custom_model_providers::CustomEndpointSchema::OpenaiChatCompletions as i32,
                 models: vec![
                     api::request::settings::custom_model_providers::CustomModel {
                         slug: "llama-3.3-70b".to_string(),
                         config_key: "cfg-123".to_string(),
+                        reasoning_effort: String::new(),
                     },
                 ],
             },
@@ -213,4 +215,23 @@ fn route_request_blocks_unsupported_input_from_server() {
         route_request(&request),
         RequestDisposition::BlockedFromServer(_)
     ));
+}
+
+#[test]
+fn unsupported_endpoint_schemas_stay_blocked_from_server() {
+    use api::request::settings::custom_model_providers::CustomEndpointSchema;
+
+    for schema in [
+        CustomEndpointSchema::OpenaiResponses as i32,
+        CustomEndpointSchema::AnthropicMessages as i32,
+        i32::MAX,
+    ] {
+        let mut providers = custom_providers();
+        providers.providers[0].schema = schema;
+        let request = request_for_model("cfg-123", Some(providers), user_query_input());
+        assert!(matches!(
+            route_request(&request),
+            RequestDisposition::BlockedFromServer(_)
+        ));
+    }
 }

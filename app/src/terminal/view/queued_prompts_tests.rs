@@ -12,10 +12,10 @@ use warp_cli::agent::Harness;
 use warpui::platform::WindowStyle;
 use warpui::{App, SingletonEntity, TypedActionView, ViewContext, ViewHandle};
 
+use super::TerminalView;
 use super::queued_prompts_panel::{
     QueuedPromptsPanelAction, QueuedPromptsPanelEvent, QueuedPromptsPanelView,
 };
-use super::TerminalView;
 use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::agent::{ImageContext, UserQueryMode};
 use crate::ai::ambient_agents::AmbientAgentTaskId;
@@ -27,12 +27,19 @@ use crate::ai::blocklist::{
     QueuedQueryOrigin, ResponseStreamId,
 };
 use crate::features::FeatureFlag;
+use crate::search::slash_command_menu::static_commands::commands;
 use crate::server::server_api::ai::SpawnAgentRequest;
+use crate::server::team_scope::RequestTeamScope;
 use crate::terminal::input::{Event as InputEvent, Input};
 use crate::terminal::shared_session::SharedSessionStatus;
 use crate::terminal::view::ambient_agent::AmbientAgentViewModelEvent;
 use crate::test_util::settings::initialize_settings_for_tests;
 use crate::test_util::terminal::{add_window_with_terminal, initialize_app_for_terminal_view};
+use crate::workspaces::user_workspaces::TeamlessScopeForTest;
+
+fn request_team_scope() -> RequestTeamScope {
+    RequestTeamScope::from_scope(&TeamlessScopeForTest)
+}
 
 fn user_query(text: &str) -> QueuedQuery {
     QueuedQuery::new(text.to_owned(), QueuedQueryOrigin::QueueSlashCommand)
@@ -92,11 +99,12 @@ fn add_window_with_cloud_mode_terminal(app: &mut App) -> ViewHandle<TerminalView
 
 fn cloud_spawn_request(prompt: &str) -> SpawnAgentRequest {
     SpawnAgentRequest {
+        metadata: Default::default(),
         prompt: Some(prompt.to_owned()),
         mode: UserQueryMode::Normal,
         config: None,
         title: None,
-        team: None,
+        team: Some(false),
         agent_identity_uid: None,
         skill: None,
         attachments: vec![],
@@ -115,11 +123,12 @@ fn cloud_spawn_request(prompt: &str) -> SpawnAgentRequest {
 /// local-to-cloud handoff where the agent skips its initial turn.
 fn promptless_cloud_spawn_request() -> SpawnAgentRequest {
     SpawnAgentRequest {
+        metadata: Default::default(),
         prompt: None,
         mode: UserQueryMode::Normal,
         config: None,
         title: None,
-        team: None,
+        team: Some(false),
         agent_identity_uid: None,
         skill: None,
         attachments: vec![],
@@ -218,7 +227,11 @@ fn dispatched_cloud_prompt_uses_locked_queue_row_when_v2_is_enabled() {
             view.ambient_agent_view_model()
                 .expect("cloud terminal should have an ambient model")
                 .update(ctx, |model, ctx| {
-                    model.spawn_agent_with_request(cloud_spawn_request("write tests"), ctx);
+                    model.spawn_agent_with_request(
+                        cloud_spawn_request("write tests"),
+                        request_team_scope(),
+                        ctx,
+                    );
                 });
             view.handle_ambient_agent_event(&AmbientAgentViewModelEvent::DispatchedAgent, ctx);
 
@@ -362,9 +375,11 @@ fn failed_event_removes_locked_queue_row_without_cloud_mode_setup_v2() {
                 },
                 ctx,
             );
-            assert!(QueuedQueryModel::as_ref(ctx)
-                .queue(conversation_id)
-                .is_empty());
+            assert!(
+                QueuedQueryModel::as_ref(ctx)
+                    .queue(conversation_id)
+                    .is_empty()
+            );
         });
     });
 }
@@ -384,7 +399,11 @@ fn cloud_setup_enter_queues_followup_input_when_v2_is_enabled() {
             view.ambient_agent_view_model()
                 .expect("cloud terminal should have an ambient model")
                 .update(ctx, |model, ctx| {
-                    model.spawn_agent_with_request(cloud_spawn_request("initial"), ctx);
+                    model.spawn_agent_with_request(
+                        cloud_spawn_request("initial"),
+                        request_team_scope(),
+                        ctx,
+                    );
                 });
 
             view.input.update(ctx, |input, ctx| {
@@ -420,7 +439,11 @@ fn cloud_setup_enter_does_not_queue_followup_for_third_party_harness() {
             view.ambient_agent_view_model()
                 .expect("cloud terminal should have an ambient model")
                 .update(ctx, |model, ctx| {
-                    model.spawn_agent_with_request(cloud_spawn_request("initial"), ctx);
+                    model.spawn_agent_with_request(
+                        cloud_spawn_request("initial"),
+                        request_team_scope(),
+                        ctx,
+                    );
                     model.set_harness(Harness::Claude, ctx);
                 });
 
@@ -429,9 +452,11 @@ fn cloud_setup_enter_does_not_queue_followup_for_third_party_harness() {
                 input.input_enter(ctx);
             });
 
-            assert!(QueuedQueryModel::as_ref(ctx)
-                .queue(conversation_id)
-                .is_empty());
+            assert!(
+                QueuedQueryModel::as_ref(ctx)
+                    .queue(conversation_id)
+                    .is_empty()
+            );
             assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), "do not queue this");
         });
     });
@@ -495,7 +520,11 @@ fn cloud_setup_enter_remains_blocked_when_v2_is_disabled() {
             view.ambient_agent_view_model()
                 .expect("cloud terminal should have an ambient model")
                 .update(ctx, |model, ctx| {
-                    model.spawn_agent_with_request(cloud_spawn_request("initial"), ctx);
+                    model.spawn_agent_with_request(
+                        cloud_spawn_request("initial"),
+                        request_team_scope(),
+                        ctx,
+                    );
                 });
 
             view.input.update(ctx, |input, ctx| {
@@ -503,9 +532,11 @@ fn cloud_setup_enter_remains_blocked_when_v2_is_disabled() {
                 input.input_enter(ctx);
             });
 
-            assert!(QueuedQueryModel::as_ref(ctx)
-                .queue(conversation_id)
-                .is_empty());
+            assert!(
+                QueuedQueryModel::as_ref(ctx)
+                    .queue(conversation_id)
+                    .is_empty()
+            );
             assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), "blocked prompt");
         });
     });
@@ -567,7 +598,7 @@ fn terminal_cloud_status_transition_drains_once_through_cloud_followup_input_eve
                 history_model.clone(),
                 &BlocklistAIHistoryEvent::UpdatedConversationStatus {
                     conversation_id,
-                    terminal_view_id,
+                    terminal_surface_id: terminal_view_id,
                     update: ConversationStatusUpdate::Changed {
                         prev_status: ConversationStatus::InProgress,
                     },
@@ -579,7 +610,7 @@ fn terminal_cloud_status_transition_drains_once_through_cloud_followup_input_eve
                 history_model,
                 &BlocklistAIHistoryEvent::UpdatedConversationStatus {
                     conversation_id,
-                    terminal_view_id,
+                    terminal_surface_id: terminal_view_id,
                     update: ConversationStatusUpdate::Changed {
                         prev_status: ConversationStatus::Success,
                     },
@@ -615,7 +646,11 @@ fn promptless_setup_complete_auto_sends_queued_prompt_to_viewer() {
             view.ambient_agent_view_model()
                 .expect("cloud terminal should have an ambient model")
                 .update(ctx, |model, ctx| {
-                    model.spawn_agent_with_request(promptless_cloud_spawn_request(), ctx);
+                    model.spawn_agent_with_request(
+                        promptless_cloud_spawn_request(),
+                        request_team_scope(),
+                        ctx,
+                    );
                 });
             QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
                 model.append(
@@ -649,9 +684,11 @@ fn promptless_setup_complete_auto_sends_queued_prompt_to_viewer() {
 
         assert_eq!(sent_prompts.borrow().as_slice(), ["queued during setup"]);
         terminal.read(&app, |_, ctx| {
-            assert!(QueuedQueryModel::as_ref(ctx)
-                .queue(conversation_id)
-                .is_empty());
+            assert!(
+                QueuedQueryModel::as_ref(ctx)
+                    .queue(conversation_id)
+                    .is_empty()
+            );
         });
     });
 }
@@ -674,7 +711,11 @@ fn promptless_setup_complete_with_initial_prompt_does_not_drain_queue() {
             view.ambient_agent_view_model()
                 .expect("cloud terminal should have an ambient model")
                 .update(ctx, |model, ctx| {
-                    model.spawn_agent_with_request(cloud_spawn_request("initial prompt"), ctx);
+                    model.spawn_agent_with_request(
+                        cloud_spawn_request("initial prompt"),
+                        request_team_scope(),
+                        ctx,
+                    );
                 });
             QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
                 model.append(
@@ -912,6 +953,204 @@ fn complete_drain_with_non_empty_input_preserves_edited_head_row() {
 }
 
 #[test]
+fn commit_edit_saves_current_editor_text_for_lrc_row() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let terminal_view_id = terminal.read(&app, |view, _| view.view_id);
+        let conversation_id =
+            BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+                let id = history.start_new_conversation(terminal_view_id, false, false, false, ctx);
+                history.set_active_conversation_id(id, terminal_view_id, ctx);
+                id
+            });
+        let query_id = QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new(
+                    "stale committed".to_owned(),
+                    QueuedQueryOrigin::LrcAutoQueue,
+                ),
+                ctx,
+            )
+        });
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.enter_edit_mode(conversation_id, query_id, ctx);
+        });
+
+        let queued_prompts_panel = terminal.read(&app, |view, ctx| {
+            view.input()
+                .as_ref(ctx)
+                .queued_prompts_panel()
+                .cloned()
+                .expect("queue panel should exist")
+        });
+        queued_prompts_panel.update(&mut app, |panel, ctx| {
+            panel.set_edit_buffer_text_for_test("edited before finish", ctx);
+            panel.commit_edit(ctx);
+        });
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].id(), query_id);
+            assert_eq!(queue[0].text(), "edited before finish");
+            assert_eq!(model.editing_row(conversation_id), None);
+        });
+    });
+}
+
+#[test]
+fn lrc_finish_commits_edited_lrc_row_before_sending() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let terminal_view_id = terminal.read(&app, |view, _| view.view_id);
+        let conversation_id =
+            BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+                let id = history.start_new_conversation(terminal_view_id, false, false, false, ctx);
+                history.set_active_conversation_id(id, terminal_view_id, ctx);
+                id
+            });
+        let query_id = QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new(
+                    "stale committed".to_owned(),
+                    QueuedQueryOrigin::LrcAutoQueue,
+                ),
+                ctx,
+            )
+        });
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.enter_edit_mode(conversation_id, query_id, ctx);
+        });
+
+        let queued_prompts_panel = terminal.read(&app, |view, ctx| {
+            view.input()
+                .as_ref(ctx)
+                .queued_prompts_panel()
+                .cloned()
+                .expect("queue panel should exist")
+        });
+        queued_prompts_panel.update(&mut app, |panel, ctx| {
+            panel.set_edit_buffer_text_for_test("edited before finish", ctx);
+        });
+
+        let edit_commit_count = Rc::new(RefCell::new(0));
+        let edit_commit_count_for_subscription = edit_commit_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_model(
+                &QueuedQueryModel::handle(ctx),
+                move |_, event: &crate::ai::blocklist::QueuedQueryEvent, _| {
+                    if matches!(
+                        event,
+                        crate::ai::blocklist::QueuedQueryEvent::EditCommitted { .. }
+                    ) {
+                        *edit_commit_count_for_subscription.borrow_mut() += 1;
+                    }
+                },
+            );
+        });
+
+        let ai_query_count = Rc::new(RefCell::new(0));
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let ai_query_count_for_subscription = ai_query_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::ExecuteAIQuery) {
+                    *ai_query_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.send_lrc_queued_prompts(conversation_id, ctx);
+        });
+
+        assert_eq!(*edit_commit_count.borrow(), 1);
+        assert_eq!(*ai_query_count.borrow(), 1);
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+        });
+    });
+}
+
+#[test]
+fn lrc_finish_queued_compact_and_sends_followup_after_summary() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let _agent_view = FeatureFlag::AgentView.override_enabled(true);
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        let _queued_prompts_v2 = FeatureFlag::QueuedPromptsV2.override_enabled(true);
+        let _summarization = FeatureFlag::SummarizationConversationCommand.override_enabled(true);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let terminal_view_id = terminal.read(&app, |view, _| view.view_id);
+        let conversation_id =
+            BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+                let id = history.start_new_conversation(terminal_view_id, false, false, false, ctx);
+                history.set_active_conversation_id(id, terminal_view_id, ctx);
+                id
+            });
+        terminal.read(&app, |view, ctx| {
+            assert_eq!(
+                view.ai_context_model
+                    .as_ref(ctx)
+                    .selected_conversation_id(ctx),
+                None
+            );
+        });
+
+        QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new_with_attachments(
+                    format!("{} follow up", commands::COMPACT_AND.name),
+                    QueuedQueryOrigin::LrcAutoQueue,
+                    vec![image_attachment("queued-context.png")],
+                ),
+                ctx,
+            );
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.send_lrc_queued_prompts(conversation_id, ctx);
+        });
+
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            let queue = model.queue(conversation_id);
+            assert_eq!(queue.len(), 1);
+            assert_eq!(queue[0].text(), "follow up");
+            assert_eq!(queue[0].origin(), QueuedQueryOrigin::CompactAndSlashCommand);
+            assert_eq!(queue[0].attachments().len(), 1);
+        });
+
+        let ai_query_count = Rc::new(RefCell::new(0));
+        let input = terminal.read(&app, |view, _| view.input().clone());
+        let ai_query_count_for_subscription = ai_query_count.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&input, move |_, event: &InputEvent, _| {
+                if matches!(event, InputEvent::ExecuteAIQuery) {
+                    *ai_query_count_for_subscription.borrow_mut() += 1;
+                }
+            });
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            view.drain_queued_prompts(conversation_id, FinishReason::Complete, ctx);
+        });
+
+        assert_eq!(*ai_query_count.borrow(), 1);
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert!(model.queue(conversation_id).is_empty());
+        });
+    });
+}
+#[test]
 fn complete_drain_with_empty_queue_returns_none() {
     with_singleton(|mut app, model, conv| {
         let action = drain_one(&model, &mut app, conv);
@@ -1089,9 +1328,11 @@ fn enqueue_followup_prompt_falls_back_to_pending_block_when_v2_is_disabled() {
                 ctx,
             );
 
-            assert!(QueuedQueryModel::as_ref(ctx)
-                .queue(conversation_id)
-                .is_empty());
+            assert!(
+                QueuedQueryModel::as_ref(ctx)
+                    .queue(conversation_id)
+                    .is_empty()
+            );
             assert!(view.queued_prompt_callback.is_some());
             assert!(view.pending_user_query_view_id.is_some());
         });
@@ -1275,6 +1516,40 @@ fn send_now_disabled_for_all_rows_while_initial_cloud_mode_row_is_present() {
     });
 }
 
+#[test]
+fn copying_locked_initial_cloud_mode_prompt_copies_full_prompt_to_clipboard() {
+    // The locked initial cloud-mode prompt can't be edited or deleted, so its row offers a Copy
+    // action instead. Firing it (the same action the Copy button dispatches) puts the full,
+    // untruncated prompt — long, multiline content included — on the clipboard and leaves the row
+    // in the queue.
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+
+        let (panel, conversation_id, _) = build_panel_with_active_conversation(&mut app);
+
+        let long_prompt = format!("line one\nline two\n{}", "x".repeat(1000));
+        let long_prompt_for_assert = long_prompt.clone();
+        let initial_id = QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(
+                conversation_id,
+                QueuedQuery::new(long_prompt, QueuedQueryOrigin::InitialCloudMode),
+                ctx,
+            )
+        });
+
+        panel.update(&mut app, |panel, ctx| {
+            panel.handle_action(&QueuedPromptsPanelAction::CopyRow(initial_id), ctx);
+        });
+
+        app.update(|ctx| {
+            assert_eq!(ctx.clipboard().read().plain_text, long_prompt_for_assert);
+        });
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert_eq!(model.queue(conversation_id).len(), 1);
+        });
+    });
+}
+
 /// Builds a panel keyed to a fresh terminal view with an active conversation, mirroring the
 /// construction the host `Input` performs. Returns the panel, the conversation id, and the
 /// host input.
@@ -1321,6 +1596,51 @@ fn build_panel_with_active_conversation(
         })
     });
     (panel, conversation_id, input)
+}
+
+#[test]
+fn redetermine_terminal_focus_preserves_focused_queued_prompt_editor() {
+    App::test((), |mut app| async move {
+        let _queue_flag = FeatureFlag::QueueSlashCommand.override_enabled(true);
+        initialize_app_for_terminal_view(&mut app);
+
+        let terminal = add_window_with_terminal(&mut app, None);
+        let terminal_view_id = terminal.read(&app, |view, _| view.view_id);
+        let conversation_id =
+            BlocklistAIHistoryModel::handle(&app).update(&mut app, |history, ctx| {
+                let id = history.start_new_conversation(terminal_view_id, false, false, false, ctx);
+                history.set_active_conversation_id(id, terminal_view_id, ctx);
+                id
+            });
+        let input = terminal.read(&app, |view, _| view.input.clone());
+        let panel = input
+            .read(&app, |input, _| input.queued_prompts_panel().cloned())
+            .expect("queue flag should create a queued prompts panel");
+        let row_id = QueuedQueryModel::handle(&app).update(&mut app, |model, ctx| {
+            model.append(conversation_id, user_query("edit me"), ctx)
+        });
+
+        panel.update(&mut app, |panel, ctx| {
+            panel.handle_action(&QueuedPromptsPanelAction::StartEditingRow(row_id), ctx);
+        });
+        panel.read(&app, |panel, ctx| {
+            assert!(panel.is_inline_edit_editor_focused(ctx));
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            assert!(
+                !view.redetermine_terminal_focus(ctx),
+                "focused queued-prompt edits should hold focus during async focus reconciliation"
+            );
+        });
+
+        panel.read(&app, |panel, ctx| {
+            assert!(panel.is_inline_edit_editor_focused(ctx));
+        });
+        QueuedQueryModel::handle(&app).read(&app, |model, _| {
+            assert_eq!(model.editing_row(conversation_id), Some(row_id));
+        });
+    });
 }
 
 #[test]

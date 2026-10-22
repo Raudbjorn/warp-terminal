@@ -1,4 +1,4 @@
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use strum_macros::{EnumDiscriminants, EnumIter};
 use warp_core::telemetry::{EnablementState, TelemetryEvent, TelemetryEventDesc};
 
@@ -19,6 +19,8 @@ pub(super) enum CliTelemetryEvent {
     },
     /// Executing `warp agent run-ambient`
     AgentRunAmbient,
+    /// Executing `warp agent run-cloud-standby`
+    AgentRunCloudStandby,
     /// Executing `warp agent profile list`
     AgentProfileList,
     /// Executing `warp agent list`
@@ -45,10 +47,29 @@ pub(super) enum CliTelemetryEvent {
     EnvironmentGet,
     /// Executing `warp environment image list`
     EnvironmentImageList,
+    EnvironmentCheckout,
     /// Executing `warp mcp list`
     MCPList,
     /// Executing `warp model list`
     ModelList,
+    /// Executing `warp memory-store list`
+    MemoryStoreList,
+    /// Executing `warp memory list`
+    MemoryStoreListMemories,
+    /// Executing `warp memory create`
+    MemoryStoreCreateMemory,
+    /// Executing `warp memory update`
+    MemoryStoreUpdateMemory,
+    /// Executing `warp memory delete`
+    MemoryStoreDeleteMemory,
+    /// Executing `warp memory-store get`
+    MemoryStoreGetStore,
+    /// Executing `warp memory-store update`
+    MemoryStoreUpdateStore,
+    /// Executing `warp memory-store list-store-agents`
+    MemoryStoreListStoreAgents,
+    /// Executing `warp memory versions`
+    MemoryStoreListVersions,
     /// Executing `warp task list`
     TaskList,
     /// Executing `warp task get`
@@ -58,15 +79,25 @@ pub(super) enum CliTelemetryEvent {
     /// Executing `warp run get <id> --conversation`
     RunConversationGet,
     /// Executing `warp run message watch`
-    RunMessageWatch { harness: &'static str },
+    RunMessageWatch {
+        harness: &'static str,
+    },
     /// Executing `warp run message send`
-    RunMessageSend { harness: &'static str },
+    RunMessageSend {
+        harness: &'static str,
+    },
     /// Executing `warp run message list`
-    RunMessageList { harness: &'static str },
+    RunMessageList {
+        harness: &'static str,
+    },
     /// Executing `warp run message read`
-    RunMessageRead { harness: &'static str },
+    RunMessageRead {
+        harness: &'static str,
+    },
     /// Executing `warp run message mark-delivered`
-    RunMessageMarkDelivered { harness: &'static str },
+    RunMessageMarkDelivered {
+        harness: &'static str,
+    },
     /// Executing `warp login`
     Login,
     /// Executing `warp logout`
@@ -124,13 +155,25 @@ pub(super) enum CliTelemetryEvent {
     /// Executing `warp harness-support ping`
     HarnessSupportPing,
     /// Executing `warp harness-support report-artifact`
-    HarnessSupportReportArtifact { artifact_type: &'static str },
+    HarnessSupportReportArtifact {
+        artifact_type: &'static str,
+    },
     /// Executing `warp harness-support notify-user`
     HarnessSupportNotifyUser,
     /// Executing `warp harness-support finish-task`
-    HarnessSupportFinishTask { success: bool },
+    HarnessSupportFinishTask {
+        success: bool,
+    },
     /// Executing `warp harness-support report-shutdown`
     HarnessSupportReportShutdown,
+    /// Executing `warp runner list`
+    RunnerList,
+    /// Executing `warp runner create`
+    RunnerCreate,
+    /// Executing `warp runner update`
+    RunnerUpdate,
+    /// Executing `warp runner delete`
+    RunnerDelete,
 }
 
 impl TelemetryEvent for CliTelemetryEvent {
@@ -154,6 +197,7 @@ impl TelemetryEvent for CliTelemetryEvent {
                 "harness": harness,
             })),
             CliTelemetryEvent::AgentRunAmbient => None,
+            CliTelemetryEvent::AgentRunCloudStandby => None,
             CliTelemetryEvent::AgentProfileList => None,
             CliTelemetryEvent::AgentList => None,
             CliTelemetryEvent::AgentGet => None,
@@ -167,8 +211,18 @@ impl TelemetryEvent for CliTelemetryEvent {
             CliTelemetryEvent::EnvironmentUpdate => None,
             CliTelemetryEvent::EnvironmentGet => None,
             CliTelemetryEvent::EnvironmentImageList => None,
+            CliTelemetryEvent::EnvironmentCheckout => None,
             CliTelemetryEvent::MCPList => None,
             CliTelemetryEvent::ModelList => None,
+            CliTelemetryEvent::MemoryStoreList => None,
+            CliTelemetryEvent::MemoryStoreListMemories => None,
+            CliTelemetryEvent::MemoryStoreCreateMemory => None,
+            CliTelemetryEvent::MemoryStoreUpdateMemory => None,
+            CliTelemetryEvent::MemoryStoreDeleteMemory => None,
+            CliTelemetryEvent::MemoryStoreGetStore => None,
+            CliTelemetryEvent::MemoryStoreUpdateStore => None,
+            CliTelemetryEvent::MemoryStoreListStoreAgents => None,
+            CliTelemetryEvent::MemoryStoreListVersions => None,
             CliTelemetryEvent::TaskList => None,
             CliTelemetryEvent::TaskGet => None,
             CliTelemetryEvent::ConversationGet => None,
@@ -216,6 +270,10 @@ impl TelemetryEvent for CliTelemetryEvent {
                 Some(json!({ "success": success }))
             }
             CliTelemetryEvent::HarnessSupportReportShutdown => None,
+            CliTelemetryEvent::RunnerList => None,
+            CliTelemetryEvent::RunnerCreate => None,
+            CliTelemetryEvent::RunnerUpdate => None,
+            CliTelemetryEvent::RunnerDelete => None,
         }
     }
 
@@ -241,6 +299,9 @@ impl TelemetryEventDesc for CliTelemetryEventDiscriminants {
         match self {
             CliTelemetryEventDiscriminants::AgentRun => "CLI.Execute.Agent.Run",
             CliTelemetryEventDiscriminants::AgentRunAmbient => "CLI.Execute.Agent.RunAmbient",
+            CliTelemetryEventDiscriminants::AgentRunCloudStandby => {
+                "CLI.Execute.Agent.RunCloudStandby"
+            }
             CliTelemetryEventDiscriminants::AgentProfileList => "CLI.Execute.Agent.Profile.List",
             CliTelemetryEventDiscriminants::AgentList => "CLI.Execute.Agent.List",
             CliTelemetryEventDiscriminants::AgentGet => "CLI.Execute.Agent.Get",
@@ -256,8 +317,36 @@ impl TelemetryEventDesc for CliTelemetryEventDiscriminants {
             CliTelemetryEventDiscriminants::EnvironmentImageList => {
                 "CLI.Execute.Environment.Image.List"
             }
+            CliTelemetryEventDiscriminants::EnvironmentCheckout => {
+                "CLI.Execute.EnvironmentCheckout"
+            }
             CliTelemetryEventDiscriminants::MCPList => "CLI.Execute.MCP.List",
             CliTelemetryEventDiscriminants::ModelList => "CLI.Execute.Model.List",
+            CliTelemetryEventDiscriminants::MemoryStoreList => "CLI.Execute.MemoryStore.List",
+            CliTelemetryEventDiscriminants::MemoryStoreListMemories => {
+                "CLI.Execute.MemoryStore.ListMemories"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreCreateMemory => {
+                "CLI.Execute.MemoryStore.CreateMemory"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreUpdateMemory => {
+                "CLI.Execute.MemoryStore.UpdateMemory"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreDeleteMemory => {
+                "CLI.Execute.MemoryStore.DeleteMemory"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreGetStore => {
+                "CLI.Execute.MemoryStore.GetStore"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreUpdateStore => {
+                "CLI.Execute.MemoryStore.UpdateStore"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreListStoreAgents => {
+                "CLI.Execute.MemoryStore.ListStoreAgents"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreListVersions => {
+                "CLI.Execute.MemoryStore.ListVersions"
+            }
             CliTelemetryEventDiscriminants::TaskList => "CLI.Execute.Task.List",
             CliTelemetryEventDiscriminants::TaskGet => "CLI.Execute.Task.Get",
             CliTelemetryEventDiscriminants::ConversationGet => "CLI.Execute.Conversation.Get",
@@ -313,6 +402,10 @@ impl TelemetryEventDesc for CliTelemetryEventDiscriminants {
             CliTelemetryEventDiscriminants::HarnessSupportReportShutdown => {
                 "CLI.Execute.HarnessSupport.ReportShutdown"
             }
+            CliTelemetryEventDiscriminants::RunnerList => "CLI.Execute.Runner.List",
+            CliTelemetryEventDiscriminants::RunnerCreate => "CLI.Execute.Runner.Create",
+            CliTelemetryEventDiscriminants::RunnerUpdate => "CLI.Execute.Runner.Update",
+            CliTelemetryEventDiscriminants::RunnerDelete => "CLI.Execute.Runner.Delete",
         }
     }
 
@@ -321,6 +414,9 @@ impl TelemetryEventDesc for CliTelemetryEventDiscriminants {
             CliTelemetryEventDiscriminants::AgentRun => "Ran an agent from the Warp CLI",
             CliTelemetryEventDiscriminants::AgentRunAmbient => {
                 "Ran an ambient agent from the Warp CLI"
+            }
+            CliTelemetryEventDiscriminants::AgentRunCloudStandby => {
+                "Prepared a pre-warmed cloud sandbox from the Warp CLI"
             }
             CliTelemetryEventDiscriminants::AgentProfileList => {
                 "Listed agent profiles from the Warp CLI"
@@ -349,8 +445,38 @@ impl TelemetryEventDesc for CliTelemetryEventDiscriminants {
             CliTelemetryEventDiscriminants::EnvironmentImageList => {
                 "Listed available base images from the Warp CLI"
             }
+            CliTelemetryEventDiscriminants::EnvironmentCheckout => {
+                "Prepared structured environment checkouts"
+            }
             CliTelemetryEventDiscriminants::MCPList => "Listed MCP servers from the Warp CLI",
             CliTelemetryEventDiscriminants::ModelList => "Listed models from the Warp CLI",
+            CliTelemetryEventDiscriminants::MemoryStoreList => {
+                "Listed memory stores from the Warp CLI"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreListMemories => {
+                "Listed memories in a memory store from the Warp CLI"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreCreateMemory => {
+                "Created a manual memory in a memory store from the Warp CLI"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreUpdateMemory => {
+                "Updated a memory in a memory store from the Warp CLI"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreDeleteMemory => {
+                "Deleted a memory from a memory store from the Warp CLI"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreGetStore => {
+                "Got a memory store from the Warp CLI"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreUpdateStore => {
+                "Updated a memory store from the Warp CLI"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreListStoreAgents => {
+                "Listed agents attached to a memory store from the Warp CLI"
+            }
+            CliTelemetryEventDiscriminants::MemoryStoreListVersions => {
+                "Listed version history of a memory from the Warp CLI"
+            }
             CliTelemetryEventDiscriminants::TaskList => "Listed tasks from the Warp CLI",
             CliTelemetryEventDiscriminants::TaskGet => "Got status of task from the Warp CLI",
             CliTelemetryEventDiscriminants::ConversationGet => {
@@ -446,6 +572,10 @@ impl TelemetryEventDesc for CliTelemetryEventDiscriminants {
             CliTelemetryEventDiscriminants::HarnessSupportReportShutdown => {
                 "Reported agent shutdown via harness-support from the Warp CLI"
             }
+            CliTelemetryEventDiscriminants::RunnerList => "Listed runners from the Warp CLI",
+            CliTelemetryEventDiscriminants::RunnerCreate => "Created a runner from the Warp CLI",
+            CliTelemetryEventDiscriminants::RunnerUpdate => "Updated a runner from the Warp CLI",
+            CliTelemetryEventDiscriminants::RunnerDelete => "Deleted a runner from the Warp CLI",
         }
     }
 
@@ -463,6 +593,9 @@ impl TelemetryEventDesc for CliTelemetryEventDiscriminants {
             }
             Self::ApiKeyList | Self::ApiKeyCreate | Self::ApiKeyExpire => {
                 EnablementState::Flag(FeatureFlag::APIKeyManagement)
+            }
+            Self::RunnerList | Self::RunnerCreate | Self::RunnerUpdate | Self::RunnerDelete => {
+                EnablementState::Flag(FeatureFlag::CloudAgentRunners)
             }
             Self::RunMessageWatch
             | Self::RunMessageSend

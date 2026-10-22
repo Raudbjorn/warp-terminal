@@ -4,8 +4,9 @@ use std::time::Duration;
 use anyhow::Context as _;
 use futures::{AsyncWriteExt as _, TryStreamExt as _};
 use http_client::StatusCode;
-use remote_server::setup::RemotePlatform;
+use remote_server::setup::{InstallScriptOptions, RemotePlatform};
 use remote_server::transport::Error;
+use sha2::{Digest, Sha256};
 
 const REMOTE_SERVER_TARBALL_CACHE_FILE_NAME: &str = "oz.tar.gz";
 
@@ -30,10 +31,13 @@ pub(super) fn should_try_install(error: &Error) -> bool {
 /// The tarball is downloaded or reused from the local cache first, then uploaded
 /// to the remote host and passed to the install script as an already-downloaded
 /// archive. This avoids requiring the remote host to download the tarball itself.
-pub(super) async fn install(socket_path: &Path) -> Result<(), Error> {
+pub(super) async fn install(
+    socket_path: &Path,
+    install_options: &InstallScriptOptions,
+) -> Result<(), Error> {
     let platform = super::super::detect_remote_platform(socket_path).await?;
 
-    let client_tarball_path = cached_remote_server_tarball(&platform)
+    let client_tarball_path = cached_remote_server_tarball(&platform, install_options)
         .await
         .map_err(Error::Other)?;
     let timeout = remote_server::setup::SCP_INSTALL_TIMEOUT;
@@ -71,7 +75,10 @@ pub(super) async fn install(socket_path: &Path) -> Result<(), Error> {
     .map_err(Error::Other)?;
 
     log::info!("Running extraction via install script with tarball at {remote_tarball_path}");
-    let script = remote_server::setup::install_script(Some(&remote_tarball_path));
+    let script = remote_server::setup::install_script_with_options(
+        install_options,
+        Some(&remote_tarball_path),
+    );
 
     let output = remote_server::ssh::run_ssh_script(socket_path, &script, timeout)
         .await
@@ -102,8 +109,13 @@ fn current_remote_server_tarball_cache_version() -> &'static str {
     remote_server::setup::remote_server_artifact_version()
 }
 
-fn remote_server_tarball_cache_path(platform: &RemotePlatform) -> PathBuf {
+fn remote_server_tarball_cache_path(
+    platform: &RemotePlatform,
+    install_options: &InstallScriptOptions,
+) -> PathBuf {
+    let url = remote_server::setup::download_tarball_url_with_options(platform, install_options);
     remote_server_tarball_cache_root()
+        .join(format!("{:x}", Sha256::digest(url.as_bytes())))
         .join(current_remote_server_tarball_cache_version())
         .join(format!(
             "{}-{}",
@@ -141,7 +153,7 @@ async fn cached_remote_server_tarball(
         let _ = async_fs::remove_file(&cache_path).await;
     }
 
-    let url = remote_server::setup::download_tarball_url(platform);
+    let url = remote_server::setup::download_tarball_url_with_options(platform, install_options);
     log::info!(
         "Downloading remote-server tarball from {url} into cache at {}",
         cache_path.display()
@@ -307,3 +319,7 @@ fn is_retryable_download_status(status: StatusCode) -> bool {
         StatusCode::REQUEST_TIMEOUT | StatusCode::TOO_MANY_REQUESTS
     ) || status.is_server_error()
 }
+
+#[cfg(test)]
+#[path = "scp_fallback_tests.rs"]
+mod tests;

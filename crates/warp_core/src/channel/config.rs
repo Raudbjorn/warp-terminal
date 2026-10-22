@@ -1,10 +1,9 @@
 use std::borrow::Cow;
 
+pub use network_policy::ServicesMode;
 use serde::{Deserialize, Serialize};
 
 use crate::AppId;
-
-pub use network_policy::ServicesMode;
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ChannelConfig {
@@ -45,6 +44,9 @@ pub struct IapConfig {
 pub struct WarpServerConfig {
     /// The root URL for the standard server pool.
     pub server_root_url: Cow<'static, str>,
+    /// The pre-warmed sandbox control origin, defaulting to the server root URL.
+    #[serde(default)]
+    pub prewarmed_sandbox_control_url: Option<Cow<'static, str>>,
     /// The URL for the RTC server, which serves real-time updates for Warp Drive objects.
     pub rtc_server_url: Cow<'static, str>,
     /// The URL for the session sharing server, or [`None`] if session sharing is not
@@ -62,6 +64,7 @@ impl WarpServerConfig {
     pub fn production() -> Self {
         Self {
             server_root_url: "https://app.warp.dev".into(),
+            prewarmed_sandbox_control_url: None,
             rtc_server_url: "wss://rtc.app.warp.dev/graphql/v2".into(),
             session_sharing_server_url: Some("wss://sessions.app.warp.dev".into()),
             firebase_auth_api_key: "AIzaSyBdy3O3S9hrdayLJxJ7mriBR4qgUaUygAs".into(),
@@ -72,6 +75,7 @@ impl WarpServerConfig {
     pub fn local_only() -> Self {
         Self {
             server_root_url: "http://127.0.0.1".into(),
+            prewarmed_sandbox_control_url: None,
             rtc_server_url: "ws://127.0.0.1/graphql/v2".into(),
             session_sharing_server_url: None,
             firebase_auth_api_key: "".into(),
@@ -177,4 +181,17 @@ pub struct McpOAuthProviderConfig {
     pub client_id: Cow<'static, str>,
     /// The OAuth client secret registered for this channel.
     pub client_secret: Cow<'static, str>,
+    /// A separately registered native client that permits loopback redirects.
+    /// This must never be inferred from the custom-scheme client.
+    #[serde(default)]
+    pub loopback_client: Option<McpOAuthLoopbackClientConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct McpOAuthLoopbackClientConfig {
+    pub client_id: Cow<'static, str>,
+    /// Native OAuth clients should normally be public, but retain optional
+    /// secret support for providers that require one.
+    #[serde(default)]
+    pub client_secret: Option<Cow<'static, str>>,
 }

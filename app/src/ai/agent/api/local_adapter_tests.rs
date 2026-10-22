@@ -31,6 +31,7 @@ fn message(id: &str, content: api::message::Message) -> api::Message {
         timestamp: None,
         server_message_data: String::new(),
         citations: vec![],
+        fetched_memories: vec![],
         message: Some(content),
     }
 }
@@ -190,6 +191,7 @@ fn mcp_context() -> api::request::McpContext {
             name: "Linear".to_string(),
             description: "Issue tracker".to_string(),
             id: "srv-1".to_string(),
+            identity: None,
             resources: vec![],
             tools: vec![api::request::mcp_context::McpTool {
                 name: "create_issue".to_string(),
@@ -1300,4 +1302,53 @@ mod passive_suggestions {
         assert_eq!(plan.config_key, CONFIG_KEY);
         assert!(plan.is_first_turn);
     }
+}
+
+#[test]
+fn partial_file_read_failures_remain_visible_to_the_local_agent() {
+    let failure = api::read_files_result::FailedRead {
+        path: "missing.rs".to_string(),
+        message: "permission denied".to_string(),
+    };
+    for result in [
+        api::read_files_result::Result::TextFilesSuccess(
+            api::read_files_result::TextFilesSuccess {
+                files: vec![],
+                failed_reads: vec![failure.clone()],
+            },
+        ),
+        api::read_files_result::Result::AnyFilesSuccess(api::read_files_result::AnyFilesSuccess {
+            files: vec![],
+            failed_reads: vec![failure.clone()],
+        }),
+    ] {
+        let result = api::message::ToolCallResult {
+            tool_call_id: "read-1".to_string(),
+            context: None,
+            result: Some(api::message::tool_call_result::Result::ReadFiles(
+                api::ReadFilesResult {
+                    result: Some(result),
+                },
+            )),
+        };
+        assert_eq!(
+            render_tool_result_text(&result),
+            "Error reading missing.rs: permission denied"
+        );
+    }
+}
+
+#[test]
+fn terminal_busy_does_not_report_command_success() {
+    let result = api::RunShellCommandResult {
+        result: Some(api::run_shell_command_result::Result::TerminalBusy(
+            api::run_shell_command_result::TerminalBusy {
+                running_command_id: "running-command".to_string(),
+            },
+        )),
+        ..Default::default()
+    };
+    let text = render_shell_result(&result);
+    assert!(text.contains("running-command"));
+    assert!(text.contains("not started"));
 }
