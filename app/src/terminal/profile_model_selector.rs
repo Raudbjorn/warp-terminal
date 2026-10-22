@@ -1054,12 +1054,12 @@ impl ProfileModelSelector {
             .clone()
             .and_then(|id| {
                 llm_preferences
-                    .get_llm_info(&id, ctx)
+                    .get_agent_mode_llm_info_for_terminal(&id, ctx, Some(self.terminal_view_id))
                     .map(|info| info.id.clone())
             })
             .unwrap_or_else(|| {
                 llm_preferences
-                    .get_default_base_model(&scope, ctx)
+                    .get_profile_default_base_model(&scope, ctx, Some(self.terminal_view_id))
                     .id
                     .clone()
             });
@@ -1068,7 +1068,12 @@ impl ProfileModelSelector {
 
         // Store all model choices for reasoning variant lookups
         self.all_model_choices = llm_preferences
-            .get_base_llm_choices_for_agent_mode(&scope, ctx)
+            .get_base_llm_choices_for_agent_mode_for_terminal(
+                &scope,
+                ctx,
+                Some(self.terminal_view_id),
+            )
+            .into_iter()
             .cloned()
             .collect();
 
@@ -1076,7 +1081,8 @@ impl ProfileModelSelector {
         // custom-endpoint choices (rendered separately under a `Custom models` sub-header so
         // the server-curated list stays visually distinct).
         let custom_ids: std::collections::HashSet<LLMId> = llm_preferences
-            .custom_llm_choices(ctx)
+            .custom_llm_choices_for_terminal(ctx, Some(self.terminal_view_id))
+            .into_iter()
             .map(|info| info.id.clone())
             .collect();
         let server_choices: Vec<&LLMInfo> = self
@@ -1225,7 +1231,12 @@ impl ProfileModelSelector {
 
         let items: Vec<MenuItem<ProfileModelSelectorAction>> = match kind {
             ModelSpecSidecarKind::Auto => llm_preferences
-                .get_base_llm_choices_for_agent_mode(&scope, ctx)
+                .get_base_llm_choices_for_agent_mode_for_terminal(
+                    &scope,
+                    ctx,
+                    Some(self.terminal_view_id),
+                )
+                .into_iter()
                 .filter(|llm| is_auto(llm))
                 .map(|llm| {
                     let is_selected = llm.id == active_llm_id;
@@ -1430,14 +1441,23 @@ impl ProfileModelSelector {
                     match action {
                         ProfileModelSelectorAction::SelectModel(llm_id) => {
                             LLMPreferences::as_ref(ctx)
-                                .get_llm_info(llm_id, ctx)
+                                .get_agent_mode_llm_info_for_terminal(
+                                    llm_id,
+                                    ctx,
+                                    Some(self.terminal_view_id),
+                                )
                                 .cloned()
                         }
                         ProfileModelSelectorAction::SelectAutoModel => {
                             // Get the first "auto" variant as the generic auto model
                             let llm_prefs = LLMPreferences::as_ref(ctx);
                             llm_prefs
-                                .get_base_llm_choices_for_agent_mode(&scope, ctx)
+                                .get_base_llm_choices_for_agent_mode_for_terminal(
+                                    &scope,
+                                    ctx,
+                                    Some(self.terminal_view_id),
+                                )
+                                .into_iter()
                                 .find(|llm| is_auto(llm))
                                 .cloned()
                         }

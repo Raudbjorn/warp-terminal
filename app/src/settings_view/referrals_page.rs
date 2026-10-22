@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::ops::Deref;
 use std::sync::Arc;
 
@@ -405,10 +406,13 @@ impl SettingsPageMeta for ReferralsPageView {
     }
 
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        true
+        !ChannelState::is_local_only()
     }
 
     fn on_page_selected(&mut self, _: bool, ctx: &mut ViewContext<Self>) {
+        if ChannelState::is_local_only() {
+            return;
+        }
         self.fetch_referral_status(ctx);
     }
 

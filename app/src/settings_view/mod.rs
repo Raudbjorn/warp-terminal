@@ -13,7 +13,7 @@ use features_page::{FeaturesPageView, FeaturesSettingsPageEvent};
 use itertools::Itertools as _;
 use keybindings::KeybindingsView;
 use knowledge_page::{KnowledgePageAction, KnowledgePageEvent, KnowledgePageView};
-use main_page::{MainPageAction, MainSettingsPageEvent, MainSettingsPageView};
+use local_ai_page::LocalAISettingsPageView;
 use mcp_servers_page::MCPServersSettingsPageView;
 use nav::{SettingsNavItem, SettingsUmbrella};
 use pathfinder_geometry::vector::Vector2F;
@@ -100,7 +100,7 @@ pub(crate) mod handoff_environment_creation_modal;
 mod join_teams_modal;
 pub mod keybindings;
 mod knowledge_page;
-mod main_page;
+mod local_ai_page;
 pub mod mcp_servers;
 pub mod mcp_servers_page;
 mod nav;
@@ -110,7 +110,7 @@ mod platform_page;
 mod privacy;
 mod privacy_page;
 mod referrals_page;
-mod remove_custom_endpoint_confirmation_dialog;
+pub(crate) mod remove_custom_endpoint_confirmation_dialog;
 mod scripting_page;
 mod set_default_model_modal;
 mod settings_file_footer;
@@ -133,7 +133,6 @@ pub use billing_and_usage_page::create_discount_badge;
 pub use cli_agents_page::cli_agent_settings_widget_id;
 pub use code_indexing_page::CodeIndexingPageView;
 pub use features_page::FeaturesPageAction;
-pub use main_page::handle_experiment_change;
 pub use privacy_page::PrivacyPageAction;
 pub use settings_page::{
     AdditionalInfo, InputListItem, LocalOnlyIconState, ToggleState, render_body_item_label,
@@ -254,7 +253,7 @@ pub(super) fn render_beta_chip(appearance: &Appearance) -> Box<dyn Element> {
 /// Renders a wrapping row of pill-shaped chips for model labels, which flow
 /// onto additional lines instead of overflowing the container horizontally.
 /// Used by custom inference endpoint cards and the remove confirmation dialog.
-pub(super) fn render_model_chips(
+pub(crate) fn render_model_chips(
     labels: impl IntoIterator<Item = String>,
     appearance: &Appearance,
     text_color: warp_core::ui::theme::Fill,
@@ -311,9 +310,8 @@ pub enum SettingsViewEvent {
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SettingsSection {
     About,
-    #[default]
-    Account,
     BillingAndUsage,
+    #[default]
     Appearance,
     Features,
     Keybindings,
@@ -324,6 +322,7 @@ pub enum SettingsSection {
     Teams,
     WarpDrive,
     Warpify,
+    LocalAI,
     // ── Agents umbrella subpages ──
     WarpAgent,
     AgentProfiles,
@@ -350,6 +349,7 @@ impl Display for SettingsSection {
             SettingsSection::SharedBlocks => write!(f, "Shared blocks"),
             SettingsSection::Scripting => write!(f, "Scripting"),
             SettingsSection::WarpDrive => write!(f, "Warp Drive"),
+            SettingsSection::LocalAI => write!(f, "Local AI"),
             SettingsSection::WarpAgent => write!(f, "Warp Agent"),
             SettingsSection::AgentProfiles => write!(f, "Profiles"),
             SettingsSection::AgentMCPServers => write!(f, "MCP servers"),
@@ -365,6 +365,36 @@ impl Display for SettingsSection {
 }
 
 impl SettingsSection {
+    pub(crate) fn is_online_services_only(self) -> bool {
+        matches!(
+            self,
+            Self::WarpAgent
+                | Self::AgentProfiles
+                | Self::AgentMCPServers
+                | Self::Knowledge
+                | Self::ThirdPartyCLIAgents
+                | Self::BillingAndUsage
+                | Self::Teams
+                | Self::Referrals
+                | Self::SharedBlocks
+                | Self::CloudEnvironments
+                | Self::WarpCloudAgentAPIKeys
+                | Self::WarpDrive
+                | Self::Privacy
+        )
+    }
+
+    fn visible_or_default(self) -> Self {
+        if (ChannelState::is_local_only() && self.is_online_services_only())
+            || (!ChannelState::is_local_only() && self == Self::LocalAI)
+            || (self == Self::Scripting && !FeatureFlag::WarpControlCli.is_enabled())
+        {
+            Self::default()
+        } else {
+            self
+        }
+    }
+
     /// Stable identifier for this section, used everywhere the section leaves
     /// the process: the SQLite session-restore key and the
     /// `surface.settings.open --page` warpctrl vocabulary.
@@ -381,7 +411,7 @@ impl SettingsSection {
     pub fn slug(self) -> &'static str {
         match self {
             Self::About => "About",
-            Self::Account => "Account",
+            Self::LocalAI => "Local AI",
             Self::BillingAndUsage => "Billing and usage",
             Self::Appearance => "Appearance",
             Self::Features => "Features",
@@ -417,7 +447,8 @@ impl SettingsSection {
     pub fn from_slug(slug: &str) -> Option<Self> {
         let section = match slug {
             "About" => Self::About,
-            "Account" => Self::Account,
+            "Account" => Self::Appearance,
+            "Local AI" | "LocalAI" => Self::LocalAI,
             "Billing and usage" => Self::BillingAndUsage,
             "Appearance" => Self::Appearance,
             "Features" => Self::Features,
@@ -508,6 +539,7 @@ pub mod flags {
     pub const FOCUS_REPORTING_CONTEXT_FLAG: &str = "Focus_Reporting";
     pub const SSH_REUSE_CONTROL_MASTER_CONTEXT_FLAG: &str = "SSH_Reuse_Control_Master";
     pub const SSH_WARPIFICATION_CONTEXT_FLAG: &str = "SSH_Warpification";
+    pub const SSH_REMOTE_SERVER_CONTEXT_FLAG: &str = "SSH_Remote_Server";
     pub const NOTIFICATIONS_CONTEXT_FLAG: &str = "Notifications_Enabled";
     pub const LONG_RUNNING_NOTIFICATIONS_FLAG: &str = "Long_Running_Notifications";
     pub const AGENT_TASK_COMPLETED_NOTIFICATIONS_FLAG: &str = "Agent_Task_Completed_Notifications";
@@ -628,6 +660,7 @@ pub mod flags {
     pub const DEBUG_SHOW_MEMORY_STATS_FLAG: &str = "Debug_Memory_Statistics";
     pub const ALLOW_NATIVE_WAYLAND: &str = "Allow_Native_Wayland";
     pub const IS_ANY_AI_ENABLED: &str = "IsAnyAIEnabled";
+    pub const AI_COMMAND_SEARCH_ENABLED: &str = "AICommandSearchEnabled";
     pub const IS_ACTIVE_AI_ENABLED: &str = "IsActiveAIEnabled";
     pub const IS_VOICE_INPUT_ENABLED: &str = "IsVoiceInputEnabled";
     pub const IS_BLOCK_AI_SUMMARIES_ENABLED: &str = "IsBlockAISummariesEnabled";
@@ -679,7 +712,6 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
     context: &ContextPredicate,
     builder: fn(SettingsAction) -> T,
 ) {
-    main_page::init_actions_from_parent_view(app, context, builder);
     appearance_page::init_actions_from_parent_view(app, context, builder);
     features_page::init_actions_from_parent_view(app, context, builder);
     warpify_page::init_actions_from_parent_view(app, context, builder);
@@ -988,7 +1020,6 @@ pub enum DebugSettingsAction {
 pub enum SettingsAction {
     SelectAndRefresh(SettingsSection),
     ToggleUmbrella(usize),
-    MainPageToggle(MainPageAction),
     AppearancePageToggle(AppearancePageAction),
     FeaturesPageToggle(FeaturesPageAction),
     PrivacyPageToggle(PrivacyPageAction),
@@ -1139,7 +1170,6 @@ fn next_stop_index(current: usize, len: usize, direction: CycleDirection) -> usi
 macro_rules! update_page {
     ($handle:expr_2021, $update:expr_2021, $ctx:expr_2021) => {
         match $handle {
-            SettingsPageViewHandle::Main(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::Appearance(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::Features(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::SharedBlocks(handle) => $ctx.update_view(handle, $update),
@@ -1156,6 +1186,7 @@ macro_rules! update_page {
             SettingsPageViewHandle::AgentProfiles(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::Knowledge(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::CLIAgents(handle) => $ctx.update_view(handle, $update),
+            SettingsPageViewHandle::LocalAI(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::CloudEnvironments(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::About(handle) => $ctx.update_view(handle, $update),
             SettingsPageViewHandle::CodeIndexing(handle) => $ctx.update_view(handle, $update),
@@ -1197,16 +1228,15 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
+    fn initial_page(page: Option<SettingsSection>) -> SettingsSection {
+        page.unwrap_or_default().visible_or_default()
+    }
+
     pub fn new(page: Option<SettingsSection>, ctx: &mut ViewContext<Self>) -> Self {
         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new("Settings"));
+        let initial_page = Self::initial_page(page);
 
         let global_resource_handles = GlobalResourceHandlesProvider::as_ref(ctx).get().clone();
-        // Main settings page with accounts info
-        let main_page_handle = ctx.add_typed_action_view(MainSettingsPageView::new);
-        ctx.subscribe_to_view(&main_page_handle, |me, _, event, ctx| {
-            me.handle_main_page_event(event, ctx);
-        });
-
         // Appearance & themes page
         let appearance_page_handle = ctx.add_typed_action_view(AppearanceSettingsPageView::new);
         ctx.subscribe_to_view(&appearance_page_handle, |me, _, event, ctx| {
@@ -1239,6 +1269,7 @@ impl SettingsView {
         // About page
         let about_page_handle = ctx.add_typed_action_view(AboutPageView::new);
 
+        let local_ai_page_handle = ctx.add_typed_action_view(LocalAISettingsPageView::new);
         // Warp Agent page
         let warp_agent_page_handle = ctx.add_typed_action_view(WarpAgentPageView::new);
         ctx.subscribe_to_view(&warp_agent_page_handle, |me, _, event, ctx| {
@@ -1372,11 +1403,11 @@ impl SettingsView {
         });
 
         let mut settings_pages = vec![
-            SettingsPage::new(main_page_handle),
             SettingsPage::new(warp_agent_page_handle),
             SettingsPage::new(agent_profiles_page_handle),
             SettingsPage::new(knowledge_page_handle),
             SettingsPage::new(cli_agents_page_handle),
+            SettingsPage::new(local_ai_page_handle),
             billing_and_usage_page,
             SettingsPage::new(code_indexing_page_handle),
             SettingsPage::new(editor_review_page_handle),
@@ -1405,7 +1436,18 @@ impl SettingsView {
         // Build sidebar nav items. Umbrellas group their subpages here and
         // nowhere else, so this list is the only place membership is declared.
         let mut nav_items = vec![
-            SettingsNavItem::Page(SettingsSection::Account),
+            SettingsNavItem::Page(SettingsSection::Appearance),
+            SettingsNavItem::Page(SettingsSection::Features),
+            SettingsNavItem::Page(SettingsSection::Keybindings),
+            SettingsNavItem::Page(SettingsSection::Warpify),
+            SettingsNavItem::Page(SettingsSection::LocalAI),
+            SettingsNavItem::Umbrella(SettingsUmbrella::new(
+                "Code",
+                vec![
+                    SettingsSection::CodeIndexing,
+                    SettingsSection::EditorAndCodeReview,
+                ],
+            )),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "Agents",
                 vec![
@@ -1418,13 +1460,6 @@ impl SettingsView {
             )),
             SettingsNavItem::Page(SettingsSection::BillingAndUsage),
             SettingsNavItem::Umbrella(SettingsUmbrella::new(
-                "Code",
-                vec![
-                    SettingsSection::CodeIndexing,
-                    SettingsSection::EditorAndCodeReview,
-                ],
-            )),
-            SettingsNavItem::Umbrella(SettingsUmbrella::new(
                 "Cloud platform",
                 vec![
                     SettingsSection::CloudEnvironments,
@@ -1432,10 +1467,6 @@ impl SettingsView {
                 ],
             )),
             SettingsNavItem::Page(SettingsSection::Teams),
-            SettingsNavItem::Page(SettingsSection::Appearance),
-            SettingsNavItem::Page(SettingsSection::Features),
-            SettingsNavItem::Page(SettingsSection::Keybindings),
-            SettingsNavItem::Page(SettingsSection::Warpify),
             SettingsNavItem::Page(SettingsSection::Referrals),
             SettingsNavItem::Page(SettingsSection::SharedBlocks),
             SettingsNavItem::Page(SettingsSection::WarpDrive),
@@ -1455,13 +1486,6 @@ impl SettingsView {
                 SettingsNavItem::Page(SettingsSection::Scripting),
             );
         }
-
-        let initial_page = match page {
-            Some(SettingsSection::Scripting) if !FeatureFlag::WarpControlCli.is_enabled() => {
-                SettingsSection::Account
-            }
-            other => other.unwrap_or_default(),
-        };
 
         // Auto-expand the umbrella if the initial page is one of its subpages.
         for item in &mut nav_items {
@@ -1731,20 +1755,6 @@ impl SettingsView {
             .iter()
             .map(|_| MatchData::Uncounted(true))
             .collect();
-    }
-
-    fn handle_main_page_event(
-        &mut self,
-        event: &MainSettingsPageEvent,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        match event {
-            MainSettingsPageEvent::CheckForUpdate => ctx.emit(SettingsViewEvent::CheckForUpdate),
-            MainSettingsPageEvent::SignupAnonymousUser => {
-                ctx.emit(SettingsViewEvent::SignupAnonymousUser)
-            }
-            _ => (),
-        }
     }
 
     fn handle_billing_and_usage_page_event(
@@ -2042,6 +2052,7 @@ impl SettingsView {
         allow_steal_focus: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        let section = section.visible_or_default();
         // Every nav target owns its backing page. Check it exists.
         if self.settings_page(section).is_none() {
             return;
@@ -2111,8 +2122,10 @@ impl SettingsView {
     }
 
     fn should_render_page(&self, settings_page: &SettingsPage, app: &AppContext) -> bool {
+        if ChannelState::is_local_only() && settings_page.section.is_online_services_only() {
+            return false;
+        }
         match &settings_page.view_handle {
-            SettingsPageViewHandle::Main(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::Teams(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::SharedBlocks(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::Keybindings(v) => v.as_ref(app).should_render(app),
@@ -2129,6 +2142,7 @@ impl SettingsView {
             SettingsPageViewHandle::AgentProfiles(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::Knowledge(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::CLIAgents(v) => v.as_ref(app).should_render(app),
+            SettingsPageViewHandle::LocalAI(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::CloudEnvironments(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::MCPServers(v) => v.as_ref(app).should_render(app),
             SettingsPageViewHandle::CodeIndexing(v) => v.as_ref(app).should_render(app),
@@ -2170,6 +2184,9 @@ impl SettingsView {
         autoinstall_gallery_title: Option<&str>,
         ctx: &mut ViewContext<Self>,
     ) {
+        if ChannelState::is_local_only() {
+            return;
+        }
         // Callers reach this through `Workspace::open_mcp_servers_page`, which
         // has already navigated to the page; only the sub-view selection is
         // left to do.
@@ -2731,15 +2748,6 @@ impl TypedActionView for SettingsView {
                 {
                     umbrella.toggle();
                     ctx.notify();
-                }
-            }
-            SettingsAction::MainPageToggle(main_page_action) => {
-                if let Some(main_page) = self.settings_page(SettingsSection::Account)
-                    && let SettingsPageViewHandle::Main(view) = &main_page.view_handle
-                {
-                    view.update(ctx, |view, ctx| {
-                        view.handle_action(main_page_action, ctx);
-                    })
                 }
             }
             SettingsAction::AppearancePageToggle(appearance_action) => {

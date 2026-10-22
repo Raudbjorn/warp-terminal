@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use itertools::Itertools as _;
 use repo_metadata::repositories::DetectedRepositories;
 use uuid::Uuid;
+use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
@@ -64,6 +65,10 @@ impl Default for InitialGlobalMcpScanState {
 
 impl FileBasedMCPManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        if ChannelState::is_local_only() {
+            return Self::default();
+        }
+
         let defer_global_warp_autostart = settings::settings_mode() == settings::SettingsMode::Tui;
         if FeatureFlag::FileBasedMcp.is_enabled() {
             ctx.subscribe_to_model(&FileMCPWatcher::handle(ctx), |me, _, event, ctx| {

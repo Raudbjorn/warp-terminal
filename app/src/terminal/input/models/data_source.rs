@@ -164,11 +164,14 @@ pub fn query_model_picker_choices<'a>(
     choices: impl IntoIterator<Item = &'a LLMInfo>,
     query_text: &str,
     conversation: Option<&AIConversation>,
+    terminal_view_id: Option<EntityId>,
     scope: &dyn TeamScope,
     app: &AppContext,
 ) -> Vec<ModelPickerChoice> {
     let choices = ModelSelectorDataSource::order_model_choices(
         llm_preferences,
+        terminal_view_id,
+        app,
         choices.into_iter().collect(),
     );
     let query_text = query_text.trim().to_lowercase();
@@ -256,6 +259,8 @@ impl ModelSelectorDataSource {
 
     fn order_model_choices<'a>(
         llm_preferences: &LLMPreferences,
+        terminal_view_id: Option<EntityId>,
+        app: &AppContext,
         choices: Vec<&'a LLMInfo>,
     ) -> Vec<&'a LLMInfo> {
         let mut auto_choices = Vec::new();
@@ -270,7 +275,10 @@ impl ModelSelectorDataSource {
                 custom_router_choices.push(llm);
             } else if is_auto(llm) {
                 auto_choices.push(llm);
-            } else if llm_preferences.custom_llm_info_for_id(&llm.id).is_some() {
+            } else if llm_preferences
+                .custom_llm_info_for_terminal(&llm.id, app, terminal_view_id)
+                .is_some()
+            {
                 custom_choices.push(llm);
             } else {
                 other_choices.push(llm);
@@ -313,17 +321,27 @@ impl SyncDataSource for ModelSelectorDataSource {
         let is_cloud_pane = self.ambient_agent_view_model.is_some();
         let choices = if is_full_terminal {
             llm_preferences
-                .get_cli_agent_llm_choices(&scope, app)
+                .get_cli_agent_llm_choices_for_terminal(&scope, app, Some(self.terminal_view_id))
+                .into_iter()
                 .filter(|llm| {
-                    let is_custom = llm_preferences.custom_llm_info_for_id(&llm.id).is_some();
+                    let is_custom = llm_preferences
+                        .custom_llm_info_for_terminal(&llm.id, app, Some(self.terminal_view_id))
+                        .is_some();
                     Self::include_model_in_picker(is_cloud_pane, is_custom)
                 })
                 .collect_vec()
         } else {
             llm_preferences
-                .get_base_llm_choices_for_agent_mode(&scope, app)
+                .get_base_llm_choices_for_agent_mode_for_terminal(
+                    &scope,
+                    app,
+                    Some(self.terminal_view_id),
+                )
+                .into_iter()
                 .filter(|llm| {
-                    let is_custom = llm_preferences.custom_llm_info_for_id(&llm.id).is_some();
+                    let is_custom = llm_preferences
+                        .custom_llm_info_for_terminal(&llm.id, app, Some(self.terminal_view_id))
+                        .is_some();
                     Self::include_model_in_picker(is_cloud_pane, is_custom)
                 })
                 .collect_vec()
@@ -336,6 +354,7 @@ impl SyncDataSource for ModelSelectorDataSource {
             choices,
             &query.text,
             conversation,
+            Some(self.terminal_view_id),
             &scope,
             app,
         )
@@ -346,6 +365,7 @@ impl SyncDataSource for ModelSelectorDataSource {
                 &active_llm_id,
                 &upgrade_url,
                 conversation,
+                Some(self.terminal_view_id),
                 &scope,
                 app,
             ))
@@ -389,6 +409,7 @@ impl ModelSearchItem {
         active_llm_id: &LLMId,
         upgrade_url: &str,
         conversation: Option<&AIConversation>,
+        terminal_view_id: Option<EntityId>,
         scope: &dyn TeamScope,
         app: &AppContext,
     ) -> Self {
@@ -398,7 +419,15 @@ impl ModelSearchItem {
         let is_using_bedrock = should_show_bedrock_icon_for_model(llm, scope, app);
         let is_using_gemini_enterprise_agent_platform =
             should_show_gemini_enterprise_agent_platform_icon_for_model(llm, scope, app);
-        let byo_key_source = byo_key_source_for_model(llm, conversation, scope, app);
+        let byo_key_source = if LLMPreferences::as_ref(app)
+            .custom_llm_info_for_terminal(&llm.id, app, terminal_view_id)
+            .is_some()
+            && UserWorkspaces::as_ref(app).are_member_byo_endpoints_allowed(scope)
+        {
+            Some(ByoKeySource::UserProvided)
+        } else {
+            byo_key_source_for_model(llm, conversation, scope, app)
+        };
         let leading_icon = model_leading_icon(
             llm,
             ModelIconFlags {

@@ -39,7 +39,7 @@ use lsp::supported_servers::LSPServerType;
 use num_traits::FromPrimitive;
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
-use persistence::model::AMBIENT_AGENT_PANE_KIND;
+use persistence::model::{AMBIENT_AGENT_PANE_KIND, BROWSER_PANE_KIND};
 use uuid::Uuid;
 use warp_core::features::FeatureFlag;
 use warp_errors::{report_error, report_if_error};
@@ -96,7 +96,7 @@ use crate::persistence::block_list::{
 };
 use crate::persistence::model::{
     CODE_REVIEW_PANE_KIND, GET_STARTED_PANE_KIND, NewPersistedObjectAction, NewTeamSettings,
-    ProjectRules, UserProfile,
+    ProjectRules, UserProfile, WELCOME_PANE_KIND,
 };
 use crate::server::experiments::ServerExperiment;
 use crate::server::ids::{ClientId, HashableId, ServerId, SyncId};
@@ -1197,8 +1197,9 @@ fn save_pane_state(
     // kind-specific tables.
     let kind = match &snapshot.contents {
         LeafContents::Terminal(_) => TERMINAL_PANE_KIND,
-        LeafContents::Notebook(_) => NOTEBOOK_PANE_KIND,
+        LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
         LeafContents::EnvVarCollection(_) => ENV_VAR_COLLECTION_PANE_KIND,
+        LeafContents::Notebook(_) => NOTEBOOK_PANE_KIND,
         LeafContents::Code(_) => CODE_PANE_KIND,
         LeafContents::Workflow(_) => WORKFLOW_PANE_KIND,
         LeafContents::Settings(_) => SETTINGS_PANE_KIND,
@@ -1209,7 +1210,8 @@ fn save_pane_state(
             EXECUTION_PROFILE_EDITOR_PANE_KIND
         }
         LeafContents::GetStarted => GET_STARTED_PANE_KIND,
-        LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
+        LeafContents::Welcome { .. } => WELCOME_PANE_KIND,
+        LeafContents::Browser { .. } => BROWSER_PANE_KIND,
         LeafContents::EnvironmentManagement(_) | LeafContents::NetworkLog => {
             // These pane types are filtered out before this function is
             // called; see `LeafContents::is_persisted` and the skip in
@@ -1440,6 +1442,18 @@ fn save_pane_state(
         }
         LeafContents::NetworkLog => {
             // Unreachable: filtered by `is_persisted` in `save_app_state`.
+        }
+        LeafContents::Welcome { .. } => {
+            // Stateless (oh-my-warp)
+        }
+        LeafContents::Browser { url } => {
+            let browser_pane = model::NewBrowserPane {
+                id,
+                url: url.clone(),
+            };
+            diesel::insert_into(schema::browser_panes::dsl::browser_panes)
+                .values(browser_pane)
+                .execute(conn)?;
         }
     }
 
@@ -2419,6 +2433,13 @@ fn read_node(conn: &mut SqliteConnection, node: model::PaneNode) -> Result<PaneN
                         uuid: pane.uuid,
                         task_id,
                     })
+                }
+                BROWSER_PANE_KIND => {
+                    let pane = schema::browser_panes::dsl::browser_panes
+                        .find(node.id)
+                        .select(model::BrowserPane::as_select())
+                        .first(conn)?;
+                    LeafContents::Browser { url: pane.url }
                 }
                 other => bail!("Unrecognized pane kind: {other}"),
             };

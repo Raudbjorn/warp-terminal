@@ -263,7 +263,7 @@ async fn send_upload_request(
         .body(body)
         .send()
         .await
-        .map_err(reqwest::Error::without_url)
+        .map_err(http_client::Error::without_url)
         .context(error_context.transport)?;
 
     ensure_upload_succeeded(response, error_context).await
@@ -332,7 +332,7 @@ async fn send_multipart_upload(
         .multipart(form)
         .send()
         .await
-        .map_err(reqwest::Error::without_url)
+        .map_err(http_client::Error::without_url)
         .context(error_context.transport)?;
     ensure_upload_succeeded(response, error_context).await
 }

@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use futures::Future;
 use warp_errors::report_error;
 use warpui::elements::{
@@ -95,9 +96,19 @@ impl DrivePanel {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
         let index_view = ctx.add_typed_action_view(move |ctx| {
             let mut index = DriveIndex::new(ctx);
-            index.initialize_section_states(ctx);
+            if !ChannelState::is_local_only() {
+                index.initialize_section_states(ctx);
+            }
             index
         });
+
+        if ChannelState::is_local_only() {
+            return Self {
+                index_view,
+                mouse_state_handles: Default::default(),
+            };
+        }
+
         ctx.subscribe_to_view(&index_view, |me, _, event, ctx| {
             me.handle_index_view_event(event, ctx);
         });

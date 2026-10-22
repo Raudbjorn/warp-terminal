@@ -128,3 +128,34 @@ fn request_carries_trace_link_header_on_warp_header_path() {
     let value = value.expect("trace-link header should be added on the warp-header path");
     assert!(value.starts_with("00-"), "unexpected header value: {value}");
 }
+
+#[test]
+fn network_policy_denials_are_not_actionable() {
+    let error = Error::NetworkPolicyDenied(NetworkPolicyDenied::new(
+        "test request",
+        "https://app.warp.dev",
+    ));
+    assert!(!error.is_actionable());
+}
+
+#[test]
+fn wrapped_reqwest_errors_preserve_actionability() {
+    let error = reqwest::Client::new().get("not a URL").build().unwrap_err();
+    let expected = error.is_actionable();
+    assert_eq!(Error::Reqwest(error).is_actionable(), expected);
+}
+
+#[test]
+fn policy_errors_redact_presigned_urls() {
+    let error = Error::NetworkPolicyDenied(NetworkPolicyDenied::new(
+        "download",
+        "https://example.test/file?signature=secret",
+    ))
+    .without_url();
+    assert!(!format!("{error:?} {error}").contains("signature"));
+    let Error::NetworkPolicyDenied(denial) = error else {
+        panic!("redaction must preserve the policy-denial error type");
+    };
+    assert_eq!(denial.purpose(), "download");
+    assert_eq!(denial.url(), "<redacted>");
+}

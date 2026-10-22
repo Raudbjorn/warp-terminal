@@ -415,7 +415,8 @@ use crate::terminal::cli_agent_sessions::{
 use crate::terminal::color::List;
 use crate::terminal::command_corrections_denylist::COMMAND_CORRECTIONS_PREFERRED_DENYLIST;
 use crate::terminal::event::{
-    AfterBlockCompletedEvent, BlockType, RemoteServerSetupState, TerminalMode, UserBlockCompleted,
+    AfterBlockCompletedEvent, BlockType, BootstrappedEvent, RemoteServerSetupState, TerminalMode,
+    UserBlockCompleted,
 };
 use crate::terminal::find::{BlockGridMatch, BlockListMatch, TerminalFindModel};
 use crate::terminal::general_settings::GeneralSettings;
@@ -498,7 +499,7 @@ pub use crate::terminal::view::rich_content::{
 };
 use crate::terminal::view::ssh_file_upload::FileUploadId;
 use crate::terminal::view::ssh_remote_server_choice_view::{
-    SshRemoteServerChoiceView, SshRemoteServerChoiceViewEvent,
+    SshRemoteServerChoiceView, SshRemoteServerChoiceViewEvent, SshRemoteServerChoiceViewMode,
 };
 use crate::terminal::view::ssh_remote_server_failed_banner::{
     SshRemoteServerFailedBanner, SshRemoteServerFailedBannerEvent,
@@ -2626,6 +2627,7 @@ pub struct TerminalView {
 
     bootstrap_start: Option<Instant>,
     is_login_shell_bootstrapped: bool,
+    degraded_bootstrap_session_ids: HashSet<SessionId>,
     /// Set when a pending command is submitted to the shell. Cleared on the
     /// next `AfterBlockCompleted`, at which point `Event::PendingCommandCompleted`
     /// is emitted so subscribers know the command has finished.
@@ -4415,6 +4417,7 @@ impl TerminalView {
             last_hover_fragment_boundary: None,
             bootstrap_start: None,
             is_login_shell_bootstrapped: false,
+            degraded_bootstrap_session_ids: HashSet::new(),
             awaiting_pending_command_completion: false,
             pending_command_queue: Default::default(),
             enter_agent_view_after_pending_commands: false,
@@ -4752,7 +4755,7 @@ impl TerminalView {
                             .unwrap_or((None, None));
                         send_telemetry_from_ctx!(
                             TelemetryEvent::RemoteServerBinaryCheck {
-                                found: matches!(result, Ok(true)),
+                                found: matches!(result, Ok(status) if status.is_found()),
                                 error: result.as_ref().err().map(|e| e.to_string()),
                                 remote_os,
                                 remote_arch,
@@ -12835,6 +12838,21 @@ impl TerminalView {
                 }
                 self.did_notify_long_running = false;
 
+                #[cfg(feature = "plugin_host")]
+                {
+                    let event = crate::plugin::events::CommandStartedEvent {
+                        command: command.clone(),
+                        cwd: String::new(),
+                    };
+                    if let Ok(input) = warp_js::SerializedJsValue::from_value(event) {
+                        self.fire_plugin_terminal_event(
+                            crate::plugin::events::EVENT_COMMAND_STARTED,
+                            input,
+                            ctx,
+                        );
+                    }
+                }
+
                 // Snapshot the prompt state as of when the command began executing.
                 // Commands may themselves affect the prompt (if running `git checkout`), for
                 // example, so we want the saved prompt state to match what the user saw when
@@ -13280,6 +13298,32 @@ impl TerminalView {
                         let model = self.model.lock();
                         compute(model.block_list())
                     });
+                    #[cfg(feature = "plugin_host")]
+                    {
+                        let event = crate::plugin::events::CommandFinishedEvent {
+                            command: block_completed
+                                .command
+                                .get_with(|compute| {
+                                    let model = self.model.lock();
+                                    compute(model.block_list())
+                                })
+                                .clone(),
+                            exit_code: serialized_block.exit_code.value(),
+                            cwd: serialized_block.pwd.clone().unwrap_or_default(),
+                            duration_ms: self
+                                .block_duration(serialized_block)
+                                .map(|d| d.as_millis() as f64)
+                                .unwrap_or(0.0),
+                        };
+                        if let Ok(input) = warp_js::SerializedJsValue::from_value(event) {
+                            self.fire_plugin_terminal_event(
+                                crate::plugin::events::EVENT_COMMAND_FINISHED,
+                                input,
+                                ctx,
+                            );
+                        }
+                    }
+
                     if let Some(block_duration) = self.block_duration(serialized_block) {
                         self.maybe_send_block_completed_notification(
                             block_completed,
@@ -13806,6 +13850,13 @@ impl TerminalView {
             ModelEvent::RemoteServerBlockRequested { session_id } => {
                 self.show_ssh_remote_server_choice_block(*session_id, ctx);
             }
+            ModelEvent::RemoteServerUpdateBlockRequested { session_id } => {
+                self.show_ssh_remote_server_choice_block_with_mode(
+                    *session_id,
+                    SshRemoteServerChoiceViewMode::UpdateRequired,
+                    ctx,
+                );
+            }
         }
     }
 
@@ -13814,6 +13865,19 @@ impl TerminalView {
     fn show_ssh_remote_server_choice_block(
         &mut self,
         session_id: SessionId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.show_ssh_remote_server_choice_block_with_mode(
+            session_id,
+            SshRemoteServerChoiceViewMode::InitialInstall,
+            ctx,
+        );
+    }
+
+    fn show_ssh_remote_server_choice_block_with_mode(
+        &mut self,
+        session_id: SessionId,
+        mode: SshRemoteServerChoiceViewMode,
         ctx: &mut ViewContext<Self>,
     ) {
         let already_present = self.rich_content_views.iter().any(|view| {
@@ -13827,8 +13891,18 @@ impl TerminalView {
             return;
         }
 
-        let choice_view =
-            ctx.add_typed_action_view(|ctx| SshRemoteServerChoiceView::new(session_id, ctx));
+        let choice_view = ctx.add_typed_action_view(|ctx| match mode {
+            SshRemoteServerChoiceViewMode::InitialInstall => {
+                SshRemoteServerChoiceView::new(session_id, ctx)
+            }
+            SshRemoteServerChoiceViewMode::UpdateRequired => {
+                SshRemoteServerChoiceView::new_with_mode(session_id, mode, ctx)
+            }
+            SshRemoteServerChoiceViewMode::RetryAfterControlMasterError
+            | SshRemoteServerChoiceViewMode::RetryAfterSetupFailure => {
+                SshRemoteServerChoiceView::new_with_mode(session_id, mode, ctx)
+            }
+        });
 
         ctx.subscribe_to_view(&choice_view, move |me, _, event, ctx| match event {
             SshRemoteServerChoiceViewEvent::Install => {
@@ -13837,7 +13911,13 @@ impl TerminalView {
             }
             SshRemoteServerChoiceViewEvent::Skip => {
                 me.remove_ssh_remote_server_choice_block(session_id, ctx);
-                ctx.emit(Event::RemoteServerSkipRequested { session_id });
+                if matches!(
+                    mode,
+                    SshRemoteServerChoiceViewMode::InitialInstall
+                        | SshRemoteServerChoiceViewMode::UpdateRequired
+                ) {
+                    ctx.emit(Event::RemoteServerSkipRequested { session_id });
+                }
             }
             SshRemoteServerChoiceViewEvent::OpenWarpifySettings => {
                 ctx.emit(Event::OpenSettings(SettingsSection::Warpify));
@@ -14478,6 +14558,11 @@ impl TerminalView {
         ctx: &mut ViewContext<Self>,
     ) {
         let session_id = bootstrap_event.session_id;
+        let is_warpified_remote = matches!(
+            bootstrap_event.session_type,
+            BootstrapSessionType::WarpifiedRemote
+        );
+        let is_degraded_bootstrap = self.degraded_bootstrap_session_ids.remove(&session_id);
         let Some(session) = self.sessions.as_ref(ctx).get(session_id) else {
             report_error!(
                 "Could not find session in sessions model after being notified that the session had bootstrapped!",
@@ -14571,11 +14656,7 @@ impl TerminalView {
         // If we were waiting for a successful warpification, it's come. Stop the timeout.
         self.warpify_state.abort_ssh_warpify_timeout();
 
-        let is_warpified_remote = matches!(
-            bootstrap_event.session_type,
-            BootstrapSessionType::WarpifiedRemote
-        );
-        if bootstrap_event.subshell_info.is_some() {
+        if bootstrap_event.subshell_info.is_some() && !is_degraded_bootstrap {
             self.add_bootstrap_success_block(bootstrap_event, ctx);
         }
 
@@ -16047,7 +16128,8 @@ impl TerminalView {
             let rule = correction.rule_applied;
 
             if AISettings::as_ref(ctx).is_intelligent_autosuggestions_enabled(ctx)
-                && UserWorkspaces::as_ref(ctx).is_next_command_enabled()
+                && (ChannelState::is_local_only()
+                    || UserWorkspaces::as_ref(ctx).is_next_command_enabled())
                 && COMMAND_CORRECTIONS_PREFERRED_DENYLIST.contains(rule.to_str())
             {
                 // Defer to Next Command if the rule is in the denylist.
@@ -16737,6 +16819,65 @@ impl TerminalView {
         }
     }
 
+    /// oh-my-warp: invokes each plugin callback registered for `event_name` with the serialized
+    /// event payload; a callback that returns a string shows it as a toast. See PLUGIN_SPEC.md (M2).
+    #[cfg(feature = "plugin_host")]
+    fn fire_plugin_terminal_event(
+        &mut self,
+        event_name: &'static str,
+        input: warp_js::SerializedJsValue,
+        ctx: &mut ViewContext<TerminalView>,
+    ) {
+        use crate::plugin::PluginHost;
+        use crate::plugin::service::{
+            CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
+        };
+        use crate::view_components::{DismissibleToast, ToastFlavor};
+        use crate::workspace::ToastStack;
+
+        let function_ids = crate::plugin::events::handlers(event_name);
+        if function_ids.is_empty() {
+            return;
+        }
+        let window_id = ctx.window_id();
+        for function_id in function_ids {
+            let Some(caller) = PluginHost::handle(ctx)
+                .as_ref(ctx)
+                .plugin_service_caller::<CallJsFunctionService>()
+            else {
+                return;
+            };
+            let input = input.clone();
+            ctx.spawn(
+                async move {
+                    caller
+                        .call(CallJsFunctionRequest {
+                            id: function_id,
+                            serialized_input: input,
+                        })
+                        .await
+                },
+                move |_view, response, ctx| {
+                    if let Ok(CallJsFunctionResponse::Success(output)) = response {
+                        if let Ok(crate::plugin::events::OptionalToast(Some(message))) =
+                            output.to_value::<crate::plugin::events::OptionalToast>()
+                        {
+                            if !message.trim().is_empty() {
+                                ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                                    toast_stack.add_ephemeral_toast(
+                                        DismissibleToast::new(message, ToastFlavor::Default),
+                                        window_id,
+                                        ctx,
+                                    );
+                                });
+                            }
+                        }
+                    }
+                },
+            );
+        }
+    }
+
     fn maybe_send_block_completed_notification(
         &mut self,
         block: &UserBlockCompleted,
@@ -17054,6 +17195,12 @@ impl TerminalView {
             block.unhide();
         });
 
+        let recovered_ssh_bootstrap = if is_ssh {
+            self.recover_failed_ssh_bootstrap(ctx)
+        } else {
+            false
+        };
+
         // Send the bootstrapping slow event synchronously to ensure that we don't drop
         // the event if the user quits the app before the event queue is flushed and then
         // never reopens the app.
@@ -17090,7 +17237,7 @@ impl TerminalView {
             ctx
         );
 
-        if !self.is_login_shell_bootstrapped {
+        if !self.is_login_shell_bootstrapped && !recovered_ssh_bootstrap {
             log::warn!("Showing bootstrap slow toast");
             self.is_slow_bootstrap_banner_open = true;
             // Replace any prior auto-dismiss timer (defensive — the banner
@@ -17108,6 +17255,43 @@ impl TerminalView {
         }
 
         ctx.emit(Event::SlowBootstrap);
+    }
+
+    fn recover_failed_ssh_bootstrap(&mut self, ctx: &mut ViewContext<Self>) -> bool {
+        let Some(bootstrap_event) = self.model.lock().recover_failed_ssh_bootstrap() else {
+            return false;
+        };
+
+        let session_id = bootstrap_event.session_info.session_id;
+        log::warn!(
+            "Recovering failed SSH bootstrap by falling back to legacy session handling: session={session_id:?}"
+        );
+        self.degraded_bootstrap_session_ids.insert(session_id);
+
+        if WarpifySettings::is_ssh_remote_server_enabled(ctx) {
+            RemoteServerManager::handle(ctx).update(ctx, |mgr, ctx| {
+                mgr.deregister_session(session_id, ctx);
+            });
+        }
+
+        let BootstrappedEvent {
+            spawning_command,
+            session_info,
+            restored_block_commands,
+            rcfiles_duration_seconds,
+        } = bootstrap_event;
+
+        self.sessions.update(ctx, |sessions, ctx| {
+            sessions.initialize_bootstrapped_session(
+                *session_info,
+                spawning_command,
+                restored_block_commands,
+                rcfiles_duration_seconds,
+                ctx,
+            );
+        });
+
+        true
     }
 
     pub fn size_info(&self) -> &SizeInfo {
@@ -17705,7 +17889,8 @@ impl TerminalView {
                         ))
                         .into_item(),
                 ];
-                if AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+                if !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+                {
                     fields.extend([
                         MenuItem::Separator,
                         MenuItemFields::new(if FeatureFlag::AgentMode.is_enabled() {
@@ -17921,7 +18106,8 @@ impl TerminalView {
                     );
                 }
 
-                if AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+                if !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+                {
                     if FeatureFlag::AgentMode.is_enabled() {
                         // We can only attach selected blocks if the input box is visible.
                         if self.is_input_box_visible(&model, ctx) {
@@ -18527,6 +18713,10 @@ impl TerminalView {
                         ctx,
                     ))
                     .into_item(),
+                // oh-my-warp: launch an embedded browser pane as a right-split.
+                MenuItemFields::new("Launch Web Pane")
+                    .with_on_select_action(TerminalAction::OpenBrowserPaneSplit)
+                    .into_item(),
             ]);
         }
 
@@ -18578,7 +18768,8 @@ impl TerminalView {
                 .into_item(),
         ]);
 
-        if AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+        let ai_settings = AISettings::as_ref(ctx);
+        if ai_settings.is_ai_command_search_enabled(ctx) {
             items.push(
                 MenuItemFields::new("AI command search")
                     .with_on_select_action(TerminalAction::InputContextMenuItem(
@@ -18591,7 +18782,9 @@ impl TerminalView {
                     .with_disabled(is_editor_disabled)
                     .into_item(),
             );
+        }
 
+        if !ChannelState::is_local_only() && ai_settings.is_any_ai_enabled(ctx) {
             if !selected_input_text.is_empty() && !FeatureFlag::AgentMode.is_enabled() {
                 items.push(
                     MenuItemFields::new("Ask Warp AI")
@@ -18778,7 +18971,7 @@ impl TerminalView {
                     .with_key_shortcut_label(Some("⌘-C"))
                     .into_item(),
             );
-            if AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+            if !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
                 menu_items.extend([
                     MenuItem::Separator,
                     MenuItemFields::new(if FeatureFlag::AgentMode.is_enabled() {
@@ -26145,7 +26338,9 @@ impl TerminalView {
                     );
                 }
 
-                self.ask_ai(ask_source, ctx);
+                if !ChannelState::is_local_only() {
+                    self.ask_ai(ask_source, ctx);
+                }
             }
             OpenWorkflowModal => self.open_workflow_modal(ctx),
             OpenShareSessionModal => self.open_share_session_modal(source, ctx),
@@ -26471,7 +26666,11 @@ impl TerminalView {
             SelectAll => self.select_all_text_from_input(ctx),
             Paste => self.paste_in_input(ctx),
             ShowCommandSearch => self.command_search_from_input(ctx),
-            AskWarpAI => self.ask_ai(&AskAISource::SelectedInputText, ctx),
+            AskWarpAI => {
+                if !ChannelState::is_local_only() {
+                    self.ask_ai(&AskAISource::SelectedInputText, ctx);
+                }
+            }
             ShowAICommandSearch => self.ai_command_search_from_input(ctx),
             SaveAsWorkflow => self.save_as_workflow_from_input(ctx),
             ToggleInputHintText => self.toggle_input_hint_text(ctx),
@@ -27766,6 +27965,7 @@ impl TypedActionView for TerminalView {
             | SplitLeft(_)
             | SplitDown(_)
             | SplitUp(_)
+            | OpenBrowserPaneSplit
             | OpenGridLink(_)
             | OpenRichContentLink(_)
             | ToggleGridSecret { .. }
@@ -28154,6 +28354,12 @@ impl TypedActionView for TerminalView {
             SplitUp(chosen_shell) => {
                 ctx.emit(Event::Pane(PaneEvent::SplitUp(chosen_shell.to_owned())))
             }
+            OpenBrowserPaneSplit => {
+                // oh-my-warp: split a browser pane to the right of the active
+                // pane group. Reuses the same workspace action the tab right-click
+                // menu and the leader chord use.
+                ctx.dispatch_typed_action(&WorkspaceAction::OpenBrowserPane);
+            }
             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
             PromptContextMenu {
                 position_offset_from_prompt,
@@ -28266,7 +28472,9 @@ impl TypedActionView for TerminalView {
                     );
                 }
 
-                self.ask_ai(&AskAISource::Block(*block_index), ctx)
+                if !ChannelState::is_local_only() {
+                    self.ask_ai(&AskAISource::Block(*block_index), ctx)
+                }
             }
             TriggerSubshellBootstrap => self.trigger_subshell_bootstrap(None, false, ctx),
             ShowSubshellBanner(command) => {

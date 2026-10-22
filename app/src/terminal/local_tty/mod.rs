@@ -1,6 +1,8 @@
 pub mod docker_sandbox;
 pub mod terminal_manager;
 mod terminal_view_adaptor;
+#[cfg(unix)]
+pub mod warpkeep;
 
 pub use terminal_manager::{TerminalManager, get_shell_starter};
 #[cfg(feature = "tui")]

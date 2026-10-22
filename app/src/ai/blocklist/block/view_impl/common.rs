@@ -30,12 +30,11 @@ use warpui::elements::shimmering_text::ShimmeringTextStateHandle;
 use warpui::elements::{
     Align, Axis, Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ConstrainedBox,
     Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, Empty, EventHandler,
-    Expanded, Fill, Flex, FormattedTextElement, HeadingFontSizeMultipliers, Highlight,
-    HighlightedRange, Hoverable, Image as WarpImage, MainAxisAlignment, MainAxisSize,
-    MouseStateHandle, NewScrollable, OffsetPositioning, ParentAnchor, ParentElement,
-    ParentOffsetBounds, Radius, SavePosition, ScrollTarget, ScrollToPositionMode, ScrollbarWidth,
-    Shrinkable, Stack, Table, TableColumnWidth, TableConfig, TableHeader, TableVerticalSizing,
-    Text, Wrap,
+    Expanded, Fill, Flex, FormattedTextElement, HeadingFontSizeMultipliers, Hoverable,
+    Image as WarpImage, MainAxisAlignment, MainAxisSize, MouseStateHandle, NewScrollable,
+    OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius, SavePosition,
+    ScrollTarget, ScrollToPositionMode, ScrollbarWidth, Shrinkable, Stack, Table, TableColumnWidth,
+    TableConfig, TableHeader, TableVerticalSizing, Text, Wrap,
 };
 use warpui::fonts::{Properties, Weight};
 use warpui::image_cache::{CacheOption, ImageType};
@@ -45,6 +44,7 @@ use warpui::text_layout::{ClipConfig, TextAlignment, TextStyle};
 use warpui::ui_components::button::Button;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{Action, AppContext, Element, EventContext, SingletonEntity, View, ViewHandle};
+use warpui_core::elements::{Highlight, HighlightedRange};
 
 use super::output::LinkActionConstructors;
 use super::{add_highlights_to_rich_text, add_highlights_to_text};
@@ -88,7 +88,7 @@ use crate::ai::loading::shimmering_warp_loading_text;
 use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::code::editor::view::CodeEditorView;
 use crate::code::editor_management::CodeSource;
-use crate::notebooks::editor::{markdown_table_appearance, rich_text_styles};
+use crate::notebooks::editor::{MarkdownTableAppearance, rich_text_styles};
 use crate::search::slash_command_menu::static_commands::commands;
 use crate::settings::{FontSettings, InputSettings};
 use crate::settings_view::SettingsSection;
@@ -2458,6 +2458,25 @@ fn blocklist_base_line_height(app: &AppContext) -> f32 {
 }
 
 const TABLE_BLOCK_CORNER_RADIUS: f32 = 8.0;
+
+fn ai_table_appearance(appearance: &Appearance) -> MarkdownTableAppearance {
+    let theme = appearance.theme();
+    MarkdownTableAppearance {
+        border_color: internal_colors::neutral_4(theme),
+        header_background: theme.surface_2().into_solid(),
+        cell_background: ColorU::transparent_black(),
+        alternate_row_background: Some(theme.surface_1().with_opacity(50).into_solid()),
+        text_color: internal_colors::text_sub(theme, theme.background()),
+        header_text_color: internal_colors::text_main(theme, theme.background()),
+        scrollbar_nonactive_thumb_color: theme.nonactive_ui_detail().into_solid(),
+        scrollbar_active_thumb_color: theme.active_ui_detail().into_solid(),
+        cell_padding: 8.,
+        outer_border: true,
+        column_dividers: true,
+        row_dividers: true,
+    }
+}
+
 fn render_table_section(
     table: &AgentOutputTable,
     table_handles: TableSectionHandles,
@@ -2477,7 +2496,7 @@ fn render_table_section(
     }
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
-    let table_appearance = markdown_table_appearance(appearance);
+    let table_appearance = ai_table_appearance(appearance);
     let notebook_styles = rich_text_styles(appearance, FontSettings::as_ref(app));
     let table_font_family = appearance.ai_font_family();
     let table_font_size = appearance.monospace_font_size();

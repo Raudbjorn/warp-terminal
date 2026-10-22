@@ -1,0 +1,378 @@
+From fef26d614ec445f45180afc4693ee8caa344443a Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Thu, 21 May 2026 11:37:28 -0400
+Subject: [PATCH 17/48] Add warp.commands plugin API + command registry
+ (oh-my-warp)
+
+Plugins can register command-palette commands via warp.commands.register(id,
+title, cb). The host registers the JS callback and sends RegisterCommandService
+to the app, which records it in a global registry (app/src/plugin/commands.rs).
+The callback returns a string shown as a toast when the command runs. Wires the
+Phase-0 dead-code items (app_services, js_function_registry_mut,
+plugin_service_caller) to real consumers. See PLUGIN_SPEC.md (M1).
+---
+ app/src/plugin/app/mod.rs                   |  6 +--
+ app/src/plugin/app/service_impl/commands.rs | 39 ++++++++++++++++
+ app/src/plugin/app/service_impl/mod.rs      |  2 +
+ app/src/plugin/commands.rs                  | 49 +++++++++++++++++++++
+ app/src/plugin/host/native/js_api/mod.rs    | 37 +++++++++++++---
+ app/src/plugin/host/native/plugin.rs        | 28 ++++++++++--
+ app/src/plugin/mod.rs                       |  1 +
+ app/src/plugin/service/commands.rs          | 31 +++++++++++++
+ app/src/plugin/service/mod.rs               |  2 +
+ 9 files changed, 183 insertions(+), 12 deletions(-)
+ create mode 100644 app/src/plugin/app/service_impl/commands.rs
+ create mode 100644 app/src/plugin/commands.rs
+ create mode 100644 app/src/plugin/service/commands.rs
+
+diff --git a/app/src/plugin/app/mod.rs b/app/src/plugin/app/mod.rs
+index 8253b8a8..6fb800eb 100644
+--- a/app/src/plugin/app/mod.rs
++++ b/app/src/plugin/app/mod.rs
+@@ -4,7 +4,7 @@ use std::sync::Arc;
+ 
+ use anyhow::{Context, Result};
+ use command::blocking::Command;
+-use service_impl::{LogServiceImpl, PluginHostBootstrapServiceImpl};
++use service_impl::{LogServiceImpl, PluginHostBootstrapServiceImpl, RegisterCommandServiceImpl};
+ use warpui::{Entity, ModelContext, SingletonEntity};
+ 
+ use super::{PLUGIN_HOST_ADDRESS_ENV_VAR, PLUGIN_HOST_FLAG};
+@@ -66,7 +66,8 @@ impl PluginHost {
+ 
+         let server_builder = ipc::ServerBuilder::default()
+             .with_service(plugin_host_bootstrap_service)
+-            .with_service(LogServiceImpl::new());
++            .with_service(LogServiceImpl::new())
++            .with_service(RegisterCommandServiceImpl::new());
+ 
+         #[cfg(feature = "completions_v2")]
+         let server_builder =
+@@ -109,7 +110,6 @@ impl PluginHost {
+     ///
+     /// `S` is assumed to be served by the plugin host process; the returned service caller directs
+     /// requests over the IPC connection to the plugin host process.
+-    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
+     pub fn plugin_service_caller<S: ipc::Service>(&self) -> Option<Box<dyn ipc::ServiceCaller<S>>> {
+         self.host_client.clone().map(ipc::service_caller::<S>)
+     }
+diff --git a/app/src/plugin/app/service_impl/commands.rs b/app/src/plugin/app/service_impl/commands.rs
+new file mode 100644
+index 00000000..1f870d90
+--- /dev/null
++++ b/app/src/plugin/app/service_impl/commands.rs
+@@ -0,0 +1,39 @@
++//! The implementation of `RegisterCommandService` served by the app process to the plugin host.
++
++use std::fmt;
++
++use async_trait::async_trait;
++
++use crate::plugin::commands::PluginCommand;
++use crate::plugin::service::{
++    RegisterCommandRequest, RegisterCommandResponse, RegisterCommandService,
++};
++
++#[derive(Clone, Default)]
++pub struct RegisterCommandServiceImpl {}
++
++impl RegisterCommandServiceImpl {
++    pub fn new() -> Self {
++        Self {}
++    }
++}
++
++impl fmt::Debug for RegisterCommandServiceImpl {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("RegisterCommandService").finish()
++    }
++}
++
++#[async_trait]
++impl ipc::ServiceImpl for RegisterCommandServiceImpl {
++    type Service = RegisterCommandService;
++
++    async fn handle_request(&self, request: RegisterCommandRequest) -> RegisterCommandResponse {
++        crate::plugin::commands::register(PluginCommand {
++            id: request.command_id,
++            title: request.title,
++            function_id: request.function_id,
++        });
++        RegisterCommandResponse { success: true }
++    }
++}
+diff --git a/app/src/plugin/app/service_impl/mod.rs b/app/src/plugin/app/service_impl/mod.rs
+index defdc6e5..dd2f0539 100644
+--- a/app/src/plugin/app/service_impl/mod.rs
++++ b/app/src/plugin/app/service_impl/mod.rs
+@@ -4,8 +4,10 @@ cfg_if::cfg_if! {
+         pub use completions::*;
+     }
+ }
++mod commands;
+ mod logging;
+ mod plugin_host_bootstrap;
+ 
++pub(super) use commands::*;
+ pub(super) use logging::*;
+ pub(super) use plugin_host_bootstrap::*;
+diff --git a/app/src/plugin/commands.rs b/app/src/plugin/commands.rs
+new file mode 100644
+index 00000000..ef252b85
+--- /dev/null
++++ b/app/src/plugin/commands.rs
+@@ -0,0 +1,49 @@
++//! oh-my-warp: runtime registry of command-palette commands registered by JS plugins.
++//!
++//! A plugin calls `warp.commands.register(id, title, cb)` in the host process; the host registers
++//! the callback in its [`warp_js::JsFunctionRegistry`] and sends a `RegisterCommandService` request
++//! to the app process, which records the command here. The command palette's
++//! [`crate::search::command_palette::plugin_command_data_source`] reads this registry live, and the
++//! palette's accept handler invokes the callback via `CallJsFunctionService`.
++//!
++//! See PLUGIN_SPEC.md (Milestone 1).
++
++use std::collections::HashMap;
++use std::sync::{LazyLock, Mutex};
++
++use warp_js::JsFunctionId;
++
++/// A command registered by a plugin via `warp.commands.register`.
++#[derive(Clone, Debug)]
++pub struct PluginCommand {
++    /// Stable id, unique across plugins (e.g. `"greet.hello"`). Used as the palette binding name.
++    pub id: String,
++    /// Human-readable title shown in the command palette.
++    pub title: String,
++    /// Id of the registered JS callback in the plugin host, invoked when the command runs.
++    pub function_id: JsFunctionId,
++}
++
++static REGISTRY: LazyLock<Mutex<HashMap<String, PluginCommand>>> =
++    LazyLock::new(|| Mutex::new(HashMap::new()));
++
++/// Registers (or replaces) a plugin command. Called on the app process when a plugin invokes
++/// `warp.commands.register`.
++pub fn register(command: PluginCommand) {
++    log::info!(
++        "Registered plugin command {:?} ({:?})",
++        command.id,
++        command.title
++    );
++    REGISTRY.lock().unwrap().insert(command.id.clone(), command);
++}
++
++/// Returns a snapshot of all registered plugin commands.
++pub fn all() -> Vec<PluginCommand> {
++    REGISTRY.lock().unwrap().values().cloned().collect()
++}
++
++/// Returns the JS callback id for the command with the given id, if registered.
++pub fn function_id(id: &str) -> Option<JsFunctionId> {
++    REGISTRY.lock().unwrap().get(id).map(|c| c.function_id)
++}
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index c1c1cd50..71182575 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -1,4 +1,4 @@
+-use rquickjs::{function::Opt, Ctx, Function, Object};
++use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
+ 
+ use super::plugin::PluginHandle;
+ 
+@@ -9,7 +9,7 @@ pub const PLUGIN_API_VERSION: &str = "1.0.0";
+ 
+ cfg_if::cfg_if! {
+     if #[cfg(feature = "completions_v2")] {
+-        use rquickjs::{prelude::MutFn, Value};
++        use rquickjs::Value;
+         use warp_completer::signatures::CommandSignature;
+         use warp_js::FromWarpJs;
+     }
+@@ -21,13 +21,12 @@ cfg_if::cfg_if! {
+ /// * `warp.version: string` — the [`PLUGIN_API_VERSION`] of the `warp.*` surface.
+ /// * `warp.log(message: string, level?: "info" | "warn" | "error")` — logs through the
+ ///   host logger (which is relayed to the app via the IPC `LogService`).
++/// * `warp.commands.register(id, title, callback)` — registers a command-palette command;
++///   `callback()` returns a string that is shown as a toast when the command runs.
+ ///
+ /// Additional namespaces are added behind feature flags (e.g. `completions` under
+ /// `completions_v2`). See PLUGIN_SPEC.md for the planned surface.
+-pub fn warp(
+-    #[allow(unused_variables)] plugin: PluginHandle,
+-    ctx: Ctx<'_>,
+-) -> rquickjs::Result<Object<'_>> {
++pub fn warp(plugin: PluginHandle, ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> {
+     let api = Object::new(ctx)?;
+ 
+     api.set("version", PLUGIN_API_VERSION)?;
+@@ -41,12 +40,38 @@ pub fn warp(
+             }
+         }),
+     )?;
++    api.set("commands", commands(plugin.clone(), ctx)?)?;
+ 
+     #[cfg(feature = "completions_v2")]
+     api.set("completions", completions(plugin, ctx)?)?;
+     Ok(api)
+ }
+ 
++/// Returns a JS object representing the Commands namespace for the Warp Plugin API.
++///
++/// API methods:
++///
++/// `register(id: string, title: string, callback: () => string)`: Registers a command-palette
++///     command. When the user runs it, `callback` executes in the plugin host and its returned
++///     string (if any) is shown to the user as a toast.
++fn commands<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
++    let commands = Object::new(ctx)?;
++    commands.set(
++        "register",
++        Function::new(
++            ctx,
++            MutFn::from(move |id: String, title: String, callback: Function<'js>| {
++                let mut plugin = plugin.get_mut();
++                let func_ref = plugin
++                    .js_function_registry_mut()
++                    .register_js_function::<String, String>(callback, ctx);
++                plugin.register_command(id, title, func_ref.id);
++            }),
++        ),
++    )?;
++    Ok(commands)
++}
++
+ /// Returns a JS object to be used as a the `console` global, implementing `console.log()` and
+ /// `console.err()`.
+ pub fn console(ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> {
+diff --git a/app/src/plugin/host/native/plugin.rs b/app/src/plugin/host/native/plugin.rs
+index 186766b2..2e100b11 100644
+--- a/app/src/plugin/host/native/plugin.rs
++++ b/app/src/plugin/host/native/plugin.rs
+@@ -6,6 +6,8 @@ use anyhow::anyhow;
+ use rquickjs::Context;
+ use warp_js::{JsFunctionId, JsFunctionRegistry, SerializedJsValue};
+ 
++use crate::plugin::service::{RegisterCommandRequest, RegisterCommandService};
++
+ cfg_if::cfg_if! {
+     if #[cfg(feature = "completions_v2")] {
+         use warp_completer::signatures::CommandSignature;
+@@ -43,14 +45,18 @@ impl PluginHandle {
+ 
+ /// Container struct for holding ipc `ServiceCaller` dependencies of `Plugin`.
+ pub(super) struct AppServiceCallers {
++    register_command_caller: Box<dyn ipc::ServiceCaller<RegisterCommandService>>,
+     #[cfg(feature = "completions_v2")]
+     register_command_signatures_caller:
+         Box<dyn ipc::ServiceCaller<RegisterCommandSignatureService>>,
+ }
+ 
+ impl AppServiceCallers {
+-    pub fn new(#[allow(unused_variables)] app_client: Arc<ipc::Client>) -> Self {
++    pub fn new(app_client: Arc<ipc::Client>) -> Self {
+         Self {
++            register_command_caller: ipc::service_caller::<RegisterCommandService>(
++                app_client.clone(),
++            ),
+             #[cfg(feature = "completions_v2")]
+             register_command_signatures_caller: ipc::service_caller::<
+                 RegisterCommandSignatureService,
+@@ -69,7 +75,6 @@ impl AppServiceCallers {
+ /// This ultimately the main backing data structure behind the JS plugin API exposed to plugins
+ /// (see [`super::js_api`]).
+ pub(super) struct Plugin {
+-    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
+     app_services: AppServiceCallers,
+     js_function_registry: JsFunctionRegistry,
+ }
+@@ -104,7 +109,24 @@ impl Plugin {
+         }
+     }
+ 
+-    #[cfg_attr(not(feature = "completions_v2"), allow(dead_code))]
++    /// Registers a command-palette command backed by a JS callback (by its `function_id`).
++    pub(super) fn register_command(
++        &mut self,
++        command_id: String,
++        title: String,
++        function_id: JsFunctionId,
++    ) {
++        if let Err(e) = warpui::r#async::block_on(self.app_services.register_command_caller.call(
++            RegisterCommandRequest {
++                command_id,
++                title,
++                function_id,
++            },
++        )) {
++            log::warn!("Failed to register plugin command: {e:?}");
++        }
++    }
++
+     pub(super) fn js_function_registry_mut(&mut self) -> &mut JsFunctionRegistry {
+         &mut self.js_function_registry
+     }
+diff --git a/app/src/plugin/mod.rs b/app/src/plugin/mod.rs
+index 8d7dd849..aff19cd0 100644
+--- a/app/src/plugin/mod.rs
++++ b/app/src/plugin/mod.rs
+@@ -1,4 +1,5 @@
+ pub(crate) mod app;
++pub(crate) mod commands;
+ pub(crate) mod service;
+ 
+ #[cfg_attr(not(target_family = "wasm"), path = "host/native/mod.rs")]
+diff --git a/app/src/plugin/service/commands.rs b/app/src/plugin/service/commands.rs
+new file mode 100644
+index 00000000..4b13a4a8
+--- /dev/null
++++ b/app/src/plugin/service/commands.rs
+@@ -0,0 +1,31 @@
++//! IPC service for registering command-palette commands defined by JS plugins.
++//!
++//! Hosted by the app process and called by the plugin host process when a plugin invokes
++//! `warp.commands.register`. See [`crate::plugin::commands`].
++
++use serde::{Deserialize, Serialize};
++use warp_js::JsFunctionId;
++
++#[derive(Clone, Serialize, Deserialize, Debug)]
++pub struct RegisterCommandRequest {
++    /// Stable command id, unique across plugins (e.g. `"greet.hello"`).
++    pub command_id: String,
++    /// Human-readable title shown in the command palette.
++    pub title: String,
++    /// Id of the JS callback (registered in the host) to invoke when the command runs.
++    pub function_id: JsFunctionId,
++}
++
++#[derive(Clone, Serialize, Deserialize, Debug)]
++pub struct RegisterCommandResponse {
++    /// `true` if the request succeeded, `false` otherwise.
++    pub success: bool,
++}
++
++/// IPC service to register plugin commands in the app-side command registry.
++pub struct RegisterCommandService {}
++
++impl ipc::Service for RegisterCommandService {
++    type Request = RegisterCommandRequest;
++    type Response = RegisterCommandResponse;
++}
+diff --git a/app/src/plugin/service/mod.rs b/app/src/plugin/service/mod.rs
+index 00ca7d9f..76db3940 100644
+--- a/app/src/plugin/service/mod.rs
++++ b/app/src/plugin/service/mod.rs
+@@ -5,9 +5,11 @@ cfg_if::cfg_if! {
+     }
+ }
+ mod call_js_function;
++mod commands;
+ mod logging;
+ mod plugin_host_bootstrap;
+ 
+ pub use call_js_function::*;
++pub use commands::*;
+ pub use logging::*;
+ pub use plugin_host_bootstrap::*;

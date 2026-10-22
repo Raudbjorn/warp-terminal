@@ -2,6 +2,10 @@ pub(crate) mod convert_conversation;
 mod convert_from;
 mod convert_to;
 mod r#impl;
+#[cfg(not(target_family = "wasm"))]
+mod local_adapter;
+#[cfg(not(target_family = "wasm"))]
+mod local_route;
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -170,6 +174,9 @@ pub struct RequestParams {
     /// `custom_model_providers`: the selected model's `config_key` indexes into this
     /// registry. `None` when no custom router is selected.
     pub custom_model_routers: Option<warp_multi_agent_api::request::settings::CustomModelRouters>,
+    pub openai_base_url: Option<String>,
+    pub local_multi_agent_server_root_url: Option<String>,
+    pub local_model_aliases: Option<String>,
     pub allow_use_of_warp_credits: bool,
     /// Asks the server not to attach the user's delegated ChatGPT token, so OpenAI requests run
     /// on Warp's key. Set for the rest of a conversation after a token-sharing failure.
@@ -210,6 +217,31 @@ pub struct ConversationData {
     pub use_warp_credits_instead_of_chatgpt: bool,
 }
 
+/// oh-my-warp: the AI tools registered by JS plugins (`warp.ai.registerTool`), built as `rmcp`
+/// tools to inject into the model's MCP context. They are dispatched in-process by the tool-call
+/// executor (`crate::ai::blocklist::action_model::execute::call_mcp_tool`). See PLUGIN_SPEC.md (M4).
+#[cfg(feature = "plugin_host")]
+fn plugin_ai_tools() -> Vec<rmcp::model::Tool> {
+    crate::plugin::ai_tools::all()
+        .into_iter()
+        .filter_map(|tool| {
+            let schema: serde_json::Value = serde_json::from_str(&tool.schema_json)
+                .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
+            serde_json::from_value(serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": schema,
+            }))
+            .ok()
+        })
+        .collect()
+}
+
+/// oh-my-warp: synthetic MCP "server" id grouping plugin-registered tools in the model request.
+/// A fixed UUID so it never collides with a real installed MCP server.
+#[cfg(feature = "plugin_host")]
+const PLUGIN_TOOLS_SERVER_ID: &str = "0a0a0a0a-0b0b-4c0c-8d0d-0e0e0e0e0e0e";
+
 impl RequestParams {
     #[cfg(test)]
     pub fn new_for_test() -> Self {
@@ -236,6 +268,9 @@ impl RequestParams {
             api_keys: None,
             custom_model_providers: None,
             custom_model_routers: None,
+            openai_base_url: None,
+            local_multi_agent_server_root_url: None,
+            local_model_aliases: None,
             allow_use_of_warp_credits: false,
             skip_chatgpt_subscription: false,
             autonomy_level: Default::default(),
@@ -295,7 +330,8 @@ impl RequestParams {
             // Include built-in Warp-hosted servers (e.g. the Factory MCP).
             active_servers.extend(templatable_manager.get_active_builtin_servers().values());
 
-            let servers: Vec<MCPServer> = active_servers
+            #[cfg_attr(not(feature = "plugin_host"), allow(unused_mut))]
+            let mut servers: Vec<MCPServer> = active_servers
                 .into_iter()
                 .map(|server| MCPServer {
                     name: server.name().to_string(),
@@ -306,6 +342,23 @@ impl RequestParams {
                     tools: server.tools().to_vec(),
                 })
                 .collect();
+
+            // oh-my-warp: surface plugin-registered AI tools as a synthetic MCP server so the
+            // model can call them; the call is dispatched in-process (see `call_mcp_tool`).
+            #[cfg(feature = "plugin_host")]
+            {
+                let plugin_tools = plugin_ai_tools();
+                if !plugin_tools.is_empty() {
+                    servers.push(MCPServer {
+                        name: "oh-my-warp plugins".to_string(),
+                        description: "Tools registered by oh-my-warp plugins".to_string(),
+                        id: PLUGIN_TOOLS_SERVER_ID.to_string(),
+                        warp_id: String::new(),
+                        resources: vec![],
+                        tools: plugin_tools,
+                    });
+                }
+            }
 
             if servers.is_empty() {
                 None
@@ -324,7 +377,11 @@ impl RequestParams {
                 .resources()
                 .cloned()
                 .collect::<Vec<_>>();
-            let tools = templatable_mcp_manager.tools().cloned().collect::<Vec<_>>();
+            #[cfg_attr(not(feature = "plugin_host"), allow(unused_mut))]
+            let mut tools = templatable_mcp_manager.tools().cloned().collect::<Vec<_>>();
+            // oh-my-warp: include plugin-registered AI tools (dispatched in-process).
+            #[cfg(feature = "plugin_host")]
+            tools.extend(plugin_ai_tools());
 
             #[allow(deprecated)]
             (!resources.is_empty() || !tools.is_empty()).then_some(MCPContext {
@@ -338,6 +395,9 @@ impl RequestParams {
 
         let user_workspaces = UserWorkspaces::as_ref(app);
         let api_key_manager = ApiKeyManager::as_ref(app);
+        let active_profile =
+            AIExecutionProfilesModel::as_ref(app).active_profile(terminal_view_id, app);
+        let inference_profile_key = active_profile.inference_profile_key();
         // Bedrock and Gemini Enterprise are admin-configured host credentials rather than member
         // BYO keys, so they deliberately skip this gate.
         let member_byo_credentials_allowed = user_workspaces.are_member_byo_keys_allowed(scope);
@@ -348,21 +408,39 @@ impl RequestParams {
             crate::ai::geap_credentials::current_geap_policy(scope, app).mint_binding();
         #[cfg(target_family = "wasm")]
         let geap_binding: Option<::ai::api_keys::GeapMintBinding> = None;
-        let api_keys = api_key_manager.api_keys_for_request(
+        let api_keys = api_key_manager.api_keys_for_profile_request(
+            &inference_profile_key,
             is_byo_enabled,
             user_workspaces.is_aws_bedrock_credentials_enabled(scope, app),
             geap_binding,
         );
         let is_custom_inference_enabled = user_workspaces.is_byo_endpoint_enabled(app)
             && user_workspaces.are_member_byo_endpoints_allowed(scope);
-        let custom_model_providers =
-            api_key_manager.custom_model_providers_for_request(is_custom_inference_enabled);
+        let custom_model_providers = api_key_manager.custom_model_providers_for_profile_request(
+            &inference_profile_key,
+            is_custom_inference_enabled,
+        );
         let custom_model_routers = FeatureFlag::CustomModelRouters.is_enabled().then(|| {
             LLMPreferences::as_ref(app).custom_model_routers_for_request(
                 &request_input.model_id,
                 &request_input.coding_model_id,
             )
         });
+        #[cfg(not(target_family = "wasm"))]
+        let local_multi_agent_server_root_url =
+            crate::local_multi_agent::LocalMultiAgentManager::global_root_url()
+                .map(|url| url.to_string())
+                .or_else(|| {
+                    api_key_manager
+                        .local_multi_agent_server_root_url_for_profile(&inference_profile_key)
+                });
+        #[cfg(target_family = "wasm")]
+        let local_multi_agent_server_root_url =
+            api_key_manager.local_multi_agent_server_root_url_for_profile(&inference_profile_key);
+        let openai_base_url = api_key_manager.openai_base_url_for_profile(&inference_profile_key);
+        let local_model_aliases = non_empty_string(
+            api_key_manager.local_model_aliases_for_profile(&inference_profile_key),
+        );
         let allow_use_of_warp_credits = *AISettings::as_ref(app).can_use_warp_credits_for_fallback;
 
         let app_execution_mode = AppExecutionMode::as_ref(app);
@@ -420,10 +498,7 @@ impl RequestParams {
         // server-side, drop the override; otherwise clamp it to the model's
         // current `[min, max]` range. This closes the window between an
         // in-flight model metadata refresh and the next request.
-        let context_window_limit = AIExecutionProfilesModel::as_ref(app)
-            .active_profile(terminal_view_id, app)
-            .data()
-            .context_window_limit_for_request(app);
+        let context_window_limit = active_profile.data().context_window_limit_for_request(app);
 
         Self {
             input: request_input.all_inputs().cloned().collect(),
@@ -448,6 +523,9 @@ impl RequestParams {
             api_keys,
             custom_model_providers,
             custom_model_routers,
+            openai_base_url,
+            local_multi_agent_server_root_url,
+            local_model_aliases,
             allow_use_of_warp_credits,
             skip_chatgpt_subscription: conversation.use_warp_credits_instead_of_chatgpt,
             autonomy_level,
@@ -483,4 +561,9 @@ fn report_computer_use_unavailable(task_id: AmbientAgentTaskId, sandboxed: bool,
         },
         app
     );
+}
+
+fn non_empty_string(value: String) -> Option<String> {
+    let value = value.trim().to_string();
+    (!value.is_empty()).then_some(value)
 }

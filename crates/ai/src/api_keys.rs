@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime};
@@ -28,6 +28,8 @@ use crate::telemetry::{
     AITelemetryEvent, ProviderCredentialTelemetryAction, ProviderCredentialTelemetryKind,
     ProviderCredentialTelemetryProvider,
 };
+
+pub const DEFAULT_PROFILE_INFERENCE_KEY: &str = "default";
 
 const SECURE_STORAGE_KEY: &str = "AiApiKeys";
 const CUSTOM_ENDPOINT_KEYS_SECURE_STORAGE_KEY: &str = "AiCustomEndpointKeys";
@@ -87,11 +89,33 @@ impl ChatGPTConnectFailure {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ApiKeys {
+    /// Legacy/global fields. New callers should prefer `profile_inference_settings`.
+    /// These stay serialized so older clients can still read/write the secure-storage payload.
     pub google: Option<String>,
     pub anthropic: Option<String>,
     pub openai: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub local_multi_agent_server_root_url: Option<String>,
     pub open_router: Option<String>,
     pub custom_endpoints: Vec<CustomEndpoint>,
+    pub profile_inference_settings: BTreeMap<String, ProfileInferenceSettings>,
+    pub profile_settings_migrated: bool,
+    pub local_profile_settings_migrated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileInferenceSettings {
+    pub google: Option<String>,
+    pub anthropic: Option<String>,
+    pub openai: Option<String>,
+    pub openai_base_url: Option<String>,
+    pub local_multi_agent_server_root_url: Option<String>,
+    pub open_router: Option<String>,
+    pub custom_endpoints: Vec<CustomEndpoint>,
+    pub local_model_aliases: String,
+    pub local_model_list: String,
+    pub local_ai_autocomplete_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -370,14 +394,16 @@ impl schemars::JsonSchema for CustomEndpointDefinitions {
 
 pub fn validate_custom_endpoint_url(value: &str) -> Result<(), &'static str> {
     let parsed = Url::parse(value).map_err(|_| "Invalid URL")?;
-    if parsed.scheme() != "https" {
-        return Err("URL must use HTTPS");
-    }
     let Some(host) = parsed.host_str().filter(|host| !host.is_empty()) else {
         return Err("URL must include a host");
     };
     if is_restricted_host(host) {
-        return Err("URL must not use a local or private host");
+        // Local inference providers commonly serve HTTP directly on loopback or the LAN.
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err("URL must use HTTP or HTTPS");
+        }
+    } else if parsed.scheme() != "https" {
+        return Err("URL must use HTTPS");
     }
     Ok(())
 }
@@ -433,19 +459,123 @@ impl CustomEndpointModel {
 
 impl ApiKeys {
     pub fn has_any_key(&self) -> bool {
-        self.openai.is_some()
-            || self.anthropic.is_some()
-            || self.google.is_some()
-            || self.open_router.is_some()
-            || self
-                .custom_endpoints
-                .iter()
-                .any(|endpoint| !endpoint.api_key.trim().is_empty())
+        self.default_profile_settings().has_any_key()
     }
 
-    /// Number of single-provider API keys currently configured (OpenAI,
-    /// Anthropic, Google, OpenRouter). Custom endpoints are counted separately
-    /// via `custom_endpoints`.
+    /// Returns `true` when the user has at least one custom endpoint configured.
+    pub fn has_custom_endpoints(&self) -> bool {
+        !self.default_profile_settings().custom_endpoints.is_empty()
+    }
+
+    pub fn default_profile_settings(&self) -> ProfileInferenceSettings {
+        self.profile_settings(DEFAULT_PROFILE_INFERENCE_KEY)
+    }
+
+    pub fn profile_settings(&self, profile_key: &str) -> ProfileInferenceSettings {
+        if let Some(settings) = self.profile_inference_settings.get(profile_key) {
+            return settings.clone();
+        }
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            return self.legacy_default_profile_settings();
+        }
+        ProfileInferenceSettings::default()
+    }
+
+    fn profile_settings_mut(&mut self, profile_key: &str) -> &mut ProfileInferenceSettings {
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY
+            && !self.profile_inference_settings.contains_key(profile_key)
+        {
+            let legacy_settings = self.legacy_default_profile_settings();
+            self.profile_inference_settings
+                .insert(profile_key.to_string(), legacy_settings);
+        }
+        self.profile_inference_settings
+            .entry(profile_key.to_string())
+            .or_default()
+    }
+
+    fn legacy_default_profile_settings(&self) -> ProfileInferenceSettings {
+        ProfileInferenceSettings {
+            google: self.google.clone(),
+            anthropic: self.anthropic.clone(),
+            openai: self.openai.clone(),
+            openai_base_url: self.openai_base_url.clone(),
+            local_multi_agent_server_root_url: self.local_multi_agent_server_root_url.clone(),
+            open_router: self.open_router.clone(),
+            custom_endpoints: self.custom_endpoints.clone(),
+            local_model_aliases: String::new(),
+            local_model_list: String::new(),
+            local_ai_autocomplete_enabled: false,
+        }
+    }
+
+    fn migrate_default_profile_if_needed(&mut self) -> bool {
+        if self.profile_settings_migrated {
+            return false;
+        }
+
+        let mut default_profile = self
+            .profile_inference_settings
+            .remove(DEFAULT_PROFILE_INFERENCE_KEY)
+            .unwrap_or_default();
+        default_profile.google = default_profile.google.or_else(|| self.google.clone());
+        default_profile.anthropic = default_profile.anthropic.or_else(|| self.anthropic.clone());
+        default_profile.openai = default_profile.openai.or_else(|| self.openai.clone());
+        default_profile.openai_base_url = default_profile
+            .openai_base_url
+            .or_else(|| self.openai_base_url.clone());
+        default_profile.local_multi_agent_server_root_url = default_profile
+            .local_multi_agent_server_root_url
+            .or_else(|| self.local_multi_agent_server_root_url.clone());
+        default_profile.open_router = default_profile
+            .open_router
+            .or_else(|| self.open_router.clone());
+        if default_profile.custom_endpoints.is_empty() {
+            default_profile.custom_endpoints = self.custom_endpoints.clone();
+        }
+
+        self.profile_inference_settings
+            .insert(DEFAULT_PROFILE_INFERENCE_KEY.to_string(), default_profile);
+        self.profile_settings_migrated = true;
+        true
+    }
+
+    pub fn migrate_default_profile_local_settings_if_needed(
+        &mut self,
+        openai_base_url: Option<String>,
+        local_model_aliases: String,
+        local_model_list: String,
+        local_ai_autocomplete_enabled: bool,
+    ) -> bool {
+        if self.local_profile_settings_migrated {
+            return false;
+        }
+
+        let default_profile = self.profile_settings_mut(DEFAULT_PROFILE_INFERENCE_KEY);
+        if default_profile.openai_base_url.is_none() {
+            default_profile.openai_base_url = normalize_absolute_http_url(openai_base_url);
+        }
+        if default_profile.local_model_aliases.trim().is_empty()
+            && !local_model_aliases.trim().is_empty()
+        {
+            default_profile.local_model_aliases = local_model_aliases;
+        }
+        if default_profile.local_model_list.trim().is_empty() && !local_model_list.trim().is_empty()
+        {
+            default_profile.local_model_list = local_model_list;
+        }
+        default_profile.local_ai_autocomplete_enabled = local_ai_autocomplete_enabled;
+        self.local_profile_settings_migrated = true;
+        true
+    }
+
+    pub fn clear_profile_settings(&mut self, profile_key: &str) {
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            return;
+        }
+        self.profile_inference_settings.remove(profile_key);
+    }
+
     pub fn provider_key_count(&self) -> usize {
         [
             &self.openai,
@@ -457,6 +587,36 @@ impl ApiKeys {
         .filter(|key| key.as_deref().is_some_and(|v| !v.trim().is_empty()))
         .count()
     }
+}
+
+impl ProfileInferenceSettings {
+    pub fn has_any_key(&self) -> bool {
+        self.openai.is_some()
+            || self.anthropic.is_some()
+            || self.google.is_some()
+            || self.open_router.is_some()
+            || self
+                .custom_endpoints
+                .iter()
+                .any(|endpoint| !endpoint.api_key.trim().is_empty())
+    }
+}
+
+fn normalize_absolute_http_url(url: Option<String>) -> Option<String> {
+    let url = url?;
+    let url = url.trim().trim_end_matches('/').to_string();
+    if url.is_empty() {
+        return None;
+    }
+
+    let Ok(parsed) = Url::parse(&url) else {
+        return None;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+
+    Some(url)
 }
 
 /// OAuth tokens for a connected xAI / Grok subscription (e.g. SuperGrok).
@@ -656,7 +816,8 @@ fn send_provider_credential_telemetry(
 
 impl ApiKeyManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
-        let keys = Self::load_keys_from_secure_storage(ctx);
+        let mut keys = Self::load_keys_from_secure_storage(ctx);
+        keys.migrate_default_profile_if_needed();
         let custom_endpoint_keys = Self::load_custom_endpoint_keys_from_secure_storage(ctx);
         let resolved_custom_endpoints = keys.custom_endpoints.clone();
         let grok_tokens = Self::load_grok_tokens_from_secure_storage(ctx);
@@ -689,6 +850,243 @@ impl ApiKeyManager {
 
     pub fn keys(&self) -> &ApiKeys {
         &self.keys
+    }
+
+    pub fn set_google_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.set_google_key_for_profile(DEFAULT_PROFILE_INFERENCE_KEY, key, ctx);
+    }
+
+    pub fn set_google_key_for_profile(
+        &mut self,
+        profile_key: &str,
+        key: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.keys.profile_settings_mut(profile_key).google = key.clone();
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.set_provider_key(LLMProvider::Google, key, ctx);
+            return;
+        }
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_anthropic_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.set_anthropic_key_for_profile(DEFAULT_PROFILE_INFERENCE_KEY, key, ctx);
+    }
+
+    pub fn set_anthropic_key_for_profile(
+        &mut self,
+        profile_key: &str,
+        key: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.keys.profile_settings_mut(profile_key).anthropic = key.clone();
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.set_provider_key(LLMProvider::Anthropic, key, ctx);
+            return;
+        }
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_openai_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.set_openai_key_for_profile(DEFAULT_PROFILE_INFERENCE_KEY, key, ctx);
+    }
+
+    pub fn set_openai_key_for_profile(
+        &mut self,
+        profile_key: &str,
+        key: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.keys.profile_settings_mut(profile_key).openai = key.clone();
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.set_provider_key(LLMProvider::OpenAI, key, ctx);
+            return;
+        }
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_openai_base_url(&mut self, base_url: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.set_openai_base_url_for_profile(DEFAULT_PROFILE_INFERENCE_KEY, base_url, ctx);
+    }
+
+    pub fn set_openai_base_url_for_profile(
+        &mut self,
+        profile_key: &str,
+        base_url: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let base_url = normalize_absolute_http_url(base_url);
+        self.keys.profile_settings_mut(profile_key).openai_base_url = base_url.clone();
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.keys.openai_base_url = base_url;
+        }
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_multi_agent_server_root_url(
+        &mut self,
+        url: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.set_local_multi_agent_server_root_url_for_profile(
+            DEFAULT_PROFILE_INFERENCE_KEY,
+            url,
+            ctx,
+        );
+    }
+
+    pub fn set_local_multi_agent_server_root_url_for_profile(
+        &mut self,
+        profile_key: &str,
+        url: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let url = normalize_absolute_http_url(url);
+        self.keys
+            .profile_settings_mut(profile_key)
+            .local_multi_agent_server_root_url = url.clone();
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.keys.local_multi_agent_server_root_url = url;
+        }
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_open_router_key(&mut self, key: Option<String>, ctx: &mut ModelContext<Self>) {
+        self.set_open_router_key_for_profile(DEFAULT_PROFILE_INFERENCE_KEY, key, ctx);
+    }
+
+    pub fn set_open_router_key_for_profile(
+        &mut self,
+        profile_key: &str,
+        key: Option<String>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.keys.profile_settings_mut(profile_key).open_router = key.clone();
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.keys.open_router = key;
+        }
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_model_aliases_for_profile(
+        &mut self,
+        profile_key: &str,
+        aliases: String,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.keys
+            .profile_settings_mut(profile_key)
+            .local_model_aliases = aliases;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_model_settings_for_profile(
+        &mut self,
+        profile_key: &str,
+        aliases: String,
+        model_list: String,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let settings = self.keys.profile_settings_mut(profile_key);
+        settings.local_model_aliases = aliases;
+        settings.local_model_list = model_list;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_local_ai_autocomplete_enabled_for_profile(
+        &mut self,
+        profile_key: &str,
+        enabled: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.keys
+            .profile_settings_mut(profile_key)
+            .local_ai_autocomplete_enabled = enabled;
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn set_profile_inference_defaults_if_missing(
+        &mut self,
+        profile_key: &str,
+        defaults: ProfileInferenceSettings,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self
+            .keys
+            .profile_inference_settings
+            .contains_key(profile_key)
+        {
+            return;
+        }
+        self.keys
+            .profile_inference_settings
+            .insert(profile_key.to_string(), defaults);
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn remove_profile_settings(&mut self, profile_key: &str, ctx: &mut ModelContext<Self>) {
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            return;
+        }
+        if self
+            .keys
+            .profile_inference_settings
+            .remove(profile_key)
+            .is_some()
+        {
+            ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+            self.write_keys_to_secure_storage(ctx);
+        }
+    }
+
+    pub fn rename_profile_settings(
+        &mut self,
+        old_profile_key: &str,
+        new_profile_key: &str,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if old_profile_key == new_profile_key || old_profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            return;
+        }
+        let Some(settings) = self.keys.profile_inference_settings.remove(old_profile_key) else {
+            return;
+        };
+        self.keys
+            .profile_inference_settings
+            .entry(new_profile_key.to_string())
+            .or_insert(settings);
+        ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+        self.write_keys_to_secure_storage(ctx);
+    }
+
+    pub fn migrate_default_profile_local_settings_if_needed(
+        &mut self,
+        openai_base_url: Option<String>,
+        local_model_aliases: String,
+        local_model_list: String,
+        local_ai_autocomplete_enabled: bool,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.keys.migrate_default_profile_local_settings_if_needed(
+            openai_base_url,
+            local_model_aliases,
+            local_model_list,
+            local_ai_autocomplete_enabled,
+        ) {
+            ctx.emit(ApiKeyManagerEvent::KeysUpdated);
+            self.write_keys_to_secure_storage(ctx);
+        }
     }
 
     pub fn custom_endpoints(&self) -> &[CustomEndpoint] {
@@ -808,6 +1206,14 @@ impl ApiKeyManager {
                 "{} does not support pasted API keys",
                 provider.display_name()
             ));
+        }
+        let key = provider.api_key(&keys).map(str::to_owned);
+        let profile = keys.profile_settings_mut(DEFAULT_PROFILE_INFERENCE_KEY);
+        match provider {
+            LLMProvider::Google => profile.google = key,
+            LLMProvider::Anthropic => profile.anthropic = key,
+            LLMProvider::OpenAI => profile.openai = key,
+            LLMProvider::Xai | LLMProvider::Unknown => (),
         }
         let json = serde_json::to_string(&keys)
             .map_err(|error| anyhow::Error::new(error).context("Failed to serialize API keys"))?;
@@ -974,6 +1380,16 @@ impl ApiKeyManager {
         if !provider.set_api_key(&mut self.keys, key) {
             return;
         }
+        let key = provider.api_key(&self.keys).map(str::to_owned);
+        let profile = self
+            .keys
+            .profile_settings_mut(DEFAULT_PROFILE_INFERENCE_KEY);
+        match provider {
+            LLMProvider::Google => profile.google = key,
+            LLMProvider::Anthropic => profile.anthropic = key,
+            LLMProvider::OpenAI => profile.openai = key,
+            LLMProvider::Xai | LLMProvider::Unknown => (),
+        }
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
         let is_present = provider.api_key(&self.keys).is_some();
@@ -992,6 +1408,15 @@ impl ApiKeyManager {
         params: CustomEndpointParams,
         ctx: &mut ModelContext<Self>,
     ) {
+        self.add_custom_endpoint_for_profile(DEFAULT_PROFILE_INFERENCE_KEY, params, ctx);
+    }
+
+    pub fn add_custom_endpoint_for_profile(
+        &mut self,
+        profile_key: &str,
+        params: CustomEndpointParams,
+        ctx: &mut ModelContext<Self>,
+    ) {
         let CustomEndpointParams {
             name,
             url,
@@ -999,24 +1424,30 @@ impl ApiKeyManager {
             models,
             schema,
         } = params;
-        self.keys.custom_endpoints.push(CustomEndpoint {
-            name,
-            url,
-            api_key,
-            schema,
-            models: models
-                .into_iter()
-                .map(|(name, alias, config_key)| CustomEndpointModel {
-                    name,
-                    alias,
-                    config_key: config_key
-                        .filter(|k| !k.is_empty())
-                        .unwrap_or_else(|| Uuid::new_v4().to_string()),
-                })
-                .collect(),
-        });
-        if self.custom_endpoints.definitions.is_none() {
-            self.custom_endpoints.resolved = self.keys.custom_endpoints.clone();
+        self.keys
+            .profile_settings_mut(profile_key)
+            .custom_endpoints
+            .push(CustomEndpoint {
+                name,
+                url,
+                api_key,
+                schema,
+                models: models
+                    .into_iter()
+                    .map(|(name, alias, config_key)| CustomEndpointModel {
+                        name,
+                        alias,
+                        config_key: config_key
+                            .filter(|k| !k.is_empty())
+                            .unwrap_or_else(|| Uuid::new_v4().to_string()),
+                    })
+                    .collect(),
+            });
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.keys.custom_endpoints = self.keys.profile_settings(profile_key).custom_endpoints;
+            if self.custom_endpoints.definitions.is_none() {
+                self.custom_endpoints.resolved = self.keys.custom_endpoints.clone();
+            }
         }
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
@@ -1028,7 +1459,23 @@ impl ApiKeyManager {
         params: CustomEndpointParams,
         ctx: &mut ModelContext<Self>,
     ) {
-        if index >= self.keys.custom_endpoints.len() {
+        self.save_custom_endpoint_for_profile(DEFAULT_PROFILE_INFERENCE_KEY, index, params, ctx);
+    }
+
+    pub fn save_custom_endpoint_for_profile(
+        &mut self,
+        profile_key: &str,
+        index: usize,
+        params: CustomEndpointParams,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if index
+            >= self
+                .keys
+                .profile_settings_mut(profile_key)
+                .custom_endpoints
+                .len()
+        {
             return;
         }
         let CustomEndpointParams {
@@ -1038,7 +1485,7 @@ impl ApiKeyManager {
             models,
             schema,
         } = params;
-        self.keys.custom_endpoints[index] = CustomEndpoint {
+        self.keys.profile_settings_mut(profile_key).custom_endpoints[index] = CustomEndpoint {
             name,
             url,
             api_key,
@@ -1054,32 +1501,75 @@ impl ApiKeyManager {
                 })
                 .collect(),
         };
-        if self.custom_endpoints.definitions.is_none() {
-            self.custom_endpoints.resolved = self.keys.custom_endpoints.clone();
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.keys.custom_endpoints = self.keys.profile_settings(profile_key).custom_endpoints;
+            if self.custom_endpoints.definitions.is_none() {
+                self.custom_endpoints.resolved = self.keys.custom_endpoints.clone();
+            }
         }
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
 
     pub fn remove_custom_endpoint(&mut self, index: usize, ctx: &mut ModelContext<Self>) {
-        if index >= self.keys.custom_endpoints.len() {
+        self.remove_custom_endpoint_for_profile(DEFAULT_PROFILE_INFERENCE_KEY, index, ctx);
+    }
+
+    pub fn remove_custom_endpoint_for_profile(
+        &mut self,
+        profile_key: &str,
+        index: usize,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if index
+            >= self
+                .keys
+                .profile_settings_mut(profile_key)
+                .custom_endpoints
+                .len()
+        {
             return;
         }
-        self.keys.custom_endpoints.remove(index);
-        if self.custom_endpoints.definitions.is_none() {
-            self.custom_endpoints.resolved = self.keys.custom_endpoints.clone();
+        self.keys
+            .profile_settings_mut(profile_key)
+            .custom_endpoints
+            .remove(index);
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.keys.custom_endpoints = self.keys.profile_settings(profile_key).custom_endpoints;
+            if self.custom_endpoints.definitions.is_none() {
+                self.custom_endpoints.resolved = self.keys.custom_endpoints.clone();
+            }
         }
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
     }
 
     pub fn clear_custom_endpoints(&mut self, ctx: &mut ModelContext<Self>) {
-        if self.keys.custom_endpoints.is_empty() {
+        self.clear_custom_endpoints_for_profile(DEFAULT_PROFILE_INFERENCE_KEY, ctx);
+    }
+
+    pub fn clear_custom_endpoints_for_profile(
+        &mut self,
+        profile_key: &str,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self
+            .keys
+            .profile_settings_mut(profile_key)
+            .custom_endpoints
+            .is_empty()
+        {
             return;
         }
-        self.keys.custom_endpoints.clear();
-        if self.custom_endpoints.definitions.is_none() {
-            self.custom_endpoints.resolved.clear();
+        self.keys
+            .profile_settings_mut(profile_key)
+            .custom_endpoints
+            .clear();
+        if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.keys.custom_endpoints = self.keys.profile_settings(profile_key).custom_endpoints;
+            if self.custom_endpoints.definitions.is_none() {
+                self.custom_endpoints.resolved = self.keys.custom_endpoints.clone();
+            }
         }
         ctx.emit(ApiKeyManagerEvent::KeysUpdated);
         self.write_keys_to_secure_storage(ctx);
@@ -1126,13 +1616,28 @@ impl ApiKeyManager {
         &self,
         include_custom_models: bool,
     ) -> Option<api::request::settings::CustomModelProviders> {
+        self.custom_model_providers_for_profile_request(
+            DEFAULT_PROFILE_INFERENCE_KEY,
+            include_custom_models,
+        )
+    }
+
+    pub fn custom_model_providers_for_profile_request(
+        &self,
+        profile_key: &str,
+        include_custom_models: bool,
+    ) -> Option<api::request::settings::CustomModelProviders> {
         if !include_custom_models {
             return None;
         }
 
-        let providers: Vec<_> = self
-            .custom_endpoints
-            .resolved
+        let profile_settings = self.keys.profile_settings(profile_key);
+        let endpoints = if profile_key == DEFAULT_PROFILE_INFERENCE_KEY {
+            self.custom_endpoints()
+        } else {
+            &profile_settings.custom_endpoints
+        };
+        let providers: Vec<_> = endpoints
             .iter()
             .filter(|endpoint| !endpoint.url.trim().is_empty() && !endpoint.api_key.is_empty())
             .map(
@@ -1170,20 +1675,36 @@ impl ApiKeyManager {
         include_aws_bedrock_credentials: bool,
         geap_binding: Option<GeapMintBinding>,
     ) -> Option<api::request::settings::ApiKeys> {
+        self.api_keys_for_profile_request(
+            DEFAULT_PROFILE_INFERENCE_KEY,
+            include_byo_keys,
+            include_aws_bedrock_credentials,
+            geap_binding,
+        )
+    }
+
+    pub fn api_keys_for_profile_request(
+        &self,
+        profile_key: &str,
+        include_byo_keys: bool,
+        include_aws_bedrock_credentials: bool,
+        geap_binding: Option<GeapMintBinding>,
+    ) -> Option<api::request::settings::ApiKeys> {
+        let profile_settings = self.keys.profile_settings(profile_key);
         let anthropic = include_byo_keys
-            .then(|| self.keys.anthropic.clone())
+            .then(|| profile_settings.anthropic.clone())
             .flatten()
             .unwrap_or_default();
         let openai = include_byo_keys
-            .then(|| self.keys.openai.clone())
+            .then(|| profile_settings.openai.clone())
             .flatten()
             .unwrap_or_default();
         let google = include_byo_keys
-            .then(|| self.keys.google.clone())
+            .then(|| profile_settings.google.clone())
             .flatten()
             .unwrap_or_default();
         let open_router = include_byo_keys
-            .then(|| self.keys.open_router.clone())
+            .then(|| profile_settings.open_router.clone())
             .flatten()
             .unwrap_or_default();
 
@@ -1247,6 +1768,37 @@ impl ApiKeyManager {
                 ..Default::default()
             })
         }
+    }
+
+    pub fn openai_key_for_profile(&self, profile_key: &str) -> Option<String> {
+        self.keys.profile_settings(profile_key).openai
+    }
+
+    pub fn openai_base_url_for_profile(&self, profile_key: &str) -> Option<String> {
+        self.keys.profile_settings(profile_key).openai_base_url
+    }
+
+    pub fn local_multi_agent_server_root_url_for_profile(
+        &self,
+        profile_key: &str,
+    ) -> Option<String> {
+        self.keys
+            .profile_settings(profile_key)
+            .local_multi_agent_server_root_url
+    }
+
+    pub fn local_model_aliases_for_profile(&self, profile_key: &str) -> String {
+        self.keys.profile_settings(profile_key).local_model_aliases
+    }
+
+    pub fn local_model_list_for_profile(&self, profile_key: &str) -> String {
+        self.keys.profile_settings(profile_key).local_model_list
+    }
+
+    pub fn local_ai_autocomplete_enabled_for_profile(&self, profile_key: &str) -> bool {
+        self.keys
+            .profile_settings(profile_key)
+            .local_ai_autocomplete_enabled
     }
 
     fn load_keys_from_secure_storage(ctx: &mut ModelContext<Self>) -> ApiKeys {

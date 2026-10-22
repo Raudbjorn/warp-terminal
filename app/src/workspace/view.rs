@@ -7,6 +7,8 @@ pub(crate) mod codex_modal;
 pub mod conversation_list;
 #[cfg(enable_crash_recovery)]
 mod crash_recovery;
+#[cfg(not(target_family = "wasm"))]
+pub(crate) mod docker_containers;
 pub(crate) mod feature_intro_modal;
 pub(crate) mod free_ai_removal_modal;
 pub mod global_search;
@@ -15,6 +17,8 @@ pub(crate) mod left_panel;
 pub(crate) mod onboarding;
 pub(crate) mod openwarp_launch_modal;
 pub(crate) mod orchestration_launch_modal;
+mod plugin_markdown_modal;
+mod plugin_palette_modal;
 pub(crate) mod right_panel;
 mod startup_directory;
 mod tab_grouping;
@@ -301,10 +305,10 @@ use crate::palette::PaletteMode;
 use crate::pane_group::FilePane;
 use crate::pane_group::pane::ActionOrigin;
 use crate::pane_group::{
-    self, AIFactPane, AnyPaneContent, ChildAgentOrigin, CodeDiffPane, CodePane, CodeReviewPanelArg,
-    CustomRouterEditorPane, Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
-    ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions, PaneGroup, PaneId, PanesLayout,
-    TabBarHoverIndex, TerminalPaneId,
+    self, AIFactPane, AnyPaneContent, BrowserPane, ChildAgentOrigin, CodeDiffPane, CodePane,
+    CodeReviewPanelArg, CustomRouterEditorPane, Direction as PaneGroupDirection, Direction,
+    EnvironmentManagementPane, ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions,
+    PaneGroup, PaneId, PanesLayout, TabBarHoverIndex, TerminalPaneId,
 };
 use crate::persistence::ModelEvent;
 use crate::projects::ProjectManagementModel;
@@ -337,7 +341,7 @@ use crate::server::cloud_objects::update_manager::{
 };
 use crate::server::ids::{ObjectUid, ServerId, SyncId};
 use crate::server::network_log_pane_manager::NetworkLogPaneManager;
-use crate::server::server_api::ai::AIClient;
+use crate::server::server_api::ai::{AIClient, WorkflowMetadataAIClient};
 use crate::server::server_api::{ServerApi, ServerApiProvider, ServerTime};
 use crate::server::telemetry::{
     AddTabWithShellSource, AnonymousUserSignupEntrypoint, CloseTarget, EnvVarTelemetryMetadata,
@@ -543,6 +547,8 @@ use crate::workspace::view::openwarp_launch_modal::{
 use crate::workspace::view::orchestration_launch_modal::{
     OrchestrationLaunchModal, OrchestrationLaunchModalEvent,
 };
+use crate::workspace::view::plugin_markdown_modal::PluginMarkdownModal;
+use crate::workspace::view::plugin_palette_modal::{PluginPaletteEvent, PluginPaletteModal};
 use crate::workspace::view::right_panel::{RightPanelEvent, RightPanelView};
 use crate::workspace::{ForkFromExchange, ForkedConversationDestination};
 use crate::workspaces::update_manager::TeamUpdateManager;
@@ -592,6 +598,14 @@ const PILL_FONT_SIZE: f32 = 12.;
 // We use the word "Warp" in the Update Ready button to make it obvious that the terminal is Warp.
 // This can lead to free advertising when users screen-share Warp when an update is available.
 const UPDATE_READY_TEXT: &str = "Update Warp";
+
+fn section_is_online_services_only(section: SettingsSection) -> bool {
+    section.is_online_services_only()
+}
+
+fn can_open_settings_section(section: Option<SettingsSection>) -> bool {
+    !ChannelState::is_local_only() || !section.is_some_and(section_is_online_services_only)
+}
 
 const TAB_BAR_OVERFLOW_MENU_WIDTH: f32 = 300.;
 
@@ -692,6 +706,7 @@ pub(crate) const OPEN_GLOBAL_SEARCH_BINDING_NAME: &str = "workspace:open_global_
 pub(crate) const TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME: &str =
     "workspace:toggle_conversation_list_view";
 pub(crate) const NEW_TAB_BINDING_NAME: &str = "workspace:new_tab";
+pub(crate) const NEW_WEB_TAB_BINDING_NAME: &str = "workspace:new_web_tab";
 pub(crate) const NEW_TERMINAL_TAB_BINDING_NAME: &str = "workspace:new_terminal_tab";
 pub(crate) const NEW_FILE_BINDING_NAME: &str = "workspace:new_file";
 pub(crate) const NEW_WINDOW_BINDING_NAME: &str = "workspace:new_window";
@@ -1116,6 +1131,10 @@ pub struct Workspace {
         Option<PendingSessionConfigTabConfigChipTutorial>,
     onboarding_tutorial_deferred_by_modal: Option<DeferredOnboardingTutorial>,
     new_worktree_modal: ModalViewState<Modal<NewWorktreeModal>>,
+    // oh-my-warp: modal that renders markdown a plugin requested via `warp.ui.showMarkdown` (M4).
+    plugin_markdown_modal: ModalViewState<Modal<PluginMarkdownModal>>,
+    // oh-my-warp: picker a plugin requested via `warp.ui.showPalette` (M4).
+    plugin_palette_modal: ModalViewState<Modal<PluginPaletteModal>>,
     close_session_confirmation_dialog: ViewHandle<CloseSessionConfirmationDialog>,
     rewind_confirmation_dialog: ViewHandle<RewindConfirmationDialog>,
     delete_conversation_confirmation_dialog: ViewHandle<DeleteConversationConfirmationDialog>,
@@ -1885,7 +1904,7 @@ impl Workspace {
     }
 
     fn build_workflow_modal(
-        ai_client: Arc<dyn AIClient>,
+        ai_client: Arc<dyn WorkflowMetadataAIClient>,
         ctx: &mut ViewContext<Self>,
     ) -> ViewHandle<WorkflowModal> {
         let workflow_modal =
@@ -2183,6 +2202,163 @@ impl Workspace {
             }
         });
         ModalViewState::new(modal)
+    }
+
+    // oh-my-warp: builds the modal that renders plugin-supplied markdown (`warp.ui.showMarkdown`).
+    fn build_plugin_markdown_modal(
+        ctx: &mut ViewContext<Self>,
+    ) -> ModalViewState<Modal<PluginMarkdownModal>> {
+        let body = ctx.add_view(PluginMarkdownModal::new);
+        let modal = ctx.add_typed_action_view(|ctx| {
+            // Wider canvas + uniform inner padding so headings/lists breathe; the body itself wraps
+            // the markdown in a ClippedScrollable so long docs stay inside the frame. Title is
+            // replaced by `show_plugin_markdown` with the plugin-supplied one.
+            Modal::new(Some("Plugin".to_string()), body, ctx)
+                .with_dismiss_on_click()
+                .with_modal_style(UiComponentStyles {
+                    width: Some(640.),
+                    height: Some(560.),
+                    ..Default::default()
+                })
+                .with_body_style(UiComponentStyles {
+                    padding: Some(Coords {
+                        top: 20.,
+                        bottom: 20.,
+                        left: 28.,
+                        right: 28.,
+                    }),
+                    ..Default::default()
+                })
+        });
+        ctx.subscribe_to_view(&modal, |me, _, event, ctx| {
+            if matches!(event, ModalEvent::Close) {
+                me.plugin_markdown_modal.close();
+                ctx.notify();
+            }
+        });
+        ModalViewState::new(modal)
+    }
+
+    /// Opens the plugin markdown modal with the given title/body (`warp.ui.showMarkdown`, M4).
+    #[cfg(feature = "plugin_host")]
+    fn show_plugin_markdown(
+        &mut self,
+        title: String,
+        markdown: String,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.plugin_markdown_modal.view.update(ctx, |modal, ctx| {
+            modal.set_title(Some(title));
+            modal.body().update(ctx, |body, ctx| {
+                body.set_markdown(&markdown, ctx);
+            });
+        });
+        self.plugin_markdown_modal.open();
+        ctx.focus(&self.plugin_markdown_modal.view);
+        ctx.notify();
+    }
+
+    // oh-my-warp: builds the picker modal for `warp.ui.showPalette`.
+    fn build_plugin_palette_modal(
+        ctx: &mut ViewContext<Self>,
+    ) -> ModalViewState<Modal<PluginPaletteModal>> {
+        let body = ctx.add_typed_action_view(PluginPaletteModal::new);
+        ctx.subscribe_to_view(&body, |me, _, event, ctx| match event {
+            PluginPaletteEvent::Selected(command_id) => {
+                me.plugin_palette_modal.close();
+                ctx.notify();
+                // Run the picked command as a fresh top-level invocation (the calling plugin
+                // callback has already returned, so no re-entrant `plugin.get_mut()`).
+                crate::plugin::commands::run_plugin_command(command_id, ctx);
+            }
+        });
+        let modal = ctx.add_typed_action_view(|ctx| {
+            Modal::new(Some("Plugin".to_string()), body, ctx)
+                .with_dismiss_on_click()
+                .with_modal_style(UiComponentStyles {
+                    width: Some(420.),
+                    height: Some(480.),
+                    ..Default::default()
+                })
+        });
+        ctx.subscribe_to_view(&modal, |me, _, event, ctx| {
+            if matches!(event, ModalEvent::Close) {
+                me.plugin_palette_modal.close();
+                ctx.notify();
+            }
+        });
+        ModalViewState::new(modal)
+    }
+
+    /// Opens the picker modal with the given title/items (`warp.ui.showPalette`, M4).
+    #[cfg(feature = "plugin_host")]
+    fn show_plugin_palette(
+        &mut self,
+        title: String,
+        items: Vec<crate::plugin::app_requests::PalettePluginItem>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.plugin_palette_modal.view.update(ctx, |modal, ctx| {
+            modal.set_title(Some(title));
+            modal.body().update(ctx, |body, ctx| {
+                body.set_items(items, ctx);
+            });
+        });
+        self.plugin_palette_modal.open();
+        ctx.focus(&self.plugin_palette_modal.view);
+        ctx.notify();
+    }
+
+    /// Subscribes to [`crate::plugin::PluginHostEvent`]s so plugin UI requests can open
+    /// workspace-owned surfaces (e.g. the markdown modal). See PLUGIN_SPEC.md (M4).
+    #[cfg(feature = "plugin_host")]
+    fn subscribe_to_plugin_host(ctx: &mut ViewContext<Self>) {
+        let plugin_host = crate::plugin::PluginHost::handle(ctx);
+        ctx.subscribe_to_model(&plugin_host, |me, _, event, ctx| match event {
+            crate::plugin::PluginHostEvent::ShowMarkdown { title, markdown } => {
+                me.show_plugin_markdown(title.clone(), markdown.clone(), ctx);
+            }
+            crate::plugin::PluginHostEvent::ShowPalette { title, items } => {
+                me.show_plugin_palette(title.clone(), items.clone(), ctx);
+            }
+            crate::plugin::PluginHostEvent::OpenWebTab { url } => {
+                // URL flows through `LeafContents::Browser { url }` so it's also
+                // persisted across restart; the restore arm propagates it into
+                // `BrowserView::new` via the one-shot URL override.
+                me.open_web_tab(Some(url.clone()), ctx);
+            }
+            crate::plugin::PluginHostEvent::OpenProject { path } => {
+                // Backs the sessionizer plugin: focus an existing tab rooted at
+                // `path` if one is open, else open a new one (tmux-sessionizer's
+                // switch-or-create).
+                me.open_or_focus_project(path, ctx);
+            }
+            crate::plugin::PluginHostEvent::SetPrompt {
+                plugin_id,
+                segments,
+            } => {
+                // Store the plugin's prompt segments (`warp.prompt.set`); every
+                // `PromptDisplay` observes this singleton model and re-renders.
+                crate::context_chips::plugin_prompt::PluginPromptModel::handle(ctx)
+                    .update(ctx, |model, ctx| {
+                        model.set(plugin_id.clone(), segments.clone(), ctx)
+                    });
+            }
+            crate::plugin::PluginHostEvent::SetStatusItem {
+                plugin_id,
+                item_id,
+                item,
+            } => {
+                // Store the plugin's tab-bar pill (`warp.ui.setStatusItem`). The tab-bar render
+                // path observes the singleton (see `Workspace::new`) and re-renders.
+                crate::workspace::plugin_status_items::PluginStatusItemsModel::handle(ctx).update(
+                    ctx,
+                    |model, ctx| {
+                        model.set(plugin_id.clone(), item_id.clone(), item.clone(), ctx);
+                    },
+                );
+            }
+        });
     }
 
     fn build_new_worktree_modal(
@@ -2506,7 +2682,8 @@ impl Workspace {
 
     pub(crate) fn show_session_config_modal(&mut self, ctx: &mut ViewContext<Self>) {
         // Configure the modal to hide Oz when AI is disabled.
-        let show_oz = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
+        let show_oz =
+            !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         self.session_config_modal.view.update(ctx, |modal, ctx| {
             modal.body().update(ctx, |body, ctx| {
                 body.configure(show_oz);
@@ -2903,6 +3080,8 @@ impl Workspace {
         let server_api_provider = ServerApiProvider::as_ref(ctx);
         let server_api = server_api_provider.get();
         let ai_client = server_api_provider.get_ai_client();
+        let command_generation_client = server_api_provider.get_command_generation_client();
+        let workflow_metadata_ai_client = server_api_provider.get_workflow_metadata_ai_client();
 
         // Inserting a (window, ModalSizes) pair to the ResizableData singleton. A restored window
         // reads the sizes from the window snapshot. A new window initializes with all default sizes.
@@ -2990,6 +3169,16 @@ impl Workspace {
             ctx.notify();
         });
 
+        // oh-my-warp: re-render the tab bar when a plugin pushes a status pill
+        // (`warp.ui.setStatusItem`). The render path reads the singleton each frame; this just
+        // wakes us up when it changes.
+        ctx.observe(
+            &crate::workspace::plugin_status_items::PluginStatusItemsModel::handle(ctx),
+            |_, _, ctx| {
+                ctx.notify();
+            },
+        );
+
         let changelog_model = ChangelogModel::handle(ctx);
         ctx.subscribe_to_model(&changelog_model, |me, _, event, ctx| {
             me.handle_changelog_event(event, ctx);
@@ -3046,7 +3235,7 @@ impl Workspace {
 
         let auth_override_warning_modal = Self::build_auth_override_warning_modal(ctx);
 
-        let workflow_modal = Self::build_workflow_modal(ai_client.clone(), ctx);
+        let workflow_modal = Self::build_workflow_modal(workflow_metadata_ai_client, ctx);
 
         let theme_creator_modal = Self::build_theme_creator_modal(ctx);
 
@@ -3096,6 +3285,8 @@ impl Workspace {
 
         let tab_config_params_modal = Self::build_tab_config_params_modal(ctx);
         let new_worktree_modal = Self::build_new_worktree_modal(ctx);
+        let plugin_markdown_modal = Self::build_plugin_markdown_modal(ctx);
+        let plugin_palette_modal = Self::build_plugin_palette_modal(ctx);
 
         let session_config_modal = Self::build_session_config_modal(ctx);
 
@@ -3105,8 +3296,9 @@ impl Workspace {
         let rewind_confirmation_dialog = Self::build_rewind_confirmation_dialog(ctx);
         let delete_conversation_confirmation_dialog =
             Self::build_delete_conversation_confirmation_dialog(ctx);
-        let command_search_view =
-            ctx.add_typed_action_view(|ctx| CommandSearchView::new(ai_client.clone(), ctx));
+        let command_search_view = ctx.add_typed_action_view(|ctx| {
+            CommandSearchView::new(command_generation_client.clone(), ctx)
+        });
         ctx.subscribe_to_view(&command_search_view, |me, _, event, ctx| {
             me.handle_command_search_event(event, ctx);
         });
@@ -3237,6 +3429,7 @@ impl Workspace {
         // Show the Warp AI warm welcome iff the user hasn't dismissed it nor interacted with Warp AI before.
         // Also, avoid showing it in integration tests to prevent interaction with other tests.
         let mut should_show_ai_assistant_warm_welcome: bool = !FeatureFlag::AgentMode.is_enabled()
+            && !ChannelState::is_local_only()
             && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
             && !matches!(ChannelState::channel(), Channel::Integration)
             && ctx
@@ -3342,6 +3535,9 @@ impl Workspace {
         Self::observe_server_api(ctx);
 
         Self::subscribe_to_workspace_toast_stack(toast_stack.clone(), ctx);
+        // oh-my-warp: open plugin UI surfaces (markdown panel) on PluginHost events (M4).
+        #[cfg(feature = "plugin_host")]
+        Self::subscribe_to_plugin_host(ctx);
         Self::subscribe_to_tab_config_errors(toast_stack.clone(), ctx);
         Self::subscribe_to_settings_errors(ctx);
         Self::subscribe_to_shared_session_manager(ctx);
@@ -3500,6 +3696,8 @@ impl Workspace {
             pending_session_config_tab_config_chip_tutorial: None,
             onboarding_tutorial_deferred_by_modal: None,
             new_worktree_modal,
+            plugin_markdown_modal,
+            plugin_palette_modal,
             close_session_confirmation_dialog,
             rewind_confirmation_dialog,
             delete_conversation_confirmation_dialog,
@@ -4393,6 +4591,11 @@ impl Workspace {
                 },
                 LeftPanelDisplayedTab::WarpDrive => ToolPanelView::WarpDrive,
                 LeftPanelDisplayedTab::ConversationListView => ToolPanelView::ConversationListView,
+                #[cfg(not(target_family = "wasm"))]
+                LeftPanelDisplayedTab::CodexConversations
+                | LeftPanelDisplayedTab::OpenCodeConversations => ToolPanelView::ProjectExplorer,
+                #[cfg(not(target_family = "wasm"))]
+                LeftPanelDisplayedTab::DockerContainers => ToolPanelView::DockerContainers,
             };
             lp.restore_active_view_from_snapshot(active_view, ctx);
             lp.set_active_pane_group(pane_group.clone(), &self.working_directories_model, ctx);
@@ -5514,7 +5717,7 @@ impl Workspace {
             }
 
             // If the agent management view is open, we want to close it when we activate a new tab.
-            if FeatureFlag::AgentManagementView.is_enabled() {
+            if !ChannelState::is_local_only() && FeatureFlag::AgentManagementView.is_enabled() {
                 self.set_is_agent_management_view_open(false, ctx);
             }
 
@@ -5680,7 +5883,7 @@ impl Workspace {
 
         // If the agent management view is open, we want to close it when we change focus to rename a tab.
         // This function doesn't call `activate_tab_internal`, which is why we need the extra check here.
-        if FeatureFlag::AgentManagementView.is_enabled() {
+        if !ChannelState::is_local_only() && FeatureFlag::AgentManagementView.is_enabled() {
             self.set_is_agent_management_view_open(false, ctx);
         }
 
@@ -6047,6 +6250,15 @@ impl Workspace {
             self.activate_tab_internal(index, ctx);
             ctx.notify();
         }
+    }
+
+    fn pane_locator_exists(&self, pane_view_locator: PaneViewLocator, ctx: &AppContext) -> bool {
+        self.tabs.iter().any(|tab| {
+            tab.pane_group.id() == pane_view_locator.pane_group_id
+                && tab.pane_group.read(ctx, |pane_group, _| {
+                    pane_group.has_pane_id(pane_view_locator.pane_id)
+                })
+        })
     }
 
     /// Searches this workspace's tabs for the given terminal view and focuses it.
@@ -6800,6 +7012,14 @@ impl Workspace {
                     modal.start_sign_in(ctx);
                 });
             }
+            #[cfg(not(target_family = "wasm"))]
+            LeftPanelEvent::OpenDockerContainerLogs {
+                container_id,
+                container_name,
+                command,
+            } => {
+                self.open_docker_container_logs(container_id, container_name, command, ctx);
+            }
         }
     }
 
@@ -6964,7 +7184,8 @@ impl Workspace {
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let mut menu_items = vec![];
 
-        let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
+        let online_agent_ui_enabled =
+            !ChannelState::is_local_only() && AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         let ai_settings = AISettings::as_ref(ctx);
         let effective_default = ai_settings.default_session_mode(ctx);
         let default_tab_config_path = ai_settings.default_tab_config_path().to_string();
@@ -6973,7 +7194,7 @@ impl Workspace {
             keybinding_name_to_display_string("app:reopen_closed_session", ctx);
 
         // 1. Agent (if AI enabled)
-        if is_any_ai_enabled {
+        if online_agent_ui_enabled {
             let mut agent_item = MenuItemFields::new("Agent")
                 .with_on_select_action(WorkspaceAction::AddAgentTab)
                 .with_icon(icons::Icon::LayoutAlt01);
@@ -7039,8 +7260,16 @@ impl Workspace {
             }
         }
 
+        // oh-my-warp: open an embedded browser pane as a new tab.
+        menu_items.push(
+            MenuItemFields::new("New Web Tab")
+                .with_on_select_action(WorkspaceAction::NewWebTab)
+                .with_icon(icons::Icon::Globe)
+                .into_item(),
+        );
+
         // 3. Cloud Agent (if flags enabled)
-        if is_any_ai_enabled
+        if online_agent_ui_enabled
             && FeatureFlag::AgentView.is_enabled()
             && FeatureFlag::CloudMode.is_enabled()
         {
@@ -8827,22 +9056,29 @@ impl Workspace {
         // Ensure there is only one settings pane per window
         let settings_pane_manager = SettingsPaneManager::handle(ctx);
         if let Some(locator) = settings_pane_manager.as_ref(ctx).find_pane(ctx.window_id()) {
-            // Update the page and/or search query if specified. The search query
-            // must be applied even when no page is given (e.g. `warp://settings?q=`)
-            // so an already-open settings tab reflects the new query.
-            if page.is_some() || search_query.is_some() {
-                self.settings_pane.update(ctx, |settings_pane, ctx| {
-                    if let Some(page) = page {
-                        settings_pane.set_and_refresh_current_page(page, ctx);
-                    }
-                    if let Some(search_query) = search_query {
-                        settings_pane.set_search_query(search_query, ctx);
-                    }
-                });
+            if self.pane_locator_exists(locator, ctx) {
+                // Update the page and/or search query if specified. The search query
+                // must be applied even when no page is given (e.g. `warp://settings?q=`)
+                // so an already-open settings tab reflects the new query.
+                if page.is_some() || search_query.is_some() {
+                    self.settings_pane.update(ctx, |settings_pane, ctx| {
+                        if let Some(page) = page {
+                            settings_pane.set_and_refresh_current_page(page, ctx);
+                        }
+                        if let Some(search_query) = search_query {
+                            settings_pane.set_search_query(search_query, ctx);
+                        }
+                    });
+                }
+                self.focus_pane(locator, ctx);
+                return;
             }
-            // Navigate to and focus existing pane
-            self.focus_pane(locator, ctx);
-            return;
+
+            log::warn!("Dropping stale settings pane locator: {locator:?}");
+            let window_id = ctx.window_id();
+            settings_pane_manager.update(ctx, |manager, ctx| {
+                manager.deregister_pane(&window_id, locator.pane_group_id, locator.pane_id, ctx);
+            });
         }
 
         let ps1_grid_info = self.active_session_ps1_grid_info(ctx);
@@ -13462,6 +13698,36 @@ impl Workspace {
         }
     }
 
+    /// Switch-or-create for a project directory (backs `warp.ui.openProject`): if
+    /// any tab already has a terminal whose cwd is `path` (or a subdirectory of
+    /// it), activate that tab; otherwise open a fresh tab rooted at `path`. This
+    /// gives the sessionizer tmux-style "jump to the session if it exists" behavior
+    /// rather than piling up duplicate tabs.
+    fn open_or_focus_project(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
+        let target = PathBuf::from(path);
+        let mut existing_tab: Option<usize> = None;
+        for index in 0..self.tabs.len() {
+            let Some(pane_group) = self.get_pane_group_view(index).cloned() else {
+                continue;
+            };
+            let rooted_here = pane_group
+                .as_ref(ctx)
+                .terminal_view_working_directories(ctx)
+                .any(|(_, cwd)| match cwd {
+                    Some(LocalOrRemotePath::Local(p)) => p == target || p.starts_with(&target),
+                    _ => false,
+                });
+            if rooted_here {
+                existing_tab = Some(index);
+                break;
+            }
+        }
+        match existing_tab {
+            Some(index) => self.activate_tab(index, ctx),
+            None => self.handle_open_repository(path, ctx),
+        }
+    }
+
     fn handle_open_repository(&mut self, path: &str, ctx: &mut ViewContext<Self>) {
         let path_buf = PathBuf::from(path);
         ProjectManagementModel::handle(ctx).update(ctx, |projects, ctx| {
@@ -15588,6 +15854,42 @@ impl Workspace {
                 ctx,
             );
         });
+    }
+
+    /// Opens an embedded browser pane (oh-my-warp) as a right-split of the
+    /// active pane group. Each pane spawns its own Chrome + CDP screencast
+    /// session, so (unlike the network log) we always open a new one rather
+    /// than focusing an existing one.
+    pub(crate) fn open_browser_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        let pane = BrowserPane::new(ctx);
+        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
+            pane_group.add_pane_with_direction(
+                Direction::Right,
+                pane,
+                true, /* focus_new_pane */
+                ctx,
+            );
+        });
+    }
+
+    /// Opens an embedded browser pane (oh-my-warp) as its own new tab. `url` is
+    /// the initial page to navigate to; pass `None` (or an empty string) to use
+    /// the configured home page. The URL is plumbed through `LeafContents::Browser`
+    /// so it's also persisted across restarts.
+    pub(crate) fn open_web_tab(&mut self, url: Option<String>, ctx: &mut ViewContext<Self>) {
+        let panes_layout = PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
+            is_focused: true,
+            custom_vertical_tabs_title: None,
+            contents: LeafContents::Browser {
+                url: url.unwrap_or_default(),
+            },
+        })));
+        self.add_tab_with_pane_layout(
+            panes_layout,
+            Arc::new(HashMap::new()),
+            Some("Browser".to_owned()),
+            ctx,
+        );
     }
 
     fn show_handoff_environment_creation_modal(&mut self, ctx: &mut ViewContext<Self>) {
@@ -17930,7 +18232,9 @@ impl Workspace {
                 );
             }
             DrivePanelEvent::OpenTeamSettingsPage => {
-                self.show_settings_with_section(Some(SettingsSection::Teams), ctx);
+                if !ChannelState::is_local_only() {
+                    self.show_settings_with_section(Some(SettingsSection::Teams), ctx);
+                }
             }
             DrivePanelEvent::OpenImportModal {
                 owner,
@@ -18181,6 +18485,43 @@ impl Workspace {
             },
             ctx,
         );
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn open_docker_container_logs(
+        &mut self,
+        _container_id: &str,
+        _container_name: &str,
+        command: &str,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !ContextFlag::CreateNewSession.is_enabled() {
+            self.toast_stack.update(ctx, |toast_stack, ctx| {
+                let toast =
+                    DismissibleToast::error("Cannot open a new terminal session".to_string());
+                toast_stack.add_ephemeral_toast(toast, ctx);
+            });
+            return;
+        }
+
+        let active_pane_group = self.active_tab_pane_group();
+        active_pane_group.update(ctx, |pane_group, ctx| {
+            pane_group.add_terminal_pane(PaneGroupDirection::Right, None, ctx);
+        });
+
+        let Some(terminal_view_handle) = active_pane_group.as_ref(ctx).active_session_view(ctx)
+        else {
+            self.toast_stack.update(ctx, |toast_stack, ctx| {
+                let toast =
+                    DismissibleToast::error("Could not open Docker container logs.".to_string());
+                toast_stack.add_ephemeral_toast(toast, ctx);
+            });
+            return;
+        };
+
+        terminal_view_handle.update(ctx, |terminal, ctx| {
+            terminal.execute_command_or_set_pending(command, ctx);
+        });
     }
 
     fn run_tab_config_skill(&mut self, path: &Path, ctx: &mut ViewContext<Self>) {
@@ -18434,7 +18775,9 @@ impl Workspace {
                         );
                     }
                     OpenWarpAI => {
-                        if !AISettings::as_ref(ctx).is_any_ai_enabled(ctx) {
+                        if ChannelState::is_local_only()
+                            || !AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
+                        {
                             return;
                         }
 
@@ -18957,9 +19300,14 @@ impl Workspace {
         &mut self,
         section: Option<SettingsSection>,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
+        if !can_open_settings_section(section) {
+            return false;
+        }
+
         self.close_all_overlays(ctx);
         self.open_settings_pane(section, None, ctx);
+        true
     }
 
     fn show_settings_with_search(
@@ -18967,9 +19315,14 @@ impl Workspace {
         search_query: &str,
         section: Option<SettingsSection>,
         ctx: &mut ViewContext<Self>,
-    ) {
+    ) -> bool {
+        if !can_open_settings_section(section) {
+            return false;
+        }
+
         self.close_all_overlays(ctx);
         self.open_settings_pane(section, Some(search_query), ctx);
+        true
     }
     fn browse_teams(&mut self, ctx: &mut ViewContext<Self>) {
         let show_join_modal = UserWorkspaces::as_ref(ctx)
@@ -18990,7 +19343,9 @@ impl Workspace {
         email_invite: Option<&String>,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.show_settings_with_section(Some(SettingsSection::Teams), ctx);
+        if !self.show_settings_with_section(Some(SettingsSection::Teams), ctx) {
+            return;
+        }
 
         self.settings_pane.update(ctx, |view, ctx| {
             view.open_teams_page_email_invite(email_invite, ctx);
@@ -19004,7 +19359,9 @@ impl Workspace {
         autoinstall_gallery_title: Option<&str>,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.show_settings_with_section(Some(SettingsSection::AgentMCPServers), ctx);
+        if !self.show_settings_with_section(Some(SettingsSection::AgentMCPServers), ctx) {
+            return;
+        }
 
         self.settings_pane.update(ctx, |view, ctx| {
             view.open_mcp_servers_page(page, autoinstall_gallery_title, ctx);
@@ -20821,6 +21178,9 @@ impl Workspace {
                         ToolPanelView::GlobalSearch { .. } => "Global search",
                         ToolPanelView::WarpDrive => "Warp Drive",
                         ToolPanelView::ConversationListView => "Agent conversations",
+
+                        #[cfg(not(target_family = "wasm"))]
+                        ToolPanelView::DockerContainers => "Docker containers",
                     }
                 } else {
                     "Tools panel"
@@ -20875,6 +21235,9 @@ impl Workspace {
                 ToolPanelView::GlobalSearch { .. } => "Global search",
                 ToolPanelView::WarpDrive => "Warp Drive",
                 ToolPanelView::ConversationListView => "Agent conversations",
+
+                #[cfg(not(target_family = "wasm"))]
+                ToolPanelView::DockerContainers => "Docker containers",
             }
         } else {
             "Tools panel"
@@ -21168,6 +21531,40 @@ impl Workspace {
         .finish()
     }
 
+    /// oh-my-warp: renders the "leader engaged" pill shown in the tab bar while a
+    /// leader/prefix chord is pending (e.g. after pressing `ctrl-b`), or `None`
+    /// when no chord is in progress. The pending state comes from the keymap
+    /// matcher via `AppContext::keymap_pending_keystrokes`.
+    fn render_leader_indicator(
+        &self,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Option<Box<dyn Element>> {
+        let pending = ctx.keymap_pending_keystrokes()?;
+        if pending.is_empty() {
+            return None;
+        }
+        let label = pending
+            .iter()
+            .map(|keystroke| keystroke.displayed())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = Text::new_inline(format!("LEADER {label}"), appearance.ui_font_family(), 11.)
+            .with_color(PhenomenonStyle::body_text())
+            .with_selectable(false)
+            .finish();
+        let pill = Container::new(text)
+            .with_padding_left(8.)
+            .with_padding_right(8.)
+            .with_padding_top(2.)
+            .with_padding_bottom(2.)
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
+            .with_background_color(blended_colors::neutral_1(appearance.theme()))
+            .with_margin_right(8.)
+            .finish();
+        Some(pill)
+    }
+
     fn render_tab_bar_contents(
         &self,
         hover_fixed_width: Option<f32>,
@@ -21175,6 +21572,17 @@ impl Workspace {
         ctx: &AppContext,
     ) -> Box<dyn Element> {
         let mut tab_bar = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
+        // oh-my-warp: show the leader/prefix indicator while a chord is pending.
+        if let Some(indicator) = self.render_leader_indicator(appearance, ctx) {
+            tab_bar.add_child(indicator);
+        }
+        // oh-my-warp: render plugin-contributed status pills (`warp.ui.setStatusItem`) right of
+        // the leader indicator — same anchor, so they share the "system status" eyeline.
+        if let Some(pills) =
+            crate::workspace::plugin_status_items::render_plugin_status_items(ctx, appearance)
+        {
+            tab_bar.add_child(pills);
+        }
         let is_web_anonymous_user = self
             .auth_state
             .is_user_web_anonymous_user()
@@ -21650,6 +22058,7 @@ impl Workspace {
 
         // Legacy AI assistant button (non-agent-mode only)
         if is_online
+            && !ChannelState::is_local_only()
             && !FeatureFlag::AgentMode.is_enabled()
             && !is_web_anonymous_user
             && !self.current_workspace_state.is_ai_assistant_panel_open
@@ -21722,9 +22131,8 @@ impl Workspace {
             traffic_light_data
                 .as_ref()
                 .filter(|data| data.side == TrafficLightSide::Left)
-                .map(|data| data.width(zoom_factor))
+                .map(|data| data.width(zoom_factor) + 16.)
                 .unwrap_or(0.)
-                + 16.
         }
     }
 
@@ -21958,17 +22366,35 @@ impl Workspace {
             .username_for_display()
             .unwrap_or(DEFAULT_USER_DISPLAY_NAME.to_owned());
 
-        let avatar_content = if self.auth_state.is_anonymous_or_logged_out() {
-            AvatarContent::Icon(icons::Icon::Gear)
-        } else {
-            self.auth_state
-                .user_photo_url()
-                .map(|url| AvatarContent::Image {
-                    url,
-                    display_name: display_name.clone(),
-                })
-                .unwrap_or(AvatarContent::DisplayName(display_name.clone()))
-        };
+        if is_anonymous {
+            return SavePosition::new(
+                Align::new(
+                    self.render_tab_bar_icon_button(
+                        appearance,
+                        icons::Icon::Gear,
+                        &self.mouse_states.settings_icon,
+                        WorkspaceAction::ToggleUserMenu,
+                        "Settings".to_string(),
+                        None,
+                        false,
+                        false,
+                    )
+                    .finish(),
+                )
+                .finish(),
+                USER_AVATAR_BUTTON_POSITION_ID,
+            )
+            .finish();
+        }
+
+        let avatar_content = self
+            .auth_state
+            .user_photo_url()
+            .map(|url| AvatarContent::Image {
+                url,
+                display_name: display_name.clone(),
+            })
+            .unwrap_or(AvatarContent::DisplayName(display_name.clone()));
 
         let mut avatar = Avatar::new(
             avatar_content,
@@ -22013,7 +22439,7 @@ impl Workspace {
                     container = container.with_background(appearance.theme().surface_2());
                 }
                 // On hover, show tooltip of user's display name (if it exists)
-                if !self.is_user_menu_open && !is_anonymous {
+                if !self.is_user_menu_open {
                     stack.add_positioned_overlay_child(
                         appearance
                             .ui_builder()
@@ -22327,7 +22753,8 @@ impl Workspace {
     ) -> Box<dyn Element> {
         let active_tab_data = &self.tabs[self.active_tab_index];
 
-        let active_content = if FeatureFlag::AgentManagementView.is_enabled()
+        let active_content = if !ChannelState::is_local_only()
+            && FeatureFlag::AgentManagementView.is_enabled()
             && self.current_workspace_state.is_agent_management_view_open
         {
             ChildView::new(&self.agent_management_view).finish()
@@ -23303,6 +23730,9 @@ impl Workspace {
                 .set
                 .insert(flags::SSH_REUSE_CONTROL_MASTER_CONTEXT_FLAG);
         }
+        if *warpify_settings.enable_ssh_remote_server.value() {
+            context.set.insert(flags::SSH_REMOTE_SERVER_CONTEXT_FLAG);
+        }
         if *warpify_settings.enable_ssh_warpification.value() {
             context.set.insert(flags::SSH_WARPIFICATION_CONTEXT_FLAG);
         }
@@ -24070,7 +24500,11 @@ impl Workspace {
         if cfg!(feature = "local_fs") && *CodeSettings::as_ref(ctx).show_project_explorer.value() {
             views.push(ToolPanelView::ProjectExplorer);
         }
+        #[cfg(not(target_family = "wasm"))]
+        views.push(ToolPanelView::DockerContainers);
         if FeatureFlag::AgentViewConversationListView.is_enabled()
+            && !ChannelState::is_local_only()
+            && AISettings::as_ref(ctx).is_any_ai_enabled(ctx)
             && *AISettings::as_ref(ctx).show_conversation_history
         {
             views.push(ToolPanelView::ConversationListView);
@@ -24175,6 +24609,25 @@ impl TypedActionView for Workspace {
         }
 
         match action {
+            RunPluginCommand(command_id) => {
+                #[cfg(feature = "plugin_host")]
+                {
+                    // oh-my-warp: a palette item whose command id is
+                    // `warp:openProject:<path>` opens that project (switch-or-create)
+                    // instead of running a registered plugin command. This lets
+                    // plugins (e.g. sessionizer) build fully-dynamic project pickers
+                    // via `showPalette` without registering a command per project —
+                    // which would re-enter `plugin.get_mut()` from inside the command
+                    // callback and crash the host.
+                    if let Some(path) = command_id.strip_prefix("warp:openProject:") {
+                        self.open_or_focus_project(path, ctx);
+                    } else {
+                        crate::plugin::commands::run_plugin_command(command_id, ctx);
+                    }
+                }
+                #[cfg(not(feature = "plugin_host"))]
+                let _ = command_id;
+            }
             ActivateTab(index) => self.activate_tab(*index, ctx),
             ActivateTabByNumber(num) => self.activate_tab(num.saturating_sub(1), ctx),
             SetTabShortcutModifierKey { key_code, pressed } => {
@@ -24394,8 +24847,16 @@ impl TypedActionView for Workspace {
                 self.add_tab_with_shell(shell.clone(), *source, ctx)
             }
             AddGetStartedTab => self.add_get_started_tab(ctx),
-            AddAmbientAgentTab => self.add_ambient_agent_tab(ctx),
-            AddAgentTab => self.add_terminal_tab_with_new_agent_view(ctx),
+            AddAmbientAgentTab => {
+                if !ChannelState::is_local_only() {
+                    self.add_ambient_agent_tab(ctx);
+                }
+            }
+            AddAgentTab => {
+                if !ChannelState::is_local_only() {
+                    self.add_terminal_tab_with_new_agent_view(ctx);
+                }
+            }
             AddDockerSandboxTab => self.add_docker_sandbox_tab(ctx),
             StartAgentOnboardingTutorial(tutorial) => {
                 self.start_agent_onboarding_tutorial(tutorial.clone(), ctx)
@@ -24609,6 +25070,12 @@ impl TypedActionView for Workspace {
             OpenNetworkLogPane => {
                 self.open_network_log_pane(ctx);
             }
+            OpenBrowserPane => {
+                self.open_browser_pane(ctx);
+            }
+            NewWebTab => {
+                self.open_web_tab(None, ctx);
+            }
             FixSettingsWithOz { error_description } => {
                 use crate::ai::skills::SkillManager;
                 let modify_settings_skill = SkillManager::as_ref(ctx)
@@ -24678,11 +25145,15 @@ impl TypedActionView for Workspace {
                 self.show_keyboard_settings(keybinding_name.as_deref(), ctx)
             }
             ShowSettings => self.show_settings(ctx),
-            ShowSettingsPage(section) => self.show_settings_with_section(Some(*section), ctx),
+            ShowSettingsPage(section) => {
+                self.show_settings_with_section(Some(*section), ctx);
+            }
             ShowSettingsPageWithSearch {
                 search_query,
                 section,
-            } => self.show_settings_with_search(search_query, *section, ctx),
+            } => {
+                self.show_settings_with_search(search_query, *section, ctx);
+            }
             OpenPromptSuggestionsUnavailableModal => {
                 self.open_prompt_suggestions_unavailable_modal(ctx)
             }
@@ -27659,6 +28130,16 @@ impl View for Workspace {
 
         if self.new_worktree_modal.is_open() {
             stack.add_child(self.new_worktree_modal.render());
+        }
+
+        // oh-my-warp: plugin markdown modal (`warp.ui.showMarkdown`, M4).
+        if self.plugin_markdown_modal.is_open() {
+            stack.add_child(self.plugin_markdown_modal.render());
+        }
+
+        // oh-my-warp: plugin picker modal (`warp.ui.showPalette`, M4).
+        if self.plugin_palette_modal.is_open() {
+            stack.add_child(self.plugin_palette_modal.render());
         }
 
         if self.workflow_modal.as_ref(app).is_open() {

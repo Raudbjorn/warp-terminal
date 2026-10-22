@@ -6,6 +6,7 @@ use chrono::{DateTime, Local, Utc};
 use futures::channel::oneshot::{self, Receiver};
 use instant::Instant;
 use serde::{Deserialize, Serialize};
+use warp_core::channel::ChannelState;
 use warp_core::user_preferences::GetUserPreferences as _;
 use warp_errors::report_error;
 pub use warp_graphql::billing::BonusGrantType;
@@ -304,6 +305,10 @@ impl AIRequestUsageModel {
         ctx: &mut ModelContext<Self>,
     ) -> Receiver<Option<usize>> {
         let (sender, receiver) = oneshot::channel();
+        if ChannelState::is_local_only() {
+            let _ = sender.send(None);
+            return receiver;
+        }
         if !AuthStateProvider::as_ref(ctx).get().is_logged_in() {
             let _ = sender.send(None);
             return receiver;
@@ -518,6 +523,9 @@ impl AIRequestUsageModel {
     /// Returns `true` if the user can start an interactive AI request.
     /// Prefers the server decision when present; otherwise uses the pre-fetch fallback.
     pub fn has_any_ai_remaining<S: TeamScope + ?Sized>(&self, scope: &S, ctx: &AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            return true;
+        }
         if let Some(availability) = self.server_availability.latest {
             return Self::server_availability_permits_ai(availability, scope, ctx);
         }

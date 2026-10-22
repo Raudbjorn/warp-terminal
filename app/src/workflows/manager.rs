@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 
+use warp_core::channel::ChannelState;
 use warpui::{Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
 
 use super::CloudWorkflowModel;
@@ -45,6 +46,12 @@ pub enum WorkflowOpenSource {
 
 impl WorkflowManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        if ChannelState::is_local_only() {
+            return WorkflowManager {
+                panes_by_hashed_id: HashMap::new(),
+            };
+        }
+
         ctx.subscribe_to_model(
             &UpdateManager::handle(ctx),
             Self::handle_update_manager_event,

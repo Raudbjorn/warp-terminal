@@ -703,6 +703,11 @@ impl TabData {
                 );
             }
         }
+        menu_items.push(
+            MenuItemFields::new("Launch Web Pane")
+                .with_on_select_action(WorkspaceAction::OpenBrowserPane)
+                .into_item(),
+        );
         if let Some(pane_name_target) = pane_name_target {
             menu_items.extend(self.pane_name_menu_items(pane_name_target, ctx));
         }

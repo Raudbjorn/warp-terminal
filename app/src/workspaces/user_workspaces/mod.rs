@@ -218,6 +218,19 @@ impl UserWorkspaces {
         current_workspace_uid: Option<WorkspaceUid>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
+        if ChannelState::is_local_only() {
+            return Self {
+                current_workspace_uid: None.into(),
+                workspaces: Vec::new().into(),
+                window_team_uids: Default::default(),
+                user_tier: Default::default(),
+                workspaceless_models_by_feature: None,
+                joinable_teams: Default::default(),
+                team_client,
+                workspace_client,
+            };
+        }
+
         ctx.subscribe_to_model(&ServerExperiments::handle(ctx), |me, _, event, ctx| {
             let ServerExperimentsEvent::ExperimentsUpdated = event;
             me.update_session_sharing_enablement(ctx);

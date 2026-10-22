@@ -40,7 +40,7 @@ use super::environments_page::EnvironmentsPageView;
 use super::features_page::FeaturesPageView;
 use super::keybindings::KeybindingsView;
 use super::knowledge_page::KnowledgePageView;
-use super::main_page::MainSettingsPageView;
+use super::local_ai_page::LocalAISettingsPageView;
 use super::mcp_servers_page::MCPServersSettingsPageView;
 use super::privacy_page::PrivacyPageView;
 use super::referrals_page::ReferralsPageView;
@@ -108,7 +108,6 @@ pub trait SettingsPageMeta {
 /// It is required to allow for SettingsPage struct be put in the collection (ie. vector).
 #[derive(Clone)]
 pub enum SettingsPageViewHandle {
-    Main(ViewHandle<MainSettingsPageView>),
     Appearance(ViewHandle<AppearanceSettingsPageView>),
     Features(ViewHandle<FeaturesPageView>),
     SharedBlocks(ViewHandle<ShowBlocksView>),
@@ -126,6 +125,7 @@ pub enum SettingsPageViewHandle {
     AgentProfiles(ViewHandle<AgentProfilesPageView>),
     Knowledge(ViewHandle<KnowledgePageView>),
     CLIAgents(ViewHandle<CLIAgentsPageView>),
+    LocalAI(ViewHandle<LocalAISettingsPageView>),
     CloudEnvironments(ViewHandle<EnvironmentsPageView>),
     BillingAndUsage(ViewHandle<BillingAndUsageDispatchView>),
     MCPServers(ViewHandle<MCPServersSettingsPageView>),
@@ -136,7 +136,6 @@ impl SettingsPageViewHandle {
     pub fn child_view(&self) -> Box<dyn Element> {
         use SettingsPageViewHandle::*;
         match self {
-            Main(view_handle) => ChildView::new(view_handle).finish(),
             Appearance(view_handle) => ChildView::new(view_handle).finish(),
             Features(view_handle) => ChildView::new(view_handle).finish(),
             SharedBlocks(view_handle) => ChildView::new(view_handle).finish(),
@@ -154,6 +153,7 @@ impl SettingsPageViewHandle {
             AgentProfiles(view_handle) => ChildView::new(view_handle).finish(),
             Knowledge(view_handle) => ChildView::new(view_handle).finish(),
             CLIAgents(view_handle) => ChildView::new(view_handle).finish(),
+            LocalAI(view_handle) => ChildView::new(view_handle).finish(),
             CloudEnvironments(view_handle) => ChildView::new(view_handle).finish(),
             BillingAndUsage(view_handle) => ChildView::new(view_handle).finish(),
             MCPServers(view_handle) => ChildView::new(view_handle).finish(),

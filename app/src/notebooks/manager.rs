@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use futures_util::stream::AbortHandle;
 use markdown_parser::markdown_parser::parse_markdown_to_raw_text;
+use warp_core::channel::ChannelState;
 use warp_errors::report_error;
 use warpui::r#async::SpawnedFutureHandle;
 use warpui::{
@@ -76,6 +77,13 @@ pub enum NotebookSource {
 impl NotebookManager {
     /// Create a new [`NotebookManager`] singleton.
     pub fn new(cached_notebooks: Vec<CloudNotebook>, ctx: &mut ModelContext<Self>) -> Self {
+        if ChannelState::is_local_only() {
+            return Self {
+                panes_by_hashed_id: HashMap::new(),
+                raw_text_by_hashed_id: HashMap::new(),
+            };
+        }
+
         ctx.subscribe_to_model(
             &UpdateManager::handle(ctx),
             Self::handle_update_manager_event,

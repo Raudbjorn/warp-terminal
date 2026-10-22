@@ -67,8 +67,9 @@ use crate::server::sync_queue::SyncQueue;
 use crate::server::telemetry::context_provider::AppTelemetryContextProvider;
 use crate::settings::PrivacySettings;
 use crate::settings::cloud_preferences_syncer::CloudPreferencesSyncer;
-use crate::settings_view::DisplayCount;
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
+use crate::settings_view::pane_manager::SettingsPaneManager;
+use crate::settings_view::{DisplayCount, SettingsSection};
 use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
 use crate::system::SystemStats;
 use crate::tab_configs::tab_config::{TabConfigPaneNode, TabConfigPaneType};
@@ -1661,6 +1662,105 @@ fn reopen_closed_session_menu_item(
         Some(MenuItem::Item(fields)) if fields.label() == "Reopen closed session" => fields,
         _ => panic!("expected Reopen closed session to be the last new-session menu item"),
     }
+}
+
+#[test]
+fn test_user_menu_hides_promotional_entries() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        #[cfg(not(target_family = "wasm"))]
+        app.add_singleton_model(crate::local_multi_agent::LocalMultiAgentManager::new);
+
+        let workspace = mock_workspace(&mut app);
+
+        workspace.read(&app, |workspace, ctx| {
+            let items = workspace.user_menu_items(ctx);
+            let labels = items
+                .iter()
+                .filter_map(|item| match item {
+                    MenuItem::Item(fields) => Some(fields.label().to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            assert!(!labels.iter().any(|label| label == "Sign up"));
+            assert!(!labels.iter().any(|label| label == "Upgrade"));
+            assert!(!labels.iter().any(|label| label == "Invite a friend"));
+            assert!(!matches!(items.last(), Some(MenuItem::Separator)));
+        });
+    });
+}
+
+#[test]
+fn show_settings_action_opens_settings_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        #[cfg(not(target_family = "wasm"))]
+        app.add_singleton_model(crate::local_multi_agent::LocalMultiAgentManager::new);
+
+        let workspace = mock_workspace(&mut app);
+        let window_id = app.read(|ctx| workspace.window_id(ctx));
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::ShowSettings, ctx);
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            let locator = SettingsPaneManager::as_ref(ctx)
+                .find_pane(window_id)
+                .expect("ShowSettings should register a settings pane locator");
+            assert!(workspace.pane_locator_exists(locator, ctx));
+            assert_eq!(
+                workspace
+                    .settings_pane
+                    .as_ref(ctx)
+                    .current_settings_section(),
+                SettingsSection::Appearance
+            );
+        });
+    });
+}
+
+#[test]
+fn show_settings_action_recovers_from_stale_settings_pane_locator() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        #[cfg(not(target_family = "wasm"))]
+        app.add_singleton_model(crate::local_multi_agent::LocalMultiAgentManager::new);
+
+        let workspace = mock_workspace(&mut app);
+        let window_id = app.read(|ctx| workspace.window_id(ctx));
+
+        let stale_locator = workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::ShowSettings, ctx);
+            SettingsPaneManager::as_ref(ctx)
+                .find_pane(ctx.window_id())
+                .expect("initial ShowSettings should register a settings pane locator")
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::CloseActiveTab, ctx);
+            SettingsPaneManager::handle(ctx).update(ctx, |manager, _| {
+                manager.set_locator_for_test(window_id, stale_locator);
+            });
+            workspace.handle_action(&WorkspaceAction::ShowSettings, ctx);
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            let locator = SettingsPaneManager::as_ref(ctx)
+                .find_pane(window_id)
+                .expect("ShowSettings should replace a stale settings pane locator");
+            assert_ne!(locator, stale_locator);
+            assert!(workspace.pane_locator_exists(locator, ctx));
+            assert_eq!(
+                workspace
+                    .settings_pane
+                    .as_ref(ctx)
+                    .current_settings_section(),
+                SettingsSection::Appearance
+            );
+        });
+    });
 }
 
 #[test]

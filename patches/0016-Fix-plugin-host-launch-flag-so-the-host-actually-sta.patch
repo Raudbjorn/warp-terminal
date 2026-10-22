@@ -1,0 +1,32 @@
+From 932c5c182a97dc689459a5ec244db12036736cc1 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Thu, 21 May 2026 10:57:51 -0400
+Subject: [PATCH 16/48] Fix plugin host launch flag so the host actually starts
+ (oh-my-warp)
+
+PLUGIN_HOST_FLAG was "--plugin_host" (underscore) but the clap parser for
+WorkerCommand::PluginHost uses long_flag = "plugin-host" (hyphen), so the
+spawned host process was rejected by arg parsing and exited instantly with no
+relayed logs. Use "--plugin-host" to match. Verified end-to-end: the host now
+discovers ~/.warp/plugins/*, runs activate(warp), and relays warp.log output.
+---
+ app/src/plugin/mod.rs | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/app/src/plugin/mod.rs b/app/src/plugin/mod.rs
+index 00065bcb..8d7dd849 100644
+--- a/app/src/plugin/mod.rs
++++ b/app/src/plugin/mod.rs
+@@ -10,7 +10,11 @@ pub use host::run as run_plugin_host;
+ 
+ /// Flag to be passed to the warp executable when executing the warp binary as the plugin host
+ /// process rather than the main app.
+-pub const PLUGIN_HOST_FLAG: &str = "--plugin_host";
++///
++/// Must match the clap `long_flag` on `warp_cli::WorkerCommand::PluginHost` (`"plugin-host"`).
++/// Upstream defines this constant with an underscore (`--plugin_host`), which clap rejects, so the
++/// spawned host exits immediately on arg parsing; use the hyphenated form so the host launches.
++pub const PLUGIN_HOST_FLAG: &str = "--plugin-host";
+ 
+ /// The name of the environment variable used to pass connection address for the app server to the
+ /// plugin host process.

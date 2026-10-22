@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 use warp_core::features::FeatureFlag;
@@ -56,6 +57,10 @@ impl WarpDriveSettings {
     /// Returns `false` when the user is anonymous or fully logged out,
     /// regardless of the user setting.
     pub fn is_warp_drive_enabled(app: &warpui::AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            return false;
+        }
+
         use warpui::SingletonEntity as _;
         *Self::as_ref(app).enable_warp_drive && Self::is_warp_drive_available(app)
     }

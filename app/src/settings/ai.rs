@@ -21,6 +21,7 @@ use settings::{
 };
 use strum::IntoEnumIterator;
 use strum_macros::EnumIter;
+use warp_core::channel::ChannelState;
 use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
 use warp_errors::report_if_error;
@@ -1098,6 +1099,49 @@ pub struct AIRequestQuotaInfo {
     pub cycle_history: Vec<CycleInfo>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalProviderKind {
+    /// A user-supplied OpenAI-compatible HTTP endpoint (Ollama, LM Studio,
+    /// vLLM, llama.cpp, etc.). This is the default.
+    #[default]
+    OpenAICompatible,
+    /// A locally-spawned OpenCode sidecar. The sidecar lifecycle is
+    /// managed by `crate::ai::local_opencode`; this kind is what
+    /// switches the chat-completion path from `base_url` to a per-CWD
+    /// sidecar pool.
+    OpenCode,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LocalOpenAISettingsSnapshot {
+    pub enabled: bool,
+    pub base_url: String,
+    pub api_key: String,
+    pub command_model: String,
+    pub prediction_model: String,
+    pub timeout_ms: u64,
+    pub provider_kind: LocalProviderKind,
+    pub opencode_command: String,
+    pub opencode_args: Vec<String>,
+    /// When `true`, multi-turn callers can opt into the OpenAI
+    /// Responses API (`/v1/responses`) and the local provider will
+    /// round-trip reasoning items between turns. The single-shot
+    /// command generation, prediction, and AI input suggestion
+    /// methods continue to use `/v1/chat/completions` regardless
+    /// of this flag.
+    pub use_responses_api: bool,
+}
+
+fn parse_provider_kind(raw: &str) -> LocalProviderKind {
+    match raw {
+        "open_code" | "opencode" | "open-code" => LocalProviderKind::OpenCode,
+        // Default to the OpenAI-compatible provider when the stored
+        // value is empty or unrecognized; matches the macro default.
+        _ => LocalProviderKind::OpenAICompatible,
+    }
+}
+
 #[derive(
     Debug,
     Serialize,
@@ -1281,9 +1325,113 @@ define_settings_group!(AISettings, settings: [
         toml_path: "agents.warp_agent.active_ai.intelligent_autosuggestions_enabled",
         description: "Controls whether AI-powered intelligent autosuggestions are enabled.",
     }
+    local_openai_enabled: LocalOpenAIEnabled {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.enabled",
+        description: "Controls whether local OpenAI-compatible AI requests are enabled.",
+    }
+    local_openai_base_url: LocalOpenAIBaseUrl {
+        type: String,
+        default: "http://127.0.0.1:1234/v1".to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.base_url",
+        description: "Base URL for a local OpenAI-compatible API endpoint.",
+    }
+    local_openai_api_key: LocalOpenAIApiKey {
+        type: String,
+        default: String::new(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.api_key",
+        description: "Optional API key for the local OpenAI-compatible endpoint.",
+    }
+    local_openai_command_model: LocalOpenAICommandModel {
+        type: String,
+        default: "google/gemma-4-e4b".to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.command_model",
+        description: "Model used for local command generation and workflow metadata.",
+    }
+    local_openai_prediction_model: LocalOpenAIPredictionModel {
+        type: String,
+        default: "google/gemma-4-e4b".to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.prediction_model",
+        description: "Model used for local command prediction.",
+    }
+    local_openai_timeout_ms: LocalOpenAITimeoutMs {
+        type: u64,
+        default: 8000,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.timeout_ms",
+        description: "Timeout for local OpenAI-compatible AI requests in milliseconds.",
+    }
+    local_openai_provider_kind: LocalOpenAIProviderKind {
+        type: String,
+        // `LocalProviderKind` is serialized as snake_case strings; the
+        // custom getter parses to the enum.
+        default: "open_ai_compatible".to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.provider_kind",
+        description: "Which local AI provider to route Chat Completions through. `open_ai_compatible` talks to a user-configured base URL; `open_code` spawns a per-working-directory sidecar.",
+    }
+    local_openai_opencode_command: LocalOpenAIOpenCodeCommand {
+        type: String,
+        default: crate::ai::local_opencode::DEFAULT_OPENCODE_BINARY.to_string(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.opencode_command",
+        description: "Path or name of the OpenCode binary to spawn when `provider_kind = open_code`.",
+    }
+    local_openai_opencode_args: LocalOpenAIOpenCodeArgs {
+        type: Vec<String>,
+        default: crate::ai::local_opencode::DEFAULT_OPENCODE_ARGS
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.opencode_args",
+        description: "Arguments to pass to the OpenCode binary when spawning a sidecar.",
+    }
+    local_openai_use_responses_api: LocalOpenAIUseResponsesApi {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.use_responses_api",
+        description: "Whether multi-turn local-AI callers should use the OpenAI Responses API (`/v1/responses`) and round-trip reasoning items between turns. Single-shot command generation and prediction keep using `/v1/chat/completions` regardless of this flag.",
+    }
     // This field should not be referenced directly to lookup Prompt Suggestions
     // enablement -- use the `is_prompt_suggestions_enabled()` getter.
-    // Note that AgentModeQuerySuggestionsEnabled is a legacy name (the feature was initially named Agent
     // Mode Query Suggestions), however, we do not want to change the name of the setting key to avoid
     // breaking existing user settings.
     prompt_suggestions_enabled_internal: AgentModeQuerySuggestionsEnabled {
@@ -2229,6 +2377,47 @@ define_settings_group!(AISettings, settings: [
 ]);
 
 impl AISettings {
+    pub(crate) fn local_openai_settings(&self) -> LocalOpenAISettingsSnapshot {
+        LocalOpenAISettingsSnapshot {
+            enabled: *self.local_openai_enabled.value(),
+            base_url: self.local_openai_base_url.value().clone(),
+            api_key: self.local_openai_api_key.value().clone(),
+            command_model: self.local_openai_command_model.value().clone(),
+            prediction_model: self.local_openai_prediction_model.value().clone(),
+            timeout_ms: *self.local_openai_timeout_ms.value(),
+            provider_kind: parse_provider_kind(self.local_openai_provider_kind.value().as_str()),
+            opencode_command: self.local_openai_opencode_command.value().clone(),
+            opencode_args: self.local_openai_opencode_args.value().clone(),
+            use_responses_api: *self.local_openai_use_responses_api.value(),
+        }
+    }
+
+    fn is_local_openai_provider_configured(&self) -> bool {
+        *self.local_openai_enabled.value() && !self.local_openai_base_url.value().trim().is_empty()
+    }
+
+    pub(crate) fn is_local_openai_prediction_enabled(&self) -> bool {
+        ChannelState::is_local_only()
+            && self.is_local_openai_provider_configured()
+            && !self.local_openai_prediction_model.value().trim().is_empty()
+    }
+
+    pub(crate) fn is_local_ai_enabled(&self) -> bool {
+        ChannelState::is_local_only() && *self.local_openai_enabled.value()
+    }
+
+    pub(crate) fn is_ai_command_search_enabled(&self, app: &AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            // Only expose command search when the local provider is actually runnable —
+            // an enabled-but-unconfigured provider would fail every request.
+            self.is_local_ai_enabled()
+                && !self.local_openai_base_url.value().trim().is_empty()
+                && !self.local_openai_command_model.value().trim().is_empty()
+        } else {
+            self.is_any_ai_enabled(app)
+        }
+    }
+
     pub fn register_and_subscribe_to_events(app: &mut AppContext) {
         Self::register(app);
         app.add_singleton_model(FocusedTerminalInfo::new);
@@ -2263,6 +2452,16 @@ impl AISettings {
     }
 
     pub fn is_any_ai_enabled(&self, app: &AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            // In local-only mode the cloud/Anthropic backend is unreachable, so the
+            // user-visible "AI enabled" state must reflect whether the local
+            // provider is actually enabled. Without this gate a user with
+            // `agents.local_openai.enabled = false` would still see AI surfaces
+            // (auto-detection, command search, etc.) as live and end up hitting
+            // "configure local provider" errors.
+            return self.is_local_ai_enabled();
+        }
+
         // Disable AI for anonymous and logged-out users.
         let is_anonymous_or_logged_out = AuthStateProvider::as_ref(app)
             .get()
@@ -2296,7 +2495,7 @@ impl AISettings {
             DefaultSessionMode::Terminal | DefaultSessionMode::TabConfig => mode,
             // Agent and CloudAgent require AI to be enabled.
             DefaultSessionMode::Agent | DefaultSessionMode::CloudAgent => {
-                if self.is_any_ai_enabled(app) {
+                if !ChannelState::is_local_only() && self.is_any_ai_enabled(app) {
                     mode
                 } else {
                     DefaultSessionMode::Terminal
@@ -2356,6 +2555,12 @@ impl AISettings {
     }
 
     pub fn is_natural_language_autosuggestions_enabled(&self, app: &warpui::AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            return self.is_local_openai_prediction_enabled()
+                && *self.natural_language_autosuggestions_enabled_internal
+                && AppExecutionMode::as_ref(app).allows_active_ai();
+        }
+
         self.is_active_ai_enabled(app) && *self.natural_language_autosuggestions_enabled_internal
     }
 
@@ -2368,6 +2573,12 @@ impl AISettings {
     }
 
     pub fn is_intelligent_autosuggestions_enabled(&self, app: &warpui::AppContext) -> bool {
+        if ChannelState::is_local_only() {
+            return self.is_local_openai_prediction_enabled()
+                && *self.intelligent_autosuggestions_enabled_internal
+                && AppExecutionMode::as_ref(app).allows_active_ai();
+        }
+
         self.is_active_ai_enabled(app) && *self.intelligent_autosuggestions_enabled_internal
     }
 

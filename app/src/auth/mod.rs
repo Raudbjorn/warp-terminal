@@ -23,7 +23,6 @@ pub use login_failure_notification::LoginFailureReason;
 #[cfg(feature = "tui")]
 use url::Url;
 pub use user_uid::UserUid;
-use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 use warp_core::user_preferences::GetUserPreferences as _;
 use warp_errors::{report_error, report_if_error};
@@ -40,6 +39,7 @@ use crate::ai::llms::LLMPreferences;
 use crate::ai::mcp::TemplatableMCPServerManager;
 use crate::ai::request_usage_model::AIRequestUsageModel;
 use crate::ai_assistant::requests::REQUEST_LIMIT_INFO_CACHE_KEY;
+use crate::channel::ChannelState;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::code::editor_management::{CodeEditorStatus, CodeEditorSummary};
 use crate::env_vars::manager::EnvVarCollectionManager;
@@ -117,6 +117,15 @@ pub fn web_logout_url_with_continue(continue_url: &str) -> Option<String> {
 /// If the app has running processes or dirty objects, we'll show a confirmation modal before logging out.
 /// If the user aborts, the user will not be logged out.
 pub fn maybe_log_out(app: &mut AppContext) {
+    // Defense-in-depth: the app menu hides the "Log out" item in
+    // local-only mode (see `app_menus.rs`), but keyboard shortcuts or
+    // future callers might still reach this path. Skip the entire
+    // logout flow when there is no Warp account to log out of: the
+    // user is anonymous by definition in local-only mode, and the
+    // telemetry and state-clearing actions are a no-op for them.
+    if ChannelState::is_local_only() {
+        return;
+    }
     send_telemetry_sync_from_app_ctx!(TelemetryEvent::UserInitiatedLogOut, app);
 
     let sessions = SessionNavigationData::all_sessions(app).collect_vec();

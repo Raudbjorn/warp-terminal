@@ -4,16 +4,20 @@ mod scp_fallback;
 use std::path::Path;
 
 use anyhow::Result;
+use remote_server::setup::InstallScriptOptions;
 use remote_server::ssh::SshCommandError;
 use remote_server::transport::{Error, InstallOutcome, InstallSource};
 
 /// Runs the binary install sequence for the SSH transport. It first asks the
 /// remote host to download directly, then falls back to uploading a cached
 /// client-side tarball over SCP when the remote download path fails.
-pub(super) async fn install_binary(socket_path: &Path) -> InstallOutcome {
+pub(super) async fn install_binary(
+    socket_path: &Path,
+    install_options: &InstallScriptOptions,
+) -> InstallOutcome {
     let binary_path = remote_server::setup::remote_server_binary();
     log::info!("Installing remote server binary to {binary_path}");
-    let mut outcome = match install_on_server(socket_path).await {
+    let mut outcome = match install_on_server(socket_path, install_options).await {
         Ok(()) => InstallOutcome {
             source: Some(InstallSource::Server),
             result: Ok(()),
@@ -21,7 +25,7 @@ pub(super) async fn install_binary(socket_path: &Path) -> InstallOutcome {
         Err(server_err) => {
             if scp_fallback::should_try_install(&server_err) {
                 log::info!("Remote server install failed; falling back to SCP upload");
-                match scp_fallback::install(socket_path).await {
+                match scp_fallback::install(socket_path, install_options).await {
                     Ok(()) => InstallOutcome {
                         source: Some(InstallSource::Client),
                         result: Ok(()),
@@ -75,8 +79,11 @@ pub(super) async fn install_binary(socket_path: &Path) -> InstallOutcome {
 
 /// Runs the install script on the remote host to download and install the
 /// binary directly from the CDN.
-async fn install_on_server(socket_path: &Path) -> Result<(), Error> {
-    let script = remote_server::setup::install_script(None);
+async fn install_on_server(
+    socket_path: &Path,
+    install_options: &InstallScriptOptions,
+) -> Result<(), Error> {
+    let script = remote_server::setup::install_script_with_options(install_options, None);
     match remote_server::ssh::run_ssh_script(
         socket_path,
         &script,

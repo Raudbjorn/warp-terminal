@@ -107,6 +107,7 @@ impl WebSocket {
         protocols: impl IntoIterator<Item = &str>,
     ) -> anyhow::Result<Self> {
         let mut request = request.into_client_request()?;
+        network_policy::check_url_str(&request.uri().to_string(), "websocket")?;
         let protocols = protocols.into_iter().join(", ");
         if !protocols.is_empty() {
             request
@@ -123,6 +124,7 @@ impl WebSocket {
         url: impl AsRef<str>,
         protocols: impl IntoIterator<Item = &str>,
     ) -> anyhow::Result<Self> {
+        network_policy::check_url_str(url.as_ref(), "websocket")?;
         let socket = imp::connect(url, protocols).await?;
         Ok(Self(socket))
     }
@@ -200,3 +202,27 @@ pub trait Stream: futures::Stream<Item = Result<Message, Error>> + Send + Unpin 
 impl<T> Sink for T where T: futures::Sink<Message, Error = Error> + Send + Unpin + 'static {}
 impl<T> Stream for T where T: futures::Stream<Item = Result<Message, Error>> + Send + Unpin + 'static
 {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn local_only_websocket_policy_allows_loopback_and_rejects_public_hosts() {
+        let allowed = url::Url::parse("ws://localhost:8080/graphql").unwrap();
+        assert_eq!(
+            network_policy::check_url_for_mode(
+                network_policy::ServicesMode::LocalOnly,
+                &allowed,
+                "websocket",
+            ),
+            Ok(())
+        );
+
+        let denied = url::Url::parse("wss://rtc.app.warp.dev/graphql/v2").unwrap();
+        assert!(network_policy::check_url_for_mode(
+            network_policy::ServicesMode::LocalOnly,
+            &denied,
+            "websocket",
+        )
+        .is_err());
+    }
+}

@@ -1,0 +1,187 @@
+From d27c97a19d1d604154a4602eff846c7587ee4223 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Fri, 22 May 2026 18:48:45 -0400
+Subject: [PATCH 29/48] Add FrameImage element + StaticImage::from_rgba for
+ live frame streams (oh-my-warp)
+
+---
+ .../warpui_core/src/elements/frame_image.rs   | 124 ++++++++++++++++++
+ crates/warpui_core/src/elements/mod.rs        |   2 +
+ crates/warpui_core/src/image_cache.rs         |  13 ++
+ 3 files changed, 139 insertions(+)
+ create mode 100644 crates/warpui_core/src/elements/frame_image.rs
+
+diff --git a/crates/warpui_core/src/elements/frame_image.rs b/crates/warpui_core/src/elements/frame_image.rs
+new file mode 100644
+index 00000000..3c565fa9
+--- /dev/null
++++ b/crates/warpui_core/src/elements/frame_image.rs
+@@ -0,0 +1,124 @@
++//! An element that draws a single caller-provided [`StaticImage`] (RGBA),
++//! scaled to *fit* (contain) its bounds with letterboxing.
++//!
++//! Unlike [`super::Image`], this is **not** asset-cache backed: the caller owns
++//! the `Arc<StaticImage>` and swaps in a new one per frame (a live video /
++//! browser-viewport stream). Because the renderer's texture cache keys on the
++//! `Arc` pointer identity, each new frame uploads to the GPU exactly once and is
++//! reclaimed once the previous `Arc` is dropped — so the only per-frame work is
++//! a single texture upload, and an idle (unchanging) stream costs nothing.
++
++use std::cell::Cell;
++use std::rc::Rc;
++use std::sync::Arc;
++
++use pathfinder_geometry::rect::RectF;
++use pathfinder_geometry::vector::{vec2f, Vector2F};
++
++use super::{
++    AfterLayoutContext, AppContext, Element, EventContext, LayoutContext, PaintContext, Point,
++    SizeConstraint,
++};
++use crate::event::DispatchedEvent;
++use crate::image_cache::StaticImage;
++use crate::scene::CornerRadius;
++
++/// A shared cell into which a [`FrameImage`] can report the (window-space) rect
++/// it actually drew the image into. Lets a parent map pointer positions into the
++/// image (accounting for letterboxing) without reaching into the element tree.
++pub type BoundsSink = Rc<Cell<Option<RectF>>>;
++
++/// A shared cell into which a [`FrameImage`] reports its full allocated size
++/// (logical points). Lets a parent size the source viewport to the element.
++pub type SizeSink = Rc<Cell<Option<Vector2F>>>;
++
++/// Draws an [`Arc<StaticImage>`] scaled to fit the element's bounds, centered.
++pub struct FrameImage {
++    image: Arc<StaticImage>,
++    size: Option<Vector2F>,
++    origin: Option<Point>,
++    bounds_sink: Option<BoundsSink>,
++    size_sink: Option<SizeSink>,
++}
++
++impl FrameImage {
++    pub fn new(image: Arc<StaticImage>) -> Self {
++        Self {
++            image,
++            size: None,
++            origin: None,
++            bounds_sink: None,
++            size_sink: None,
++        }
++    }
++
++    /// Report the drawn image rect (window space, letterbox-corrected) into
++    /// `sink` on every paint, for pointer-coordinate mapping.
++    pub fn report_bounds(mut self, sink: BoundsSink) -> Self {
++        self.bounds_sink = Some(sink);
++        self
++    }
++
++    /// Report the element's full allocated size into `sink` on every paint.
++    pub fn report_size(mut self, sink: SizeSink) -> Self {
++        self.size_sink = Some(sink);
++        self
++    }
++}
++
++impl Element for FrameImage {
++    fn layout(
++        &mut self,
++        constraint: SizeConstraint,
++        _ctx: &mut LayoutContext,
++        _app: &AppContext,
++    ) -> Vector2F {
++        let size = constraint.max;
++        self.size = Some(size);
++        size
++    }
++
++    fn after_layout(&mut self, _ctx: &mut AfterLayoutContext, _app: &AppContext) {}
++
++    fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, _app: &AppContext) {
++        self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
++        let bounds = self.size.unwrap_or_else(|| vec2f(0.0, 0.0));
++        if let Some(sink) = &self.size_sink {
++            sink.set(Some(bounds));
++        }
++        let iw = self.image.width() as f32;
++        let ih = self.image.height() as f32;
++        if bounds.x() <= 0.0 || bounds.y() <= 0.0 || iw <= 0.0 || ih <= 0.0 {
++            return;
++        }
++
++        // Contain: scale to the smaller axis ratio, then center within bounds.
++        let scale = (bounds.x() / iw).min(bounds.y() / ih);
++        let draw = vec2f(iw * scale, ih * scale);
++        let offset = vec2f((bounds.x() - draw.x()) / 2.0, (bounds.y() - draw.y()) / 2.0);
++        let rect = RectF::new(origin + offset, draw);
++        if let Some(sink) = &self.bounds_sink {
++            sink.set(Some(rect));
++        }
++
++        ctx.scene
++            .draw_image(rect, self.image.clone(), 1.0, CornerRadius::default());
++    }
++
++    fn dispatch_event(
++        &mut self,
++        _event: &DispatchedEvent,
++        _ctx: &mut EventContext,
++        _app: &AppContext,
++    ) -> bool {
++        false
++    }
++
++    fn size(&self) -> Option<Vector2F> {
++        self.size
++    }
++
++    fn origin(&self) -> Option<Point> {
++        self.origin
++    }
++}
+diff --git a/crates/warpui_core/src/elements/mod.rs b/crates/warpui_core/src/elements/mod.rs
+index 9520cdd7..60bcfbf1 100644
+--- a/crates/warpui_core/src/elements/mod.rs
++++ b/crates/warpui_core/src/elements/mod.rs
+@@ -13,6 +13,7 @@ mod empty;
+ mod event_handler;
+ mod flex;
+ mod formatted_text_element;
++mod frame_image;
+ mod hoverable;
+ mod icon;
+ mod image;
+@@ -55,6 +56,7 @@ pub use empty::*;
+ pub use event_handler::*;
+ pub use flex::*;
+ pub use formatted_text_element::*;
++pub use frame_image::*;
+ pub use hoverable::*;
+ pub use icon::*;
+ pub use image::*;
+diff --git a/crates/warpui_core/src/image_cache.rs b/crates/warpui_core/src/image_cache.rs
+index d729e57d..fd8c5d3d 100644
+--- a/crates/warpui_core/src/image_cache.rs
++++ b/crates/warpui_core/src/image_cache.rs
+@@ -411,6 +411,19 @@ impl StaticImage {
+     pub fn rgba_bytes(&self) -> &[u8] {
+         self.img.as_raw().as_slice()
+     }
++
++    /// Constructs a [`StaticImage`] directly from a decoded RGBA buffer, bypassing
++    /// the asset cache.
++    ///
++    /// This is the entry point for *live* frame streams (e.g. the embedded browser
++    /// pane's viewport): the caller wraps each decoded frame in a fresh
++    /// `Arc<StaticImage>` and swaps it into its view. Because the renderer's
++    /// texture cache is keyed by `Arc` pointer identity (see
++    /// [`crate::rendering::texture_cache`]), each new frame uploads to the GPU
++    /// exactly once and is reclaimed when its `Arc` is dropped.
++    pub fn from_rgba(img: image::RgbaImage) -> Self {
++        Self { img }
++    }
+ }
+ 
+ /// A representation of a single frame in an animated image.

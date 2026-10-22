@@ -77,6 +77,14 @@ diesel::table! {
 }
 
 diesel::table! {
+    browser_panes (id) {
+        id -> Integer,
+        kind -> Text,
+        url -> Text,
+    }
+}
+
+diesel::table! {
     blocks (id) {
         id -> Nullable<Integer>,
         pane_leaf_uuid -> Binary,
@@ -367,6 +375,30 @@ diesel::table! {
 }
 
 diesel::table! {
+    ssh_nodes (id) {
+        id -> Text,
+        parent_id -> Nullable<Text>,
+        kind -> Text,
+        name -> Text,
+        sort_order -> Integer,
+        created_at -> Timestamp,
+        updated_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    ssh_servers (node_id) {
+        node_id -> Text,
+        host -> Text,
+        port -> Integer,
+        username -> Text,
+        auth_type -> Text,
+        key_path -> Nullable<Text>,
+        last_connected_at -> Nullable<Timestamp>,
+    }
+}
+
+diesel::table! {
     tabs (id) {
         id -> Integer,
         window_id -> Integer,
@@ -513,6 +545,7 @@ diesel::table! {
 
 diesel::joinable!(ambient_agent_panes -> pane_nodes (id));
 diesel::joinable!(app -> windows (active_window_id));
+diesel::joinable!(browser_panes -> pane_nodes (id));
 diesel::joinable!(code_pane_tabs -> code_panes (code_pane_id));
 diesel::joinable!(object_permissions -> object_metadata (object_metadata_id));
 diesel::joinable!(pane_branches -> pane_nodes (pane_node_id));
@@ -521,6 +554,7 @@ diesel::joinable!(pane_nodes -> tabs (tab_id));
 diesel::joinable!(panels -> tabs (tab_id));
 diesel::joinable!(tab_groups -> windows (window_id));
 diesel::joinable!(tabs -> tab_groups (tab_group_id));
+diesel::joinable!(ssh_servers -> ssh_nodes (node_id));
 diesel::joinable!(tabs -> windows (window_id));
 diesel::joinable!(team_members -> teams (team_id));
 diesel::joinable!(team_settings -> teams (team_id));
@@ -529,6 +563,7 @@ diesel::joinable!(workspace_language_server -> workspace_metadata (workspace_id)
 diesel::allow_tables_to_appear_in_same_query!(
     ambient_agent_panes,
     app,
+    browser_panes,
     pane_branches,
     pane_leaves,
     pane_nodes,

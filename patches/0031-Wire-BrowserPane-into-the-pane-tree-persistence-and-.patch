@@ -1,0 +1,326 @@
+From 69474f2fff7a9b09e639c5f86dbc6a55815f6328 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Fri, 22 May 2026 18:48:45 -0400
+Subject: [PATCH 31/48] Wire BrowserPane into the pane tree, persistence, and
+ layout (oh-my-warp)
+
+---
+ app/src/app_state.rs                    |   7 +-
+ app/src/launch_configs/launch_config.rs |   1 +
+ app/src/pane_group/mod.rs               |  16 ++++
+ app/src/pane_group/pane/browser_pane.rs | 110 ++++++++++++++++++++++++
+ app/src/pane_group/pane/mod.rs          |  25 +++++-
+ app/src/persistence/sqlite.rs           |   7 +-
+ app/src/workspace/view/vertical_tabs.rs |   1 +
+ 7 files changed, 164 insertions(+), 3 deletions(-)
+ create mode 100644 app/src/pane_group/pane/browser_pane.rs
+
+diff --git a/app/src/app_state.rs b/app/src/app_state.rs
+index f54aec7b..b2363d3f 100644
+--- a/app/src/app_state.rs
++++ b/app/src/app_state.rs
+@@ -146,6 +146,9 @@ pub enum LeafContents {
+     /// The in-app network log pane. Not persisted across restarts because the
+     /// backing log is an in-memory ring buffer that starts empty on launch.
+     NetworkLog,
++    /// The embedded browser pane (oh-my-warp). Not persisted: each owns a live
++    /// Chrome + CDP screencast session created at open time.
++    Browser,
+     /// An entrypoint pane type to launch other pane types from a search palette. The default view
+     /// when creating a tab.
+     Welcome {
+@@ -174,7 +177,9 @@ impl LeafContents {
+             LeafContents::NetworkLog
+             // Environment management panes are opened on-demand via workspace
+             // actions and have no persistable state.
+-            | LeafContents::EnvironmentManagement(_) => false,
++            | LeafContents::EnvironmentManagement(_)
++            // Browser panes (oh-my-warp) own a live CDP session, not restorable state.
++            | LeafContents::Browser => false,
+             LeafContents::Terminal(_)
+             | LeafContents::Notebook(_)
+             | LeafContents::AIDocument(_)
+diff --git a/app/src/launch_configs/launch_config.rs b/app/src/launch_configs/launch_config.rs
+index 988bb133..f3d3ad6e 100644
+--- a/app/src/launch_configs/launch_config.rs
++++ b/app/src/launch_configs/launch_config.rs
+@@ -156,6 +156,7 @@ impl TryFrom<PaneNodeSnapshot> for PaneTemplateType {
+                 | LeafContents::ExecutionProfileEditor
+                 | LeafContents::GetStarted
+                 | LeafContents::NetworkLog
++                | LeafContents::Browser
+                 | LeafContents::Welcome { .. }
+                 | LeafContents::AIDocument(_)
+                 | LeafContents::EnvironmentManagement(_)
+diff --git a/app/src/pane_group/mod.rs b/app/src/pane_group/mod.rs
+index 17dcbb4e..8a887ace 100644
+--- a/app/src/pane_group/mod.rs
++++ b/app/src/pane_group/mod.rs
+@@ -178,6 +178,7 @@ mod tests;
+ 
+ pub use pane::ai_document_pane::AIDocumentPane;
+ pub use pane::ai_fact_pane::AIFactPane;
++pub use pane::browser_pane::BrowserPane;
+ pub use pane::code_diff_pane::CodeDiffPane;
+ pub use pane::code_pane::CodePane;
+ pub use pane::env_var_collection_pane::EnvVarCollectionPane;
+@@ -1948,6 +1949,21 @@ impl PaneGroup {
+                     "Network log pane should not have been persisted, as it cannot be restored"
+                 ))
+             }
++            LeafContents::Browser => {
++                // Browser panes (oh-my-warp) construct a fresh Chrome + CDP
++                // session here. This arm is reached for newly-opened panes/tabs
++                // (e.g. "New Web Tab"); it is never reached during session
++                // restore because `is_persisted()` is false (so `save_pane_state`
++                // never writes a browser leaf to restore).
++                let pane: Box<dyn AnyPaneContent + 'static> = Box::new(BrowserPane::new(ctx));
++                let pane_id = pane.as_pane().id();
++                pane_contents.insert(pane_id, pane);
++                let focus = InitialFocus {
++                    focused_pane: leaf.is_focused.then_some(pane_id),
++                    active_session: None,
++                };
++                Ok((PaneData::new(pane_id), focus))
++            }
+             LeafContents::GetStarted => {
+                 if !FeatureFlag::GetStartedTab.is_enabled() {
+                     Err(anyhow::anyhow!("GetStarted pane not supported"))
+diff --git a/app/src/pane_group/pane/browser_pane.rs b/app/src/pane_group/pane/browser_pane.rs
+new file mode 100644
+index 00000000..f5a901b9
+--- /dev/null
++++ b/app/src/pane_group/pane/browser_pane.rs
+@@ -0,0 +1,110 @@
++//! [`PaneContent`] wrapper that lets a [`BrowserView`] live in the pane tree
++//! (oh-my-warp). Mirrors the other non-terminal panes (e.g. `NetworkLogPane`),
++//! minus the singleton manager: browser panes are not deduplicated, so opening
++//! the action again always creates a new one.
++
++use warpui::{AppContext, ModelHandle, View, ViewContext, ViewHandle};
++
++use super::view::PaneView;
++use super::{
++    DetachType, PaneConfiguration, PaneContent, PaneGroup, PaneId, ShareableLink,
++    ShareableLinkError,
++};
++use crate::app_state::LeafContents;
++use crate::browser::view::{BrowserView, BrowserViewEvent};
++
++pub struct BrowserPane {
++    view: ViewHandle<PaneView<BrowserView>>,
++    pane_configuration: ModelHandle<PaneConfiguration>,
++}
++
++impl BrowserPane {
++    pub fn from_view(browser_view: ViewHandle<BrowserView>, ctx: &mut AppContext) -> Self {
++        let pane_configuration = browser_view.as_ref(ctx).pane_configuration();
++
++        let view = ctx.add_typed_action_view(browser_view.window_id(ctx), |ctx| {
++            let pane_id = PaneId::from_browser_pane_ctx(ctx);
++            PaneView::new(pane_id, browser_view, (), pane_configuration.clone(), ctx)
++        });
++
++        Self {
++            view,
++            pane_configuration,
++        }
++    }
++
++    pub fn new<V: View>(ctx: &mut ViewContext<V>) -> Self {
++        let view = ctx.add_typed_action_view(BrowserView::new);
++        Self::from_view(view, ctx)
++    }
++
++    pub fn browser_view(&self, ctx: &AppContext) -> ViewHandle<BrowserView> {
++        self.view.as_ref(ctx).child(ctx)
++    }
++}
++
++impl PaneContent for BrowserPane {
++    fn id(&self) -> PaneId {
++        PaneId::from_browser_pane_view(&self.view)
++    }
++
++    fn attach(
++        &self,
++        _group: &PaneGroup,
++        focus_handle: crate::pane_group::focus_state::PaneFocusHandle,
++        ctx: &mut ViewContext<PaneGroup>,
++    ) {
++        self.view
++            .update(ctx, |view, ctx| view.set_focus_handle(focus_handle, ctx));
++
++        let browser_view = self.browser_view(ctx);
++        let pane_id = self.id();
++
++        ctx.subscribe_to_view(&browser_view, move |pane_group, _, event, ctx| {
++            let BrowserViewEvent::Pane(pane_event) = event;
++            pane_group.handle_pane_event(pane_id, pane_event, ctx)
++        });
++        ctx.subscribe_to_view(&self.view, move |group, _, event, ctx| {
++            group.handle_pane_view_event(pane_id, event, ctx);
++        });
++    }
++
++    fn detach(
++        &self,
++        _group: &PaneGroup,
++        _detach_type: DetachType,
++        ctx: &mut ViewContext<PaneGroup>,
++    ) {
++        let browser_view = self.browser_view(ctx);
++        ctx.unsubscribe_to_view(&browser_view);
++        ctx.unsubscribe_to_view(&self.view);
++    }
++
++    fn snapshot(&self, _app: &AppContext) -> LeafContents {
++        LeafContents::Browser
++    }
++
++    fn has_application_focus(&self, ctx: &mut ViewContext<PaneGroup>) -> bool {
++        self.view.is_self_or_child_focused(ctx)
++    }
++
++    fn focus(&self, ctx: &mut ViewContext<PaneGroup>) {
++        self.browser_view(ctx)
++            .update(ctx, |view, ctx| view.focus(ctx));
++    }
++
++    fn shareable_link(
++        &self,
++        _ctx: &mut ViewContext<PaneGroup>,
++    ) -> Result<ShareableLink, ShareableLinkError> {
++        Ok(ShareableLink::Base)
++    }
++
++    fn pane_configuration(&self) -> ModelHandle<PaneConfiguration> {
++        self.pane_configuration.clone()
++    }
++
++    fn is_pane_being_dragged(&self, ctx: &AppContext) -> bool {
++        self.view.as_ref(ctx).is_being_dragged()
++    }
++}
+diff --git a/app/src/pane_group/pane/mod.rs b/app/src/pane_group/pane/mod.rs
+index 8d50285f..2435c248 100644
+--- a/app/src/pane_group/pane/mod.rs
++++ b/app/src/pane_group/pane/mod.rs
+@@ -10,6 +10,7 @@
+ //! used to render a [`PaneView`] which internally renders the pane, including the [`BackingView`].
+ pub(super) mod ai_document_pane;
+ pub(super) mod ai_fact_pane;
++pub(super) mod browser_pane;
+ pub(super) mod code_diff_pane;
+ pub(super) mod code_diff_pane_model;
+ pub(super) mod code_pane;
+@@ -50,6 +51,7 @@ use crate::ai::ai_document_view::AIDocumentView;
+ use crate::ai::blocklist::inline_action::code_diff_view::CodeDiffView;
+ use crate::ai::execution_profiles::editor::ExecutionProfileEditorView;
+ use crate::ai::facts::AIFactView;
++use crate::browser::view::BrowserView;
+ #[cfg(feature = "local_fs")]
+ use crate::code::buffer_location::LocalOrRemotePath;
+ use crate::code::view::CodeView;
+@@ -148,6 +150,7 @@ pub(crate) enum IPaneType {
+     ExecutionProfileEditor,
+     GetStarted,
+     NetworkLog,
++    Browser,
+     Welcome,
+     DeferredPlaceholder,
+     /// A pane type only for tests.
+@@ -172,6 +175,7 @@ impl Display for IPaneType {
+             IPaneType::ExecutionProfileEditor => write!(f, "Execution Profile Editor"),
+             IPaneType::GetStarted => write!(f, "GetStarted"),
+             IPaneType::NetworkLog => write!(f, "Network Log"),
++            IPaneType::Browser => write!(f, "Browser"),
+             IPaneType::Welcome => write!(f, "Welcome"),
+             IPaneType::DeferredPlaceholder => write!(f, "Placeholder"),
+             #[cfg(test)]
+@@ -274,6 +278,11 @@ impl PaneId {
+         Self::new_from_ctx(IPaneType::NetworkLog, ctx)
+     }
+ 
++    /// Creates a [`PaneId`] from a [`ViewContext<PaneView<BrowserView>>`].
++    pub fn from_browser_pane_ctx(ctx: &ViewContext<PaneView<BrowserView>>) -> Self {
++        Self::new_from_ctx(IPaneType::Browser, ctx)
++    }
++
+     /// Creates a [`PaneId`] from a [`PaneView<TerminalView>`] entity ID.
+     pub fn from_terminal_pane_view(
+         terminal_pane_view: &ViewHandle<terminal_pane::TerminalPaneView>,
+@@ -375,6 +384,11 @@ impl PaneId {
+         Self::new(IPaneType::NetworkLog, network_log_pane_view)
+     }
+ 
++    /// Creates a [`PaneId`] from a [`PaneView<BrowserView>`] entity ID.
++    pub fn from_browser_pane_view(browser_pane_view: &ViewHandle<PaneView<BrowserView>>) -> Self {
++        Self::new(IPaneType::Browser, browser_pane_view)
++    }
++
+     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+     pub(super) fn deferred_placeholder_pane_id() -> Self {
+         Self(IPaneId {
+@@ -490,6 +504,9 @@ impl PaneId {
+             IPaneType::NetworkLog => {
+                 ChildView::<PaneView<NetworkLogView>>::with_id(self.0.pane_view_id).finish()
+             }
++            IPaneType::Browser => {
++                ChildView::<PaneView<BrowserView>>::with_id(self.0.pane_view_id).finish()
++            }
+             IPaneType::Welcome => {
+                 ChildView::<PaneView<WelcomeView>>::with_id(self.0.pane_view_id).finish()
+             }
+@@ -497,7 +514,13 @@ impl PaneId {
+             #[cfg(test)]
+             IPaneType::Dummy => warpui::elements::Empty::new().finish(),
+         };
+-        if *PaneSettings::as_ref(app).focus_panes_on_hover {
++        // oh-my-warp: the browser pane is focused on click only, never on hover.
++        // Focus-follows-mouse here would re-grab keyboard whenever the cursor is
++        // over the pane and forward keystrokes into the web page — jarring, and it
++        // prevents focus from staying on a sibling pane the user clicked.
++        if *PaneSettings::as_ref(app).focus_panes_on_hover
++            && !matches!(self.0.pane_type, IPaneType::Browser)
++        {
+             element = EventHandler::new(element)
+                 .on_mouse_in(
+                     move |ctx, _, _| {
+diff --git a/app/src/persistence/sqlite.rs b/app/src/persistence/sqlite.rs
+index 9d0a415d..4d952888 100644
+--- a/app/src/persistence/sqlite.rs
++++ b/app/src/persistence/sqlite.rs
+@@ -1134,7 +1134,9 @@ fn save_pane_state(
+         LeafContents::GetStarted => GET_STARTED_PANE_KIND,
+         LeafContents::Welcome { .. } => WELCOME_PANE_KIND,
+         LeafContents::AIDocument(_) => AI_DOCUMENT_PANE_KIND,
+-        LeafContents::EnvironmentManagement(_) | LeafContents::NetworkLog => {
++        LeafContents::EnvironmentManagement(_)
++        | LeafContents::NetworkLog
++        | LeafContents::Browser => {
+             // These pane types are filtered out before this function is
+             // called; see `LeafContents::is_persisted` and the skip in
+             // `save_app_state`. Reaching this arm would mean a `pane_nodes`
+@@ -1376,6 +1378,9 @@ fn save_pane_state(
+         LeafContents::NetworkLog => {
+             // Unreachable: filtered by `is_persisted` in `save_app_state`.
+         }
++        LeafContents::Browser => {
++            // Unreachable: filtered by `is_persisted` in `save_app_state`.
++        }
+     }
+ 
+     Ok(())
+diff --git a/app/src/workspace/view/vertical_tabs.rs b/app/src/workspace/view/vertical_tabs.rs
+index b066ce8d..c3ab9ccf 100644
+--- a/app/src/workspace/view/vertical_tabs.rs
++++ b/app/src/workspace/view/vertical_tabs.rs
+@@ -3921,6 +3921,7 @@ impl PaneGroup {
+             IPaneType::ExecutionProfileEditor => TypedPane::ExecutionProfileEditor,
+             IPaneType::GetStarted
+             | IPaneType::NetworkLog
++            | IPaneType::Browser
+             | IPaneType::Welcome
+             | IPaneType::DeferredPlaceholder => TypedPane::Other,
+             #[cfg(test)]

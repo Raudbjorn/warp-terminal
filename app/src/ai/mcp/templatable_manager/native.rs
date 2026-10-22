@@ -275,6 +275,14 @@ impl TemplatableMCPServerManager {
         running_legacy_server_uuids: &[Uuid],
         ctx: &mut ModelContext<Self>,
     ) -> Self {
+        if ChannelState::is_local_only() {
+            return Self {
+                locally_installed_servers,
+                spawner: Some(ctx.spawner()),
+                ..Default::default()
+            };
+        }
+
         // Subscribe to FileBasedMCPManager events.
         let file_based_mcp_manager = FileBasedMCPManager::handle(ctx);
         ctx.subscribe_to_model(&file_based_mcp_manager, |me, _, event, ctx| match event {

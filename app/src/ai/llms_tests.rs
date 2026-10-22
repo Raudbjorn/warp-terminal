@@ -1646,6 +1646,7 @@ fn shared_model_picker_query_orders_filters_and_marks_disabled_choices() {
             preferences.get_base_llm_choices_for_agent_mode(&TeamlessScopeForTest, app),
             "",
             None,
+            None,
             scope,
             app,
         );
@@ -1663,6 +1664,7 @@ fn shared_model_picker_query_orders_filters_and_marks_disabled_choices() {
             preferences,
             preferences.get_base_llm_choices_for_agent_mode(&TeamlessScopeForTest, app),
             "gpt 5",
+            None,
             None,
             scope,
             app,
@@ -1895,4 +1897,23 @@ fn explicit_child_model_pin_preserves_gui_behavior_and_only_emits_for_effective_
         });
         assert_eq!(active_model_events.get(), 1);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn local_catalog_uses_configured_alias_and_deduplicates_discovered_models() {
+    let config = LocalMultiAgentConfig {
+        local_model_aliases: r#"{"auto":"local-model"}"#.to_string(),
+        local_model_list: String::new(),
+        openai_model: Some("local-model".to_string()),
+        ..Default::default()
+    };
+    let models = models_by_feature_for_local_multi_agent(
+        &config,
+        &["discovered-model".to_string(), "local-model".to_string()],
+    )
+    .expect("configured models produce a catalog");
+    assert_eq!(models.agent_mode.default_id.as_str(), "local-model");
+    assert_eq!(models.agent_mode.choices.len(), 2);
+    assert_eq!(models.coding.default_id.as_str(), "discovered-model");
 }

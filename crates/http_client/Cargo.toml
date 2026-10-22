@@ -17,6 +17,7 @@ cfg-if.workspace = true
 futures.workspace = true
 http.workspace = true
 log.workspace = true
+network_policy.workspace = true
 oauth2.workspace = true
 prevent_sleep.workspace = true
 prost.workspace = true
@@ -25,8 +26,9 @@ reqwest-eventsource.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_urlencoded.workspace = true
+thiserror.workspace = true
 warp_core.workspace = true
-warp_errors.workspace = true
+warp_errors = { workspace = true, features = ["reqwest-errors"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # Used to read the current OTEL span context and inject it as a trace-link
@@ -34,6 +36,10 @@ warp_errors.workspace = true
 opentelemetry.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
+
+[dev-dependencies]
+rustls.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 gloo.workspace = true

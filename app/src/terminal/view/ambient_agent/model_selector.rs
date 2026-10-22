@@ -20,6 +20,9 @@ use crate::ai::blocklist::agent_view::agent_input_footer::AgentInputButtonTheme;
 use crate::ai::cloud_agent_settings::CloudAgentSettings;
 use crate::ai::custom_model_routers::is_custom_router_id;
 use crate::ai::execution_profiles::model_menu_items::is_auto;
+use crate::ai::execution_profiles::profiles::{
+    AIExecutionProfilesModel, AIExecutionProfilesModelEvent,
+};
 use crate::ai::harness_availability::{HarnessAvailabilityEvent, HarnessAvailabilityModel};
 use crate::ai::harness_display::icon_for as harness_icon_for;
 use crate::ai::llms::{LLMId, LLMPreferences, LLMPreferencesEvent};
@@ -179,6 +182,20 @@ impl ModelSelector {
                     me.refresh_menu(ctx);
                 }
                 LLMPreferencesEvent::UpdatedActiveCodingLLM => {}
+            },
+        );
+
+        ctx.subscribe_to_model(
+            &AIExecutionProfilesModel::handle(ctx),
+            |me, _, event, ctx| {
+                if matches!(
+                    event,
+                    AIExecutionProfilesModelEvent::UpdatedActiveProfile { terminal_view_id }
+                        if *terminal_view_id == me.terminal_view_id
+                ) {
+                    me.refresh_button(ctx);
+                    me.refresh_menu(ctx);
+                }
             },
         );
 
@@ -494,8 +511,15 @@ impl ModelSelector {
 
         let mut auto_choices = Vec::new();
         let mut other_choices = Vec::new();
-        for llm in llm_preferences.get_base_llm_choices_for_agent_mode(scope, ctx) {
-            if llm_preferences.custom_llm_info_for_id(&llm.id).is_some() {
+        for llm in llm_preferences.get_base_llm_choices_for_agent_mode_for_terminal(
+            scope,
+            ctx,
+            Some(self.terminal_view_id),
+        ) {
+            if llm_preferences
+                .custom_llm_info_for_terminal(&llm.id, ctx, Some(self.terminal_view_id))
+                .is_some()
+            {
                 continue;
             }
 

@@ -57,9 +57,12 @@ use warpui::r#async::BoxFuture;
 use warpui::{Entity, ModelContext, SingletonEntity};
 use workspace::WorkspaceClient;
 
+use self::ai::{CommandGenerationClient, WorkflowMetadataAIClient};
 use super::experiments::{ServerExperiment, ServerExperiments};
+use crate::ChannelState;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::get_relevant_files::api::{GetRelevantFiles, GetRelevantFilesResponse};
+use crate::ai::local_openai::LocalOpenAIClient;
 use crate::ai::predict::generate_ai_input_suggestions::GenerateAIInputSuggestionsRequest;
 use crate::ai::predict::generate_am_query_suggestions::GenerateAMQuerySuggestionsRequest;
 use crate::ai::predict::predict_am_queries::{PredictAMQueriesRequest, PredictAMQueriesResponse};
@@ -69,8 +72,7 @@ use crate::auth::auth_manager::AuthManager;
 use crate::auth::auth_state::AuthState;
 use crate::server::team_scope::RequestTeamScope;
 use crate::server::telemetry::TelemetryApi;
-use crate::settings::PrivacySettingsSnapshot;
-use crate::{ChannelState, settings_view};
+use crate::settings::{AISettings, LocalOpenAISettingsSnapshot, PrivacySettingsSnapshot};
 
 pub const FETCH_CHANNEL_VERSIONS_TIMEOUT: std::time::Duration = Duration::from_secs(60);
 #[derive(Serialize)]
@@ -178,6 +180,9 @@ pub enum AIApiError {
     #[error("Failed with status code {0}: {1}")]
     ErrorStatus(http::StatusCode, String),
 
+    #[error("Network policy denied: {0}")]
+    NetworkPolicyDenied(#[source] network_policy::NetworkPolicyDenied),
+
     #[error(transparent)]
     Other(#[from] anyhow::Error),
 
@@ -218,6 +223,21 @@ impl From<http_client::ResponseError> for AIApiError {
 impl From<reqwest::Error> for AIApiError {
     fn from(err: reqwest::Error) -> Self {
         Self::from_transport_error(err)
+    }
+}
+
+impl From<http_client::Error> for AIApiError {
+    fn from(err: http_client::Error) -> Self {
+        match err {
+            http_client::Error::Reqwest(err) => Self::from_transport_error(err),
+            // NetworkPolicyDenied is deterministic in local-only mode
+            // (the policy is checked before send). Preserve it as a
+            // first-class variant so the AI runtime can short-circuit
+            // recovery and surface the actual reason instead of
+            // falling through to the generic "Other" path with
+            // `is_recoverable: true`.
+            http_client::Error::NetworkPolicyDenied(err) => AIApiError::NetworkPolicyDenied(err),
+        }
     }
 }
 
@@ -346,6 +366,10 @@ impl AIApiError {
             // A failed Grok token refresh is a credential problem the user must
             // fix by reconnecting, so retrying or resuming won't help.
             AIApiError::GrokSubscriptionTokenRefreshFailed => false,
+            // Network-policy denials are deterministic in local-only
+            // mode — the policy is checked before send — so retrying
+            // is pointless.
+            AIApiError::NetworkPolicyDenied(_) => false,
             // By default, attempt recovery on error.
             _ => true,
         }
@@ -360,6 +384,10 @@ impl ErrorExt for AIApiError {
                 DeserializationError::Transport(error) => error.is_actionable(),
             },
             AIApiError::Transport(error) => error.is_actionable(),
+            // Network-policy denials are not actionable: the request
+            // was stopped before send, and the user needs to either
+            // change modes (online) or accept the offline behavior.
+            AIApiError::NetworkPolicyDenied(_) => false,
             AIApiError::Other(error) => error.is_actionable(),
             AIApiError::Stream { source, .. } => source.is_actionable(),
             AIApiError::ErrorStatus(_, _) => self.is_recoverable(),
@@ -432,6 +460,17 @@ impl ErrorExt for TranscribeError {
 }
 register_error!(TranscribeError);
 
+/// Whether all Warp API traffic must be suppressed. This is a fully-local
+/// build: the client never contacts the Warp server, so shared request helpers
+/// short-circuit here and no request is ever initiated.
+fn warp_api_disabled() -> bool {
+    true
+}
+
+fn warp_api_disabled_error() -> anyhow::Error {
+    anyhow!("Warp API is disabled in fully-local mode")
+}
+
 /// An API wrapper struct with methods to requests to warp-server.
 ///
 /// Prefer NOT adding new methods directly on this struct; instead, add to one of the existing
@@ -442,6 +481,7 @@ pub struct ServerApi {
     // TODO(jeff): Make `TelemetryApi` another type of client, and move it off `ServerApi`.
     telemetry_api: TelemetryApi,
     last_server_time: Arc<Mutex<Option<ServerTime>>>,
+    local_openai_client: LocalOpenAIClient,
 }
 
 impl ServerApi {
@@ -509,6 +549,7 @@ impl ServerApi {
             base_client,
             telemetry_api,
             last_server_time: Arc::new(Mutex::new(None)),
+            local_openai_client: LocalOpenAIClient::new(LocalOpenAISettingsSnapshot::default()),
         }
     }
 
@@ -547,6 +588,17 @@ impl ServerApi {
             None,
             TelemetryApi::new(),
         )
+    }
+
+    fn set_local_openai_config(&self, config: LocalOpenAISettingsSnapshot) {
+        self.local_openai_client.set_config(config);
+    }
+
+    fn ensure_public_api_enabled(path: &str) -> Result<()> {
+        if ChannelState::is_local_only() {
+            anyhow::bail!("Public API request {path} is disabled in local-only services mode");
+        }
+        Ok(())
     }
 
     /// Sets the ambient agent task ID to be sent with all subsequent requests.
@@ -607,6 +659,9 @@ impl ServerApi {
     where
         QF: 'a,
     {
+        if warp_api_disabled() {
+            return Box::pin(async { Err(warp_api_disabled_error()) });
+        }
         warp_server_client::graphql_helpers::send_graphql_request(
             &self.base_client,
             operation,
@@ -659,7 +714,16 @@ impl ServerApi {
         run_ids: &[String],
         since_sequence: i64,
     ) -> Result<http_client::EventSourceStream> {
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
+        }
         debug_assert!(!run_ids.is_empty(), "run_ids must not be empty");
+        if ChannelState::is_local_only() {
+            return Err(anyhow::anyhow!(
+                "Agent event streams are disabled in local-only services mode"
+            ));
+        }
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -694,6 +758,9 @@ impl ServerApi {
         include_self: bool,
         since_sequence: i64,
     ) -> Result<http_client::EventSourceStream> {
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
+        }
         debug_assert!(
             !ancestor_run_id.is_empty(),
             "ancestor_run_id must not be empty"
@@ -732,6 +799,9 @@ impl ServerApi {
         run_ids: &[String],
         since_sequence: i64,
     ) -> Result<http_client::EventSourceStream> {
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
+        }
         debug_assert!(!run_ids.is_empty(), "run_ids must not be empty");
         let auth_token = self
             .get_or_refresh_access_token()
@@ -782,6 +852,8 @@ impl ServerApi {
     where
         B: Serialize,
     {
+        Self::ensure_public_api_enabled(path)?;
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -1032,6 +1104,8 @@ impl ServerApi {
     where
         B: Serialize,
     {
+        Self::ensure_public_api_enabled(path)?;
+
         let auth_token = self
             .get_or_refresh_access_token()
             .await
@@ -1063,6 +1137,11 @@ impl ServerApi {
     /// Sends an authenticated empty POST request to /client/login, which signals to the server
     /// that the user is logged in.
     pub async fn notify_login(&self) {
+        if ChannelState::is_local_only() {
+            log::debug!("Skipping login notification in local-only services mode");
+            return;
+        }
+
         match self.get_or_refresh_access_token().await {
             Ok(auth_token) => {
                 let url = format!("{}/client/login", ChannelState::server_root_url());
@@ -1102,6 +1181,9 @@ impl ServerApi {
         event: impl TelemetryEvent,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if warp_api_disabled() {
+            return Ok(());
+        }
         let user_id = self.user_id();
         let anonymous_id = self.anonymous_id();
         self.telemetry_api
@@ -1154,6 +1236,9 @@ impl ServerApi {
         &self,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<usize> {
+        if warp_api_disabled() {
+            return Ok(0);
+        }
         self.telemetry_api.flush_events(settings_snapshot).await
     }
 
@@ -1164,6 +1249,9 @@ impl ServerApi {
         path: &Path,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if warp_api_disabled() {
+            return Ok(());
+        }
         self.telemetry_api
             .flush_persisted_events_to_rudder(path, settings_snapshot)
             .await
@@ -1189,6 +1277,14 @@ impl ServerApi {
         team_scope: RequestTeamScope,
     ) -> Result<generate_ai_input_suggestions::GenerateAIInputSuggestionsResponseV2, AIApiError>
     {
+        if ChannelState::is_local_only() {
+            return self
+                .local_openai_client
+                .generate_ai_input_suggestions(self.base_client.http_client(), request)
+                .await
+                .map_err(|err| AIApiError::Other(err.into()));
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let mut request_builder = self.base_client.http_client().post(format!(
@@ -1218,6 +1314,9 @@ impl ServerApi {
         request: &GetRelevantFiles,
         team_scope: RequestTeamScope,
     ) -> Result<GetRelevantFilesResponse, AIApiError> {
+        if warp_api_disabled() {
+            return Err(AIApiError::Other(warp_api_disabled_error()));
+        }
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let mut request_builder = self.base_client.http_client().post(format!(
@@ -1248,6 +1347,9 @@ impl ServerApi {
         request: &GenerateAMQuerySuggestionsRequest,
         team_scope: RequestTeamScope,
     ) -> Result<generate_am_query_suggestions::GenerateAMQuerySuggestionsResponse, AIApiError> {
+        if warp_api_disabled() {
+            return Err(AIApiError::Other(warp_api_disabled_error()));
+        }
         let auth_token = self.get_or_refresh_access_token().await?;
 
         cfg_if::cfg_if! {
@@ -1287,6 +1389,14 @@ impl ServerApi {
         request: &PredictAMQueriesRequest,
         team_scope: RequestTeamScope,
     ) -> Result<PredictAMQueriesResponse, AIApiError> {
+        if ChannelState::is_local_only() {
+            return self
+                .local_openai_client
+                .predict_am_queries(self.base_client.http_client(), request)
+                .await
+                .map_err(|err| AIApiError::Other(err.into()));
+        }
+
         let auth_token = self.get_or_refresh_access_token().await?;
         let mut request_builder = self.base_client.http_client().post(format!(
             "{}/ai/predict_am_queries",
@@ -1316,6 +1426,9 @@ impl ServerApi {
         request: &TranscribeRequest,
         team_scope: RequestTeamScope,
     ) -> Result<TranscribeResponse, TranscribeError> {
+        if warp_api_disabled() {
+            return Err(TranscribeError::Other(warp_api_disabled_error()));
+        }
         let auth_token = self.get_or_refresh_access_token().await?;
 
         let mut request_builder = self
@@ -1363,7 +1476,12 @@ impl ServerApi {
             }
             Err(e) => {
                 log::warn!("Error while sending request: {e:?}");
-                Err(TranscribeError::Transport(e))
+                Err(match e {
+                    http_client::Error::Reqwest(error) => TranscribeError::Transport(error),
+                    http_client::Error::NetworkPolicyDenied(error) => {
+                        TranscribeError::Other(error.into())
+                    }
+                })
             }
         }
     }
@@ -1381,6 +1499,9 @@ impl ServerApi {
     pub async fn server_time(&self) -> Result<ServerTime> {
         if let Some(cached) = self.cached_server_time() {
             return Ok(cached);
+        }
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
         }
 
         let time_endpoint = format!("{}/current_time", ChannelState::server_root_url());
@@ -1429,6 +1550,9 @@ impl ServerApi {
         include_changelogs: bool,
         is_daily: bool,
     ) -> Result<ChannelVersions> {
+        if warp_api_disabled() {
+            return Err(warp_api_disabled_error());
+        }
         let mut url = Url::parse(&ChannelState::server_root_url())
             .expect("Should not fail to parse server root URL");
         if is_daily {
@@ -1535,10 +1659,24 @@ impl ServerApiProvider {
         );
         let server_api = Arc::new(server_api);
         let auth_client = Arc::new(AuthClientImpl::new(server_api.base_client.clone()));
-        Self {
+        let provider = Self {
             server_api,
             auth_client,
-        }
+        };
+
+        // Propagate the user-configured local OpenAI provider settings to the client now and
+        // whenever AI settings change. Without this, local-only mode would never see the
+        // configured endpoint and the client would stay on disabled defaults.
+        provider
+            .server_api
+            .set_local_openai_config(AISettings::as_ref(ctx).local_openai_settings());
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |provider, _, _, ctx| {
+            provider
+                .server_api
+                .set_local_openai_config(AISettings::as_ref(ctx).local_openai_settings());
+        });
+
+        provider
     }
 
     /// Handles fetching server-side experiments by updating the appropriate app state.
@@ -1550,8 +1688,6 @@ impl ServerApiProvider {
         ServerExperiments::handle(ctx).update(ctx, |state, ctx| {
             state.apply_latest_state(experiments, ctx);
         });
-
-        settings_view::handle_experiment_change(ctx);
     }
 
     /// Constructs a new SeverApiProvider for tests.
@@ -1596,6 +1732,16 @@ impl ServerApiProvider {
     }
 
     pub fn get_ai_client(&self) -> Arc<dyn AIClient> {
+        // oh-my-warp: route agent ops through the in-process gRPC bridge when a
+        // gRPC backend is selected; otherwise returns the client unchanged.
+        ai::bridge::maybe_wrap(self.server_api.clone())
+    }
+
+    pub fn get_command_generation_client(&self) -> Arc<dyn CommandGenerationClient> {
+        self.server_api.clone()
+    }
+
+    pub fn get_workflow_metadata_ai_client(&self) -> Arc<dyn WorkflowMetadataAIClient> {
         self.server_api.clone()
     }
 
@@ -1649,3 +1795,55 @@ impl SingletonEntity for ServerApiProvider {}
 #[cfg(test)]
 #[path = "server_api_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod fully_local_tests {
+    use super::*;
+    use crate::ai::predict::generate_ai_input_suggestions::GenerateAIInputSuggestionsRequest;
+
+    #[test]
+    fn warp_api_is_always_disabled() {
+        assert!(warp_api_disabled(), "this is a fully-local build");
+    }
+
+    // These construct `ServerApi` in a sync context (outside any Tokio runtime)
+    // because the test-util `server_root_url()` lazily spins up a mockito server,
+    // which panics if first initialized from within a runtime. The gated methods
+    // are then driven on a current-thread runtime.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn rest_call_is_blocked_without_touching_the_network() {
+        let api = ServerApi::new_for_test();
+
+        // fetch_channel_versions early-returns the disabled error rather than
+        // building a request to the Warp server.
+        let result = block_on(api.fetch_channel_versions(false, false));
+
+        let err = result.expect_err("fully-local mode must block the channel-version fetch");
+        assert!(
+            err.to_string().contains("fully-local"),
+            "should be the fully-local disabled error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn ai_input_suggestions_are_blocked_in_fully_local() {
+        let api = ServerApi::new_for_test();
+
+        let result = block_on(
+            api.generate_ai_input_suggestions(&GenerateAIInputSuggestionsRequest::default()),
+        );
+
+        assert!(
+            matches!(result, Err(AIApiError::Other(_))),
+            "fully-local mode must block AI input suggestions at the server"
+        );
+    }
+}

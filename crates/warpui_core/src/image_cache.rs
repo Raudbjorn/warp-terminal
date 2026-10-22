@@ -411,6 +411,19 @@ impl StaticImage {
     pub fn rgba_bytes(&self) -> &[u8] {
         self.img.as_raw().as_slice()
     }
+
+    /// Constructs a [`StaticImage`] directly from a decoded RGBA buffer, bypassing
+    /// the asset cache.
+    ///
+    /// This is the entry point for *live* frame streams (e.g. the embedded browser
+    /// pane's viewport): the caller wraps each decoded frame in a fresh
+    /// `Arc<StaticImage>` and swaps it into its view. Because the renderer's
+    /// texture cache is keyed by `Arc` pointer identity (see
+    /// [`crate::rendering::texture_cache`]), each new frame uploads to the GPU
+    /// exactly once and is reclaimed when its `Arc` is dropped.
+    pub fn from_rgba(img: image::RgbaImage) -> Self {
+        Self { img }
+    }
 }
 
 /// A representation of a single frame in an animated image.

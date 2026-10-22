@@ -618,7 +618,7 @@ impl SettingsPageMeta for PrivacyPageView {
     }
 
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        true
+        !ChannelState::is_local_only()
     }
 
     fn update_filter(&mut self, query: &str, ctx: &mut ViewContext<Self>) -> MatchData {
@@ -1972,7 +1972,8 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             )),
             context,
             flags::TELEMETRY_FLAG,
-        ),
+        )
+        .with_enabled(|| !ChannelState::is_local_only()),
         ToggleSettingActionPair::new(
             "crash reporting",
             builder(SettingsAction::PrivacyPageToggle(
@@ -1980,17 +1981,21 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             )),
             context,
             flags::CRASH_REPORTING_FLAG,
-        ),
+        )
+        .with_enabled(|| !ChannelState::is_local_only()),
     ];
 
-    toggle_binding_pairs.push(ToggleSettingActionPair::new(
-        "secret redaction",
-        builder(SettingsAction::PrivacyPageToggle(
-            PrivacyPageAction::ToggleSafeMode,
-        )),
-        context,
-        flags::SAFE_MODE_FLAG,
-    ));
+    toggle_binding_pairs.push(
+        ToggleSettingActionPair::new(
+            "secret redaction",
+            builder(SettingsAction::PrivacyPageToggle(
+                PrivacyPageAction::ToggleSafeMode,
+            )),
+            context,
+            flags::SAFE_MODE_FLAG,
+        )
+        .with_enabled(|| !ChannelState::is_local_only()),
+    );
 
     toggle_binding_pairs.push(
         ToggleSettingActionPair::new(

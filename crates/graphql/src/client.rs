@@ -42,7 +42,7 @@ pub trait Operation<QF> {
 pub enum GraphQLError {
     /// Encountered an error while sending the request.
     #[error("error sending request")]
-    RequestError(#[source] reqwest::Error),
+    RequestError(#[source] http_client::Error),
     /// Not authorized to talk to the staging server.
     #[error("not authorized for staging")]
     StagingAccessBlocked,
@@ -59,7 +59,8 @@ pub enum GraphQLError {
 impl ErrorExt for GraphQLError {
     fn is_actionable(&self) -> bool {
         match self {
-            GraphQLError::RequestError(e) | GraphQLError::ResponseError(e) => e.is_actionable(),
+            GraphQLError::RequestError(e) => e.is_actionable(),
+            GraphQLError::ResponseError(e) => e.is_actionable(),
             GraphQLError::StagingAccessBlocked | GraphQLError::IapChallengeBlocked => false,
             GraphQLError::HttpError { status, .. } => {
                 !matches!(status.as_u16(), 408 | 429 | 500..=599)
@@ -260,7 +261,9 @@ macro_rules! define_operation {
             where
                 Self: Sized,
             {
-                let req = $crate::client::build_graphql_request(&client, self, options).map_err($crate::client::GraphQLError::RequestError);
+                let req = $crate::client::build_graphql_request(&client, self, options)
+                    .map_err(http_client::Error::from)
+                    .map_err($crate::client::GraphQLError::RequestError);
                 Box::pin(async move { $crate::client::send_graphql_request(&client, req?).await })
             }
         }

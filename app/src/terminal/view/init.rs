@@ -259,7 +259,8 @@ pub fn init(app: &mut AppContext) {
                     & (!id!(flags::AGENT_VIEW_ENABLED)
                         | id!(flags::ACTIVE_AGENT_VIEW)
                         | id!(flags::ACTIVE_INLINE_AGENT_VIEW)),
-            ),
+            )
+            .with_enabled(|| !ChannelState::is_local_only()),
         ]);
     }
 
@@ -310,6 +311,8 @@ pub fn init(app: &mut AppContext) {
             TerminalAction::ToggleCLIAgentRichInput,
         )
         .with_key_binding("ctrl-g")
+        .with_enabled(|| !ChannelState::is_local_only())
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
             // Case 1: Open from terminal during CLI agent session
             (id!("Terminal")
@@ -350,6 +353,13 @@ pub fn init(app: &mut AppContext) {
         } else {
             "ctrl-shift-enter"
         })
+        // The `AcceptPromptSuggestion` keybinding must remain enabled in local-only
+        // mode: prompt suggestions are produced by the local OpenAI prediction
+        // feature, which is exactly the mode where the user accepts them. The
+        // `with_context_predicate(HAS_PENDING_PROMPT_SUGGESTION)` below already
+        // gates the binding to fire only when a suggestion is actually pending,
+        // so no `with_enabled` is needed.
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
             id!("Terminal") & !id!("IMEOpen") & id!(flags::HAS_PENDING_PROMPT_SUGGESTION),
         ),
@@ -758,7 +768,7 @@ pub fn init(app: &mut AppContext) {
                 ),
             TerminalAction::ContextMenu(ContextMenuAction::AskAI(AskAISource::SelectedBlocks)),
         )
-        .with_enabled(|| FeatureFlag::AgentMode.is_enabled())
+        .with_enabled(|| FeatureFlag::AgentMode.is_enabled() && !ChannelState::is_local_only())
         .with_custom_action(CustomAction::AttachSelectionAsAgentModeContext)
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         // When possible, prioritize the text selection action over attaching a block as
@@ -781,7 +791,7 @@ pub fn init(app: &mut AppContext) {
                 AskAISource::SelectedTerminalText,
             )),
         )
-        .with_enabled(|| FeatureFlag::AgentMode.is_enabled())
+        .with_enabled(|| FeatureFlag::AgentMode.is_enabled() && !ChannelState::is_local_only())
         .with_custom_action(CustomAction::AttachSelectionAsAgentModeContext)
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
@@ -798,7 +808,7 @@ pub fn init(app: &mut AppContext) {
             "Ask Warp AI about Selection",
             TerminalAction::ContextMenu(ContextMenuAction::AskAI(AskAISource::SelectedBlockOrText)),
         )
-        .with_enabled(|| !FeatureFlag::AgentMode.is_enabled())
+        .with_enabled(|| !FeatureFlag::AgentMode.is_enabled() && !ChannelState::is_local_only())
         .with_custom_action(CustomAction::AttachSelectionAsAgentModeContext)
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
@@ -816,7 +826,7 @@ pub fn init(app: &mut AppContext) {
             "Ask Warp AI about last block",
             TerminalAction::ContextMenu(ContextMenuAction::AskAI(AskAISource::LastBlock)),
         )
-        .with_enabled(|| !FeatureFlag::AgentMode.is_enabled())
+        .with_enabled(|| !FeatureFlag::AgentMode.is_enabled() && !ChannelState::is_local_only())
         .with_key_binding("ctrl-shift->")
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
@@ -827,7 +837,7 @@ pub fn init(app: &mut AppContext) {
             "Ask Warp AI",
             TerminalAction::ContextMenu(ContextMenuAction::AskAI(AskAISource::SelectedInputText)),
         )
-        .with_enabled(|| !FeatureFlag::AgentMode.is_enabled())
+        .with_enabled(|| !FeatureFlag::AgentMode.is_enabled() && !ChannelState::is_local_only())
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_key_binding("ctrl-shift-space")
         .with_context_predicate(id!("Input") & id!(flags::IS_ANY_AI_ENABLED)),
@@ -852,8 +862,11 @@ pub fn init(app: &mut AppContext) {
             )),
         )
         .with_enabled(|| {
-            FeatureFlag::AgentOnboarding.is_enabled() && ChannelState::enable_debug_features()
+            FeatureFlag::AgentOnboarding.is_enabled()
+                && ChannelState::enable_debug_features()
+                && !ChannelState::is_local_only()
         })
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
             id!("Terminal") & id!(SharedSessionStatus::NotShared.as_keymap_context()),
         ),
@@ -865,8 +878,11 @@ pub fn init(app: &mut AppContext) {
             )),
         )
         .with_enabled(|| {
-            FeatureFlag::AgentOnboarding.is_enabled() && ChannelState::enable_debug_features()
+            FeatureFlag::AgentOnboarding.is_enabled()
+                && ChannelState::enable_debug_features()
+                && !ChannelState::is_local_only()
         })
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
             id!("Terminal") & id!(SharedSessionStatus::NotShared.as_keymap_context()),
         ),
@@ -882,8 +898,11 @@ pub fn init(app: &mut AppContext) {
             )),
         )
         .with_enabled(|| {
-            FeatureFlag::AgentOnboarding.is_enabled() && ChannelState::enable_debug_features()
+            FeatureFlag::AgentOnboarding.is_enabled()
+                && ChannelState::enable_debug_features()
+                && !ChannelState::is_local_only()
         })
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
             id!("Terminal") & id!(SharedSessionStatus::NotShared.as_keymap_context()),
         ),
@@ -898,8 +917,11 @@ pub fn init(app: &mut AppContext) {
             )),
         )
         .with_enabled(|| {
-            FeatureFlag::AgentOnboarding.is_enabled() && ChannelState::enable_debug_features()
+            FeatureFlag::AgentOnboarding.is_enabled()
+                && ChannelState::enable_debug_features()
+                && !ChannelState::is_local_only()
         })
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
             id!("Terminal") & id!(SharedSessionStatus::NotShared.as_keymap_context()),
         ),
@@ -914,8 +936,11 @@ pub fn init(app: &mut AppContext) {
             )),
         )
         .with_enabled(|| {
-            FeatureFlag::AgentOnboarding.is_enabled() && ChannelState::enable_debug_features()
+            FeatureFlag::AgentOnboarding.is_enabled()
+                && ChannelState::enable_debug_features()
+                && !ChannelState::is_local_only()
         })
+        .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(
             id!("Terminal") & id!(SharedSessionStatus::NotShared.as_keymap_context()),
         ),
@@ -941,7 +966,8 @@ pub fn init(app: &mut AppContext) {
         )
         .with_custom_action(CustomAction::ShareCurrentSession)
         .with_enabled(|| {
-            FeatureFlag::CreatingSharedSessions.is_enabled()
+            !ChannelState::is_local_only()
+                && FeatureFlag::CreatingSharedSessions.is_enabled()
                 && ContextFlag::CreateSharedSession.is_enabled()
         }),
         EditableBinding::new(
@@ -993,7 +1019,9 @@ pub fn init(app: &mut AppContext) {
         .with_key_binding("cmdorctrl-shift-I")
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(id!(flags::IS_ANY_AI_ENABLED) & id!("Terminal"))
-        .with_enabled(|| FeatureFlag::FastForwardAutoexecuteButton.is_enabled()),
+        .with_enabled(|| {
+            FeatureFlag::FastForwardAutoexecuteButton.is_enabled() && !ChannelState::is_local_only()
+        }),
         EditableBinding::new(
             TOGGLE_QUEUE_NEXT_PROMPT_KEYBINDING,
             "Toggle Queue Next Prompt",
@@ -1002,7 +1030,9 @@ pub fn init(app: &mut AppContext) {
         .with_key_binding("cmdorctrl-shift-J")
         .with_group(bindings::BindingGroup::WarpAi.as_str())
         .with_context_predicate(id!(flags::IS_ANY_AI_ENABLED) & id!("Terminal"))
-        .with_enabled(|| FeatureFlag::QueueSlashCommand.is_enabled()),
+        .with_enabled(|| {
+            FeatureFlag::QueueSlashCommand.is_enabled() && !ChannelState::is_local_only()
+        }),
         EditableBinding::new(
             "terminal:generate_codebase_index",
             "[Debug] Generate codebase index",
@@ -1013,6 +1043,7 @@ pub fn init(app: &mut AppContext) {
         .with_enabled(|| {
             FeatureFlag::FullSourceCodeEmbedding.is_enabled()
                 && ChannelState::enable_debug_features()
+                && !ChannelState::is_local_only()
         }),
     ]);
 
@@ -1021,7 +1052,10 @@ pub fn init(app: &mut AppContext) {
         BindingDescription::new("Write current codebase index snapshot"),
         TerminalAction::WriteCodebaseIndex,
     )
-    .with_enabled(|| FeatureFlag::CodebaseIndexPersistence.is_enabled())
+    .with_enabled(|| {
+        FeatureFlag::CodebaseIndexPersistence.is_enabled() && !ChannelState::is_local_only()
+    })
+    .with_group(bindings::BindingGroup::WarpAi.as_str())
     .with_context_predicate(id!("Workspace"))]);
 
     app.register_editable_bindings([EditableBinding::new(
@@ -1029,7 +1063,8 @@ pub fn init(app: &mut AppContext) {
         "Load agent mode conversation (from debug link in clipboard)",
         TerminalAction::LoadAgentModeConversation,
     )
-    .with_enabled(ChannelState::enable_debug_features)
+    .with_enabled(|| ChannelState::enable_debug_features() && !ChannelState::is_local_only())
+    .with_group(bindings::BindingGroup::WarpAi.as_str())
     .with_context_predicate(id!("Terminal"))]);
 
     app.register_editable_bindings([EditableBinding::new(
@@ -1045,6 +1080,7 @@ pub fn init(app: &mut AppContext) {
         BindingDescription::new("Initiate project for warp"),
         TerminalAction::InitProject,
     )
+    .with_enabled(|| !ChannelState::is_local_only())
     .with_context_predicate(id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED))]);
 
     app.register_editable_bindings([EditableBinding::new(
@@ -1052,7 +1088,7 @@ pub fn init(app: &mut AppContext) {
         BindingDescription::new("Add current folder as project"),
         TerminalAction::AddProjectAtCurrentDirectory,
     )
-    .with_enabled(|| FeatureFlag::Projects.is_enabled())
+    .with_enabled(|| FeatureFlag::Projects.is_enabled() && !ChannelState::is_local_only())
     .with_context_predicate(id!("Workspace") & id!(flags::IS_ANY_AI_ENABLED))]);
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1100,7 +1136,8 @@ pub fn init(app: &mut AppContext) {
             id!("Terminal") & id!(flags::IS_ANY_AI_ENABLED),
         )
         .with_enabled(|| {
-            FeatureFlag::AgentView.is_enabled()
+            !ChannelState::is_local_only()
+                && FeatureFlag::AgentView.is_enabled()
                 && FeatureFlag::CloudMode.is_enabled()
                 && FeatureFlag::CloudModeFromLocalSession.is_enabled()
         })
@@ -1115,7 +1152,8 @@ pub fn init(app: &mut AppContext) {
                 "cmd-meta-enter",
                 TerminalAction::EnterCloudAgentView,
                 id!("Terminal") & id!(flags::IS_ANY_AI_ENABLED),
-            )]);
+            )
+            .with_enabled(|| !ChannelState::is_local_only())]);
         }
     }
 }
@@ -1200,6 +1238,7 @@ fn register_input_mode_bindings(app: &mut AppContext) {
             TerminalAction::SetInputModeAgent,
         )
         .with_group(bindings::BindingGroup::WarpAi.as_str())
+        .with_enabled(|| !ChannelState::is_local_only())
         .with_context_predicate(agent_mode_predicate)
         .with_mac_key_binding("cmd-i")
         .with_linux_or_windows_key_binding("ctrl-i"),
@@ -1209,6 +1248,7 @@ fn register_input_mode_bindings(app: &mut AppContext) {
             TerminalAction::SetInputModeTerminal,
         )
         .with_group(bindings::BindingGroup::WarpAi.as_str())
+        .with_enabled(|| !ChannelState::is_local_only())
         .with_context_predicate(terminal_mode_predicate)
         .with_mac_key_binding("cmd-i")
         .with_linux_or_windows_key_binding("ctrl-i"),
@@ -1219,6 +1259,7 @@ fn register_input_mode_bindings(app: &mut AppContext) {
         )
         .with_key_binding("cmdorctrl-g")
         .with_group(bindings::BindingGroup::WarpAi.as_str())
+        .with_enabled(|| !ChannelState::is_local_only())
         .with_context_predicate(
             id!(flags::IS_ANY_AI_ENABLED) & !id!(LONG_RUNNING_AGENT_REQUESTED_COMMAND_CONTEXT_KEY),
         ),

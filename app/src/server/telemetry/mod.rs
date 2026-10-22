@@ -95,6 +95,10 @@ impl TelemetryApi {
     pub async fn flush_events(&self, settings_snapshot: PrivacySettingsSnapshot) -> Result<usize> {
         let events = warpui::telemetry::flush_events();
         let event_count = events.len();
+        if ChannelState::is_local_only() {
+            log::debug!("Dropping queued telemetry events in local-only services mode");
+            return Ok(event_count);
+        }
 
         #[cfg(not(target_family = "wasm"))]
         if FeatureFlag::SendTelemetryToFile.is_enabled() {
@@ -122,6 +126,11 @@ impl TelemetryApi {
         path: &Path,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if ChannelState::is_local_only() {
+            log::debug!("Skipping persisted telemetry flush in local-only services mode");
+            return Ok(());
+        }
+
         if path.exists() {
             let file = File::open(path)?;
             let events: Vec<RudderBatchMessage> = serde_json::from_reader(file)?;
@@ -150,6 +159,12 @@ impl TelemetryApi {
         max_event_count: usize,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if ChannelState::is_local_only() {
+            warpui::telemetry::flush_events();
+            log::debug!("Dropping queued telemetry events in local-only services mode");
+            return Ok(());
+        }
+
         self.flush_and_persist_events_at_path(
             max_event_count,
             settings_snapshot,
@@ -227,6 +242,11 @@ impl TelemetryApi {
             event.contains_ugc(),
             warpui::time::get_current_time(),
         );
+
+        if ChannelState::is_local_only() {
+            log::debug!("Skipping telemetry event send in local-only services mode");
+            return Ok(());
+        }
 
         self.send_telemetry_event_internal(event, settings_snapshot)
             .await
@@ -306,6 +326,11 @@ impl TelemetryApi {
         messages: Vec<RudderBatchMessageWithMetadata>,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if ChannelState::is_local_only() {
+            log::debug!("Dropping RudderStack telemetry batch in local-only services mode");
+            return Ok(());
+        }
+
         if messages.is_empty() {
             log::debug!("Dropping empty RudderStack telemetry batch");
             return Ok(());
@@ -395,13 +420,9 @@ impl TelemetryApi {
             RudderMessage::Batch(_) => "/v1/batch",
         };
 
-        self.client
-            .post(&format!("{}{}", rudder_stack_destination.root_url, path))
-            .basic_auth(rudder_stack_destination.write_key, Some(""))
-            .json(&msg)
-            .send()
-            .await?
-            .error_for_status()?;
+        // oh-my-warp: observability stripped — drop the telemetry request instead
+        // of POSTing it to RudderStack so no data ever leaves the machine.
+        let _ = (&self.client, &msg, path, rudder_stack_destination);
 
         Ok(())
     }

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use warp_core::channel::ChannelState;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::Icon;
 use warp_core::ui::theme::color::internal_colors;
@@ -60,6 +61,8 @@ use crate::workspace::WorkspaceAction;
 use crate::workspace::view::conversation_list::view::{
     ConversationListView, Event as ConversationListViewEvent,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::workspace::view::docker_containers::{DockerContainersEvent, DockerContainersView};
 use crate::workspace::view::global_search::view::{
     Event as GlobalSearchViewEvent, GlobalSearchEntryFocus, GlobalSearchView,
 };
@@ -78,15 +81,21 @@ struct MouseStateHandles {
     global_search_button: MouseStateHandle,
     warp_drive_button: MouseStateHandle,
     sign_in_button: MouseStateHandle,
+    #[cfg(not(target_family = "wasm"))]
+    docker_containers_button: MouseStateHandle,
 }
 
 #[derive(Clone, Debug)]
 pub enum LeftPanelAction {
     ProjectExplorer,
-    GlobalSearch { entry_focus: GlobalSearchEntryFocus },
+    GlobalSearch {
+        entry_focus: GlobalSearchEntryFocus,
+    },
     WarpDrive,
     ConversationListView,
     SignIn,
+    #[cfg(not(target_family = "wasm"))]
+    DockerContainers,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +111,8 @@ impl ToolPanelView {
             ToolPanelView::ProjectExplorer | ToolPanelView::GlobalSearch { .. } => {
                 ToolPanelAvailability::Available
             }
+            #[cfg(not(target_family = "wasm"))]
+            ToolPanelView::DockerContainers => ToolPanelAvailability::Available,
             ToolPanelView::WarpDrive => {
                 if WarpDriveSettings::is_warp_drive_available(app) {
                     ToolPanelAvailability::Available
@@ -143,14 +154,24 @@ pub enum LeftPanelEvent {
         terminal_view_id: Option<warpui::EntityId>,
     },
     SignInRequested,
+    #[cfg(not(target_family = "wasm"))]
+    OpenDockerContainerLogs {
+        container_id: String,
+        container_name: String,
+        command: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolPanelView {
     ProjectExplorer,
-    GlobalSearch { entry_focus: GlobalSearchEntryFocus },
+    GlobalSearch {
+        entry_focus: GlobalSearchEntryFocus,
+    },
     WarpDrive,
     ConversationListView,
+    #[cfg(not(target_family = "wasm"))]
+    DockerContainers,
 }
 
 /// Encapsulates the active view state to enforce that all mutations go through
@@ -218,6 +239,8 @@ pub struct LeftPanelView {
     close_button_mouse_state: MouseStateHandle,
     warp_drive_view: ViewHandle<DrivePanel>,
     conversation_list_view: ViewHandle<ConversationListView>,
+    #[cfg(not(target_family = "wasm"))]
+    docker_containers_view: ViewHandle<DockerContainersView>,
     active_view: active_view_state::ActiveViewState,
     toolbelt_buttons: Vec<ToolbeltButtonConfig>,
     active_pane_group: Option<WeakViewHandle<PaneGroup>>,
@@ -284,6 +307,17 @@ impl LeftPanelView {
                     "This feature is currently unavailable.",
                 )
             }
+            #[cfg(not(target_family = "wasm"))]
+            (
+                ToolPanelView::DockerContainers,
+                ToolPanelAvailability::RequiresAccount | ToolPanelAvailability::RequiresAi,
+            ) => {
+                debug_assert!(false, "unexpected locked local tool-panel state");
+                (
+                    "Feature unavailable",
+                    "This feature is currently unavailable.",
+                )
+            }
         };
         let theme = appearance.theme();
         let title = appearance
@@ -314,7 +348,8 @@ impl LeftPanelView {
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_child(title)
             .with_child(Container::new(description).with_margin_top(8.).finish());
-        if availability == ToolPanelAvailability::RequiresAccount {
+        if availability == ToolPanelAvailability::RequiresAccount && !ChannelState::is_local_only()
+        {
             let sign_in = appearance
                 .ui_builder()
                 .button(
@@ -353,6 +388,8 @@ impl LeftPanelView {
         };
         let warp_drive_view = ctx.add_typed_action_view(DrivePanel::new);
         let conversation_list_view = ctx.add_typed_action_view(ConversationListView::new);
+        #[cfg(not(target_family = "wasm"))]
+        let docker_containers_view = ctx.add_typed_action_view(DockerContainersView::new);
 
         ctx.subscribe_to_view(&warp_drive_view, |_me, _, event, ctx| {
             ctx.emit(LeftPanelEvent::WarpDrive(event.clone()));
@@ -371,6 +408,20 @@ impl LeftPanelView {
                     conversation_id: *conversation_id,
                     conversation_title: conversation_title.clone(),
                     terminal_view_id: *terminal_view_id,
+                });
+            }
+        });
+        #[cfg(not(target_family = "wasm"))]
+        ctx.subscribe_to_view(&docker_containers_view, |_me, _, event, ctx| match event {
+            DockerContainersEvent::OpenLogs {
+                container_id,
+                container_name,
+                command,
+            } => {
+                ctx.emit(LeftPanelEvent::OpenDockerContainerLogs {
+                    container_id: container_id.clone(),
+                    container_name: container_name.clone(),
+                    command: command.clone(),
                 });
             }
         });
@@ -468,6 +519,8 @@ impl LeftPanelView {
             close_button_mouse_state: Default::default(),
             warp_drive_view,
             conversation_list_view,
+            #[cfg(not(target_family = "wasm"))]
+            docker_containers_view,
             active_view: active_view_state::new(active_view),
             toolbelt_buttons,
             active_pane_group: None,
@@ -610,6 +663,20 @@ impl LeftPanelView {
                     tooltip_keybinding_names,
                 }
             }
+            #[cfg(not(target_family = "wasm"))]
+            ToolPanelView::DockerContainers => {
+                let tooltip_keybinding_names = vec![];
+
+                ToolbeltButtonConfig {
+                    icon: Icon::Docker,
+                    active_icon: Some(Icon::Docker),
+                    tooltip_text: "Docker containers".to_string(),
+                    action: LeftPanelAction::DockerContainers,
+                    render_with_active_state: false,
+                    tooltip_keybinding: None,
+                    tooltip_keybinding_names,
+                }
+            }
         }
     }
 
@@ -742,6 +809,10 @@ impl LeftPanelView {
             .map(|pane_group| pane_group.id());
 
         self.active_pane_group = Some(pane_group.downgrade());
+        #[cfg(not(target_family = "wasm"))]
+        self.docker_containers_view.update(ctx, |view, ctx| {
+            view.set_active_pane_group(pane_group.downgrade(), ctx);
+        });
 
         if let Some(previous_pane_group_id) = previous_pane_group_id
             && previous_pane_group_id != pane_group_id
@@ -871,6 +942,12 @@ impl LeftPanelView {
             }
             ToolPanelView::ConversationListView => {
                 self.conversation_list_view.update(ctx, |view, ctx| {
+                    view.on_left_panel_focused(ctx);
+                });
+            }
+            #[cfg(not(target_family = "wasm"))]
+            ToolPanelView::DockerContainers => {
+                self.docker_containers_view.update(ctx, |view, ctx| {
                     view.on_left_panel_focused(ctx);
                 });
             }
@@ -1041,6 +1118,10 @@ impl LeftPanelView {
                     self.active_view.get() == ToolPanelView::ConversationListView
                 }
                 LeftPanelAction::SignIn => false,
+                #[cfg(not(target_family = "wasm"))]
+                LeftPanelAction::DockerContainers => {
+                    self.active_view.get() == ToolPanelView::DockerContainers
+                }
             };
         }
     }
@@ -1109,6 +1190,27 @@ impl LeftPanelView {
         })
         .with_cursor(Cursor::PointingHand)
         .finish()
+    }
+
+    fn mouse_state_for_action(&self, action: &LeftPanelAction) -> MouseStateHandle {
+        match action {
+            LeftPanelAction::ProjectExplorer => {
+                self.mouse_state_handles.project_explorer_button.clone()
+            }
+            LeftPanelAction::GlobalSearch { .. } => {
+                self.mouse_state_handles.global_search_button.clone()
+            }
+            LeftPanelAction::WarpDrive => self.mouse_state_handles.warp_drive_button.clone(),
+            LeftPanelAction::SignIn => self.mouse_state_handles.sign_in_button.clone(),
+            LeftPanelAction::ConversationListView => self
+                .mouse_state_handles
+                .conversation_list_view_button
+                .clone(),
+            #[cfg(not(target_family = "wasm"))]
+            LeftPanelAction::DockerContainers => {
+                self.mouse_state_handles.docker_containers_button.clone()
+            }
+        }
     }
 }
 
@@ -1187,7 +1289,16 @@ impl LeftPanelView {
                 }
             }
             LeftPanelAction::SignIn => {
-                ctx.emit(LeftPanelEvent::SignInRequested);
+                if !ChannelState::is_local_only() {
+                    ctx.emit(LeftPanelEvent::SignInRequested);
+                }
+            }
+            #[cfg(not(target_family = "wasm"))]
+            LeftPanelAction::DockerContainers => {
+                active_view_state::set(self, ToolPanelView::DockerContainers, ctx);
+                self.docker_containers_view.update(ctx, |view, ctx| {
+                    view.refresh_if_needed(ctx);
+                });
             }
         }
     }
@@ -1294,6 +1405,8 @@ impl View for LeftPanelView {
                 }
                 ToolPanelView::WarpDrive => ctx.focus(&self.warp_drive_view),
                 ToolPanelView::ConversationListView => ctx.focus(&self.conversation_list_view),
+                #[cfg(not(target_family = "wasm"))]
+                ToolPanelView::DockerContainers => ctx.focus(&self.docker_containers_view),
             }
         }
     }
@@ -1370,6 +1483,11 @@ impl View for LeftPanelView {
                 .finish(),
                 ToolPanelView::ConversationListView => {
                     Shrinkable::new(1.0, ChildView::new(&self.conversation_list_view).finish())
+                        .finish()
+                }
+                #[cfg(not(target_family = "wasm"))]
+                ToolPanelView::DockerContainers => {
+                    Shrinkable::new(1.0, ChildView::new(&self.docker_containers_view).finish())
                         .finish()
                 }
             }

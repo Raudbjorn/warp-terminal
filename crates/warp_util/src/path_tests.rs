@@ -1091,9 +1091,12 @@ fn test_resolve_command() {
         &resolve_executable("/bin/sh").unwrap(),
         Path::new("/bin/sh")
     );
-    assert_eq!(
-        &resolve_executable("env").unwrap(),
-        Path::new("/usr/bin/env")
+    // PATH can prefer another installation, such as Homebrew coreutils on macOS.
+    let env_path = resolve_executable("env").unwrap();
+    assert_eq!(env_path.file_name(), Some(std::ffi::OsStr::new("env")));
+    assert!(
+        env_path.is_absolute(),
+        "expected an absolute path for `env`, got {env_path:?}"
     );
     // This path exists in the Warp repo, so it should resolve. The `../../`
     // is because Rust unit tests run from the root of the crate (`warp_util` in
