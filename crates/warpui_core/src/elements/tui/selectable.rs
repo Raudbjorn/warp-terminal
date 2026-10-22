@@ -431,6 +431,8 @@ where
             | TuiEvent::Paste { .. }
             | TuiEvent::MiddleMouseDown { .. }
             | TuiEvent::RightMouseDown { .. }
+            | TuiEvent::RightMouseUp { .. }
+            | TuiEvent::RightMouseDragged { .. }
             | TuiEvent::MouseMoved { .. } => false,
         }
     }

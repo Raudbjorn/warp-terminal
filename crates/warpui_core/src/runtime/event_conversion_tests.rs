@@ -159,6 +159,22 @@ fn non_shift_modifiers_are_preserved_from_the_key_event() {
 }
 
 #[test]
+fn terminal_alt_preserves_shortcuts_and_maps_to_meta_on_macos() {
+    let Some(TuiEvent::KeyDown {
+        keystroke, chars, ..
+    }) = key(KeyCode::Char('b'), KeyModifiers::ALT)
+    else {
+        panic!("expected Alt+B key event");
+    };
+    assert!(keystroke.alt);
+    assert_eq!(
+        keystroke.meta,
+        crate::platform::OperatingSystem::get().is_mac()
+    );
+    assert_eq!(chars, "b");
+}
+
+#[test]
 fn shifted_letter_preserves_case_and_base_key() {
     // Backends disagree on which character a shifted letter reports: terminals
     // speaking the Kitty protocol send the unshifted codepoint and leave the
@@ -429,6 +445,24 @@ fn left_mouse_up_and_drag_map_to_tui_mouse_events() {
 }
 
 #[test]
+fn right_mouse_release_and_drag_preserve_position_and_modifiers() {
+    for (kind, is_release) in [
+        (MouseEventKind::Up(MouseButton::Right), true),
+        (MouseEventKind::Drag(MouseButton::Right), false),
+    ] {
+        let event = mouse(kind, KeyModifiers::CONTROL | KeyModifiers::ALT).unwrap();
+        assert_eq!(event.position(), Some(TuiPoint::new(7, 3)));
+        let modifiers = match event {
+            TuiEvent::RightMouseUp { modifiers, .. } if is_release => modifiers,
+            TuiEvent::RightMouseDragged { modifiers, .. } if !is_release => modifiers,
+            _ => panic!("expected matching right-button event"),
+        };
+        assert!(modifiers.ctrl);
+        assert!(modifiers.alt);
+    }
+}
+
+#[test]
 fn mouse_moved_maps_to_tui_mouse_moved_event() {
     let Some(TuiEvent::MouseMoved {
         position,
@@ -449,24 +483,11 @@ fn mouse_moved_maps_to_tui_mouse_moved_event() {
 }
 
 #[test]
-fn unsupported_mouse_up_and_drag_buttons_are_ignored() {
-    assert!(
-        mouse(
-            MouseEventKind::Up(MouseButton::Right),
-            KeyModifiers::empty()
-        )
-        .is_none()
-    );
+fn middle_mouse_up_and_drag_are_ignored() {
+    // Middle-button release and drag still have no TUI consumer.
     assert!(
         mouse(
             MouseEventKind::Up(MouseButton::Middle),
-            KeyModifiers::empty()
-        )
-        .is_none()
-    );
-    assert!(
-        mouse(
-            MouseEventKind::Drag(MouseButton::Right),
             KeyModifiers::empty()
         )
         .is_none()

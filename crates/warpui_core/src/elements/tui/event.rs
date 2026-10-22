@@ -72,6 +72,14 @@ pub enum TuiEvent {
         modifiers: ModifiersState,
         click_count: u32,
     },
+    RightMouseUp {
+        position: TuiPoint,
+        modifiers: ModifiersState,
+    },
+    RightMouseDragged {
+        position: TuiPoint,
+        modifiers: ModifiersState,
+    },
     MouseMoved {
         position: TuiPoint,
         modifiers: ModifiersState,
@@ -89,6 +97,8 @@ impl TuiEvent {
             | Self::LeftMouseDragged { position, .. }
             | Self::MiddleMouseDown { position, .. }
             | Self::RightMouseDown { position, .. }
+            | Self::RightMouseUp { position, .. }
+            | Self::RightMouseDragged { position, .. }
             | Self::MouseMoved { position, .. } => Some(*position),
             Self::FocusGained
             | Self::FocusLost

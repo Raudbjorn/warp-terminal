@@ -324,6 +324,7 @@ impl<T: ModeProvider> ToEscapeSequence<T> for MouseState {
             MouseButton::Left => (EscCodes::MOUSE_LEFT, 1),
             MouseButton::Right => (EscCodes::MOUSE_RIGHT, 1),
             MouseButton::LeftDrag => (EscCodes::MOUSE_DRAG, 1),
+            MouseButton::RightDrag => (EscCodes::MOUSE_DRAG | EscCodes::MOUSE_RIGHT, 1),
             MouseButton::Move => (EscCodes::MOUSE_MOVE, 1),
             MouseButton::Wheel => {
                 if let MouseAction::Scrolled { delta } = self.action() {

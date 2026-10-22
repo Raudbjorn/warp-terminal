@@ -8,6 +8,7 @@ pub enum MouseButton {
     Right,
     Wheel,
     LeftDrag,
+    RightDrag,
     Move, // Used for mouse hover events (when cursor is moving)
 }
 #[derive(Debug, Copy, Clone)]

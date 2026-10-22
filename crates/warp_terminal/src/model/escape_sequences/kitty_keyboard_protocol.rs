@@ -197,8 +197,8 @@ fn keystroke_to_csi_u(
     //
     // Both `alt` and `meta` map to the Kitty Alt bit because they both represent
     // the terminal concept of Alt — `meta` is just the macOS user preference that
-    // remaps Option to behave as a terminal Meta/Alt key. They cannot both be true
-    // simultaneously in practice (Option is either raw or Meta, never both).
+    // remaps Option to behave as a terminal Meta/Alt key. Terminal backends may set both;
+    // modifier_param combines them into a single Alt bit.
     let modifiers = super::modifier_param(keystroke);
 
     // Compute associated text if REPORT_ASSOCIATED_TEXT is active.

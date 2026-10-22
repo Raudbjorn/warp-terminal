@@ -303,3 +303,56 @@ fn apply_deltas_normalizes_newline_less_insertions() {
 
     assert_eq!(final_content, "one\nTWO\nTWO-AND-A-HALF\nthree\n");
 }
+
+#[test]
+fn apply_deltas_separates_eof_insertions_from_the_final_line() {
+    for content in ["one", "one\n"] {
+        for insertion in ["two", "two\n"] {
+            let delta = DiffDelta {
+                replacement_line_range: 2..2,
+                insertion: insertion.to_owned(),
+            };
+
+            assert_eq!(
+                apply_deltas_to_content(content, &[delta]).unwrap(),
+                "one\ntwo\n",
+                "content: {content:?}, insertion: {insertion:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn apply_deltas_preserves_empty_eof_insertions() {
+    for (content, line) in [("", 1), ("one", 2), ("one\n", 2)] {
+        let delta = DiffDelta {
+            replacement_line_range: line..line,
+            insertion: String::new(),
+        };
+
+        assert_eq!(apply_deltas_to_content(content, &[delta]).unwrap(), content);
+        assert_eq!(apply_deltas_to_content(content, &[]).unwrap(), content);
+    }
+}
+
+#[test]
+fn apply_deltas_preserves_other_insertion_and_replacement_boundaries() {
+    for (content, range, insertion, expected) in [
+        ("", 1..1, "one", "one"),
+        ("one\nthree", 2..2, "two", "one\ntwo\nthree"),
+        ("one\ntwo", 2..3, "TWO", "one\nTWO\n"),
+        ("one\ntwo", 2..3, "", "one\n"),
+        ("one", 1..1, "zero", "zero\none"),
+    ] {
+        let delta = DiffDelta {
+            replacement_line_range: range,
+            insertion: insertion.to_owned(),
+        };
+
+        assert_eq!(
+            apply_deltas_to_content(content, &[delta]).unwrap(),
+            expected,
+            "content: {content:?}, insertion: {insertion:?}"
+        );
+    }
+}
