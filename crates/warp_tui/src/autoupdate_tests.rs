@@ -420,12 +420,19 @@ fn finalized_unlaunched_version_is_marked_and_reclaimed() {
 #[test]
 fn completed_version_is_reused_and_invalid_version_is_not_replaced() {
     let root = temp_root("immutable");
-    create_complete_version(root.path(), "A", "running");
-    let target = create_complete_version(root.path(), "C", "original");
-    let layout = layout(root.path(), "A");
-    point_current_at(&layout, "A").unwrap();
+    // Activation compares release tags, so these fixtures must use real version syntax.
+    let running_version = "v0.2026.07.22.18.00.dev_00";
+    let target_version = "v0.2026.07.29.18.00.dev_00";
+    create_complete_version(root.path(), running_version, "running");
+    let target = create_complete_version(root.path(), target_version, "original");
+    let layout = layout(root.path(), running_version);
+    point_current_at(&layout, running_version).unwrap();
 
-    futures::executor::block_on(install_update(layout.clone(), "C".to_owned())).unwrap();
+    let outcome =
+        futures::executor::block_on(install_update(layout.clone(), target_version.to_owned()))
+            .unwrap();
+    assert!(matches!(outcome, UpdateOutcome::Installed { version } if version == target_version));
+    assert!(super::current_points_at(&layout, target_version));
     assert_eq!(
         fs::read_to_string(target.join(BINARY_NAME)).unwrap(),
         "original"
@@ -438,15 +445,49 @@ fn completed_version_is_reused_and_invalid_version_is_not_replaced() {
     fs::remove_dir_all(&target).unwrap();
     fs::create_dir_all(&target).unwrap();
     fs::write(target.join(BINARY_NAME), "partial").unwrap();
-    point_current_at(&layout, "A").unwrap();
+    point_current_at(&layout, running_version).unwrap();
     let error =
-        futures::executor::block_on(install_update(layout.clone(), "C".to_owned())).unwrap_err();
+        futures::executor::block_on(install_update(layout.clone(), target_version.to_owned()))
+            .unwrap_err();
     assert!(format!("{error:#}").contains("refusing to replace incomplete or invalid"));
     assert_eq!(
         fs::read_to_string(target.join(BINARY_NAME)).unwrap(),
         "partial"
     );
-    assert!(super::current_points_at(&layout, "A"));
+    assert!(super::current_points_at(&layout, running_version));
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_install_preserves_newer_active_version_and_its_files() {
+    let root = temp_root("stale-install");
+    let running_version = "v0.2026.07.22.18.00.dev_00";
+    let stale_version = "v0.2026.07.29.18.00.dev_00";
+    let active_version = "v0.2026.08.05.18.00.dev_00";
+    let layout = layout(root.path(), running_version);
+    create_complete_version(root.path(), running_version, "running");
+    create_complete_version(root.path(), stale_version, "stale download");
+    let active_dir = create_complete_version(root.path(), active_version, "newer install");
+    fs::create_dir_all(root.path().join(VERSION_LEASES_DIR_NAME)).unwrap();
+    fs::write(lease_path(root.path(), active_version), "").unwrap();
+    set_current(&layout, active_version);
+
+    // Reproduce an update superseded by either a newer release or another install of the same one.
+    for target_version in [stale_version, active_version] {
+        let outcome =
+            futures::executor::block_on(install_update(layout.clone(), target_version.into()))
+                .unwrap();
+
+        assert!(
+            matches!(outcome, UpdateOutcome::PendingRestart { version } if version == active_version)
+        );
+        assert!(super::current_points_at(&layout, active_version));
+        assert_eq!(
+            fs::read_to_string(active_dir.join(BINARY_NAME)).unwrap(),
+            "newer install"
+        );
+        assert!(active_dir.join("resources").is_dir());
+    }
 }
 
 #[test]

@@ -624,8 +624,9 @@ fn test_to_pty_bytes_layers_fallbacks_over_the_encoder() {
     assert_eq!(pty_bytes(&named("escape"), None), Some(vec![C0::ESC]));
     assert_eq!(pty_bytes(&named("tab"), None), Some(vec![C0::HT]));
 
-    // Nothing to send.
-    assert_eq!(pty_bytes(&named("insert"), None), None);
+    // Insert is a legacy editing key; only unknown named keys produce no input.
+    assert_eq!(pty_bytes(&named("insert"), None), Some(b"\x1b[2~".to_vec()));
+    assert_eq!(pty_bytes(&named("unknown"), None), None);
 }
 
 struct TerminalModelMock {
@@ -1290,4 +1291,138 @@ fn test_fn_keystroke_with_cmd_modifier() {
         (cmd_shift("f5"), b"\x1b[15;10~".to_vec()),
     ];
     validate_keystroke_test_cases(cases, &mock);
+}
+
+#[test]
+fn test_to_pty_bytes_preserves_control_with_meta() {
+    let mock = TerminalModelMock::new();
+    for key in ["a", "A", "z", "Z"] {
+        let keystroke = Keystroke {
+            key: key.to_owned(),
+            ctrl: true,
+            alt: !OperatingSystem::get().is_mac(),
+            meta: OperatingSystem::get().is_mac(),
+            ..Keystroke::parse("a").unwrap()
+        };
+        let details = KeystrokeWithDetails {
+            keystroke: &keystroke,
+            key_without_modifiers: None,
+            chars: Some(key),
+        };
+        assert_eq!(
+            details.to_pty_bytes(&mock),
+            Some(vec![C0::ESC, key.as_bytes()[0].to_ascii_uppercase() & 0x1f])
+        );
+        // GUI events retain their existing encoder path and separate OS text handling.
+        assert_eq!(
+            details.to_escape_sequence(&mock),
+            Some([&[C0::ESC], key.as_bytes()].concat())
+        );
+    }
+}
+
+#[test]
+fn test_to_pty_bytes_encodes_control_punctuation() {
+    let mock = TerminalModelMock::new();
+    for (key, expected) in [
+        ("@", C0::NUL),
+        ("[", C0::ESC),
+        ("\\", C0::FS),
+        ("]", C0::GS),
+        ("^", C0::RS),
+        ("_", C0::US),
+        ("?", C0::DEL),
+    ] {
+        for with_meta in [false, true] {
+            let keystroke = Keystroke {
+                key: key.to_owned(),
+                ctrl: true,
+                alt: with_meta && !OperatingSystem::get().is_mac(),
+                meta: with_meta && OperatingSystem::get().is_mac(),
+                ..Keystroke::parse("a").unwrap()
+            };
+            let details = KeystrokeWithDetails {
+                keystroke: &keystroke,
+                key_without_modifiers: None,
+                chars: Some(key),
+            };
+            assert_eq!(
+                details.to_pty_bytes(&mock),
+                Some(if with_meta {
+                    vec![C0::ESC, expected]
+                } else {
+                    vec![expected]
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn test_to_pty_bytes_encodes_named_editing_keys() {
+    let mock = TerminalModelMock::new();
+    for (key, expected) in [
+        ("delete", b"\x1b[3~"),
+        ("insert", b"\x1b[2~"),
+        ("pageup", b"\x1b[5~"),
+        ("pagedown", b"\x1b[6~"),
+    ] {
+        let keystroke = Keystroke::parse(key).unwrap();
+        let details = KeystrokeWithDetails {
+            keystroke: &keystroke,
+            key_without_modifiers: None,
+            chars: Some(""),
+        };
+        assert_eq!(details.to_pty_bytes(&mock), Some(expected.to_vec()));
+        assert_eq!(details.to_escape_sequence(&mock), None);
+    }
+}
+
+#[test]
+fn test_to_pty_bytes_preserves_shift_tab() {
+    let mock = TerminalModelMock::new();
+    let keystroke = Keystroke::parse("shift-tab").unwrap();
+    for chars in [None, Some(""), Some("\t")] {
+        let details = KeystrokeWithDetails {
+            keystroke: &keystroke,
+            key_without_modifiers: None,
+            chars,
+        };
+        assert_eq!(details.to_pty_bytes(&mock), Some(b"\x1b[Z".to_vec()));
+        assert_eq!(details.to_escape_sequence(&mock), None);
+    }
+}
+
+#[test]
+fn test_to_pty_bytes_keeps_kitty_before_legacy_fallbacks() {
+    for mock in [
+        mock_with_disambiguate_only(),
+        mock_with_all_keys_as_escape(),
+    ] {
+        for (key, expected) in [
+            ("ctrl-a", b"\x1b[97;5u".as_slice()),
+            ("ctrl-\\", b"\x1b[92;5u".as_slice()),
+            ("ctrl-]", b"\x1b[93;5u".as_slice()),
+            ("shift-tab", b"\x1b[9;2u".as_slice()),
+        ] {
+            let keystroke = Keystroke::parse(key).unwrap();
+            let details = KeystrokeWithDetails {
+                keystroke: &keystroke,
+                key_without_modifiers: None,
+                chars: None,
+            };
+            assert_eq!(details.to_pty_bytes(&mock), Some(expected.to_vec()));
+        }
+        let keystroke = Keystroke {
+            alt: !OperatingSystem::get().is_mac(),
+            meta: OperatingSystem::get().is_mac(),
+            ..Keystroke::parse("ctrl-a").unwrap()
+        };
+        let details = KeystrokeWithDetails {
+            keystroke: &keystroke,
+            key_without_modifiers: None,
+            chars: Some("a"),
+        };
+        assert_eq!(details.to_pty_bytes(&mock), Some(b"\x1b[97;7u".to_vec()));
+    }
 }

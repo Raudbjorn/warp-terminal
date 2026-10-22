@@ -767,6 +767,17 @@ async fn install_update(layout: InstallLayout, latest_version: String) -> Result
         let Some(_lock) = InstallLock::acquire(&layout.root)? else {
             return Ok(UpdateOutcome::Locked);
         };
+        // Downloads run outside the lock, so another process may have activated a newer release.
+        let active_version = read_current_pointer(&layout)?;
+        let active_version = active_version
+            .to_str()
+            .context("current TUI version is not valid UTF-8")?;
+        if !is_newer_version(active_version, &latest_version)? {
+            return Ok(UpdateOutcome::PendingRestart {
+                version: active_version.to_owned(),
+            });
+        }
+
         // Another installer may have completed this exact immutable version
         // while this process downloaded, so recheck under the install lock.
         match version_dir_state(&layout, &version_dir)? {
