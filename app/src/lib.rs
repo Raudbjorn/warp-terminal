@@ -760,6 +760,30 @@ fn apply_scroll_multiplier(event: &mut Event, app: &AppContext) {
     }
 }
 
+/// Returns the system's preferred UI locale as a BCP-47 tag, or `None` when the
+/// platform does not report one.
+///
+/// `sys_locale` reads `GetUserPreferredUILanguages` on Windows and `CFLocale` on
+/// macOS — the authoritative UI-language sources there — and falls back to
+/// `LC_ALL` / `LC_MESSAGES` / `LANG` on Unix. The POSIX forms those env vars use
+/// (`ja_JP.UTF-8`, `zh_TW@foo`) are normalised here to the BCP-47 shape that
+/// [`warpui::current_ui_locale`] consumers expect.
+fn detect_system_ui_locale() -> Option<String> {
+    let raw = sys_locale::get_locale()?;
+    // Drop a codeset (`.UTF-8`) or modifier (`@euro`) suffix, then switch the
+    // POSIX `_` separator for BCP-47's `-`.
+    let tag = raw
+        .split(['.', '@'])
+        .next()
+        .unwrap_or(&raw)
+        .replace('_', "-");
+    // `C` and `POSIX` are "no locale", not language tags.
+    if tag.is_empty() || tag.eq_ignore_ascii_case("c") || tag.eq_ignore_ascii_case("posix") {
+        return None;
+    }
+    Some(tag)
+}
+
 /// Runs the shared Warp executable as the app or as one of its command-line modes.
 ///
 /// The bundled Warp Control wrapper injects `--warpctrl`, which is dispatched
@@ -781,6 +805,17 @@ pub fn run() -> Result<()> {
         // SAFETY: Startup has not spawned threads yet.
         unsafe { std::env::set_var("LANG", "en_US.UTF-8") };
     }
+
+    // Publish the system UI locale so `warpui::current_ui_locale()` is accurate
+    // before any font fallback runs. Without this it stays at the hard-coded
+    // `en-US` default, and `font_fallback::cjk_han_font_for_ui_locale` then picks
+    // Simplified Chinese Han glyphs for Japanese, Korean and Traditional Chinese
+    // users. There is no translation catalogue in this fork — only the locale
+    // itself is propagated.
+    if let Some(locale) = detect_system_ui_locale() {
+        warpui::set_ui_locale(locale);
+    }
+
     // Perform any necessary platform-specific initialization.
     platform::init();
 
@@ -1362,12 +1397,7 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
         #[cfg(enable_crash_recovery)]
         ctx.add_singleton_model(move |_ctx| crash_recovery);
 
-        let app_state = initialize_app(
-            &launch_mode,
-            timer,
-            startup_toml_parse_error,
-            ctx,
-        );
+        let app_state = initialize_app(&launch_mode, timer, startup_toml_parse_error, ctx);
 
         if ImprovedPaletteSearch::improved_search_enabled(ctx) {
             FeatureFlag::UseTantivySearch.set_enabled(true);

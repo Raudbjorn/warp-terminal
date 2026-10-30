@@ -15292,6 +15292,7 @@ dependencies = [
  "sum_tree",
  "syntax_tree",
  "syntect",
+ "sys-locale",
  "sysinfo",
  "tabwriter",
  "tempfile",

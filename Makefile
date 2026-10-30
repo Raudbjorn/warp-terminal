@@ -3,7 +3,7 @@ LOCAL_AGENT_BIN := warp-local-multi-agent
 
 .DEFAULT_GOAL := help
 
-.PHONY: help local-agent-install local-agent-dev local-agent-build local-agent-start local-agent-test warp-check warp-build warp-build-optimized warp-build-oss warp-trash-local-settings
+.PHONY: help local-agent-install local-agent-dev local-agent-build local-agent-start local-agent-test warp-check warp-build warp-build-optimized warp-build-oss warp-run warp-trash-local-settings
 
 help:
 	@echo "Slipstream local development targets:"
@@ -13,8 +13,9 @@ help:
 	@echo "  make local-agent-start    Run the built local multi-agent service"
 	@echo "  make local-agent-test     Build and test the local multi-agent service"
 	@echo "  make warp-check           Run Rust formatting and Slipstream app check"
-	@echo "  make warp-build-oss       Build the Slipstream app bundle"
-	@echo "  make warp-build-optimized Build an optimized Slipstream app bundle"
+	@echo "  make warp-build-oss       Build a debug Slipstream app bundle"
+	@echo "  make warp-build-optimized Build a release-lto Slipstream app bundle"
+	@echo "  make warp-run             Build and run Slipstream without bundling"
 	@echo "  make warp-trash-local-settings  Remove local Slipstream settings/state"
 
 local-agent-install:
@@ -75,10 +76,16 @@ warp-check:
 	cargo fmt --check
 	cargo check -p warp --bin warp-oss --features gui
 
+# Produces an AppImage under target/dist. `--debug` selects the `dev` cargo
+# profile; without it the oss channel builds `release-lto`.
 warp-build:
-	PATH="$$HOME/.cargo/bin:$$PATH" TERM=xterm-256color FEATURES=gui WARP_BIN_NAME=warp-oss WARP_CHANNEL=oss ./script/run
+	PATH="$$HOME/.cargo/bin:$$PATH" TERM=xterm-256color ./script/bundle --channel oss --debug
 
 warp-build-optimized:
-	PATH="$$HOME/.cargo/bin:$$PATH" TERM=xterm-256color FEATURES=gui WARP_BIN_NAME=warp-oss WARP_CHANNEL=oss CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=unpacked ./script/run --profile release-lto
+	PATH="$$HOME/.cargo/bin:$$PATH" TERM=xterm-256color CARGO_PROFILE_RELEASE_SPLIT_DEBUGINFO=unpacked ./script/bundle --channel oss
 
 warp-build-oss: warp-build
+
+# Builds and launches the app directly via cargo, producing no bundle.
+warp-run:
+	PATH="$$HOME/.cargo/bin:$$PATH" TERM=xterm-256color FEATURES=gui WARP_BIN_NAME=warp-oss WARP_CHANNEL=oss ./script/run
