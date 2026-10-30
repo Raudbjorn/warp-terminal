@@ -1676,8 +1676,22 @@ impl AISettings {
         }
     }
 
+    /// Whether the field the selected provider needs to reach its backend is
+    /// set: the Base URL for an OpenAI-compatible endpoint, the binary for an
+    /// OpenCode sidecar. Mirrors `LocalOpenAIClient::configured`.
+    fn local_openai_endpoint_configured(&self) -> bool {
+        match parse_provider_kind(self.local_openai_provider_kind.value().as_str()) {
+            LocalProviderKind::OpenAICompatible => {
+                !self.local_openai_base_url.value().trim().is_empty()
+            }
+            LocalProviderKind::OpenCode => {
+                !self.local_openai_opencode_command.value().trim().is_empty()
+            }
+        }
+    }
+
     fn is_local_openai_provider_configured(&self) -> bool {
-        *self.local_openai_enabled.value() && !self.local_openai_base_url.value().trim().is_empty()
+        *self.local_openai_enabled.value() && self.local_openai_endpoint_configured()
     }
 
     pub(crate) fn is_local_openai_prediction_enabled(&self) -> bool {
@@ -1695,7 +1709,7 @@ impl AISettings {
             // Only expose command search when the local provider is actually runnable —
             // an enabled-but-unconfigured provider would fail every request.
             self.is_local_ai_enabled()
-                && !self.local_openai_base_url.value().trim().is_empty()
+                && self.local_openai_endpoint_configured()
                 && !self.local_openai_command_model.value().trim().is_empty()
         } else {
             self.is_any_ai_enabled(app)

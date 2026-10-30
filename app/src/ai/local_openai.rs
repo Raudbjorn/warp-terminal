@@ -140,19 +140,20 @@ impl LocalOpenAIClient {
     }
 
     pub(crate) fn set_config(&self, config: LocalOpenAISettingsSnapshot) {
-        let old_config = self.config.read().clone();
-        let provider_kind = config.provider_kind;
-        *self.config.write() = config;
         // Clear the sidecar pool when:
         // 1. Switching away from OpenCode (avoid leaking unused children), or
         // 2. OpenCode settings change (command/args) so stale sidecars are dropped.
+        // The comparison and the swap happen under one write lock so a
+        // concurrent `set_config` cannot interleave between them.
         // `clear()` is synchronous (parking_lot lock) so this runs directly on
         // the UI thread — no Tokio runtime required, and no fire-and-forget task
         // that could be dropped before it runs.
-        let should_clear = provider_kind != LocalProviderKind::OpenCode
-            || (provider_kind == LocalProviderKind::OpenCode
-                && (old_config.opencode_command != self.config.read().opencode_command
-                    || old_config.opencode_args != self.config.read().opencode_args));
+        let mut guard = self.config.write();
+        let should_clear = config.provider_kind != LocalProviderKind::OpenCode
+            || guard.opencode_command != config.opencode_command
+            || guard.opencode_args != config.opencode_args;
+        *guard = config;
+        drop(guard);
         if should_clear {
             self.opencode_pool.clear();
         }

@@ -22,8 +22,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use futures::io::{AsyncBufReadExt, BufReader};
 use futures::AsyncReadExt;
 use serde::Deserialize;
 use thiserror::Error;
@@ -147,6 +149,10 @@ struct SidecarInner {
     /// `OpenCodeSidecar` is dropped; the drain task observes that
     /// closure as a shutdown signal.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Set by the drain task once the child has exited on its own (crash,
+    /// external kill). The pool uses it to evict and respawn instead of
+    /// handing out a URL nothing is listening on.
+    exited: Arc<AtomicBool>,
 }
 
 /// Handle to a running OpenCode sidecar. Cloneable; clones share the
@@ -161,6 +167,12 @@ impl OpenCodeSidecar {
     /// Base URL the Chat Completions endpoint is reachable at.
     pub fn base_url(&self) -> &str {
         &self.inner.base_url
+    }
+
+    /// Whether the child process is still running. `false` once it has
+    /// exited on its own; the pool replaces such sidecars on the next lookup.
+    pub fn is_alive(&self) -> bool {
+        !self.inner.exited.load(Ordering::Acquire)
     }
 
     /// Working directory the sidecar was launched with. Kept on the
@@ -227,43 +239,47 @@ pub async fn spawn(
 
     // Spawn the background drain that owns the kill path.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(drain_sidecar(process, stderr, Some(stdout), shutdown_rx));
+    let exited = Arc::new(AtomicBool::new(false));
+    tokio::spawn(drain_sidecar(
+        process,
+        stderr,
+        Some(stdout),
+        shutdown_rx,
+        Arc::clone(&exited),
+    ));
 
     Ok(OpenCodeSidecar {
         inner: Arc::new(SidecarInner {
             base_url,
             working_dir: working_dir.to_path_buf(),
             shutdown_tx,
+            exited,
         }),
     })
 }
 
-/// Read from `stdout` until we have a parseable announcement. Reads one
-/// byte at a time so the announcement can be detected whether the sidecar
-/// emits it on a fresh line or appended to the first line of output.
+/// Read `stdout` line by line until one parses as a port announcement.
+/// Lines are read as raw bytes (not `String`s) so a non-UTF-8 log line is
+/// skipped by `try_parse_buffer` rather than failing the whole startup.
 async fn read_announcement(
-    mut stdout: async_process::ChildStdout,
+    stdout: async_process::ChildStdout,
 ) -> Result<(OpenCodeAnnouncement, async_process::ChildStdout), OpenCodeError> {
-    let mut buffer = Vec::with_capacity(256);
-    let mut byte = [0u8; 1];
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::with_capacity(256);
     loop {
-        match stdout.read(&mut byte).await {
+        // Only ever parse the current line, so a preceding log line cannot
+        // poison the parse and nothing is re-parsed.
+        line.clear();
+        match reader.read_until(b'\n', &mut line).await {
             Ok(0) => break, // EOF before announcement
             Ok(_) => {
-                buffer.push(byte[0]);
-                // Try to parse on every newline; this keeps the
-                // recognizer from buffering arbitrarily long log lines.
-                if byte[0] == b'\n' {
-                    if let Ok(ann) = try_parse_buffer(&buffer) {
-                        // Hand stdout back so the caller can keep draining it;
-                        // dropping it here would close the pipe and risk
-                        // EPIPE/blocking if the sidecar logs more to stdout.
-                        return Ok((ann, stdout));
-                    }
-                    // Drop the non-matching line so we only ever parse the
-                    // current line (avoids O(N^2) re-parsing and prevents a
-                    // preceding log line from poisoning the JSON parse).
-                    buffer.clear();
+                if let Ok(ann) = try_parse_buffer(&line) {
+                    // Hand stdout back so the caller can keep draining it;
+                    // dropping it here would close the pipe and risk
+                    // EPIPE/blocking if the sidecar logs more to stdout.
+                    // Bytes the reader buffered past this line are dropped,
+                    // which is fine: the drain task discards stdout anyway.
+                    return Ok((ann, reader.into_inner()));
                 }
             }
             Err(err) => return Err(OpenCodeError::Io(err)),
@@ -284,13 +300,14 @@ fn try_parse_buffer(buffer: &[u8]) -> Result<OpenCodeAnnouncement, OpenCodeError
     OpenCodeAnnouncement::from_line(text)
 }
 
-/// Long-running task: drains stderr (so the child never blocks), and on
-/// shutdown signal kills the child.
+/// Long-running task: drains stderr (so the child never blocks), flags
+/// `exited` if the child dies on its own, and on shutdown signal kills it.
 async fn drain_sidecar(
     mut child: async_process::Child,
     stderr: Option<async_process::ChildStderr>,
     stdout: Option<async_process::ChildStdout>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    exited: Arc<AtomicBool>,
 ) {
     // Drain stderr in a sibling task so a noisy OpenCode log cannot wedge
     // the drain loop. Future work can pipe the bytes through `tracing`.
@@ -330,7 +347,9 @@ async fn drain_sidecar(
     // the child to exit on its own.
     let should_shutdown = tokio::select! {
         _ = child.status() => {
-            // Process exited on its own; nothing to do.
+            // Process exited on its own; mark the handle dead so the pool
+            // evicts it rather than reusing a stale URL.
+            exited.store(true, Ordering::Release);
             return;
         }
         changed = shutdown.changed() => {
@@ -368,9 +387,9 @@ impl OpenCodeSidecarPool {
         Self::default()
     }
 
-    /// Borrow the sidecar for `working_dir`, spawning a new one if absent.
-    /// Errors propagate from the spawn call; the pool is left unchanged on
-    /// failure so the next call retries.
+    /// Borrow the sidecar for `working_dir`, spawning a new one if absent or
+    /// if the pooled one has exited. Errors propagate from the spawn call;
+    /// the pool is left unchanged on failure so the next call retries.
     pub async fn get_or_spawn(
         &self,
         command: &str,
@@ -379,16 +398,22 @@ impl OpenCodeSidecarPool {
     ) -> Result<OpenCodeSidecar, OpenCodeError> {
         let canonical = canonicalize_for_pool(working_dir);
 
-        if let Some(existing) = self.inner.lock().get(&canonical).cloned() {
-            return Ok(existing);
+        if let Some(existing) = self.inner.lock().get(&canonical) {
+            if existing.is_alive() {
+                return Ok(existing.clone());
+            }
+            // Exited since it was pooled (crash or external kill): fall
+            // through and respawn; the insert below replaces the entry.
         }
 
         let sidecar = spawn(command, args, &canonical).await?;
         let mut guard = self.inner.lock();
         // Another caller may have raced us to insert; prefer the
-        // existing sidecar so we do not leak a duplicate child.
-        if let Some(existing) = guard.get(&canonical).cloned() {
-            return Ok(existing);
+        // existing live sidecar so we do not leak a duplicate child.
+        if let Some(existing) = guard.get(&canonical) {
+            if existing.is_alive() {
+                return Ok(existing.clone());
+            }
         }
         guard.insert(canonical, sidecar.clone());
         Ok(sidecar)
@@ -488,5 +513,30 @@ mod tests {
             result,
             Err(OpenCodeError::BinaryNotFound(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_replaces_exited_sidecar() {
+        // `sh` announces a port and exits straight away, standing in for a
+        // sidecar that crashes after becoming ready.
+        let args = vec![
+            "-c".to_string(),
+            "echo 'server listening on http://127.0.0.1:43123'".to_string(),
+        ];
+        let pool = OpenCodeSidecarPool::new();
+        let dir = std::env::temp_dir();
+
+        let first = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
+        for _ in 0..100 {
+            if !first.is_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!first.is_alive());
+
+        let second = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
+        assert!(!Arc::ptr_eq(&first.inner, &second.inner));
     }
 }

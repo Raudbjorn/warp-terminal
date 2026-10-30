@@ -107,6 +107,12 @@ impl From<ViewHandle<LocalAISettingsPageView>> for SettingsPageViewHandle {
     }
 }
 
+/// Render args the way `shlex::split` will read them back, so quoted
+/// arguments survive an edit round-trip.
+fn format_opencode_args(args: &[String]) -> String {
+    shlex::try_join(args.iter().map(String::as_str)).unwrap_or_else(|_| args.join(" "))
+}
+
 struct LocalAIProviderWidget {
     enabled_toggle: SwitchStateHandle,
     base_url_editor: ViewHandle<EditorView>,
@@ -137,10 +143,7 @@ impl LocalAIProviderWidget {
                 ai_settings.local_openai_prediction_model.value().clone(),
                 ai_settings.local_openai_timeout_ms.value().to_string(),
                 ai_settings.local_openai_opencode_command.value().clone(),
-                ai_settings
-                    .local_openai_opencode_args
-                    .value()
-                    .join(" "),
+                format_opencode_args(ai_settings.local_openai_opencode_args.value()),
             )
         };
         let base_url_editor = Self::create_editor(ctx, base_url, "http://127.0.0.1:1234/v1", false);
@@ -229,12 +232,23 @@ impl LocalAIProviderWidget {
         ctx.subscribe_to_view(&opencode_args_editor, |_, editor, event, ctx| {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
-                // Split on whitespace; preserve tokens that contain
-                // `=` since the sidecar may receive flag arguments.
-                let value: Vec<String> = buffer_text
-                    .split_whitespace()
-                    .map(|s| s.to_string())
-                    .collect();
+                // Shell-style split so quoted arguments containing spaces
+                // (`--model "my model"`) stay one token. Unbalanced quotes
+                // are rejected and the saved value restored, matching the
+                // timeout editor above.
+                let Some(value) = shlex::split(&buffer_text) else {
+                    log::warn!(
+                        "Invalid OpenCode args (unbalanced quote): {:?}",
+                        buffer_text.trim()
+                    );
+                    let current = format_opencode_args(
+                        AISettings::as_ref(ctx).local_openai_opencode_args.value(),
+                    );
+                    editor.update(ctx, |editor, ctx| {
+                        editor.set_buffer_text(&current, ctx);
+                    });
+                    return;
+                };
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(
                         settings.local_openai_opencode_args.set_value(value, ctx)
