@@ -489,7 +489,7 @@ impl SettingsWidget for LocalAIProviderWidget {
             LocalProviderKind::OpenCode => column
                 .with_child(Self::render_description(
                     appearance,
-                    "OpenCode sidecar: Warp starts `opencode serve` in the working directory on a random loopback port, protected by a per-process password. Each request runs in a short-lived session with every tool permission denied. Set `OpenCode Command` to the binary name or an absolute path; the default `opencode` resolves from `$PATH`. Arguments are split shell-style.",
+                    "OpenCode sidecar: Warp starts `opencode serve` in its own working directory on a random loopback port, protected by a per-process password. Each request runs in a short-lived session with every tool permission denied. Set `OpenCode Command` to the binary name or an absolute path; the default `opencode` resolves from `$PATH`. Arguments are split shell-style.",
                 ))
                 .with_child(Self::render_input(
                     appearance,
