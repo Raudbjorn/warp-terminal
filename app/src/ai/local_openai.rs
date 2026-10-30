@@ -43,7 +43,7 @@ pub(crate) enum LocalOpenAIError {
     Status(#[from] http_client::ResponseError),
     #[error("local OpenAI-compatible provider response could not be decoded")]
     Decode(#[from] reqwest::Error),
-    #[error("local OpenAI-compatible provider's OpenCode sidecar could not be started: {0}")]
+    #[error("OpenCode provider failed: {0}")]
     OpenCode(#[from] OpenCodeError),
 }
 
@@ -338,48 +338,14 @@ impl LocalOpenAIClient {
         model: String,
         messages: Vec<ChatMessage>,
     ) -> Result<String, LocalOpenAIError> {
-        let (base_url, api_key) = match config.provider_kind {
-            LocalProviderKind::OpenAICompatible => (config.base_url.clone(), config.api_key.clone()),
-            LocalProviderKind::OpenCode => {
-                // Spawning a local process is unavailable on wasm; short-circuit
-                // with the stub's `Unsupported` error before touching
-                // `current_dir()`. This also keeps the non-wasm-only
-                // `OpenCodeError::NoWorkingDirectory` variant out of the wasm
-                // build (the wasm stub does not define it). Tail-expression
-                // `return` keeps the arm typed as the `(String, String)` tuple
-                // via the `!` coercion.
-                #[cfg(target_family = "wasm")]
-                {
-                    return Err(OpenCodeError::Unsupported.into())
-                }
-                #[cfg(not(target_family = "wasm"))]
-                {
-                    let working_dir = self
-                        .opencode_working_dir
-                        .read()
-                        .clone()
-                        .or_else(|| std::env::current_dir().ok())
-                        .ok_or(OpenCodeError::NoWorkingDirectory)?;
-                    let sidecar = self
-                        .opencode_pool
-                        .get_or_spawn(
-                            &config.opencode_command,
-                            &config.opencode_args,
-                            &working_dir,
-                        )
-                        .await?;
-                    // OpenCode ships an OpenAI-compatible /v1/chat/completions
-                    // endpoint without an API key by default. We still pass
-                    // the user-configured key through if one is set, since
-                    // some self-hosted OpenCode builds gate `/v1` behind a
-                    // bearer token.
-                    (sidecar.base_url().to_string(), config.api_key.clone())
-                }
-            }
-        };
+        if config.provider_kind == LocalProviderKind::OpenCode {
+            return self
+                .opencode_completion(http_client, config, &model, &messages)
+                .await;
+        }
 
         let mut request_builder = http_client
-            .post(chat_completions_url(&base_url))
+            .post(chat_completions_url(&config.base_url))
             .timeout(Duration::from_millis(config.timeout_ms))
             .json(&ChatCompletionRequest {
                 model,
@@ -388,8 +354,8 @@ impl LocalOpenAIClient {
                 stream: false,
             });
 
-        if !api_key.trim().is_empty() {
-            request_builder = request_builder.bearer_auth(api_key.trim());
+        if !config.api_key.trim().is_empty() {
+            request_builder = request_builder.bearer_auth(config.api_key.trim());
         }
 
         let response: ChatCompletionResponse = request_builder
@@ -405,6 +371,56 @@ impl LocalOpenAIClient {
             .next()
             .map(|choice| choice.message.content)
             .ok_or(LocalOpenAIError::EmptyResponse)
+    }
+
+    /// Answer one chat request through the OpenCode sidecar for the current
+    /// working directory, spawning it on first use. OpenCode does not speak
+    /// Chat Completions, so the transcript is folded into a single prompt and
+    /// run through its session API (see `local_opencode`).
+    #[cfg(not(target_family = "wasm"))]
+    async fn opencode_completion(
+        &self,
+        http_client: &http_client::Client,
+        config: &LocalOpenAISettingsSnapshot,
+        model: &str,
+        messages: &[ChatMessage],
+    ) -> Result<String, LocalOpenAIError> {
+        let working_dir = self
+            .opencode_working_dir
+            .read()
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or(OpenCodeError::NoWorkingDirectory)?;
+        let sidecar = self
+            .opencode_pool
+            .get_or_spawn(
+                &config.opencode_command,
+                &config.opencode_args,
+                &working_dir,
+            )
+            .await?;
+        let text = sidecar
+            .generate(
+                http_client,
+                model,
+                &flatten_messages(messages),
+                Duration::from_millis(config.timeout_ms),
+            )
+            .await?;
+        Ok(text)
+    }
+
+    /// Spawning a local process is unavailable on wasm; fail with the stub's
+    /// `Unsupported` error instead of touching `current_dir()`.
+    #[cfg(target_family = "wasm")]
+    async fn opencode_completion(
+        &self,
+        _http_client: &http_client::Client,
+        _config: &LocalOpenAISettingsSnapshot,
+        _model: &str,
+        _messages: &[ChatMessage],
+    ) -> Result<String, LocalOpenAIError> {
+        Err(OpenCodeError::Unsupported.into())
     }
 
     fn configured(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
@@ -439,6 +455,25 @@ impl PredictionJson {
             Self::String(value) => value,
         }
     }
+}
+
+/// OpenCode's `/generate` takes one prompt string, so fold the chat
+/// transcript into one, each message under a `System:` / `User:` heading.
+#[cfg(not(target_family = "wasm"))]
+fn flatten_messages(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            let heading = match message.role {
+                "system" => "System",
+                "user" => "User",
+                "assistant" => "Assistant",
+                other => other,
+            };
+            format!("{heading}:\n{}", message.content.trim())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn chat_completions_url(base_url: &str) -> String {
@@ -537,5 +572,24 @@ mod tests {
         let parsed: PredictionJson =
             parse_json_content("```json\n{\"suggestion\":\"git status\"}\n```").unwrap();
         assert_eq!(parsed.into_string(), "git status");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn flattens_chat_messages_into_one_prompt() {
+        let messages = vec![
+            ChatMessage {
+                role: "system",
+                content: "Reply with one shell command.\n".to_string(),
+            },
+            ChatMessage {
+                role: "user",
+                content: "list files".to_string(),
+            },
+        ];
+        assert_eq!(
+            flatten_messages(&messages),
+            "System:\nReply with one shell command.\n\nUser:\nlist files"
+        );
     }
 }

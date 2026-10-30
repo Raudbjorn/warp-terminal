@@ -2,14 +2,16 @@ use crate::{
     appearance::Appearance,
     editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextColors, TextOptions},
     report_if_error,
-    settings::{AISettings, LocalOpenAIEnabled},
+    settings::{AISettings, LocalOpenAIEnabled, LocalOpenAIProviderKind, LocalProviderKind},
+    view_components::{Dropdown, DropdownItem},
 };
 use settings::{Setting, ToggleableSetting};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use warpui::{
     elements::{
-        Container, CrossAxisAlignment, Element, Flex, MouseStateHandle, ParentElement, Text,
+        ChildView, Container, CrossAxisAlignment, Element, Flex, MouseStateHandle, ParentElement,
+        Text,
     },
     fonts::{Properties, Weight},
     ui_components::{
@@ -21,9 +23,9 @@ use warpui::{
 
 use super::{
     settings_page::{
-        build_toggle_element, render_body_item_label, LocalOnlyIconState, MatchData, PageType,
-        SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, ToggleState, CONTENT_FONT_SIZE,
-        HEADER_PADDING,
+        build_toggle_element, render_body_item, render_body_item_label, LocalOnlyIconState,
+        MatchData, PageType, SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, ToggleState,
+        CONTENT_FONT_SIZE, HEADER_PADDING,
     },
     SettingsSection,
 };
@@ -31,22 +33,62 @@ use super::{
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalAISettingsPageAction {
     ToggleLocalOpenAIProvider,
+    SetProviderKind(LocalProviderKind),
 }
 
 pub struct LocalAISettingsPageView {
     page: PageType<Self>,
     local_only_icon_tooltip_states: RefCell<HashMap<String, MouseStateHandle>>,
+    provider_kind_dropdown: ViewHandle<Dropdown<LocalAISettingsPageAction>>,
 }
 
 impl LocalAISettingsPageView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
+        let provider_kind_dropdown = ctx.add_typed_action_view(|ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(360.);
+            dropdown
+        });
+        Self::update_provider_kind_dropdown(provider_kind_dropdown.clone(), ctx);
+        // Keep the selection in sync when the setting changes elsewhere
+        // (settings file, another window), and re-render so the fields shown
+        // match the provider.
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |view, _, _, ctx| {
+            Self::update_provider_kind_dropdown(view.provider_kind_dropdown.clone(), ctx);
+            ctx.notify();
+        });
+
         Self {
             page: PageType::new_uncategorized(
                 vec![Box::new(LocalAIProviderWidget::new(ctx))],
                 Some("Local AI"),
             ),
             local_only_icon_tooltip_states: Default::default(),
+            provider_kind_dropdown,
         }
+    }
+
+    fn update_provider_kind_dropdown(
+        dropdown: ViewHandle<Dropdown<LocalAISettingsPageAction>>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let current = AISettings::as_ref(ctx).local_provider_kind();
+        dropdown.update(ctx, |dropdown, ctx| {
+            dropdown.set_items(
+                LocalProviderKind::ALL
+                    .into_iter()
+                    .map(|kind| {
+                        DropdownItem::new(
+                            kind.label(),
+                            LocalAISettingsPageAction::SetProviderKind(kind),
+                        )
+                    })
+                    .collect(),
+                ctx,
+            );
+            dropdown
+                .set_selected_by_action(LocalAISettingsPageAction::SetProviderKind(current), ctx);
+        });
     }
 }
 
@@ -72,6 +114,14 @@ impl TypedActionView for LocalAISettingsPageView {
             LocalAISettingsPageAction::ToggleLocalOpenAIProvider => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings.local_openai_enabled.toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            LocalAISettingsPageAction::SetProviderKind(kind) => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings
+                        .local_openai_provider_kind
+                        .set_value(kind.setting_value().to_string(), ctx));
                 });
                 ctx.notify();
             }
@@ -197,10 +247,7 @@ impl LocalAIProviderWidget {
                 let value = match buffer_text.trim().parse::<u64>() {
                     Ok(value) if value > 0 => value,
                     _ => {
-                        log::warn!(
-                            "Invalid local OpenAI timeout: {:?}",
-                            buffer_text.trim()
-                        );
+                        log::warn!("Invalid local OpenAI timeout: {:?}", buffer_text.trim());
                         let current = AISettings::as_ref(ctx)
                             .local_openai_timeout_ms
                             .value()
@@ -216,8 +263,7 @@ impl LocalAIProviderWidget {
                 });
             }
         });
-        let opencode_command_editor =
-            Self::create_editor(ctx, opencode_command, "opencode", false);
+        let opencode_command_editor = Self::create_editor(ctx, opencode_command, "opencode", false);
         ctx.subscribe_to_view(&opencode_command_editor, |_, editor, event, ctx| {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let value = editor.as_ref(ctx).buffer_text(ctx).trim().to_string();
@@ -227,8 +273,7 @@ impl LocalAIProviderWidget {
             }
         });
 
-        let opencode_args_editor =
-            Self::create_editor(ctx, opencode_args, "serve --port 0", false);
+        let opencode_args_editor = Self::create_editor(ctx, opencode_args, "serve --port 0", false);
         ctx.subscribe_to_view(&opencode_args_editor, |_, editor, event, ctx| {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
@@ -250,9 +295,7 @@ impl LocalAIProviderWidget {
                     return;
                 };
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                    report_if_error!(
-                        settings.local_openai_opencode_args.set_value(value, ctx)
-                    );
+                    report_if_error!(settings.local_openai_opencode_args.set_value(value, ctx));
                 });
             }
         });
@@ -352,6 +395,27 @@ impl LocalAIProviderWidget {
         )
     }
 
+    fn render_provider_selector(
+        view: &LocalAISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        render_body_item::<LocalAISettingsPageAction>(
+            "Provider".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                LocalOpenAIProviderKind::storage_key(),
+                LocalOpenAIProviderKind::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            ChildView::new(&view.provider_kind_dropdown).finish(),
+            Some("Where local AI requests are sent.".to_owned()),
+        )
+    }
+
     fn render_input(
         appearance: &Appearance,
         label: &'static str,
@@ -390,7 +454,7 @@ impl SettingsWidget for LocalAIProviderWidget {
     type View = LocalAISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "local ai local openai openai compatible endpoint base url api key model command prediction timeout ollama lm studio opencode sidecar"
+        "local ai local openai openai compatible provider endpoint base url api key model command prediction timeout ollama lm studio opencode sidecar"
     }
 
     fn render(
@@ -399,15 +463,19 @@ impl SettingsWidget for LocalAIProviderWidget {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        Container::new(
-            Flex::column()
-                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
-                .with_spacing(16.)
-                .with_child(Self::render_description(
-                    appearance,
-                    "Use an OpenAI-compatible local or private endpoint for command generation, workflow metadata, and command prediction. Local AI does not use Warp credits, account state, or workspace policy.",
-                ))
-                .with_child(self.render_toggle(view, appearance, app))
+        let provider_kind = AISettings::as_ref(app).local_provider_kind();
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(16.)
+            .with_child(Self::render_description(
+                appearance,
+                "Use a local or private AI provider for command generation, workflow metadata, and command prediction. Local AI does not use Warp credits, account state, or workspace policy.",
+            ))
+            .with_child(self.render_toggle(view, appearance, app))
+            .with_child(Self::render_provider_selector(view, appearance, app));
+
+        column = match provider_kind {
+            LocalProviderKind::OpenAICompatible => column
                 .with_child(Self::render_input(
                     appearance,
                     "Base URL",
@@ -417,7 +485,30 @@ impl SettingsWidget for LocalAIProviderWidget {
                     appearance,
                     "API Key",
                     self.api_key_editor.clone(),
+                )),
+            LocalProviderKind::OpenCode => column
+                .with_child(Self::render_description(
+                    appearance,
+                    "OpenCode sidecar: Warp starts `opencode serve` in the working directory on a random loopback port, protected by a per-process password. Each request runs in a short-lived session with every tool permission denied. Set `OpenCode Command` to the binary name or an absolute path; the default `opencode` resolves from `$PATH`. Arguments are split shell-style.",
                 ))
+                .with_child(Self::render_input(
+                    appearance,
+                    "OpenCode Command",
+                    self.opencode_command_editor.clone(),
+                ))
+                .with_child(Self::render_input(
+                    appearance,
+                    "OpenCode Args",
+                    self.opencode_args_editor.clone(),
+                ))
+                .with_child(Self::render_description(
+                    appearance,
+                    "With OpenCode, write models as `providerID/modelID`, for example `ollama/qwen2.5-coder:7b`. The provider must already be configured in OpenCode. A hosted provider sends your prompts off this machine.",
+                )),
+        };
+
+        Container::new(
+            column
                 .with_child(Self::render_input(
                     appearance,
                     "Command Model",
@@ -433,23 +524,9 @@ impl SettingsWidget for LocalAIProviderWidget {
                     "Timeout (ms)",
                     self.timeout_ms_editor.clone(),
                 ))
-                .with_child(Self::render_description(
-                    appearance,
-                    "OpenCode sidecar: route requests through a locally-spawned OpenCode process bound to the working directory. The sidecar exposes an OpenAI-compatible endpoint on a random loopback port; we read the port from its startup announcement. Set `OpenCode Command` to the binary name or absolute path; the default `opencode` resolves from `$PATH`.",
-                ))
-                .with_child(Self::render_input(
-                    appearance,
-                    "OpenCode Command",
-                    self.opencode_command_editor.clone(),
-                ))
-                .with_child(Self::render_input(
-                    appearance,
-                    "OpenCode Args",
-                    self.opencode_args_editor.clone(),
-                ))
                 .finish(),
         )
         .with_margin_bottom(HEADER_PADDING)
         .finish()
-}
+    }
 }

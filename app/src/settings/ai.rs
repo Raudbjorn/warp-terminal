@@ -603,9 +603,29 @@ pub enum LocalProviderKind {
     OpenAICompatible,
     /// A locally-spawned OpenCode sidecar. The sidecar lifecycle is
     /// managed by `crate::ai::local_opencode`; this kind is what
-    /// switches the chat-completion path from `base_url` to a per-CWD
-    /// sidecar pool.
+    /// switches requests from `base_url` to a per-CWD sidecar pool that
+    /// is driven through OpenCode's session API.
     OpenCode,
+}
+
+impl LocalProviderKind {
+    pub(crate) const ALL: [Self; 2] = [Self::OpenAICompatible, Self::OpenCode];
+
+    /// The value stored in `agents.local_openai.provider_kind`; the inverse
+    /// of `parse_provider_kind`.
+    pub(crate) fn setting_value(self) -> &'static str {
+        match self {
+            Self::OpenAICompatible => "open_ai_compatible",
+            Self::OpenCode => "open_code",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::OpenAICompatible => "OpenAI-compatible endpoint",
+            Self::OpenCode => "OpenCode sidecar",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -870,7 +890,7 @@ define_settings_group!(AISettings, settings: [
         sync_to_cloud: SyncToCloud::Never,
         private: false,
         toml_path: "agents.local_openai.provider_kind",
-        description: "Which local AI provider to route Chat Completions through. `open_ai_compatible` talks to a user-configured base URL; `open_code` spawns a per-working-directory sidecar.",
+        description: "Which local AI provider to use. `open_ai_compatible` sends Chat Completions requests to a user-configured base URL; `open_code` spawns a per-working-directory OpenCode sidecar and drives it through its session API (models are then written `providerID/modelID`).",
     }
     local_openai_opencode_command: LocalOpenAIOpenCodeCommand {
         type: String,
@@ -1668,19 +1688,21 @@ impl AISettings {
             command_model: self.local_openai_command_model.value().clone(),
             prediction_model: self.local_openai_prediction_model.value().clone(),
             timeout_ms: *self.local_openai_timeout_ms.value(),
-            provider_kind: parse_provider_kind(
-                self.local_openai_provider_kind.value().as_str(),
-            ),
+            provider_kind: self.local_provider_kind(),
             opencode_command: self.local_openai_opencode_command.value().clone(),
             opencode_args: self.local_openai_opencode_args.value().clone(),
         }
+    }
+
+    pub(crate) fn local_provider_kind(&self) -> LocalProviderKind {
+        parse_provider_kind(self.local_openai_provider_kind.value().as_str())
     }
 
     /// Whether the field the selected provider needs to reach its backend is
     /// set: the Base URL for an OpenAI-compatible endpoint, the binary for an
     /// OpenCode sidecar. Mirrors `LocalOpenAIClient::configured`.
     fn local_openai_endpoint_configured(&self) -> bool {
-        match parse_provider_kind(self.local_openai_provider_kind.value().as_str()) {
+        match self.local_provider_kind() {
             LocalProviderKind::OpenAICompatible => {
                 !self.local_openai_base_url.value().trim().is_empty()
             }

@@ -1,9 +1,18 @@
 //! OpenCode sidecar lifecycle for the local AI provider.
 //!
-//! OpenCode (https://opencode.io) is a CLI agent runtime that exposes an
-//! OpenAI-compatible HTTP server. When the user picks `OpenCode` as their
+//! OpenCode (https://opencode.ai) is a CLI agent runtime whose `serve`
+//! command exposes an HTTP API. It does **not** serve OpenAI Chat
+//! Completions; it is session based. When the user picks `OpenCode` as their
 //! `local_openai` provider, we spawn the binary, capture the listening port
-//! from its stdout, and route Chat Completions requests to it.
+//! from its stdout, and for each request create a throwaway session, call
+//! `POST /api/session/{id}/generate`, and delete the session again.
+//!
+//! The server listens on loopback and refuses unauthenticated requests. We
+//! pick a random password per sidecar, hand it over through
+//! `OPENCODE_SERVER_PASSWORD`, and authenticate with HTTP Basic auth, so
+//! other local processes cannot drive the sidecar. Sessions are created with
+//! a deny-all permission ruleset: OpenCode is a coding agent, and a
+//! command-generation prompt must never be able to run tools.
 //!
 //! The sidecar is pooled per working directory so that sessions in different
 //! repos do not share state (mirroring the pattern in `JMrtzsn/warpdrive`,
@@ -20,14 +29,14 @@
 //! drain task prevents the child from blocking on a full pipe and owns the
 //! kill path so the `Drop` impl stays non-blocking.
 
+use futures::io::{AsyncBufReadExt, BufReader};
+use futures::AsyncReadExt;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use futures::io::{AsyncBufReadExt, BufReader};
-use futures::AsyncReadExt;
-use serde::Deserialize;
 use thiserror::Error;
 /// Default binary name resolved from `$PATH` when the user does not pin one.
 pub const DEFAULT_OPENCODE_BINARY: &str = "opencode";
@@ -36,9 +45,19 @@ pub const DEFAULT_OPENCODE_BINARY: &str = "opencode";
 /// port and announce it on stdout, which we then parse.
 pub const DEFAULT_OPENCODE_ARGS: &[&str] = &["serve", "--port", "0"];
 
-/// Time we wait for the sidecar to print its port after spawn.
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Time we wait for the sidecar to print its port after spawn. A cold first
+/// start (database migration) has been observed to take ~20s.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Environment variables OpenCode reads its Basic-auth credentials from. The
+/// username is pinned so an `OPENCODE_SERVER_USERNAME` in the user's own
+/// environment cannot make our requests fail with 401.
+const SERVER_USERNAME_ENV: &str = "OPENCODE_SERVER_USERNAME";
+const SERVER_PASSWORD_ENV: &str = "OPENCODE_SERVER_PASSWORD";
+const SERVER_USERNAME: &str = "opencode";
+
+/// Longest slice of an unparseable error body we echo into an error message.
+const ERROR_BODY_PREVIEW_CHARS: usize = 200;
 
 #[derive(Debug, Error)]
 pub enum OpenCodeError {
@@ -54,6 +73,14 @@ pub enum OpenCodeError {
     NoWorkingDirectory,
     #[error("OpenCode sidecar I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "OpenCode model `{0}` must be written `providerID/modelID`, e.g. `ollama/qwen2.5-coder:7b`"
+    )]
+    InvalidModel(String),
+    #[error("OpenCode request failed: {0}")]
+    Request(String),
+    #[error("OpenCode returned no text")]
+    EmptyResponse,
 }
 
 /// JSON announcement OpenCode prints once it is bound to a port.
@@ -124,10 +151,7 @@ impl OpenCodeAnnouncement {
         // `ready:43123`).
         if let Some(idx) = line.rfind(':') {
             let tail = &line[idx + 1..];
-            let digits: String = tail
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
+            let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
             if let Ok(port) = digits.parse::<u16>() {
                 if port > 0 {
                     return Ok(OpenCodeAnnouncement { port });
@@ -153,6 +177,8 @@ struct SidecarInner {
     /// external kill). The pool uses it to evict and respawn instead of
     /// handing out a URL nothing is listening on.
     exited: Arc<AtomicBool>,
+    /// Basic-auth password this sidecar was started with.
+    password: String,
 }
 
 /// Handle to a running OpenCode sidecar. Cloneable; clones share the
@@ -164,9 +190,26 @@ pub struct OpenCodeSidecar {
 }
 
 impl OpenCodeSidecar {
-    /// Base URL the Chat Completions endpoint is reachable at.
-    pub fn base_url(&self) -> &str {
-        &self.inner.base_url
+    /// Run one prompt through the sidecar and return the generated text.
+    /// `model` must be `providerID/modelID`. `timeout` applies to each of the
+    /// (up to three) HTTP calls, not to the whole exchange.
+    pub async fn generate(
+        &self,
+        client: &http_client::Client,
+        model: &str,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<String, OpenCodeError> {
+        generate_via_session(
+            client,
+            &self.inner.base_url,
+            &self.inner.password,
+            &self.inner.working_dir,
+            model,
+            prompt,
+            timeout,
+        )
+        .await
     }
 
     /// Whether the child process is still running. `false` once it has
@@ -177,7 +220,8 @@ impl OpenCodeSidecar {
 
     /// Working directory the sidecar was launched with. Kept on the
     /// public API for callers that want to log or display the
-    /// sidecar's CWD; not used by the chat-completion path.
+    /// sidecar's CWD; the session path passes it to OpenCode as the
+    /// session location.
     #[allow(dead_code)]
     pub fn working_dir(&self) -> &Path {
         &self.inner.working_dir
@@ -198,9 +242,12 @@ pub async fn spawn(
         return Err(OpenCodeError::BinaryNotFound(String::new()));
     }
 
+    let password = generate_password();
     let mut process = async_process::Command::new(command)
         .args(args)
         .current_dir(working_dir)
+        .env(SERVER_USERNAME_ENV, SERVER_USERNAME)
+        .env(SERVER_PASSWORD_ENV, &password)
         .stdout(async_process::Stdio::piped())
         .stderr(async_process::Stdio::piped())
         .kill_on_drop(true)
@@ -254,6 +301,7 @@ pub async fn spawn(
             working_dir: working_dir.to_path_buf(),
             shutdown_tx,
             exited,
+            password,
         }),
     })
 }
@@ -372,6 +420,138 @@ async fn drain_sidecar(
     let _ = child.status().await;
 }
 
+/// Random Basic-auth password for one sidecar (~240 bits from the OS RNG).
+/// The sidecar listens on loopback, so without a password any local process
+/// could drive it.
+fn generate_password() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Split `providerID/modelID`. Only the first `/` separates the two, since
+/// model IDs can contain slashes themselves (`openrouter/anthropic/claude`).
+/// A bare model name is rejected on purpose: OpenCode would otherwise fall
+/// back to its own default model, which may be a hosted one, and a "Local AI"
+/// request must go where the user pointed it.
+fn parse_model_ref(model: &str) -> Result<(&str, &str), OpenCodeError> {
+    match model.trim().split_once('/') {
+        Some((provider_id, model_id)) if !provider_id.is_empty() && !model_id.is_empty() => {
+            Ok((provider_id, model_id))
+        }
+        _ => Err(OpenCodeError::InvalidModel(model.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct DataEnvelope<T> {
+    data: T,
+}
+
+#[derive(Deserialize)]
+struct SessionInfo {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct GenerateData {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    message: String,
+}
+
+/// Create a session, generate once, delete the session. Split out from
+/// `OpenCodeSidecar::generate` so tests can point it at a mock server.
+///
+/// A fresh session per request keeps requests from sharing context. If the
+/// returned future is dropped between create and delete, the session is left
+/// behind until the sidecar exits.
+async fn generate_via_session(
+    client: &http_client::Client,
+    base_url: &str,
+    password: &str,
+    working_dir: &Path,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, OpenCodeError> {
+    let (provider_id, model_id) = parse_model_ref(model)?;
+
+    // Deny every permission: OpenCode is an agent with file and shell tools,
+    // and this path only ever wants text back.
+    let create = client
+        .post(format!("{base_url}/api/session"))
+        .basic_auth(SERVER_USERNAME, Some(password))
+        .timeout(timeout)
+        .json(&serde_json::json!({
+            "location": { "directory": working_dir.to_string_lossy() },
+            "model": { "id": model_id, "providerID": provider_id },
+            "permissions": [{ "action": "*", "resource": "*", "effect": "deny" }],
+        }));
+    let session: DataEnvelope<SessionInfo> = send_checked(create)
+        .await?
+        .json()
+        .await
+        .map_err(|err| OpenCodeError::Request(err.to_string()))?;
+    let session_id = session.data.id;
+
+    let generate = client
+        .post(format!("{base_url}/api/session/{session_id}/generate"))
+        .basic_auth(SERVER_USERNAME, Some(password))
+        .timeout(timeout)
+        .json(&serde_json::json!({ "prompt": prompt }));
+    let generated = async {
+        let response: DataEnvelope<GenerateData> = send_checked(generate)
+            .await?
+            .json()
+            .await
+            .map_err(|err| OpenCodeError::Request(err.to_string()))?;
+        Ok::<_, OpenCodeError>(response.data.text)
+    }
+    .await;
+
+    // Best effort: the sidecar goes away with its pool entry, so a failed
+    // delete only leaves one idle session behind.
+    let delete = client
+        .delete(format!("{base_url}/api/session/{session_id}"))
+        .basic_auth(SERVER_USERNAME, Some(password))
+        .timeout(timeout);
+    if let Err(err) = send_checked(delete).await {
+        log::debug!("failed to delete OpenCode session {session_id}: {err}");
+    }
+
+    let text = generated?;
+    if text.trim().is_empty() {
+        return Err(OpenCodeError::EmptyResponse);
+    }
+    Ok(text)
+}
+
+/// Send the request and turn a non-2xx response into an `OpenCodeError`
+/// carrying OpenCode's own `message` (e.g. "Authentication required").
+async fn send_checked(
+    request: http_client::RequestBuilder<'_>,
+) -> Result<http_client::Response, OpenCodeError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|err| OpenCodeError::Request(err.to_string()))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<ErrorBody>(&body)
+        .map(|parsed| parsed.message)
+        .unwrap_or_else(|_| body.chars().take(ERROR_BODY_PREVIEW_CHARS).collect());
+    Err(OpenCodeError::Request(format!("{status}: {message}")))
+}
+
 /// Pool of `OpenCodeSidecar`s keyed by working directory. Cheap to clone;
 /// clones share the same backing map. The internal `parking_lot::Mutex` is
 /// only ever held for synchronous map lookups/inserts (never across an
@@ -445,8 +625,8 @@ mod tests {
 
     #[test]
     fn parses_announcement_with_address_alias() {
-        let ann = OpenCodeAnnouncement::from_line("{\"address\":\"http://127.0.0.1:43123\"}")
-            .unwrap();
+        let ann =
+            OpenCodeAnnouncement::from_line("{\"address\":\"http://127.0.0.1:43123\"}").unwrap();
         assert_eq!(ann.port, 43123);
     }
 
@@ -473,8 +653,8 @@ mod tests {
         // The original regex would have matched the IPv4 octet `127`
         // instead of `43123`; the URL-aware parser must skip past
         // the host's `:` and read after it.
-        let ann = OpenCodeAnnouncement::from_line(r#"{"address":"http://127.0.0.1:43123"}"#)
-            .unwrap();
+        let ann =
+            OpenCodeAnnouncement::from_line(r#"{"address":"http://127.0.0.1:43123"}"#).unwrap();
         assert_eq!(ann.port, 43123);
     }
 
@@ -509,10 +689,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_rejects_empty_command() {
         let result = spawn("", &[], Path::new(".")).await;
-        assert!(matches!(
-            result,
-            Err(OpenCodeError::BinaryNotFound(_))
-        ));
+        assert!(matches!(result, Err(OpenCodeError::BinaryNotFound(_))));
     }
 
     #[cfg(unix)]
@@ -538,5 +715,188 @@ mod tests {
 
         let second = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
         assert!(!Arc::ptr_eq(&first.inner, &second.inner));
+    }
+
+    #[test]
+    fn parse_model_ref_splits_on_first_slash() {
+        assert_eq!(
+            parse_model_ref("ollama/qwen2.5-coder:7b").unwrap(),
+            ("ollama", "qwen2.5-coder:7b")
+        );
+        assert_eq!(
+            parse_model_ref(" openrouter/anthropic/claude ").unwrap(),
+            ("openrouter", "anthropic/claude")
+        );
+    }
+
+    #[test]
+    fn parse_model_ref_rejects_bare_and_empty_halves() {
+        for bad in ["qwen2.5-coder:7b", "", "/model", "provider/", "/"] {
+            assert!(
+                matches!(parse_model_ref(bad), Err(OpenCodeError::InvalidModel(_))),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_passwords_are_long_and_distinct() {
+        let first = generate_password();
+        assert!(first.len() >= 64);
+        assert_ne!(first, generate_password());
+    }
+
+    const TEST_PASSWORD: &str = "test-password";
+    // base64("opencode:test-password")
+    const TEST_BASIC_AUTH: &str = "Basic b3BlbmNvZGU6dGVzdC1wYXNzd29yZA==";
+    const JSON: &str = "application/json";
+
+    async fn run_generate(
+        server: &mockito::ServerGuard,
+        model: &str,
+    ) -> Result<String, OpenCodeError> {
+        generate_via_session(
+            &http_client::Client::new(),
+            &server.url(),
+            TEST_PASSWORD,
+            Path::new("/work/repo"),
+            model,
+            "list files",
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn generate_creates_session_generates_and_deletes() {
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/api/session")
+            .match_header("authorization", TEST_BASIC_AUTH)
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "location": { "directory": "/work/repo" },
+                "model": { "id": "qwen2.5-coder:7b", "providerID": "ollama" },
+                "permissions": [{ "action": "*", "resource": "*", "effect": "deny" }],
+            })))
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"id":"ses_1"}}"#)
+            .create_async()
+            .await;
+        let generate = server
+            .mock("POST", "/api/session/ses_1/generate")
+            .match_header("authorization", TEST_BASIC_AUTH)
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({ "prompt": "list files" }),
+            ))
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"text":"ls -la"}}"#)
+            .create_async()
+            .await;
+        let delete = server
+            .mock("DELETE", "/api/session/ses_1")
+            .match_header("authorization", TEST_BASIC_AUTH)
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let text = run_generate(&server, "ollama/qwen2.5-coder:7b")
+            .await
+            .unwrap();
+
+        assert_eq!(text, "ls -la");
+        create.assert_async().await;
+        generate.assert_async().await;
+        delete.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn generate_failure_surfaces_message_and_still_deletes_session() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/session")
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"id":"ses_2"}}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/session/ses_2/generate")
+            .with_status(503)
+            .with_header("content-type", JSON)
+            .with_body(
+                r#"{"_tag":"ServiceUnavailableError","message":"Free usage limit reached","service":"session generation"}"#,
+            )
+            .create_async()
+            .await;
+        let delete = server
+            .mock("DELETE", "/api/session/ses_2")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let err = run_generate(&server, "opencode/flint-40b-free")
+            .await
+            .unwrap_err();
+
+        match err {
+            OpenCodeError::Request(message) => {
+                assert!(message.contains("503"), "{message}");
+                assert!(message.contains("Free usage limit reached"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        delete.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn unauthorized_create_reports_opencode_message() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/session")
+            .with_status(401)
+            .with_header("content-type", JSON)
+            .with_body(r#"{"_tag":"UnauthorizedError","message":"Authentication required"}"#)
+            .create_async()
+            .await;
+
+        let err = run_generate(&server, "ollama/m").await.unwrap_err();
+
+        assert!(
+            matches!(&err, OpenCodeError::Request(m) if m.contains("Authentication required")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_generated_text_is_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/session")
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"id":"ses_3"}}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/session/ses_3/generate")
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"text":"  \n"}}"#)
+            .create_async()
+            .await;
+        server
+            .mock("DELETE", "/api/session/ses_3")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let err = run_generate(&server, "ollama/m").await.unwrap_err();
+
+        assert!(matches!(err, OpenCodeError::EmptyResponse), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn bare_model_is_rejected_before_any_request() {
+        // No mocks registered: any request would fail the test with a 501.
+        let server = mockito::Server::new_async().await;
+        let err = run_generate(&server, "qwen2.5-coder:7b").await.unwrap_err();
+        assert!(matches!(err, OpenCodeError::InvalidModel(_)), "{err:?}");
     }
 }
