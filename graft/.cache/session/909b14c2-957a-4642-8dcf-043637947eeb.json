@@ -2,7 +2,7 @@
   "lastQuery": "I need you to remove everything upstream-specific from this branch of my fork(mean to resync relevant bits), I have already cleaned up a whole bunch, then remove any scaffolding to do with windows, macos but leave any code that deals with either OS intact, remove any .github-related, or CI-related code or config, scrub anything to do with sentry, and scrub anything changelog related; also remove anything to with telemetry, also scrub any skills or file in general in ./{.claude,.agents} you believe is too much for the rest of our solo-developer fork. \nWhen done, commit + push, and get PR 25 into a mergeable state.",
   "perAgentQuery": {},
   "graftReads": 0,
-  "sourceReads": 7,
+  "sourceReads": 9,
   "savedTokens": 0,
   "injectedPointers": [],
   "nudges": 0,

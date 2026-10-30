@@ -185,9 +185,6 @@ if [[ "$CARGO_PROFILE" == "dev" ]]; then
 else
   CARGO_TARGET_OUTPUT_DIR="$CARGO_TARGET_OUTPUT_ROOT/$CARGO_PROFILE"
 fi
-# NOTE: if you change this path, update the "Clean stale bundle output"
-# steps in .github/workflows/create_release.yml so they continue to wipe
-# stale packages left in the shared Namespace runner cache.
 OUT_DIR="$CARGO_TARGET_OUTPUT_DIR/bundle/linux"
 mkdir -p "$OUT_DIR"
 
@@ -391,16 +388,6 @@ fi
 # If this is being run within a GitHub action, set an output variable with the
 # location of the binary so it can be referenced by subsequent actions, as well
 # as the directory containing all built packages.
-if [ "${GITHUB_ACTIONS}" == "true" ]; then
-  echo "::echo::on"
-  echo "executable_path=$BINARY_PATH" >> "$GITHUB_OUTPUT"
-  echo "debug_executable_path=$DEBUG_EXECUTABLE_PATH" >> "$GITHUB_OUTPUT"
-  echo "packages_dir=$OUT_DIR" >> "$GITHUB_OUTPUT"
-  echo "bundled_resources_dir=${BUNDLED_RESOURCES_DIR:-}" >> "$GITHUB_OUTPUT"
-  echo "settings_schema_path=${SETTINGS_SCHEMA_SOURCE:-}" >> "$GITHUB_OUTPUT"
-  echo "::echo::off"
-fi
-
 # Make sure a variety of environment variables are available in downstream scripts.
 export \
   WORKSPACE_ROOT_DIR \

@@ -46,9 +46,7 @@ configure_musl_toolchain() {
   fi
 
   local default_musl_cross_root
-  if [[ -z "${WARP_MUSL_CROSS_ROOT:-}" && "${GITHUB_ACTIONS:-}" == "true" && -n "${RUNNER_TEMP:-}" ]]; then
-    default_musl_cross_root="$RUNNER_TEMP/warp-musl-cross"
-  elif [[ -n "${HOME:-}" ]]; then
+  if [[ -n "${HOME:-}" ]]; then
     default_musl_cross_root="${XDG_CACHE_HOME:-$HOME/.cache}/warp-musl-cross"
   else
     default_musl_cross_root="${TMPDIR:-/tmp}/warp-musl-cross-${UID:-$(id -u)}"
