@@ -1,6 +1,6 @@
-use warp_core::channel::ChannelState;
 use std::sync::Arc;
 use std::time::Duration;
+use warp_core::channel::ChannelState;
 
 use async_channel::Sender;
 pub use cloud_object_client::ObjectUpdateMessage;
@@ -397,12 +397,12 @@ impl SingletonEntity for Listener {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::server_api::object::MockObjectClient;
+    use cloud_object_client::MockObjectClient;
     use serial_test::serial;
     use std::sync::Arc;
     use warp_core::{
-        channel::{Channel, ChannelConfig, OzConfig, ServicesMode, WarpServerConfig},
         AppId,
+        channel::{Channel, ChannelConfig, OzConfig, ServicesMode, WarpServerConfig},
     };
     use warpui::App;
 

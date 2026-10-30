@@ -103,6 +103,7 @@ fn provider_key_controls_key_connected_callout() {
                 [&llm],
                 "",
                 None,
+                None,
                 &scope,
                 ctx,
             )
@@ -125,6 +126,7 @@ fn provider_key_controls_key_connected_callout() {
                 LLMPreferences::as_ref(ctx),
                 [&llm],
                 "",
+                None,
                 None,
                 &scope,
                 ctx,

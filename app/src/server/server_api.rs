@@ -1800,6 +1800,7 @@ mod tests;
 mod fully_local_tests {
     use super::*;
     use crate::ai::predict::generate_ai_input_suggestions::GenerateAIInputSuggestionsRequest;
+    use crate::workspaces::user_workspaces::TeamlessScopeForTest;
 
     #[test]
     fn warp_api_is_always_disabled() {
@@ -1837,9 +1838,10 @@ mod fully_local_tests {
     fn ai_input_suggestions_are_blocked_in_fully_local() {
         let api = ServerApi::new_for_test();
 
-        let result = block_on(
-            api.generate_ai_input_suggestions(&GenerateAIInputSuggestionsRequest::default()),
-        );
+        let result = block_on(api.generate_ai_input_suggestions(
+            &GenerateAIInputSuggestionsRequest::default(),
+            RequestTeamScope::from_scope(&TeamlessScopeForTest),
+        ));
 
         assert!(
             matches!(result, Err(AIApiError::Other(_))),

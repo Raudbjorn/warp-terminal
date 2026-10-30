@@ -3,6 +3,11 @@ use warp_core::SessionId;
 use warp_util::standardized_path::StandardizedPath;
 use warpui_core::App;
 
+#[cfg(not(target_family = "wasm"))]
+use warp_core::channel::Channel;
+
+#[cfg(not(target_family = "wasm"))]
+use super::version_is_compatible_for_channel;
 use super::{
     HostRequestError, PendingHostRequest, RemoteServerManager, RemoteServerManagerEvent,
     RipgrepSearchParams,
@@ -106,4 +111,50 @@ fn start_ripgrep_search_without_connected_host_resolves_immediately() {
             Err(HostRequestError::AllSessionsDisconnected)
         ));
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn oss_without_client_version_rejects_production_remote_server_version() {
+    assert!(!version_is_compatible_for_channel(
+        Channel::Oss,
+        None,
+        "v0.2026.04.29.08.57.stable_01"
+    ));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn local_without_client_version_rejects_production_remote_server_version() {
+    assert!(!version_is_compatible_for_channel(
+        Channel::Local,
+        None,
+        "v0.2026.04.29.08.57.stable_01"
+    ));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn matching_release_versions_are_compatible() {
+    assert!(version_is_compatible_for_channel(
+        Channel::Stable,
+        Some("v0.2026.04.29.08.57.stable_01"),
+        "v0.2026.04.29.08.57.stable_01"
+    ));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn mismatched_release_versions_are_incompatible() {
+    assert!(!version_is_compatible_for_channel(
+        Channel::Stable,
+        Some("v0.2026.04.29.08.57.stable_01"),
+        "v0.2026.04.30.08.57.stable_01"
+    ));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn empty_client_and_server_versions_are_compatible() {
+    assert!(version_is_compatible_for_channel(Channel::Local, None, ""));
 }

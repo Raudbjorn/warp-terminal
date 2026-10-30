@@ -431,6 +431,7 @@ fn encode_tool_call(tool: WarpToolCall) -> api::message::tool_call::Tool {
                 .map(|file| tool_call::apply_file_diffs::NewFile {
                     file_path: file.file_path,
                     content: file.content,
+                    ..Default::default()
                 })
                 .collect(),
             deleted_files: deleted_files
@@ -453,6 +454,7 @@ fn encode_tool_call(tool: WarpToolCall) -> api::message::tool_call::Tool {
                             old: hunk.old.unwrap_or_default(),
                             new: hunk.new.unwrap_or_default(),
                             post_context: hunk.post_context.unwrap_or_default(),
+                            ..Default::default()
                         })
                         .collect(),
                 })
@@ -475,6 +477,7 @@ fn encode_tool_call(tool: WarpToolCall) -> api::message::tool_call::Tool {
             tool_call::Tool::ReadMcpResource(tool_call::ReadMcpResource {
                 uri,
                 server_id: server_id.unwrap_or_default(),
+                ..Default::default()
             })
         }
         WarpToolCall::CallMcpTool {
@@ -487,6 +490,7 @@ fn encode_tool_call(tool: WarpToolCall) -> api::message::tool_call::Tool {
                 args.unwrap_or_else(|| Value::Object(Default::default())),
             )),
             server_id: server_id.unwrap_or_default(),
+            ..Default::default()
         }),
     }
 }

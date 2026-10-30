@@ -259,6 +259,7 @@ impl TuiModelMenuModel {
             preferences.get_base_llm_choices_for_agent_mode(&scope, ctx),
             &query,
             None,
+            Some(self.terminal_view_id),
             &scope,
             ctx,
         );

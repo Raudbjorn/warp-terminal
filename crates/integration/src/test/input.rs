@@ -129,7 +129,6 @@ pub fn test_inline_model_selector_restores_prompt_on_model_selection() -> Builde
     // selector only lists custom-endpoint models. Register one (and wait for it
     // to load) so there is a model to actually select — searching for it still
     // parks the typed prompt, which is what this test asserts gets restored.
-    FeatureFlag::CustomInferenceEndpoints.set_enabled(true);
 
     const CONFIG_KEY: &str = "11111111-2222-3333-4444-555555555555";
     let original_prompt = "summarize this output without losing details";

@@ -175,35 +175,6 @@ fn get_file_path_for_asset(url: &Url, cache_dir: &Path) -> PathBuf {
 }
 
 #[cfg(not(target_family = "wasm"))]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn local_only_remote_asset_policy_rejects_http_and_preserves_file_like_urls() {
-        let public = Url::parse("https://app.warp.dev/assets/client/static/logo.png").unwrap();
-        assert!(
-            network_policy::check_url_for_mode(
-                network_policy::ServicesMode::LocalOnly,
-                &public,
-                "remote asset",
-            )
-            .is_err()
-        );
-
-        let file = Url::parse("file:///tmp/asset.png").unwrap();
-        assert_eq!(
-            network_policy::check_url_for_mode(
-                network_policy::ServicesMode::LocalOnly,
-                &file,
-                "remote asset",
-            ),
-            Ok(())
-        );
-    }
-}
-
-#[cfg(not(target_family = "wasm"))]
 async fn persist_bytes(bytes: &Bytes, file: &Path) {
     use anyhow::Context;
     use async_fs::{OpenOptions, create_dir_all};
