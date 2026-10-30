@@ -50,7 +50,6 @@ impl ChannelState {
                 services_mode: ServicesMode::Online,
                 telemetry_config: None,
                 autoupdate_config: None,
-                crash_reporting_config: None,
                 mcp_static_config: None,
             },
         }
@@ -216,12 +215,11 @@ impl ChannelState {
         !Self::is_local_only() && CHANNEL_STATE.lock().config.telemetry_config.is_some()
     }
 
-    /// Returns whether this build has a crash reporting config and can therefore
-    /// ship crash reports. Builds like OpenWarp intentionally ship with
-    /// `crash_reporting_config: None`, in which case UI that controls crash
-    /// reporting should be hidden since the toggle has no effect.
+    /// Always `false` in this fork: the Sentry crash-reporting subsystem has been
+    /// removed, so there is nowhere to ship crash reports. Callers use this to hide
+    /// UI that controls crash reporting, since the toggle has no effect.
     pub fn is_crash_reporting_available() -> bool {
-        !Self::is_local_only() && CHANNEL_STATE.lock().config.crash_reporting_config.is_some()
+        false
     }
 
     pub fn releases_base_url() -> Cow<'static, str> {
@@ -388,16 +386,6 @@ impl ChannelState {
     #[cfg(not(feature = "test-util"))]
     pub fn app_version() -> Option<&'static str> {
         option_env!("GIT_RELEASE_TAG")
-    }
-
-    pub fn sentry_url() -> Cow<'static, str> {
-        CHANNEL_STATE
-            .lock()
-            .config
-            .crash_reporting_config
-            .as_ref()
-            .map(|crc| crc.sentry_url.clone())
-            .unwrap_or_default()
     }
 
     pub fn show_autoupdate_menu_items() -> bool {

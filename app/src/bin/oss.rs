@@ -19,7 +19,6 @@ fn main() -> Result<()> {
             oz_config: OzConfig::local_only(),
             services_mode: ServicesMode::LocalOnly,
             telemetry_config: None,
-            crash_reporting_config: None,
             autoupdate_config: None,
             mcp_static_config: None,
         },

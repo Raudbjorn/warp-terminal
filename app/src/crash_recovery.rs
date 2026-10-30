@@ -20,7 +20,7 @@ lazy_static! {
     static ref IS_CRASH_RECOVERY_PROCESS_RUNNING: RwLock<bool> = RwLock::new(false);
 }
 
-#[cfg_attr(not(feature = "crash_reporting"), allow(dead_code))]
+#[allow(dead_code)]
 pub fn is_crash_recovery_process_running() -> bool {
     *IS_CRASH_RECOVERY_PROCESS_RUNNING.read()
 }
@@ -108,10 +108,6 @@ impl CrashRecoveryProcess {
             report_error!(
                 "Failed to render a frame {NUM_DRAW_ERRORS_BEFORE_EXITING} times in a row; exiting..."
             );
-
-            // Uninitialize sentry (ensuring any remaining events get flushed) before hard exiting.
-            #[cfg(feature = "crash_reporting")]
-            crate::crash_reporting::uninit_sentry();
 
             std::process::exit(1);
         }

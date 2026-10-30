@@ -4,10 +4,7 @@ pub(super) fn is_online_services_only(feature: FeatureFlag) -> bool {
     matches!(
         feature,
         FeatureFlag::Changelog
-            | FeatureFlag::CocoaSentry
-            | FeatureFlag::CrashReporting
             | FeatureFlag::Autoupdate
-            | FeatureFlag::LogExpensiveFramesInSentry
             | FeatureFlag::WithSandboxTelemetry
             | FeatureFlag::RecordAppActiveEvents
             | FeatureFlag::CloudObjects
