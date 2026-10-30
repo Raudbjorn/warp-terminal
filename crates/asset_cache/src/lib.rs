@@ -81,12 +81,25 @@ async fn fetch_file_to_memory(url: Url) -> Result<Bytes, anyhow::Error> {
 
     cfg_if::cfg_if! {
         if #[cfg(target_family = "wasm")] {
+            // The browser follows redirects inside `fetch`, so targets can't be re-checked here.
             let response = reqwest::get(url).await?;
         } else {
             // On non-web platforms, reqwest expects that it is operating within
             // a Tokio-compatible runtime, so use async-compat to wrap the call
             // so reqwest's expectations are met.
-            let response = async_compat::Compat::new(async move { reqwest::get(url).await }).await?;
+            //
+            // This uses a plain reqwest client rather than `http_client::Client` so that
+            // Warp-specific headers aren't sent to arbitrary asset hosts, but still
+            // validates every redirect hop against the network policy.
+            let response = async_compat::Compat::new(async move {
+                reqwest::Client::builder()
+                    .redirect(http_client::network_policy_redirect_policy())
+                    .build()?
+                    .get(url)
+                    .send()
+                    .await
+            })
+            .await?;
         }
     }
     let content = response.error_for_status()?.bytes().await?;

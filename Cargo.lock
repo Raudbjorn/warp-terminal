@@ -1189,6 +1189,7 @@ dependencies = [
  "bytes",
  "cfg-if",
  "futures",
+ "http_client",
  "log",
  "network_policy",
  "reqwest",

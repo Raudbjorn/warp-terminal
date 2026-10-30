@@ -53,6 +53,10 @@ pub mod headers {
 /// list of `Name:Value` pairs, where each pair is split on the first colon.
 const EXTRA_HTTP_HEADERS_ENV_VAR: &str = "WARP_EXTRA_HTTP_HEADERS";
 
+/// Maximum number of redirects to follow, matching reqwest's default policy.
+#[cfg(not(target_family = "wasm"))]
+const MAX_REDIRECTS: usize = 10;
+
 /// A wrapper around a `reqwest::Client` to execute requests. Returns a custom `RequestBuilder` type
 /// that ensures any call to the underlying `reqwest::Client` are properly adapted so that they can
 /// run outside of a Tokio context.
@@ -124,7 +128,10 @@ pub struct Request {
 pub enum Error {
     #[error(transparent)]
     NetworkPolicyDenied(#[from] NetworkPolicyDenied),
-    #[error(transparent)]
+    // Not `transparent`: that would delegate `source()` to the reqwest error's
+    // own source, hiding the `reqwest::Error` from callers that walk the chain
+    // and downcast (e.g. `is_connect()` checks in the sync queue and telemetry).
+    #[error("HTTP request failed")]
     Reqwest(#[from] reqwest::Error),
 }
 
@@ -178,7 +185,9 @@ impl Client {
         // default reqwest policy follows up to 10 redirects without
         // re-checking the URL, which would let a loopback URL that passes
         // the initial check redirect to a public host and bypass LocalOnly
-        // restrictions. The closure is consulted on every hop.
+        // restrictions. The closure is consulted on every hop. On wasm the
+        // browser follows redirects inside `fetch`, so there is nothing to hook.
+        #[cfg(not(target_family = "wasm"))]
         let client_builder = client_builder.redirect(network_policy_redirect_policy());
         client_builder.build().map(|client| Self {
             wrapped: client,
@@ -231,35 +240,60 @@ impl Client {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.get(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.get(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     pub fn post<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.post(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.post(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     pub fn put<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.put(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.put(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     pub fn patch<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.patch(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.patch(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     pub fn delete<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.delete(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.delete(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     /// Returns the IAP bearer token to attach to a request targeting
@@ -672,12 +706,19 @@ fn denied_eventsource_stream()
 /// `check_url` could redirect to a public host and bypass LocalOnly
 /// restrictions. This policy refuses any redirect whose target is denied by
 /// the policy in effect at request time.
-fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
+///
+/// Denied redirects fail the request with the `NetworkPolicyDenied` as the
+/// source, rather than returning the 3xx response as if it were the result.
+/// Also keeps reqwest's default redirect limit, which a custom policy replaces.
+#[cfg(not(target_family = "wasm"))]
+pub fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        if network_policy::check_url(attempt.url(), "redirect target").is_ok() {
-            attempt.follow()
-        } else {
-            attempt.stop()
+        if attempt.previous().len() >= MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        match network_policy::check_url(attempt.url(), "redirect target") {
+            Ok(()) => attempt.follow(),
+            Err(denied) => attempt.error(denied),
         }
     })
 }
@@ -954,6 +995,77 @@ mod tests {
             let url = reqwest::Url::parse("http://localhost:8080").unwrap();
             assert_eq!(network_policy::check_url(&url, "http request"), Ok(()));
         });
+    }
+
+    /// Serves `connections` HTTP responses on loopback, each a 302 to
+    /// `location(port)`, and returns the port.
+    fn spawn_redirect_server(connections: usize, location: fn(u16) -> String) -> u16 {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(connections) {
+                let Ok(mut stream) = stream else { return };
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    location(port)
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn reqwest_error_stays_in_source_chain() {
+        let reqwest_err = reqwest::Client::new().get("http://").build().unwrap_err();
+        let err = anyhow::Error::from(Error::from(reqwest_err));
+        assert!(
+            err.chain()
+                .any(|cause| cause.downcast_ref::<reqwest::Error>().is_some()),
+            "reqwest::Error should be reachable by walking the chain"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_only_fails_loopback_redirect_to_public_host() {
+        run_with_services_mode_async(network_policy::ServicesMode::LocalOnly, async {
+            let port = spawn_redirect_server(1, |_| "https://app.warp.dev/leak".to_string());
+            let client = new_test_client();
+            let err = match client.get(format!("http://127.0.0.1:{port}/")).send().await {
+                Ok(response) => panic!("denied redirect returned {}", response.status()),
+                Err(err) => err,
+            };
+
+            let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(&err);
+            let mut denied = false;
+            while let Some(err) = cause {
+                denied |= err.is::<NetworkPolicyDenied>();
+                cause = err.source();
+            }
+            assert!(denied, "expected NetworkPolicyDenied in chain: {err:?}");
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_loop_is_cut_off_at_limit() {
+        run_with_services_mode_async(network_policy::ServicesMode::LocalOnly, async {
+            let port = spawn_redirect_server(MAX_REDIRECTS + 1, |port| {
+                format!("http://127.0.0.1:{port}/")
+            });
+            let client = new_test_client();
+            let err = match client.get(format!("http://127.0.0.1:{port}/")).send().await {
+                Ok(response) => panic!("redirect loop returned {}", response.status()),
+                Err(Error::Reqwest(err)) => err,
+                Err(err) => panic!("unexpected error: {err:?}"),
+            };
+            assert!(err.is_redirect(), "expected redirect error: {err:?}");
+        })
+        .await
     }
 
     #[tokio::test(flavor = "current_thread")]

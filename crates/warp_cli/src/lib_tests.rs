@@ -64,6 +64,30 @@ fn disabled_subcommand_skips_global_option_values() {
 }
 
 #[test]
+fn global_options_with_values_covers_value_taking_top_level_options() {
+    // `Args` has an inherent `command()` accessor, so name the trait explicitly.
+    let mut command = <Args as clap::CommandFactory>::command();
+    command.build();
+    for arg in command.get_arguments().filter(|arg| !arg.is_positional()) {
+        if !arg.get_num_args().is_some_and(|range| range.takes_values()) {
+            continue;
+        }
+        let names = arg
+            .get_long()
+            .map(|long| format!("--{long}"))
+            .into_iter()
+            .chain(arg.get_short().map(|short| format!("-{short}")));
+        for name in names {
+            assert!(
+                GLOBAL_OPTIONS_WITH_VALUES.contains(&name.as_str()),
+                "`{name}` takes a value but is missing from GLOBAL_OPTIONS_WITH_VALUES, \
+                 so `disabled_subcommand` would mistake its value for the subcommand"
+            );
+        }
+    }
+}
+
+#[test]
 fn disabled_subcommand_detects_help_target_and_aliases() {
     assert_eq!(
         Some("agent"),
