@@ -124,7 +124,9 @@ pub struct Request {
 pub enum Error {
     #[error(transparent)]
     NetworkPolicyDenied(#[from] NetworkPolicyDenied),
-    #[error(transparent)]
+    // Not `transparent`: that forwards `source()` to the inner error's source, which drops the
+    // `reqwest::Error` from the chain. Callers walk the chain looking for it (e.g. `is_connect`).
+    #[error("{0}")]
     Reqwest(#[from] reqwest::Error),
 }
 
@@ -173,13 +175,11 @@ impl Client {
     }
 
     pub fn from_client_builder(client_builder: reqwest::ClientBuilder) -> reqwest::Result<Self> {
-        // Wrap the user's builder with a custom redirect policy that
-        // re-validates each redirect target against network_policy. The
-        // default reqwest policy follows up to 10 redirects without
-        // re-checking the URL, which would let a loopback URL that passes
-        // the initial check redirect to a public host and bypass LocalOnly
-        // restrictions. The closure is consulted on every hop.
-        let client_builder = client_builder.redirect(network_policy_redirect_policy());
+        // Re-validate every redirect target against the network policy; the default reqwest policy
+        // would let a loopback URL that passes the initial check redirect to a public host. wasm
+        // has no redirect policy to set, since the browser follows redirects itself.
+        #[cfg(not(target_family = "wasm"))]
+        let client_builder = client_builder.redirect(network_policy::redirect_policy());
         client_builder.build().map(|client| Self {
             wrapped: client,
             before_request_sent: None,
@@ -666,21 +666,6 @@ fn denied_eventsource_stream()
         yield Err(reqwest_eventsource::Error::StreamEnded);
     }
 }
-/// Custom reqwest redirect policy that re-validates each redirect target
-/// against the network policy. The default reqwest policy follows up to 10
-/// hops without consulting the URL — a loopback URL that passes the initial
-/// `check_url` could redirect to a public host and bypass LocalOnly
-/// restrictions. This policy refuses any redirect whose target is denied by
-/// the policy in effect at request time.
-fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        if network_policy::check_url(attempt.url(), "redirect target").is_ok() {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    })
-}
 
 /// An error returned from `Response::error_for_status` that includes response metadata.
 #[derive(Debug)]
@@ -943,6 +928,106 @@ mod tests {
             assert!(!hook_called.load(std::sync::atomic::Ordering::SeqCst));
         })
         .await
+    }
+
+    /// Serves `302` responses on a loopback port, with the `Location` header chosen by `location`
+    /// from the port the server is listening on. Returns that port.
+    fn spawn_redirect_server(location: impl Fn(u16) -> String + Send + 'static) -> u16 {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let _ = stream.read(&mut [0; 1024]);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    location(port)
+                );
+            }
+        });
+        port
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_only_rejects_redirect_to_public_host() {
+        run_with_services_mode_async(network_policy::ServicesMode::LocalOnly, async {
+            let port = spawn_redirect_server(|_| "https://app.warp.dev/graphql/v2".to_owned());
+            let client = new_test_client();
+            let request = client
+                .get(format!("http://127.0.0.1:{port}/start"))
+                .build()
+                .unwrap();
+
+            let err = match client.execute(request).await {
+                Ok(response) => panic!(
+                    "redirect to a public host should be denied, got {}",
+                    response.status()
+                ),
+                Err(err) => err,
+            };
+
+            let err = anyhow::Error::from(err);
+            assert!(
+                err.chain()
+                    .any(|cause| cause.is::<network_policy::NetworkPolicyDenied>()),
+                "unexpected error: {err:#}"
+            );
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn redirect_loops_are_bounded() {
+        run_with_services_mode_async(network_policy::ServicesMode::Online, async {
+            let port = spawn_redirect_server(|port| format!("http://127.0.0.1:{port}/loop"));
+            let client = new_test_client();
+            let request = client
+                .get(format!("http://127.0.0.1:{port}/loop"))
+                .build()
+                .unwrap();
+
+            let err = match client.execute(request).await {
+                Ok(response) => panic!("redirect loop should fail, got {}", response.status()),
+                Err(err) => err,
+            };
+
+            assert!(
+                matches!(&err, Error::Reqwest(err) if err.is_redirect()),
+                "unexpected error: {err:?}"
+            );
+        })
+        .await
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reqwest_error_stays_in_the_source_chain() {
+        // Bind then drop a listener to get a loopback port that refuses connections.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client = new_test_client();
+        let request = client
+            .get(format!("http://127.0.0.1:{port}/"))
+            .build()
+            .unwrap();
+
+        let err = match client.execute(request).await {
+            Ok(_) => panic!("connection to a closed port should fail"),
+            Err(err) => anyhow::Error::from(err),
+        };
+
+        // Callers such as the sync queue and telemetry walk the chain for `is_connect`.
+        assert!(
+            err.chain().any(|cause| cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(reqwest::Error::is_connect)),
+            "unexpected error: {err:#}"
+        );
     }
 
     #[test]

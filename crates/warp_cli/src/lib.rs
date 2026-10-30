@@ -249,12 +249,7 @@ impl Args {
         let mut command = <Args as CommandFactory>::command();
 
         if ChannelState::is_local_only() {
-            command = command.about("Local terminal CLI").long_about(
-                "Local terminal CLI for commands that do not require Warp online services.",
-            );
-            for subcommand in LOCAL_ONLY_HIDDEN_SUBCOMMANDS {
-                command = command.mut_subcommand(subcommand, |c| c.hide(true));
-            }
+            command = apply_local_only_help(command);
         }
 
         // Hide the environment subcommands and --environment flags from help text
@@ -444,11 +439,15 @@ const LOCAL_ONLY_DISABLED_SUBCOMMANDS: &[&str] = &[
     "artifact",
 ];
 
+/// Subcommands hidden from `--help` in local-only mode. These are passed to
+/// [`clap::Command::mut_subcommand`], which panics on any name that isn't a subcommand's canonical
+/// name, so aliases must not be listed here. Notably `task` is an alias of `run`, which hides it
+/// too. It is still in [`LOCAL_ONLY_DISABLED_SUBCOMMANDS`], since that list is matched against raw
+/// argv.
 const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
     "agent",
     "environment",
     "run",
-    "task",
     "model",
     "login",
     "logout",
@@ -461,6 +460,18 @@ const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
     "harness-support",
     "artifact",
 ];
+
+/// Rewrites the help text of `command` for local-only mode, hiding the subcommands that need
+/// Warp online services.
+fn apply_local_only_help(mut command: clap::Command) -> clap::Command {
+    command = command
+        .about("Local terminal CLI")
+        .long_about("Local terminal CLI for commands that do not require Warp online services.");
+    for subcommand in LOCAL_ONLY_HIDDEN_SUBCOMMANDS {
+        command = command.mut_subcommand(subcommand, |c| c.hide(true));
+    }
+    command
+}
 
 #[cfg(not(target_family = "wasm"))]
 const GLOBAL_OPTIONS_WITH_VALUES: &[&str] = &[

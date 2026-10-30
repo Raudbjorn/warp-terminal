@@ -86,7 +86,18 @@ async fn fetch_file_to_memory(url: Url) -> Result<Bytes, anyhow::Error> {
             // On non-web platforms, reqwest expects that it is operating within
             // a Tokio-compatible runtime, so use async-compat to wrap the call
             // so reqwest's expectations are met.
-            let response = async_compat::Compat::new(async move { reqwest::get(url).await }).await?;
+            //
+            // `reqwest::get` would use the default redirect policy, which follows redirects
+            // without re-checking them against the network policy.
+            let response = async_compat::Compat::new(async move {
+                reqwest::Client::builder()
+                    .redirect(network_policy::redirect_policy())
+                    .build()?
+                    .get(url)
+                    .send()
+                    .await
+            })
+            .await?;
         }
     }
     let content = response.error_for_status()?.bytes().await?;
@@ -110,34 +121,6 @@ fn get_file_path_for_asset(url: &Url, cache_dir: &Path) -> PathBuf {
 }
 
 #[cfg(not(target_family = "wasm"))]
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn local_only_remote_asset_policy_rejects_http_and_preserves_file_like_urls() {
-        let public = Url::parse("https://app.warp.dev/assets/client/static/logo.png").unwrap();
-        assert!(
-            network_policy::check_url_for_mode(
-                network_policy::ServicesMode::LocalOnly,
-                &public,
-                "remote asset",
-            )
-            .is_err()
-        );
-
-        let file = Url::parse("file:///tmp/asset.png").unwrap();
-        assert_eq!(
-            network_policy::check_url_for_mode(
-                network_policy::ServicesMode::LocalOnly,
-                &file,
-                "remote asset",
-            ),
-            Ok(())
-        );
-    }
-}
-
 async fn persist_bytes(bytes: &Bytes, file: &Path) {
     use async_fs::{OpenOptions, create_dir_all};
     use futures::AsyncWriteExt;
@@ -209,5 +192,70 @@ async fn fetch_asset_from_url(url: Url, file: Option<PathBuf>) -> Result<Bytes> 
         }
         // Otherwise, fetch the bytes from the url.
         _ => fetch_file_and_persist_bytes(url, file).await,
+    }
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn local_only_remote_asset_policy_rejects_http_and_preserves_file_like_urls() {
+        let public = Url::parse("https://app.warp.dev/assets/client/static/logo.png").unwrap();
+        assert!(
+            network_policy::check_url_for_mode(
+                network_policy::ServicesMode::LocalOnly,
+                &public,
+                "remote asset",
+            )
+            .is_err()
+        );
+
+        let file = Url::parse("file:///tmp/asset.png").unwrap();
+        assert_eq!(
+            network_policy::check_url_for_mode(
+                network_policy::ServicesMode::LocalOnly,
+                &file,
+                "remote asset",
+            ),
+            Ok(())
+        );
+    }
+
+    /// Serves a single `302` to `location` on a loopback port and returns the port.
+    fn spawn_redirect_server(location: &'static str) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.read(&mut [0; 1024]);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn local_only_fetch_rejects_redirect_to_public_host() {
+        let port = spawn_redirect_server("https://app.warp.dev/assets/logo.png");
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/logo.png")).unwrap();
+
+        // The only test in this crate that changes the global services mode.
+        network_policy::set_services_mode(network_policy::ServicesMode::LocalOnly);
+        let result = futures::executor::block_on(fetch_file_to_memory(url));
+        network_policy::set_services_mode(network_policy::ServicesMode::Online);
+
+        let err = result.expect_err("redirect to a public host should be denied");
+        assert!(
+            err.chain()
+                .any(|cause| cause.is::<network_policy::NetworkPolicyDenied>()),
+            "unexpected error: {err:#}"
+        );
     }
 }
