@@ -67,6 +67,14 @@ impl SettingsPaneManager {
         }
     }
 
+    #[cfg(test)]
+    pub fn set_locator_for_test(&mut self, window_id: WindowId, locator: PaneViewLocator) {
+        let Some(data) = self.panes.get_mut(&window_id) else {
+            panic!("Window should have corresponding settings view");
+        };
+        data.locator = Some(locator);
+    }
+
     pub fn deregister_pane(
         &mut self,
         window_id: &WindowId,

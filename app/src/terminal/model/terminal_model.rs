@@ -52,7 +52,9 @@ use super::lifecycle::{
 };
 use super::secrets::{RespectObfuscatedSecrets, SecretAndHandle};
 use super::selection::ScrollDelta;
-use super::session::{BootstrapSessionType, InBandCommandOutputReceiver, SessionId};
+use super::session::{
+    BootstrapSessionType, InBandCommandOutputReceiver, IsSSHWrapperSession, SessionId,
+};
 use super::{Secret, SecretHandle};
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::SerializedBlockListItem;
@@ -1699,6 +1701,9 @@ impl TerminalModel {
 
     pub fn has_pending_ssh_session(&self) -> bool {
         self.pending_ssh_wrapper_session.is_some()
+            || self.pending_session_info.as_ref().is_some_and(|info| {
+                matches!(info.is_ssh_wrapper_session, IsSSHWrapperSession::Yes { .. })
+            })
     }
 
     pub fn pending_shell_type(&self) -> Option<ShellType> {
@@ -2119,6 +2124,47 @@ impl TerminalModel {
 
     pub fn get_pending_session_info(&self) -> &Option<SessionInfo> {
         &self.pending_session_info
+    }
+
+    /// Converts a pending SSH session into a degraded bootstrapped session.
+    ///
+    /// This is used when Warp's bootstrap script fails after the remote shell
+    /// has already emitted `InitShell`. At that point the underlying SSH PTY is
+    /// alive, and keeping the block list in `NotBootstrapped` prevents the user
+    /// from interacting with it at all.
+    pub fn recover_failed_ssh_bootstrap(&mut self) -> Option<BootstrappedEvent> {
+        let pending_session_info = self.pending_session_info.take()?;
+        if !matches!(
+            pending_session_info.is_ssh_wrapper_session,
+            IsSSHWrapperSession::Yes { .. }
+        ) {
+            self.pending_session_info = Some(pending_session_info);
+            return None;
+        }
+
+        self.block_list.bootstrapped(BootstrappedValue::default());
+        self.block_list
+            .early_output_mut()
+            .init_session(&pending_session_info);
+        self.block_list.prompt_only_precmd(PromptMetadata {
+            ps1: Some(String::new()),
+            ps1_is_encoded: Some(false),
+            session_id: Some(pending_session_info.session_id.as_u64()),
+            ..Default::default()
+        });
+
+        let spawning_command = pending_session_info
+            .subshell_info
+            .as_ref()
+            .map(|subshell_info| subshell_info.spawning_command.clone())
+            .unwrap_or_else(|| self.block_list.active_block().command_to_string());
+
+        Some(BootstrappedEvent {
+            spawning_command,
+            session_info: Box::new(pending_session_info),
+            restored_block_commands: self.restored_block_commands(),
+            rcfiles_duration_seconds: None,
+        })
     }
 
     pub fn is_term_mode_set(&self, mode: TermMode) -> bool {

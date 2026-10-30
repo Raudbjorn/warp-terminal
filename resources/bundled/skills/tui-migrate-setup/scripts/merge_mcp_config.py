@@ -155,7 +155,7 @@ def _detect_wrapper(document: dict[str, Any]) -> tuple[tuple[str, ...], dict[str
     if matches:
         return matches[0]
 
-    # Warp accepts an unwrapped map. Require object-valued entries so unrelated
+    # Accept unwrapped migration input. Require object-valued entries so unrelated
     # application JSON does not silently become an MCP config.
     if all(isinstance(value, dict) for value in document.values()):
         return (), document
@@ -349,11 +349,13 @@ def build_plan(source: ParsedConfig, destination: ParsedConfig) -> MergePlan:
         merged_servers[name] = copy.deepcopy(value)
 
     if destination.exists:
-        result_document = copy.deepcopy(destination.document)
-        wrapper_path = destination.wrapper_path
+        result_document = (
+            copy.deepcopy(destination.document) if destination.wrapper_path else {}
+        )
+        wrapper_path = destination.wrapper_path or ("mcpServers",)
     else:
         result_document = {}
-        wrapper_path = source.wrapper_path
+        wrapper_path = source.wrapper_path or ("mcpServers",)
     _set_path(result_document, wrapper_path, merged_servers)
 
     permission_update_required = (
@@ -372,7 +374,8 @@ def build_plan(source: ParsedConfig, destination: ParsedConfig) -> MergePlan:
         skipped_sensitive_count=skipped_sensitive,
         skipped_reinstall_count=skipped_reinstall,
         result_server_count=len(merged_servers),
-        content_change_required=bool(additions),
+        content_change_required=bool(additions)
+        or (destination.exists and result_document != destination.document),
         permission_update_required=permission_update_required,
     )
 

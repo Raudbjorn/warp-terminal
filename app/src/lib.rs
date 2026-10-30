@@ -11,6 +11,7 @@ mod auth;
 mod autoupdate;
 mod banner;
 mod billing;
+mod browser;
 mod changelog_model;
 mod chip_configurator;
 mod cloud_object;
@@ -39,11 +40,13 @@ mod external_secrets;
 mod font_fallback;
 mod global_resource_handles;
 mod gpu_state;
+mod i18n;
 mod input_classifier;
 mod interval_timer;
 mod linear;
-#[cfg(feature = "local_fs")]
 mod local_control;
+#[cfg(not(target_family = "wasm"))]
+mod local_multi_agent;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod login_item;
 mod menu;
@@ -54,6 +57,10 @@ mod notification;
 mod palette;
 mod persistence;
 mod platform;
+#[cfg(feature = "plugin_host")]
+mod plugin;
+#[cfg(feature = "plugin_host")]
+pub use plugin::{PLUGIN_HOST_FLAG, run_plugin_host};
 mod prefix;
 #[cfg(target_os = "macos")]
 mod preview_config_migration;
@@ -185,8 +192,6 @@ use watcher::HomeDirectoryWatcher;
 use crate::ai::active_agent_views_model::ActiveAgentViewsModel;
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::aws_credentials::AwsCredentialRefresher as _;
-#[cfg(not(target_family = "wasm"))]
-use crate::ai::geap_credentials::GeapCredentialRefresher as _;
 use crate::ai::mcp::{FileBasedMCPManager, FileMCPWatcher};
 use crate::uri::web_intent_parser::maybe_rewrite_web_url_to_intent;
 use crate::view_components::DismissibleToast;
@@ -778,6 +783,26 @@ fn apply_scroll_multiplier(event: &mut Event, app: &AppContext) {
 /// parser and therefore do not require a separate mode flag.
 #[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
 pub fn run() -> Result<()> {
+    // POSIX locale fallback: When LANG/LC_* are all unset, provide C/Rust libraries
+    // (chrono number formatting, libc strftime, etc.) with a reasonable UTF-8 default.
+    // Intentionally skipped on Windows — Windows API (`GetUserPreferredUILanguages`) is
+    // the true source of UI locale; forcing `LANG=en_US.UTF-8` here makes
+    // `DesktopLanguageRequester` return en regardless of user's UI language choice,
+    // which biases CJK Han glyph fallback incorrectly (Japanese UI gets Simplified Chinese shapes).
+    #[cfg(not(windows))]
+    if std::env::var_os("LANG").is_none()
+        && std::env::var_os("LC_ALL").is_none()
+        && std::env::var_os("LC_CTYPE").is_none()
+    {
+        // SAFETY: Startup has not spawned threads yet.
+        unsafe { std::env::set_var("LANG", "en_US.UTF-8") };
+    }
+    // Initialize the i18n layer so `warpui::current_ui_locale()` reflects the user's
+    // chosen (or system) locale before font fallback / DirectWrite paths query it.
+    // `override_locale` is None until settings expose a UI-language picker; for now
+    // we always defer to the system locale requester.
+    i18n::init(None);
+
     // Perform any necessary platform-specific initialization.
     platform::init();
 
@@ -791,6 +816,13 @@ pub fn run() -> Result<()> {
 
     // Parse command-line arguments.
     let args = warp_cli::Args::from_env();
+
+    // oh-my-warp: apply the user-selected server/agent backend (configurable via
+    // agent_backends.toml + the Settings "Default backend" dropdown). Done before
+    // the CLI overrides below so an explicit `--server-root-url` still wins, and
+    // unconditionally (unlike the dev-only CLI gate) since picking a backend is a
+    // deliberate fork feature.
+    crate::util::agent_backends::apply_selected_backend();
 
     // Server URL overrides are only honored on internal dev channels. Release channels silently
     // ignore `--server-root-url` / `--ws-server-url` / `--session-sharing-server-url` (and their
@@ -881,6 +913,27 @@ pub fn run() -> Result<()> {
 /// Runs a parsed Warp worker command.
 fn run_worker_command(worker: &warp_cli::WorkerCommand) -> Result<()> {
     match worker {
+        #[cfg(all(feature = "local_tty", unix))]
+        warp_cli::WorkerCommand::Warpkeep(args) => {
+            crate::terminal::local_tty::warpkeep::run_attach(args.dir.clone(), args.command.clone())
+        }
+        #[cfg(all(feature = "local_tty", unix))]
+        warp_cli::WorkerCommand::WarpkeepMaster(args) => {
+            crate::terminal::local_tty::warpkeep::run_master(
+                args.socket.clone(),
+                args.command.clone(),
+            )
+        }
+        #[cfg(feature = "plugin_host")]
+        warp_cli::WorkerCommand::PluginHost { .. } => crate::run_plugin_host(),
+        #[cfg(not(target_family = "wasm"))]
+        warp_cli::WorkerCommand::RemoteServerProtocolVersion => {
+            println!(
+                "{}",
+                remote_server::protocol::REMOTE_SERVER_PROTOCOL_VERSION
+            );
+            Ok(())
+        }
         #[cfg(all(feature = "local_tty", unix))]
         warp_cli::WorkerCommand::TerminalServer(args) => {
             crate::terminal::local_tty::run_terminal_server(args);
@@ -1802,29 +1855,39 @@ pub(crate) fn initialize_app(
         }
         #[cfg(not(target_family = "wasm"))]
         manager.subscribe_to_settings_changes(ctx);
-        // Gemini Enterprise (GEAP) credential refresh triggers: workspace
-        // settings saves / team changes and the member's enablement toggle.
-        #[cfg(not(target_family = "wasm"))]
-        if FeatureFlag::GeminiEnterprise.is_enabled() {
-            manager.subscribe_to_geap_settings_changes(ctx);
-        }
-        // The Grok subscription refresher (`ai::grok_subscription`) has no
-        // visibility into workspace policy, so wire the BYO API key policy in
-        // here. The initial value resumes proactive refresh of any tokens
-        // restored from secure storage; TeamsChanged keeps the policy aligned
-        // as team data loads or the workspace changes.
-        #[cfg(not(target_family = "wasm"))]
-        if FeatureFlag::SuperGrok.is_enabled() {
-            use crate::workspaces::user_workspaces::UserWorkspacesEvent;
-            ctx.subscribe_to_model(&UserWorkspaces::handle(ctx), |manager, _, event, ctx| {
-                if matches!(event, UserWorkspacesEvent::TeamsChanged) {
-                    let allowed = UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
-                    manager.set_grok_refresh_allowed(allowed, ctx);
+        manager
+    });
+
+    #[cfg(not(target_family = "wasm"))]
+    ctx.add_singleton_model(|ctx| {
+        let mut manager = local_multi_agent::LocalMultiAgentManager::new(ctx);
+        let local_config = manager.config().clone();
+        let local_ai_autocomplete_enabled = ::ai::api_keys::ApiKeyManager::as_ref(ctx)
+            .local_ai_autocomplete_enabled_for_profile(
+                ::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY,
+            );
+        ::ai::api_keys::ApiKeyManager::handle(ctx).update(ctx, |api_keys, ctx| {
+            api_keys.migrate_default_profile_local_settings_if_needed(
+                local_config.openai_base_url.clone(),
+                local_config.local_model_aliases.clone(),
+                local_config.local_model_list.clone(),
+                local_ai_autocomplete_enabled,
+                ctx,
+            );
+        });
+        let openai_key = ::ai::api_keys::ApiKeyManager::as_ref(ctx)
+            .openai_key_for_profile(::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY);
+        manager.update_provider_config(openai_key, ctx);
+        ctx.subscribe_to_model(
+            &::ai::api_keys::ApiKeyManager::handle(ctx),
+            |manager: &mut local_multi_agent::LocalMultiAgentManager, _, event, ctx| {
+                if matches!(event, ::ai::api_keys::ApiKeyManagerEvent::KeysUpdated) {
+                    let openai_key = ::ai::api_keys::ApiKeyManager::as_ref(ctx)
+                        .openai_key_for_profile(::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY);
+                    manager.update_provider_config(openai_key, ctx);
                 }
-            });
-            let allowed = UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
-            manager.set_grok_refresh_allowed(allowed, ctx);
-        }
+            },
+        );
         manager
     });
 
@@ -1863,6 +1926,11 @@ pub(crate) fn initialize_app(
         });
     }
 
+    #[cfg(feature = "plugin_host")]
+    ctx.add_singleton_model(|ctx| {
+        plugin::PluginHost::new(ctx).expect("Could not instantiate PluginHost")
+    });
+
     ctx.add_singleton_model(AntivirusInfo::new);
 
     cfg_if::cfg_if! {
@@ -1874,8 +1942,10 @@ pub(crate) fn initialize_app(
     }
     // Send buffered pre-init errors to Sentry now that the client is ready.
     #[cfg(feature = "crash_reporting")]
-    for err in _pre_sentry_errors {
-        sentry::integrations::anyhow::capture_anyhow(&err);
+    if is_crash_reporting_enabled {
+        for err in _pre_sentry_errors {
+            sentry::integrations::anyhow::capture_anyhow(&err);
+        }
     }
     timer.mark_interval_end("INIT_CRASH_REPORTING");
 
@@ -1883,7 +1953,9 @@ pub(crate) fn initialize_app(
         autoupdate::check_and_report_update_errors(ctx);
     }
 
-    ctx.set_fallback_font_source_provider(|url| ::asset_cache::url_source(url));
+    if !ChannelState::is_local_only() {
+        ctx.set_fallback_font_source_provider(|url| ::asset_cache::url_source(url));
+    }
 
     ctx.set_default_binding_validator(is_binding_cross_platform);
 
@@ -2319,6 +2391,15 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(
         ai::blocklist::local_agent_task_sync_model::LocalAgentTaskSyncModel::new,
     );
+    // oh-my-warp: holds plugin-contributed prompt segments (`warp.prompt.set`). Registered
+    // unconditionally so the prompt render path never depends on the plugin host being built in.
+    ctx.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
+    // oh-my-warp: holds plugin-contributed tab-bar status pills (`warp.ui.setStatusItem`). Same
+    // pattern as `PluginPromptModel`: registered unconditionally so the tab-bar render path doesn't
+    // depend on the plugin host being built in (empty store ↔ no pills).
+    ctx.add_singleton_model(|_| {
+        crate::workspace::plugin_status_items::PluginStatusItemsModel::new()
+    });
     ctx.add_singleton_model(
         ai::blocklist::pending_cli_harness_prompt_queue::PendingCliHarnessPromptQueue::new,
     );
@@ -2602,7 +2683,7 @@ pub(crate) fn initialize_app(
         };
 
         let codebase_limits = AIRequestUsageModel::as_ref(ctx).codebase_context_limits();
-        let mut codebase_index_config = CodebaseIndexManagerConfig::new(
+        let codebase_index_config = CodebaseIndexManagerConfig::new(
             indices_to_restore,
             codebase_limits.max_indices_allowed,
             codebase_limits.max_files_per_repo,
@@ -2610,9 +2691,6 @@ pub(crate) fn initialize_app(
             server_api_provider.as_ref(ctx).get(),
             launch_mode.supports_indexing(),
         );
-        if matches!(launch_mode, LaunchMode::RemoteServerDaemon { .. }) {
-            codebase_index_config = codebase_index_config.defer_persisted_index_restore();
-        }
         #[cfg(feature = "local_fs")]
         if let Some(snapshot_storage) = daemon_codebase_index_snapshot_storage(launch_mode) {
             return CodebaseIndexManager::new_with_snapshot_storage(
@@ -3162,7 +3240,9 @@ fn launch(ctx: &mut warpui::AppContext, app_state: Option<AppState>, launch_mode
 
     // For now, we only specify application-level fallback fonts on web.
     #[cfg(target_family = "wasm")]
-    ctx.set_fallback_font_fn(font_fallback::fallback_font_fn);
+    if !ChannelState::is_local_only() {
+        ctx.set_fallback_font_fn(font_fallback::fallback_font_fn);
+    }
 
     match launch_mode {
         // The TUI front-end runs its own mount in the run closure and returns

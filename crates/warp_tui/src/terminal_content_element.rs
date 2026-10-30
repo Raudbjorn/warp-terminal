@@ -183,6 +183,8 @@ impl TuiElement for TuiTerminalContentElement {
                 | TuiEvent::LeftMouseDragged { .. }
                 | TuiEvent::MiddleMouseDown { .. }
                 | TuiEvent::RightMouseDown { .. }
+                | TuiEvent::RightMouseUp { .. }
+                | TuiEvent::RightMouseDragged { .. }
                 | TuiEvent::MouseMoved { .. } => {
                     let bytes =
                         self.child
@@ -270,6 +272,8 @@ fn forwarded_pty_input_for_event<'a>(
         | TuiEvent::LeftMouseDragged { .. }
         | TuiEvent::MiddleMouseDown { .. }
         | TuiEvent::RightMouseDown { .. }
+        | TuiEvent::RightMouseUp { .. }
+        | TuiEvent::RightMouseDragged { .. }
         | TuiEvent::MouseMoved { .. } => None,
     }
 }
@@ -328,6 +332,14 @@ fn mouse_event_to_pty_bytes<T: ModeProvider>(
             if policy.report_buttons && !modifiers.shift =>
         {
             MouseState::new(MouseButton::LeftDrag, MouseAction::Pressed, *modifiers)
+        }
+        TuiEvent::RightMouseUp { modifiers, .. } if policy.report_buttons && !modifiers.shift => {
+            MouseState::new(MouseButton::Right, MouseAction::Released, *modifiers)
+        }
+        TuiEvent::RightMouseDragged { modifiers, .. }
+            if policy.report_buttons && !modifiers.shift =>
+        {
+            MouseState::new(MouseButton::RightDrag, MouseAction::Pressed, *modifiers)
         }
         TuiEvent::MouseMoved {
             modifiers,

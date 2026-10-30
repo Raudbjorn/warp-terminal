@@ -151,6 +151,17 @@ pub enum LeafContents {
     /// The in-app network log pane. Not persisted across restarts because the
     /// backing log is an in-memory ring buffer that starts empty on launch.
     NetworkLog,
+    /// The embedded browser pane (oh-my-warp). We persist only the current URL —
+    /// the Chrome + CDP screencast session itself is ephemeral and recreated on
+    /// restore (navigating to the stored URL).
+    Browser {
+        url: String,
+    },
+    /// An entrypoint pane type to launch other pane types from a search palette. The default view
+    /// when creating a tab.
+    Welcome {
+        startup_directory: Option<PathBuf>,
+    },
     /// A new first-time user experience which prioritizes choosing a coding repository.
     GetStarted,
 }
@@ -175,6 +186,9 @@ impl LeafContents {
             // Environment management panes are opened on-demand via workspace
             // actions and have no persistable state.
             | LeafContents::EnvironmentManagement(_) => false,
+            // Browser panes (oh-my-warp): persist the URL; the live CDP session
+            // is rebuilt on restore.
+            LeafContents::Browser { .. } => true,
             LeafContents::Terminal(_)
             | LeafContents::Notebook(_)
             | LeafContents::AIDocument(_)
@@ -186,8 +200,9 @@ impl LeafContents {
             | LeafContents::CustomRouterEditor
             | LeafContents::ExecutionProfileEditor
             | LeafContents::CodeReview(_)
-            | LeafContents::AmbientAgent(_)
-            | LeafContents::GetStarted => true,
+            | LeafContents::GetStarted
+            | LeafContents::Welcome { .. }
+            | LeafContents::AmbientAgent(_) => true,
         }
     }
 }
@@ -314,6 +329,12 @@ pub enum LeftPanelDisplayedTab {
     GlobalSearch,
     WarpDrive,
     ConversationListView,
+    #[cfg(not(target_family = "wasm"))]
+    CodexConversations,
+    #[cfg(not(target_family = "wasm"))]
+    OpenCodeConversations,
+    #[cfg(not(target_family = "wasm"))]
+    DockerContainers,
 }
 
 impl From<ToolPanelView> for LeftPanelDisplayedTab {
@@ -323,6 +344,8 @@ impl From<ToolPanelView> for LeftPanelDisplayedTab {
             ToolPanelView::GlobalSearch { .. } => LeftPanelDisplayedTab::GlobalSearch,
             ToolPanelView::WarpDrive => LeftPanelDisplayedTab::WarpDrive,
             ToolPanelView::ConversationListView => LeftPanelDisplayedTab::ConversationListView,
+            #[cfg(not(target_family = "wasm"))]
+            ToolPanelView::DockerContainers => LeftPanelDisplayedTab::DockerContainers,
         }
     }
 }

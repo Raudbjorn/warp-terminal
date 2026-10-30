@@ -259,9 +259,99 @@ class MergeMcpConfigTests(unittest.TestCase):
                         "mcp_servers": ("mcp_servers",),
                         "servers": ("servers",),
                         "mcp.servers": ("mcp", "servers"),
-                        "flat": (),
+                        # The file watcher requires a wrapper even for bare migration input.
+                        "flat": ("mcpServers",),
                     }[name],
                 )
+
+    def test_empty_destination_receives_wrapped_servers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.json"
+            destination = Path(directory) / "destination.json"
+            servers = {"example": {"command": "example-command"}}
+            source.write_text(json.dumps({"mcpServers": servers}))
+            destination.write_text("{}\n")
+
+            _, summary = self.dry_run(source, destination)
+            self.assertEqual(destination.read_text(), "{}\n")
+            self.assertEqual(summary["add_count"], 1)
+            result = self.apply(source, destination, summary["fingerprint"])
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(destination.read_text()), {"mcpServers": servers}
+            )
+
+    def test_missing_destination_wraps_bare_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.json"
+            destination = Path(directory) / "destination.json"
+            servers = {"example": {"command": "example-command"}}
+            original = json.dumps(servers)
+            source.write_text(original)
+
+            _, summary = self.dry_run(source, destination)
+            result = self.apply(source, destination, summary["fingerprint"])
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                json.loads(destination.read_text()), {"mcpServers": servers}
+            )
+            self.assertEqual(source.read_text(), original)
+            self.assertFalse(json.loads(result.stdout)["backup_created"])
+
+    def test_bare_destination_normalization_is_backed_up_and_idempotent(self):
+        for servers in ({}, {"existing": {"command": "keep-command"}}):
+            with (
+                self.subTest(servers=servers),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                source = Path(directory) / "missing-source.json"
+                destination = Path(directory) / "destination.json"
+                original = json.dumps(servers).encode()
+                destination.write_bytes(original)
+                os.chmod(destination, 0o600)
+
+                _, summary = self.dry_run(source, destination)
+                self.assertEqual(summary["add_count"], 0)
+                self.assertTrue(summary["content_change_required"])
+                self.assertFalse(summary["permission_update_required"])
+                self.assertEqual(destination.read_bytes(), original)
+                result = self.apply(source, destination, summary["fingerprint"])
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    json.loads(destination.read_text()), {"mcpServers": servers}
+                )
+                backups = list(Path(directory).glob("destination.json.backup-*"))
+                self.assertEqual(len(backups), 1)
+                self.assertEqual(backups[0].read_bytes(), original)
+                if os.name == "posix":
+                    self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o600)
+                    self.assertEqual(stat.S_IMODE(backups[0].stat().st_mode), 0o600)
+
+                normalized = destination.read_bytes()
+                _, second_summary = self.dry_run(source, destination)
+                self.assertFalse(second_summary["would_change"])
+                second_result = self.apply(
+                    source, destination, second_summary["fingerprint"]
+                )
+                self.assertEqual(second_result.returncode, 0, second_result.stderr)
+                self.assertFalse(json.loads(second_result.stdout)["backup_created"])
+                self.assertEqual(destination.read_bytes(), normalized)
+
+    def test_missing_destination_and_empty_source_do_not_create_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "source.json"
+            destination = Path(directory) / "missing-directory" / "destination.json"
+            source.write_text("{}\n")
+
+            _, summary = self.dry_run(source, destination)
+            self.assertFalse(summary["would_change"])
+            result = self.apply(source, destination, summary["fingerprint"])
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(destination.parent.exists())
 
     def test_invalid_input_is_sanitized_no_op(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -341,9 +431,10 @@ class MergeMcpConfigTests(unittest.TestCase):
         if os.name != "posix":
             self.skipTest("symlink creation is not generally available on Windows")
         for symlink_role in ("source", "destination"):
-            with self.subTest(
-                role=symlink_role
-            ), tempfile.TemporaryDirectory() as directory:
+            with (
+                self.subTest(role=symlink_role),
+                tempfile.TemporaryDirectory() as directory,
+            ):
                 source, destination = self.copy_fixtures(directory)
                 selected = source if symlink_role == "source" else destination
                 target = selected.with_suffix(".target")

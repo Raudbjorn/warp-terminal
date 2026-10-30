@@ -49,6 +49,7 @@ required-features = ["preview_channel"]
 test = false
 
 [dependencies]
+warp_js = { workspace = true, optional = true }
 addr = "0.15.6"
 ai.workspace = true
 ai_types.workspace = true
@@ -115,6 +116,7 @@ hex.workspace = true
 http.workspace = true
 http_client.workspace = true
 image.workspace = true
+network_policy.workspace = true
 infer = "0.19.0"
 jaq-json.workspace = true
 jaq-all.workspace = true
@@ -166,6 +168,7 @@ pprof = { workspace = true, optional = true, features = ["protobuf-codec"] }
 prost.workspace = true
 prost-types.workspace = true
 qrcode.workspace = true
+warp_agent_grpc.workspace = true
 rand.workspace = true
 rangemap.workspace = true
 rayon.workspace = true
@@ -177,6 +180,7 @@ sentry-log = { workspace = true, optional = true }
 inventory = "0.3"
 schemars = "1"
 secret_redaction.workspace = true
+semver = "1"
 serde.workspace = true
 serde_bytes.workspace = true
 serde-bytes-repr.workspace = true
@@ -196,7 +200,7 @@ siphasher = "0.3.11"
 similar.workspace = true
 simple_logger.workspace = true
 smallvec.workspace = true
-smol_str.workspace = true
+ smol_str.workspace = true
 static_assertions.workspace = true
 string-offset.workspace = true
 sum_tree.workspace = true
@@ -211,6 +215,7 @@ toml = "0.8.13"
 toml_edit.workspace = true
 tracing.workspace = true
 tracing-futures = { workspace = true, features = ["futures-03"] }
+tungstenite.workspace = true
 ui_components.workspace = true
 unicase = "2.7.0"
 unicode-general-category.workspace = true
@@ -302,7 +307,9 @@ winit = { workspace = true }
 wgpu.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
+rquickjs = { workspace = true, optional = true }
 app-installation-detection.workspace = true
+local_agent.workspace = true
 async-io.workspace = true
 axum.workspace = true
 build_cache.workspace = true
@@ -324,6 +331,7 @@ opentelemetry-http.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 tokio.workspace = true
+async-process.workspace = true
 tokio-util.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
@@ -503,6 +511,8 @@ well_known_mcp_ids = []
 factory_mcp = []
 preview_urls_mcp = []
 default = [
+    # oh-my-warp: enable the JavaScript plugin host (see PLUGIN_SPEC.md)
+    "omw_plugins",
     "agent_mode",
     "osc_hyperlinks",
     "viewing_shared_sessions",
@@ -711,6 +721,11 @@ default = [
     "history_search_ranking_v2",
     "cloud_agent_shell_respawn",
     "acp_harness",
+    # Fully-local build: no Warp API traffic and no auth required (synthetic
+    # local user via skip_login), with passive prompt suggestions routed through
+    # the local multi-agent path instead of the gated-off server endpoint.
+    "skip_login",
+    "prompt_suggestions_via_maa",
 ]
 # Enable this feature to automatically perform heap profiling.  NOTE: This will
 # substantially slow down program execution.
@@ -819,6 +834,14 @@ resize_fix = []
 pluggable_notifications = []
 # This enables `read_files` to support images.
 read_image_files = []
+# This feature enables plugin support in Warp. Note that its typically checked
+# directly, rather than via the `FeatureFlag` enum, because its value is
+# required early in the app lifecycle prior to `FeatureFlag` initialization.
+plugin_host = ["dep:rquickjs", "dep:warp_js", "warp_cli/plugin_host"]
+# oh-my-warp: umbrella feature that turns the JavaScript plugin host on in the
+# default build, without dragging in the completions_v2 classic-vs-v2 machinery.
+# See PLUGIN_SPEC.md.
+omw_plugins = ["plugin_host"]
 # Enable this feature to automatically perform CPU profiling via pprof.  The
 # generated profile will be written to profile.pb in the current directory.
 # NOTE: This may slow down program execution.
@@ -1045,7 +1068,7 @@ acp_harness = []
 category = "public.app-category.developer-tools"
 copyright = "© 2025, Denver Technologies, Inc"
 identifier = "dev.warp.WarpOss"
-name = "WarpOss"
+name = "oh-my-warp"
 resources = ["assets/onboarding"]
 icon = ["channels/oss/icon/no-padding/512x512.png", "channels/oss/icon/no-padding/icon.ico"]
 short_description = "The open-source, cloud-backed terminal for individuals and teams."

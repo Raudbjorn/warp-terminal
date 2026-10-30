@@ -76,6 +76,7 @@ gethostname = "1.1.0"
 mio = { version = "1.1.1", features = ["os-poll", "os-ext"] }
 
 [target.'cfg(unix)'.dependencies]
+dirs.workspace = true
 cvt = "0.1.1"
 nix = { workspace = true, features = [
     "fs",

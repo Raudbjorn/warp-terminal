@@ -1,3 +1,5 @@
+#![cfg(not(feature = "skip_login"))]
+
 use std::sync::{Arc, Barrier};
 
 use chrono::Utc;
@@ -78,6 +80,7 @@ fn bearer_credentials_are_returned_without_session_refresh_events() {
     assert!(event_receiver.try_recv().is_err());
 }
 
+#[cfg(not(feature = "skip_login"))]
 #[test]
 fn unexpired_firebase_credentials_return_cached_token_without_refresh_events() {
     let auth_state = Arc::new(AuthState::new_logged_out_for_test());

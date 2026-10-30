@@ -293,6 +293,20 @@ fn sgr_mouse_events_use_area_relative_coordinates() {
             b"\x1b[<2;3;2M".as_slice(),
         ),
         (
+            TuiEvent::RightMouseUp {
+                position,
+                modifiers,
+            },
+            b"\x1b[<2;3;2m".as_slice(),
+        ),
+        (
+            TuiEvent::RightMouseDragged {
+                position,
+                modifiers,
+            },
+            b"\x1b[<34;3;2M".as_slice(),
+        ),
+        (
             TuiEvent::LeftMouseUp {
                 position,
                 modifiers,
@@ -368,6 +382,31 @@ fn events_are_gated_by_their_policy_category() {
     assert!(mouse_bytes(&left_dragged, area, policy(true, false, false)).is_some());
     assert!(mouse_bytes(&moved, area, policy(true, false, true)).is_none());
     assert!(mouse_bytes(&moved, area, policy(false, true, false)).is_some());
+}
+
+#[test]
+fn right_release_and_drag_respect_reporting_policy_and_shift_override() {
+    let area = bounds(0, 0, 10, 10);
+    let position = TuiPoint::new(2, 3);
+    for shift in [false, true] {
+        let modifiers = ModifiersState {
+            shift,
+            ..Default::default()
+        };
+        for event in [
+            TuiEvent::RightMouseUp {
+                position,
+                modifiers,
+            },
+            TuiEvent::RightMouseDragged {
+                position,
+                modifiers,
+            },
+        ] {
+            assert!(mouse_bytes(&event, area, policy(false, true, true)).is_none());
+            assert_eq!(mouse_bytes(&event, area, report_all()).is_some(), !shift);
+        }
+    }
 }
 
 #[test]

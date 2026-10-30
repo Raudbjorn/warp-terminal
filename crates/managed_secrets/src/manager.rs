@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vec1::vec1;
+use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 use warp_graphql::managed_secrets::ManagedSecret;
 use warp_graphql::queries::task_secrets::ManagedSecretValue as GqlManagedSecretValue;
@@ -98,6 +99,7 @@ where
         let client = self.client.clone();
         let actor_provider = self.actor_provider.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             if !FeatureFlag::WarpManagedSecrets.is_enabled() {
                 return Err(anyhow::anyhow!("This feature is not enabled"));
             }
@@ -145,6 +147,7 @@ where
     ) -> impl Future<Output = anyhow::Result<()>> + use<RequestScope> {
         let client = self.client.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             if !FeatureFlag::WarpManagedSecrets.is_enabled() {
                 return Err(anyhow::anyhow!("This feature is not enabled"));
             }
@@ -167,6 +170,7 @@ where
         let client = self.client.clone();
         let actor_provider = self.actor_provider.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             if !FeatureFlag::WarpManagedSecrets.is_enabled() {
                 return Err(anyhow::anyhow!("This feature is not enabled"));
             }
@@ -213,6 +217,7 @@ where
     ) -> impl Future<Output = anyhow::Result<Vec<ManagedSecret>>> + use<RequestScope> {
         let client = self.client.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             let secrets = client.list_secrets(request_scope.as_ref()).await?;
             Ok(secrets)
         }
@@ -225,6 +230,7 @@ where
     ) -> impl Future<Output = anyhow::Result<Vec<ManagedSecret>>> + use<RequestScope> {
         let client = self.client.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             let secrets = client
                 .list_harness_auth_secrets(&request_scope, harness)
                 .await?;
@@ -249,6 +255,7 @@ where
         where
             RequestScope: Send + Sync + 'static,
         {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             // We only need the workload token for the duration of the request.
             let workload_token =
                 warp_isolation_platform::issue_workload_token(Some(Duration::from_mins(5))).await?;
@@ -269,6 +276,7 @@ where
     ) -> impl Future<Output = anyhow::Result<TaskIdentityToken>> + use<RequestScope> {
         let client = self.client.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")?;
             client
                 .issue_task_identity_token(request_scope.as_ref(), options)
                 .await
@@ -287,6 +295,8 @@ where
     > + use<RequestScope> {
         let client = self.client.clone();
         async move {
+            ChannelState::ensure_online_services_enabled("Managed secrets")
+                .map_err(|err| GcpWorkloadIdentityFederationError::new(err.to_string()))?;
             match token_type.as_str() {
                 gcp::TOKEN_TYPE_ID_TOKEN | gcp::TOKEN_TYPE_JWT => (),
                 other => {

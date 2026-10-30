@@ -7,6 +7,7 @@ use cloud_object_models::JsonSerializer;
 use lazy_static::lazy_static;
 use settings::{Setting as _, SyncToCloud};
 use warp_core::r#async::debounce;
+use warp_core::channel::ChannelState;
 use warp_core::execution_mode::AppExecutionMode;
 use warp_core::settings::ChangeEventReason;
 use warp_core::user_preferences::GetUserPreferences;
@@ -67,6 +68,10 @@ pub fn initialize_cloud_preferences_syncer(
     startup_toml_parse_error: Option<&str>,
     ctx: &mut ModelContext<CloudPreferencesSyncer>,
 ) -> CloudPreferencesSyncer {
+    if ChannelState::is_local_only() {
+        return CloudPreferencesSyncer::new_local_only(toml_file_path);
+    }
+
     let current_hash = TomlBackedUserPreferences::file_content_hash(&toml_file_path);
     let stored_hash = ctx
         .private_user_preferences()
@@ -207,6 +212,10 @@ impl CloudPreferencesSyncer {
         sync_enabled: bool,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
+        if ChannelState::is_local_only() {
+            return Self::new_local_only(toml_file_path);
+        }
+
         let mut me = Self::new_internal(
             ctx,
             Arc::new(DefaultClientIdProvider),
@@ -229,6 +238,19 @@ impl CloudPreferencesSyncer {
     #[cfg(test)]
     pub(crate) fn mark_initial_load_completed_for_test(&mut self) {
         self.has_completed_initial_load = true;
+    }
+
+    fn new_local_only(toml_file_path: PathBuf) -> Self {
+        let (update_tx, _) = async_channel::unbounded();
+        Self {
+            update_tx,
+            dirty_local_prefs: HashSet::new(),
+            client_id_provider: Arc::new(DefaultClientIdProvider),
+            has_completed_initial_load: true,
+            force_local_wins_on_startup: false,
+            sync_enabled: false,
+            toml_file_path,
+        }
     }
 
     fn new_internal(
@@ -439,7 +461,7 @@ impl CloudPreferencesSyncer {
         ctx: &mut ModelContext<Self>,
     ) {
         // Inert when cloud sync is disabled for this surface (e.g. the TUI).
-        if !self.sync_enabled {
+        if !self.sync_enabled || ChannelState::is_local_only() {
             return;
         }
 
@@ -491,7 +513,7 @@ impl CloudPreferencesSyncer {
         ctx: &mut ModelContext<Self>,
     ) {
         // Inert when cloud sync is disabled for this surface (e.g. the TUI).
-        if !self.sync_enabled {
+        if !self.sync_enabled || ChannelState::is_local_only() {
             return;
         }
 
@@ -687,7 +709,7 @@ impl CloudPreferencesSyncer {
         ctx: &mut ModelContext<Self>,
     ) {
         // Inert when cloud sync is disabled for this surface (e.g. the TUI).
-        if !self.sync_enabled {
+        if !self.sync_enabled || ChannelState::is_local_only() {
             return;
         }
 

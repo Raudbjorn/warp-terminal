@@ -12,6 +12,7 @@ use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 use super::generic_string_model::GenericStringObjectId;
 use crate::ai::execution_profiles::CloudAIExecutionProfile;
 use crate::auth::AuthStateProvider;
+use crate::channel::ChannelState;
 use crate::cloud_object::{
     CloudModelType, CloudObject, CloudObjectLocation, CloudObjectPermissions, GenericCloudObject,
     GenericServerObject, GenericStringObjectFormat, JsonObjectType, ObjectIdType, ObjectType,
@@ -123,6 +124,14 @@ impl CloudModel {
         cached_objects: Vec<Box<dyn CloudObject>>,
         time_of_next_force_refresh: Option<DateTime<Utc>>,
     ) -> Self {
+        if ChannelState::is_local_only() {
+            return Self {
+                objects_by_id: Default::default(),
+                model_event_sender: None,
+                time_of_next_force_refresh: None,
+            };
+        }
+
         let objects_by_id = cached_objects
             .into_iter()
             .map(|object| (object.uid().to_owned(), object))

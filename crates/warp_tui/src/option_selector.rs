@@ -1719,6 +1719,8 @@ impl TuiElement for SelectorInputElement {
             | TuiEvent::LeftMouseDragged { .. }
             | TuiEvent::MiddleMouseDown { .. }
             | TuiEvent::RightMouseDown { .. }
+            | TuiEvent::RightMouseUp { .. }
+            | TuiEvent::RightMouseDragged { .. }
             | TuiEvent::MouseMoved { .. } => false,
         }
     }

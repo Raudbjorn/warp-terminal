@@ -4,7 +4,6 @@ mod mixer;
 mod search_item;
 pub(super) mod view;
 
-#[cfg(feature = "local_fs")]
 use std::path::PathBuf;
 
 use ai::skills::SkillReference;
@@ -14,6 +13,7 @@ pub use mixer::{SlashCommandMixer, build_slash_command_mixer, slash_command_quer
 pub use view::{CloseReason, InlineSlashCommandView, SlashCommandsEvent};
 #[cfg(not(target_family = "wasm"))]
 use warp_cli::agent::Harness;
+use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::appearance::Appearance;
@@ -497,6 +497,9 @@ impl Input {
                 ctx.dispatch_typed_action(&TerminalAction::OpenAddRulePane);
             }
             SlashCommandKind::Agent | SlashCommandKind::New => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 // Without this, a fast `/agent` right after an ambient tombstone renders (before
                 // its async task fetch resolves) would fall through to `EnterAgentView` below and
                 // start a local conversation instead of the retained cloud one.
@@ -593,6 +596,9 @@ impl Input {
                 });
             }
             SlashCommandKind::CloudAgent => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 let prompt = argument.and_then(|argument| {
                     let trimmed = argument.trim();
                     if trimmed.is_empty() {
@@ -705,6 +711,9 @@ impl Input {
                 ctx.dispatch_typed_action(&WorkspaceAction::SetActiveTabColor(color));
             }
             SlashCommandKind::CreateEnvironment => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 // If the user included args after the slash command, treat them as repo paths/URLs.
                 let repos = argument
                     .map(|arg| {
@@ -718,6 +727,9 @@ impl Input {
                 ctx.emit(Event::TriggerEnvironmentSetup { repos });
             }
             SlashCommandKind::CreateNewProject => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 if argument.is_none_or(|args| args.is_empty()) {
                     show_error_toast(
                         "Please describe the project you want to create after /create-new-project"
@@ -895,12 +907,15 @@ impl Input {
                 ctx.dispatch_typed_action(&TerminalAction::InitProject);
             }
             SlashCommandKind::Changelog => {
-                if !FeatureFlag::Changelog.is_enabled() {
+                if ChannelState::is_local_only() || !FeatureFlag::Changelog.is_enabled() {
                     return false;
                 }
                 ctx.dispatch_typed_action(&WorkspaceAction::ViewLatestChangelog);
             }
             SlashCommandKind::Feedback => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
                 ctx.dispatch_typed_action(&WorkspaceAction::SendFeedback);
             }
             SlashCommandKind::OpenCodeReview => {

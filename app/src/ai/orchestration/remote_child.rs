@@ -363,7 +363,8 @@ pub fn classify_cloud_agent_startup_error(error: &anyhow::Error) -> CloudAgentSt
                     },
                 );
             }
-            AIApiError::Transport(_)
+            AIApiError::NetworkPolicyDenied(_)
+            | AIApiError::Transport(_)
             | AIApiError::Deserialization(_)
             | AIApiError::NoContextFound
             | AIApiError::ErrorStatus(_, _)

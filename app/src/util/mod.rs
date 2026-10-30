@@ -1,3 +1,4 @@
+pub mod agent_backends;
 pub mod bindings;
 pub mod clipboard;
 pub mod color;
@@ -6,6 +7,7 @@ pub mod extensions;
 pub mod file;
 pub mod git;
 pub mod image;
+pub mod leader;
 pub(crate) mod link_detection;
 pub mod links;
 pub mod openable_file_type;

@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -371,6 +372,20 @@ impl SyncQueue {
         object_client: Arc<dyn ObjectClient>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
+        if ChannelState::is_local_only() {
+            return Self {
+                queue: Default::default(),
+                waiting_response: Default::default(),
+                in_flight_bulk_create_objects: Default::default(),
+                object_client,
+                client_id_to_server: Default::default(),
+                server_id_to_client_hash: Default::default(),
+                should_dequeue: false,
+                spawned_futures: vec![],
+                queue_dependencies: Default::default(),
+            };
+        }
+
         let mut sync_queue = Self {
             queue: queue_items
                 .into_iter()
@@ -399,6 +414,10 @@ impl SyncQueue {
     }
 
     pub fn start_dequeueing(&mut self, ctx: &mut ModelContext<Self>) {
+        if ChannelState::is_local_only() {
+            return;
+        }
+
         self.should_dequeue = true;
         self.dequeue(ctx)
     }

@@ -1,0 +1,96 @@
+From 7eaf24ee7131668c61186c8f9df3dc4eef2af9ee Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 20 May 2026 22:12:45 -0400
+Subject: [PATCH 08/48] Rebrand the OSS app bundle as oh-my-warp
+
+Build output is now oh-my-warp.app (display name oh-my-warp) instead of
+WarpOss.app. Only the bundle product/display name changes: the binary
+(warp-oss), bundle identifier (dev.warp.WarpOss), URL scheme, channel
+identity, app-data paths, and autoupdate are intentionally left untouched
+so the rebrand stays purely cosmetic and doesn't ripple into warp_core.
+---
+ app/Cargo.toml      | 2 +-
+ app/src/bin/oss.rs  | 4 ++--
+ script/macos/bundle | 2 +-
+ script/macos/run    | 6 +++---
+ 4 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/app/Cargo.toml b/app/Cargo.toml
+index c7f20ec7..abadaecc 100644
+--- a/app/Cargo.toml
++++ b/app/Cargo.toml
+@@ -1013,7 +1013,7 @@ git_credential_refresh = []
+ category = "public.app-category.developer-tools"
+ copyright = "© 2025, Denver Technologies, Inc"
+ identifier = "dev.warp.WarpOss"
+-name = "WarpOss"
++name = "oh-my-warp"
+ resources = ["assets/onboarding"]
+ icon = ["channels/oss/icon/no-padding/512x512.png", "channels/oss/icon/no-padding/icon.ico"]
+ short_description = "The open-source, cloud-backed terminal for individuals and teams."
+diff --git a/app/src/bin/oss.rs b/app/src/bin/oss.rs
+index 0d07bae5..d17c67d2 100644
+--- a/app/src/bin/oss.rs
++++ b/app/src/bin/oss.rs
+@@ -39,7 +39,7 @@ embed_plist::embed_info_plist_bytes!(r#"
+     <key>CFBundleDevelopmentRegion</key>
+     <string>English</string>
+     <key>CFBundleDisplayName</key>
+-    <string>WarpOss</string>
++    <string>oh-my-warp</string>
+     <key>CFBundleExecutable</key>
+     <string>warp-oss</string>
+     <key>CFBundleIdentifier</key>
+@@ -47,7 +47,7 @@ embed_plist::embed_info_plist_bytes!(r#"
+     <key>CFBundleInfoDictionaryVersion</key>
+     <string>6.0</string>
+     <key>CFBundleName</key>
+-    <string>WarpOss</string>
++    <string>oh-my-warp</string>
+     <key>CFBundlePackageType</key>
+     <string>APPL</string>
+     <key>CFBundleShortVersionString</key>
+diff --git a/script/macos/bundle b/script/macos/bundle
+index 9b228c9d..e1b955dc 100755
+--- a/script/macos/bundle
++++ b/script/macos/bundle
+@@ -309,7 +309,7 @@ elif [[ $RELEASE_CHANNEL = "stable" ]]; then
+ elif [[ $RELEASE_CHANNEL = "oss" ]]; then
+     WARP_BIN="warp-oss"
+     BUNDLE_ID="dev.warp.WarpOss"
+-    WARP_APP_NAME="WarpOss"
++    WARP_APP_NAME="oh-my-warp"
+     WARP_SCHEME_NAME="warposs"
+     # The OSS channel does not ship Sentry, so drop the cocoa_sentry feature
+     # (which would otherwise pull in the Sentry framework dependency).
+diff --git a/script/macos/run b/script/macos/run
+index 6118843d..64914540 100755
+--- a/script/macos/run
++++ b/script/macos/run
+@@ -33,7 +33,7 @@ if [ "$WARP_CHANNEL" = "local" ]; then
+     WARP_APP_PATH="${TARGET_DIR}/debug/bundle/osx/WarpLocal.app"
+     WARP_SCHEME_NAME="warplocal"
+ else
+-    WARP_APP_PATH="${TARGET_DIR}/debug/bundle/osx/WarpOss.app"
++    WARP_APP_PATH="${TARGET_DIR}/debug/bundle/osx/oh-my-warp.app"
+     WARP_SCHEME_NAME="warposs"
+ fi
+ DONT_OPEN=false
+@@ -70,7 +70,7 @@ while (( "$#" )); do
+       if [ "$WARP_CHANNEL" = "local" ]; then
+           WARP_APP_PATH="${TARGET_DIR}/release/bundle/osx/WarpLocal.app"
+       else
+-          WARP_APP_PATH="${TARGET_DIR}/release/bundle/osx/WarpOss.app"
++          WARP_APP_PATH="${TARGET_DIR}/release/bundle/osx/oh-my-warp.app"
+       fi
+       PARAMS="$PARAMS $1"
+       shift
+@@ -81,7 +81,7 @@ while (( "$#" )); do
+       if [ "$WARP_CHANNEL" = "local" ]; then
+           WARP_APP_PATH="${TARGET_DIR}/${PROFILE}/bundle/osx/WarpLocal.app"
+       else
+-          WARP_APP_PATH="${TARGET_DIR}/${PROFILE}/bundle/osx/WarpOss.app"
++          WARP_APP_PATH="${TARGET_DIR}/${PROFILE}/bundle/osx/oh-my-warp.app"
+       fi
+       PARAMS="$PARAMS --profile $PROFILE"
+       ;;

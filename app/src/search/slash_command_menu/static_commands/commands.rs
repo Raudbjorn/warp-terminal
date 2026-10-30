@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 
 use super::{Availability, SlashCommandKind, SlashCommandSurfaces};
@@ -971,6 +972,7 @@ fn all_commands(settings_mode: settings::SettingsMode) -> Vec<StaticCommand> {
 }
 
 fn all_commands_for_all_surfaces() -> Vec<StaticCommand> {
+    let online_services_enabled = !ChannelState::is_local_only();
     let mut commands = vec![
         ADD_MCP,
         ADD_PROMPT.clone(),
@@ -1017,40 +1019,41 @@ fn all_commands_for_all_surfaces() -> Vec<StaticCommand> {
         commands.push(CREATE_DOCKER_SANDBOX);
     }
 
-    if FeatureFlag::CreatingSharedSessions.is_enabled()
+    if online_services_enabled
+        && FeatureFlag::CreatingSharedSessions.is_enabled()
         && FeatureFlag::HOARemoteControl.is_enabled()
     {
         commands.push(REMOTE_CONTROL);
     }
 
-    if FeatureFlag::Changelog.is_enabled() {
+    if online_services_enabled && FeatureFlag::Changelog.is_enabled() {
         commands.push(CHANGELOG);
     }
 
-    if FeatureFlag::AgentView.is_enabled() {
+    if online_services_enabled && FeatureFlag::AgentView.is_enabled() {
         commands.push(PROMPTS.clone());
     }
 
     commands.push(OPEN_CODE_REVIEW);
 
-    if FeatureFlag::CreateEnvironmentSlashCommand.is_enabled() {
+    if online_services_enabled && FeatureFlag::CreateEnvironmentSlashCommand.is_enabled() {
         commands.push(CREATE_ENVIRONMENT.clone());
     }
 
-    if FeatureFlag::CreateProjectFlow.is_enabled() {
+    if online_services_enabled && FeatureFlag::CreateProjectFlow.is_enabled() {
         commands.push(CREATE_NEW_PROJECT.clone());
     }
 
-    if FeatureFlag::SummarizationConversationCommand.is_enabled() {
+    if online_services_enabled && FeatureFlag::SummarizationConversationCommand.is_enabled() {
         commands.push(COMPACT.clone());
         commands.push(COMPACT_AND.clone());
     }
 
-    if FeatureFlag::QueueSlashCommand.is_enabled() {
+    if online_services_enabled && FeatureFlag::QueueSlashCommand.is_enabled() {
         commands.push(QUEUE.clone());
     }
 
-    if !cfg!(target_family = "wasm") {
+    if online_services_enabled && !cfg!(target_family = "wasm") {
         commands.extend([
             FORK.clone(),
             FORK_AND_COMPACT.clone(),
@@ -1066,12 +1069,18 @@ fn all_commands_for_all_surfaces() -> Vec<StaticCommand> {
         commands.extend([EDIT.clone(), EXPORT_TO_FILE.clone()]);
     }
 
-    if FeatureFlag::ListSkills.is_enabled() && !cfg!(target_family = "wasm") {
+    if online_services_enabled
+        && FeatureFlag::ListSkills.is_enabled()
+        && !cfg!(target_family = "wasm")
+    {
         commands.push(EDIT_SKILL.clone());
         commands.push(INVOKE_SKILL.clone());
     }
 
-    if FeatureFlag::CloudMode.is_enabled() && FeatureFlag::CloudModeFromLocalSession.is_enabled() {
+    if online_services_enabled
+        && FeatureFlag::CloudMode.is_enabled()
+        && FeatureFlag::CloudModeFromLocalSession.is_enabled()
+    {
         commands.push(CLOUD_AGENT.clone());
     }
 
@@ -1086,7 +1095,9 @@ fn all_commands_for_all_surfaces() -> Vec<StaticCommand> {
         commands.push(PROFILE.clone());
     }
 
-    if FeatureFlag::RevertToCheckpoints.is_enabled() && FeatureFlag::RewindSlashCommand.is_enabled()
+    if online_services_enabled
+        && FeatureFlag::RevertToCheckpoints.is_enabled()
+        && FeatureFlag::RewindSlashCommand.is_enabled()
     {
         commands.push(REWIND);
     }

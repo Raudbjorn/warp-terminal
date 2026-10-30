@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::borrow::Cow;
 use std::boxed::Box;
 use std::cell::RefCell;
@@ -263,6 +264,10 @@ impl ActionButtonTheme for UDIDisabledButtonTheme {
 
 impl From<&BlocklistAIInputModel> for InputToggleMode {
     fn from(input_model: &BlocklistAIInputModel) -> Self {
+        if ChannelState::is_local_only() {
+            return InputToggleMode::Terminal;
+        }
+
         if input_model.is_input_type_locked() {
             match input_model.input_type() {
                 InputType::Shell => InputToggleMode::Terminal,
@@ -283,6 +288,10 @@ struct CachedUIState {
     is_input_empty: bool,
     is_hovered: bool,
     is_in_active_terminal: bool,
+}
+
+fn online_agent_controls_allowed_by_channel() -> bool {
+    !ChannelState::is_local_only()
 }
 
 impl CachedUIState {
@@ -440,10 +449,13 @@ impl UniversalDeveloperInputButtonBar {
         let ai_settings = AISettings::as_ref(ctx);
         let is_autodetection_enabled = ai_settings.is_ai_autodetection_enabled(ctx);
 
-        let mut options = vec![InputToggleMode::Terminal, InputToggleMode::AgentMode];
+        let mut options = vec![InputToggleMode::Terminal];
+        if online_agent_controls_allowed_by_channel() {
+            options.push(InputToggleMode::AgentMode);
+        }
 
         let mut default_option = input_model.as_ref(ctx).into();
-        if is_autodetection_enabled {
+        if is_autodetection_enabled && online_agent_controls_allowed_by_channel() {
             options.push(InputToggleMode::AutoDetection);
         } else if default_option == InputToggleMode::AutoDetection {
             // Don't set the default to auto-detection if it's not enabled.
@@ -484,12 +496,16 @@ impl UniversalDeveloperInputButtonBar {
                     ));
                 }
                 InputToggleMode::AgentMode => {
-                    ctx.emit(UniversalDeveloperInputButtonBarEvent::InputTypeSelected(
-                        InputType::AI,
-                    ));
+                    if online_agent_controls_allowed_by_channel() {
+                        ctx.emit(UniversalDeveloperInputButtonBarEvent::InputTypeSelected(
+                            InputType::AI,
+                        ));
+                    }
                 }
                 InputToggleMode::AutoDetection => {
-                    ctx.emit(UniversalDeveloperInputButtonBarEvent::EnableAutoDetection);
+                    if online_agent_controls_allowed_by_channel() {
+                        ctx.emit(UniversalDeveloperInputButtonBarEvent::EnableAutoDetection);
+                    }
                 }
             },
         });
@@ -505,8 +521,8 @@ impl UniversalDeveloperInputButtonBar {
             // Re-render when AI settings change (like voice input enabled/disabled)
             // Also update segmented control options when auto-detection setting changes
             if let AISettingsChangedEvent::AIAutoDetectionEnabled { .. } = event {
-                let is_autodection_enabled =
-                    ai_settings.as_ref(ctx).is_ai_autodetection_enabled(ctx);
+                let is_autodection_enabled = online_agent_controls_allowed_by_channel()
+                    && ai_settings.as_ref(ctx).is_ai_autodetection_enabled(ctx);
                 me.segmented_control.update(ctx, |segmented_control, ctx| {
                     if is_autodection_enabled {
                         segmented_control.update_options(
@@ -518,10 +534,11 @@ impl UniversalDeveloperInputButtonBar {
                             ctx,
                         );
                     } else {
-                        segmented_control.update_options(
-                            vec![InputToggleMode::Terminal, InputToggleMode::AgentMode],
-                            ctx,
-                        );
+                        let mut options = vec![InputToggleMode::Terminal];
+                        if online_agent_controls_allowed_by_channel() {
+                            options.push(InputToggleMode::AgentMode);
+                        }
+                        segmented_control.update_options(options, ctx);
                     }
                 });
             }
@@ -804,6 +821,10 @@ impl View for UniversalDeveloperInputButtonBar {
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn warpui::Element> {
+        // We still render in local-only mode so the user keeps the offline-compatible
+        // controls (segmented mode switcher, slash-command button). Online-only
+        // controls (mic, @, file, model selector) are gated below on
+        // `online_agent_controls_allowed_by_channel()`.
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
         #[cfg(feature = "voice_input")]
@@ -825,6 +846,7 @@ impl View for UniversalDeveloperInputButtonBar {
         };
 
         let build_buttons = |model_selector_element: Box<dyn warpui::Element>| {
+            let online_agent_controls_allowed = online_agent_controls_allowed_by_channel();
             // Create a horizontal layout with buttons arranged in a row
             let mut buttons = Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
@@ -835,29 +857,33 @@ impl View for UniversalDeveloperInputButtonBar {
                         .with_padding_right(4.0)
                         .finish(),
                 );
-            buttons = buttons.with_child(create_divider());
 
             buttons = buttons.with_child(ChildView::new(&self.slash_command_button).finish());
 
             #[cfg(feature = "voice_input")]
-            if is_voice_input_enabled {
+            if online_agent_controls_allowed && is_voice_input_enabled {
                 buttons = buttons.with_child(ChildView::new(&self.mic_button).finish());
             }
 
-            buttons = buttons.with_child(ChildView::new(&self.at_button).finish());
+            if online_agent_controls_allowed {
+                buttons = buttons.with_child(create_divider());
+                buttons = buttons.with_child(ChildView::new(&self.at_button).finish());
+            }
 
             // Viewers cannot attach files in shared sessions at this point.
-            if !self
-                .terminal_model
-                .lock()
-                .shared_session_status()
-                .is_viewer()
+            if online_agent_controls_allowed
+                && !self
+                    .terminal_model
+                    .lock()
+                    .shared_session_status()
+                    .is_viewer()
             {
                 buttons = buttons.with_child(ChildView::new(&self.file_button).finish());
             }
 
-            let show_model_selector = FeatureFlag::ProfilesDesignRevamp.is_enabled()
-                || *SessionSettings::as_ref(app).show_model_selectors_in_prompt;
+            let show_model_selector = online_agent_controls_allowed
+                && (FeatureFlag::ProfilesDesignRevamp.is_enabled()
+                    || *SessionSettings::as_ref(app).show_model_selectors_in_prompt);
             if show_model_selector {
                 buttons = buttons
                     .with_child(create_divider())

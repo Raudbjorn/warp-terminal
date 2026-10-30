@@ -111,7 +111,7 @@ impl BaseClient {
             .get(url)
             .send()
             .await
-            .map_err(reqwest::Error::without_url)
+            .map_err(http_client::Error::without_url)
             .context("Failed to send presigned download request")?;
         if !response.status().is_success() {
             return Err(HttpStatusError::new(response.status().as_u16(), String::new()).into());

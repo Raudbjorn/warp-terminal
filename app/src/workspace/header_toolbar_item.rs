@@ -3,6 +3,7 @@ use settings::Setting as _;
 use warpui::{AppContext, SingletonEntity};
 
 use crate::auth::AuthStateProvider;
+use crate::channel::ChannelState;
 use crate::features::FeatureFlag;
 use crate::settings::AISettings;
 use crate::ui_components::icons::Icon;
@@ -65,6 +66,10 @@ impl HeaderToolbarItemKind {
             }
             Self::ToolsPanel => true,
             Self::AgentManagement => {
+                if ChannelState::is_local_only() {
+                    return false;
+                }
+
                 let is_web_anonymous_user = AuthStateProvider::as_ref(app)
                     .get()
                     .is_user_web_anonymous_user()
@@ -74,7 +79,9 @@ impl HeaderToolbarItemKind {
                     && !is_web_anonymous_user
             }
             Self::CodeReview => cfg!(feature = "local_fs"),
-            Self::NotificationsMailbox => FeatureFlag::HOANotifications.is_enabled(),
+            Self::NotificationsMailbox => {
+                !ChannelState::is_local_only() && FeatureFlag::HOANotifications.is_enabled()
+            }
         }
     }
 

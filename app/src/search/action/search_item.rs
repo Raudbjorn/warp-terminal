@@ -199,6 +199,7 @@ impl SearchItemIcon for BindingGroup {
             Self::Notifications => Icon::Bell,
             Self::EnvVarCollection => Icon::EnvVarCollection,
             Self::Terminal => Icon::Terminal,
+            Self::Leader => Icon::Keyboard,
         }
     }
 
@@ -211,6 +212,7 @@ impl SearchItemIcon for BindingGroup {
             | Self::AutoUpdate
             | Self::Folders
             | Self::Terminal
+            | Self::Leader
             | Self::Notifications => appearance.theme().foreground().into_solid(),
             Self::WarpAi if !FeatureFlag::AgentMode.is_enabled() => {
                 ColorU::from_u32(colors::WARP_AI)

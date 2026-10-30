@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# oh-my-warp (omw) — a quilt-style patch manager for a Warp fork that always
+# stays mergeable with upstream (warpdotdev/warp). Think "oh-my-zsh for Warp":
+# a curated, additive layer of customizations on top of pristine upstream.
+#
+# MODEL
+#   * Branch `master` is a PRISTINE MIRROR of upstream (warpdotdev/warp) — never
+#     edited, so it fast-forwards to new Warp releases trivially (GitHub's
+#     "Sync fork" just works, and `git pull upstream master` is always clean).
+#   * Branch `oh-my-warp` is the WORKING branch: master's tree PLUS an additive
+#     overlay (this script, patches/, docs, examples/). Upstream files are never
+#     edited in place here either, so merging a new upstream stays conflict-free.
+#   * Your changes to upstream files live as patch files in patches/, listed in
+#     apply-order by patches/series. They are applied on demand onto a
+#     throwaway branch `omw/applied` — that branch is what you build / run / edit.
+#
+# COMMANDS
+#   omw apply     Rebuild omw/applied = oh-my-warp + every patch; switch to it to edit/build
+#   omw save      Capture omw/applied's commits back into patches/ + series; return to oh-my-warp
+#   omw sync      Fetch upstream, fast-forward master, merge it into oh-my-warp, re-apply patches
+#   omw status    Show working/mirror revisions, upstream drift, patch count, current branch
+#   omw list      List patches in apply order
+#   omw help      Show this help
+#
+# TYPICAL FLOW
+#   ./omw apply                 # land on omw/applied with all patches applied
+#   <edit upstream files>
+#   git commit -am "my tweak"   # one commit == one patch (use a clear subject)
+#   ./omw save                  # writes patches/NNNN-my-tweak.patch, back on oh-my-warp
+#   git push                    # publish the overlay to your fork
+#
+# Patches are stored as `git format-patch` files, so they carry authorship and
+# re-apply with 3-way merge when upstream moves. (Same idea as `gbp pq` / quilt.)
+
+set -euo pipefail
+
+PATCH_DIR="patches"
+SERIES="$PATCH_DIR/series"
+WORK_BRANCH="omw/applied"
+BASE_BRANCH="oh-my-warp"
+MIRROR_BRANCH="master"
+UPSTREAM_REMOTE="upstream"
+UPSTREAM_BRANCH="master"
+
+die()  { printf 'omw: %s\n' "$*" >&2; exit 1; }
+info() { printf 'omw: %s\n' "$*"; }
+
+root="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
+cd "$root"
+
+ensure_clean() {
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    die "you have uncommitted changes — commit or stash them first (untracked files are fine)"
+  fi
+}
+
+# Print patch filenames from series (skip blanks and # comments).
+read_series() {
+  [ -f "$SERIES" ] || return 0
+  grep -vE '^[[:space:]]*(#|$)' "$SERIES" || true
+}
+
+series_count() { read_series | grep -c . || true; }
+
+write_series_header() {
+  {
+    echo "# omw patch series — applied top-to-bottom by 'omw apply'."
+    echo "# One patch file (relative to patches/) per line; '#' lines are ignored."
+  } > "$SERIES"
+}
+
+cmd_status() {
+  info "working     : $BASE_BRANCH ($(git rev-parse --short "$BASE_BRANCH" 2>/dev/null || echo '?'))"
+  info "mirror      : $MIRROR_BRANCH ($(git rev-parse --short "$MIRROR_BRANCH" 2>/dev/null || echo '?'))"
+  if git rev-parse --verify -q "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" >/dev/null; then
+    local up; up="$(git rev-parse --short "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH")"
+    if git merge-base --is-ancestor "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH" "$BASE_BRANCH"; then
+      info "upstream    : $UPSTREAM_REMOTE/$UPSTREAM_BRANCH ($up) — up to date"
+    else
+      info "upstream    : $UPSTREAM_REMOTE/$UPSTREAM_BRANCH ($up) — BEHIND, run 'omw sync'"
+    fi
+  else
+    info "upstream    : (no $UPSTREAM_REMOTE/$UPSTREAM_BRANCH ref; run 'git fetch $UPSTREAM_REMOTE')"
+  fi
+  info "patches     : $(series_count) in $SERIES"
+  info "current     : $(git rev-parse --abbrev-ref HEAD)"
+}
+
+cmd_list() {
+  local n=0 p
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    n=$((n + 1))
+    printf '%3d  %s\n' "$n" "$p"
+  done < <(read_series)
+  [ "$n" -gt 0 ] || info "no patches yet — './omw apply' then edit, then './omw save'"
+}
+
+cmd_apply() {
+  ensure_clean
+  git checkout -q "$BASE_BRANCH"
+  git branch -f "$WORK_BRANCH" "$BASE_BRANCH"
+  git checkout -q "$WORK_BRANCH"
+  local p applied=0
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    [ -f "$PATCH_DIR/$p" ] || die "series lists '$p' but $PATCH_DIR/$p is missing"
+    if ! git am --3way --keep-cr "$PATCH_DIR/$p"; then
+      die "patch '$p' did not apply cleanly. Resolve the conflict, 'git am --continue' (or --skip), then './omw save'."
+    fi
+    applied=$((applied + 1))
+  done < <(read_series)
+  info "applied $applied patch(es); you are on '$WORK_BRANCH'"
+  info "edit + commit your changes here (one commit per patch), then './omw save'"
+}
+
+cmd_save() {
+  git rev-parse --verify -q "$WORK_BRANCH" >/dev/null || die "no '$WORK_BRANCH' branch — run './omw apply' first"
+  ensure_clean
+  local tmp; tmp="$(mktemp -d)"
+  git format-patch --no-signature -o "$tmp" "$BASE_BRANCH..$WORK_BRANCH" >/dev/null
+  git checkout -q "$BASE_BRANCH"
+  rm -f "$PATCH_DIR"/*.patch
+  write_series_header
+  local f
+  for f in "$tmp"/*.patch; do
+    [ -e "$f" ] || continue
+    cp "$f" "$PATCH_DIR/"
+    basename "$f" >> "$SERIES"
+  done
+  rm -rf "$tmp"
+  git add "$PATCH_DIR"
+  if git diff --cached --quiet; then
+    info "no patch changes to save (omw/applied has no commits beyond $BASE_BRANCH)"
+  else
+    git commit -q -m "omw: refresh patch series ($(series_count) patch(es))"
+    info "saved $(series_count) patch(es) into $PATCH_DIR/ and committed on $BASE_BRANCH"
+  fi
+}
+
+cmd_sync() {
+  ensure_clean
+  info "fetching ${UPSTREAM_REMOTE}…"
+  git fetch -q "$UPSTREAM_REMOTE"
+  info "fast-forwarding mirror ${MIRROR_BRANCH} → ${UPSTREAM_REMOTE}/${UPSTREAM_BRANCH}…"
+  git checkout -q "$MIRROR_BRANCH"
+  if ! git merge --ff-only "$UPSTREAM_REMOTE/$UPSTREAM_BRANCH"; then
+    die "mirror '$MIRROR_BRANCH' diverged from upstream — it must stay a pristine mirror (never commit to it)."
+  fi
+  git checkout -q "$BASE_BRANCH"
+  info "merging ${MIRROR_BRANCH} into ${BASE_BRANCH}…"
+  if ! git merge --no-edit "$MIRROR_BRANCH"; then
+    die "unexpected merge conflict pulling upstream (overlay should be additive). Resolve, commit, then './omw apply'."
+  fi
+  info "re-applying patches onto the new upstream base…"
+  cmd_apply
+  info "synced. publish both branches: git push origin $MIRROR_BRANCH $BASE_BRANCH"
+}
+
+case "${1:-help}" in
+  status)        cmd_status ;;
+  list)          cmd_list ;;
+  apply)         cmd_apply ;;
+  save)          cmd_save ;;
+  sync)          cmd_sync ;;
+  help|-h|--help) awk 'NR==1{next} /^#/{l=$0; sub(/^#+ ?/,"",l); print l; next} {exit}' "$0" ;;
+  *)             die "unknown command '${1:-}'. Try './omw help'." ;;
+esac

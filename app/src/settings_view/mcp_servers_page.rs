@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::collections::HashMap;
 
 use uuid::Uuid;
@@ -543,7 +544,7 @@ impl SettingsPageMeta for MCPServersSettingsPageView {
     }
 
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        true
+        !ChannelState::is_local_only()
     }
 
     fn update_filter(&mut self, query: &str, ctx: &mut ViewContext<Self>) -> MatchData {

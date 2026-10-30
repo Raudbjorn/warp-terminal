@@ -127,7 +127,7 @@ fn subpage_display_names_are_correct() {
 /// breaks the exhaustive match there, which is the prompt to add it here.
 const ALL_SECTIONS: &[SettingsSection] = &[
     SettingsSection::About,
-    SettingsSection::Account,
+    SettingsSection::LocalAI,
     SettingsSection::BillingAndUsage,
     SettingsSection::Appearance,
     SettingsSection::Features,
@@ -161,7 +161,7 @@ fn all_sections_list_is_exhaustive() {
     fn is_listed(section: SettingsSection) -> bool {
         let known = match section {
             SettingsSection::About
-            | SettingsSection::Account
+            | SettingsSection::LocalAI
             | SettingsSection::BillingAndUsage
             | SettingsSection::Appearance
             | SettingsSection::Features
@@ -336,11 +336,10 @@ const AGENT_SUBPAGES: &[SettingsSection] = &[
     SettingsSection::ThirdPartyCLIAgents,
 ];
 
-/// Builds the nav-items layout used by `SettingsView::new`, matching the real
-/// sidebar ordering so tests exercise realistic nav orders.
+/// A representative sidebar with Local AI as the standalone page because this fork has no Account page.
 fn realistic_nav_items() -> Vec<SettingsNavItem> {
     vec![
-        SettingsNavItem::Page(SettingsSection::Account),
+        SettingsNavItem::Page(SettingsSection::LocalAI),
         SettingsNavItem::Umbrella(SettingsUmbrella::new("Agents", AGENT_SUBPAGES.to_vec())),
         SettingsNavItem::Page(SettingsSection::BillingAndUsage),
         SettingsNavItem::Umbrella(SettingsUmbrella::new(
@@ -376,12 +375,12 @@ fn collapsed_umbrella_is_a_single_nav_stop() {
     // All umbrellas default to collapsed.
     let stops = build_nav_stops(&nav_items, |_| true);
 
-    // Expect: Account, <Agents umbrella>, BillingAndUsage, <Code umbrella>,
+    // Expect: LocalAI, <Agents umbrella>, BillingAndUsage, <Code umbrella>,
     // <Cloud platform umbrella>, Teams.
     assert_eq!(stops.len(), 6);
     assert!(matches!(
         stops[0],
-        NavStop::Section(SettingsSection::Account)
+        NavStop::Section(SettingsSection::LocalAI)
     ));
     assert!(matches!(
         stops[1],
@@ -422,7 +421,7 @@ fn expanded_umbrella_produces_section_stop_per_subpage() {
 
     let stops = build_nav_stops(&nav_items, |_| true);
 
-    // Expect: Account, WarpAgent, AgentProfiles, AgentMCPServers, Knowledge,
+    // Expect: LocalAI, WarpAgent, AgentProfiles, AgentMCPServers, Knowledge,
     // ThirdPartyCLIAgents, BillingAndUsage, <Code umbrella>,
     // <Cloud platform umbrella>, Teams.
     let sections: Vec<_> = stops
@@ -435,7 +434,7 @@ fn expanded_umbrella_produces_section_stop_per_subpage() {
     assert_eq!(
         sections,
         vec![
-            "Account",
+            "LocalAI",
             "WarpAgent",
             "AgentProfiles",
             "AgentMCPServers",
@@ -529,7 +528,7 @@ fn filtered_out_top_level_page_is_skipped() {
     assert!(
         stops
             .iter()
-            .any(|s| matches!(s, NavStop::Section(SettingsSection::Account)))
+            .any(|s| matches!(s, NavStop::Section(SettingsSection::LocalAI)))
     );
 }
 
@@ -625,12 +624,12 @@ fn arrow_down_from_account_with_collapsed_agents_lands_on_first_subpage() {
     let nav_items = realistic_nav_items();
     let stops = build_nav_stops(&nav_items, |_| true);
 
-    // Pressing Down from Account should auto-expand Agents and select WarpAgent,
+    // Pressing Down from LocalAI should auto-expand Agents and select WarpAgent,
     // not skip over to BillingAndUsage.
     let next = simulate_cycle(
         &nav_items,
         &stops,
-        SettingsSection::Account,
+        SettingsSection::LocalAI,
         CycleDirection::Down,
     );
     assert_eq!(next, SettingsSection::WarpAgent);
@@ -737,13 +736,13 @@ fn arrow_down_collapsed_umbrella_respects_search_filter() {
     };
     let stops = build_nav_stops(&nav_items, is_visible);
 
-    // From Account, Down should land on AgentMCPServers (first visible
+    // From LocalAI, Down should land on AgentMCPServers (first visible
     // subpage of the still-collapsed Agents umbrella), not on WarpAgent /
     // AgentProfiles.
     let next = simulate_cycle(
         &nav_items,
         &stops,
-        SettingsSection::Account,
+        SettingsSection::LocalAI,
         CycleDirection::Down,
     );
     assert_eq!(next, SettingsSection::AgentMCPServers);
@@ -1159,4 +1158,36 @@ fn category_header_with_trailing_element_and_no_subtitle_does_not_panic_flex_lay
             presenter.build_scene(vec2f(800., 600.), 1., None, ctx);
         });
     });
+}
+
+#[test]
+fn split_agent_and_cloud_pages_keep_the_local_only_boundary() {
+    // Splitting the old AI page must not expose its hosted subpages in local-only builds.
+    for section in [
+        SettingsSection::WarpAgent,
+        SettingsSection::AgentProfiles,
+        SettingsSection::AgentMCPServers,
+        SettingsSection::Knowledge,
+        SettingsSection::ThirdPartyCLIAgents,
+        SettingsSection::CloudEnvironments,
+        SettingsSection::WarpCloudAgentAPIKeys,
+    ] {
+        assert!(section.is_online_services_only(), "{section:?}");
+    }
+    for section in [
+        SettingsSection::Appearance,
+        SettingsSection::LocalAI,
+        SettingsSection::CodeIndexing,
+        SettingsSection::EditorAndCodeReview,
+    ] {
+        assert!(!section.is_online_services_only(), "{section:?}");
+    }
+    assert_eq!(
+        SettingsView::initial_page(None),
+        SettingsSection::Appearance
+    );
+    assert_eq!(
+        SettingsSection::from_slug("Account"),
+        Some(SettingsSection::Appearance)
+    );
 }

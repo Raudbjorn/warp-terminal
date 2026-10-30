@@ -326,20 +326,23 @@ fn custom_endpoint_definitions_reject_duplicate_model_config_keys() {
 }
 
 #[test]
-fn custom_endpoint_url_requires_public_https() {
+fn custom_endpoint_url_requires_https_except_for_local_inference() {
     for valid in [
         "https://api.example.com/v1",
         "https://openrouter.ai/api/v1",
         "https://8.8.8.8/v1",
+        // Direct local inference must support loopback and LAN servers without TLS.
+        "http://localhost:8080",
+        "http://127.0.0.1/v1",
+        "http://10.0.0.1/v1",
+        "http://[::1]/v1",
+        "https://localhost:8080",
     ] {
         assert_eq!(validate_custom_endpoint_url(valid), Ok(()));
     }
     for invalid in [
         "http://api.example.com/v1",
-        "https://localhost:8080",
-        "https://127.0.0.1/v1",
-        "https://10.0.0.1/v1",
-        "https://[::1]/v1",
+        "ftp://localhost:8080",
         "not a url",
     ] {
         assert!(
@@ -1450,4 +1453,166 @@ fn grok_expired_refresh_token_ignores_in_flight_refresh() {
         mgr.grok_expired_refresh_token(true),
         Some("refresh".to_string())
     );
+}
+
+#[test]
+fn default_profile_settings_fall_back_to_legacy_fields_before_migration() {
+    let keys = ApiKeys {
+        openai: Some("sk-openai".into()),
+        anthropic: Some("sk-anthropic".into()),
+        openai_base_url: Some("http://127.0.0.1:1234/v1".into()),
+        custom_endpoints: vec![endpoint("ep", "https://a.io", "key", &[("m", None)])],
+        ..Default::default()
+    };
+
+    let settings = keys.profile_settings(DEFAULT_PROFILE_INFERENCE_KEY);
+    assert_eq!(settings.openai.as_deref(), Some("sk-openai"));
+    assert_eq!(settings.anthropic.as_deref(), Some("sk-anthropic"));
+    assert_eq!(
+        settings.openai_base_url.as_deref(),
+        Some("http://127.0.0.1:1234/v1")
+    );
+    assert_eq!(settings.custom_endpoints.len(), 1);
+}
+
+#[test]
+fn local_settings_migration_populates_default_profile_once() {
+    let mut keys = ApiKeys {
+        openai: Some("sk-openai".into()),
+        ..Default::default()
+    };
+
+    assert!(keys.migrate_default_profile_if_needed());
+    assert!(keys.migrate_default_profile_local_settings_if_needed(
+        Some(" http://127.0.0.1:1234/v1/ ".into()),
+        r#"{"auto-autocomplete":"local/model"}"#.into(),
+        "local/model,local/other".into(),
+        true,
+    ));
+
+    let settings = keys.profile_settings(DEFAULT_PROFILE_INFERENCE_KEY);
+    assert_eq!(settings.openai.as_deref(), Some("sk-openai"));
+    assert_eq!(
+        settings.openai_base_url.as_deref(),
+        Some("http://127.0.0.1:1234/v1")
+    );
+    assert_eq!(
+        settings.local_model_aliases,
+        r#"{"auto-autocomplete":"local/model"}"#
+    );
+    assert_eq!(settings.local_model_list, "local/model,local/other");
+    assert!(settings.local_ai_autocomplete_enabled);
+
+    assert!(!keys.migrate_default_profile_local_settings_if_needed(
+        Some("http://different.test/v1".into()),
+        r#"{"auto":"different"}"#.into(),
+        "different".into(),
+        false,
+    ));
+    let settings = keys.profile_settings(DEFAULT_PROFILE_INFERENCE_KEY);
+    assert_eq!(
+        settings.openai_base_url.as_deref(),
+        Some("http://127.0.0.1:1234/v1")
+    );
+    assert!(settings.local_ai_autocomplete_enabled);
+}
+
+#[test]
+fn api_keys_for_request_uses_requested_profile() {
+    let mut keys = ApiKeys::default();
+    keys.profile_inference_settings.insert(
+        DEFAULT_PROFILE_INFERENCE_KEY.to_string(),
+        ProfileInferenceSettings {
+            openai: Some("sk-default".into()),
+            ..Default::default()
+        },
+    );
+    keys.profile_inference_settings.insert(
+        "profile-2".to_string(),
+        ProfileInferenceSettings {
+            openai: Some("sk-profile-2".into()),
+            anthropic: Some("sk-anthropic-2".into()),
+            ..Default::default()
+        },
+    );
+    let mgr = make_manager(keys);
+
+    let result = mgr
+        .api_keys_for_profile_request("profile-2", true, false, None)
+        .expect("profile scoped keys should be present");
+    assert_eq!(result.openai, "sk-profile-2");
+    assert_eq!(result.anthropic, "sk-anthropic-2");
+}
+
+#[test]
+fn custom_model_providers_for_request_uses_requested_profile() {
+    let mut keys = ApiKeys::default();
+    keys.profile_inference_settings.insert(
+        DEFAULT_PROFILE_INFERENCE_KEY.to_string(),
+        ProfileInferenceSettings {
+            custom_endpoints: vec![endpoint_with_keys(
+                "default",
+                "https://default.test/v1",
+                "default-key",
+                &[("default-model", None, "default-cfg")],
+            )],
+            ..Default::default()
+        },
+    );
+    keys.profile_inference_settings.insert(
+        "profile-2".to_string(),
+        ProfileInferenceSettings {
+            custom_endpoints: vec![endpoint_with_keys(
+                "profile",
+                "https://profile.test/v1",
+                "profile-key",
+                &[("profile-model", None, "profile-cfg")],
+            )],
+            ..Default::default()
+        },
+    );
+    let mgr = make_manager(keys);
+
+    let result = mgr
+        .custom_model_providers_for_profile_request("profile-2", true)
+        .expect("profile custom endpoint should be present");
+    assert_eq!(result.providers.len(), 1);
+    assert_eq!(result.providers[0].base_url, "https://profile.test/v1");
+    assert_eq!(result.providers[0].api_key, "profile-key");
+    assert_eq!(result.providers[0].models[0].slug, "profile-model");
+    assert_eq!(result.providers[0].models[0].config_key, "profile-cfg");
+}
+
+#[cfg(test)]
+mod url_normalization_tests {
+    use crate::api_keys::normalize_absolute_http_url;
+
+    #[test]
+    fn normalizes_absolute_http_urls() {
+        assert_eq!(
+            normalize_absolute_http_url(Some(" http://127.0.0.1:8787/// ".to_string())),
+            Some("http://127.0.0.1:8787".to_string()),
+        );
+        assert_eq!(
+            normalize_absolute_http_url(Some("https://llm.example.test/v1/".to_string())),
+            Some("https://llm.example.test/v1".to_string()),
+        );
+    }
+
+    #[test]
+    fn rejects_empty_relative_and_non_http_urls() {
+        assert_eq!(normalize_absolute_http_url(Some("   ".to_string())), None);
+        assert_eq!(
+            normalize_absolute_http_url(Some("localhost:8787".to_string())),
+            None,
+        );
+        assert_eq!(
+            normalize_absolute_http_url(Some("/v1/chat/completions".to_string())),
+            None,
+        );
+        assert_eq!(
+            normalize_absolute_http_url(Some("ftp://example.test".to_string())),
+            None,
+        );
+    }
 }

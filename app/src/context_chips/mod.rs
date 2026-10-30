@@ -9,6 +9,7 @@ pub mod display_menu;
 pub(crate) mod git_branch_on_click;
 pub(crate) mod logging;
 pub mod node_version_popup;
+pub mod plugin_prompt;
 pub mod prompt;
 pub mod prompt_snapshot;
 pub mod prompt_type;

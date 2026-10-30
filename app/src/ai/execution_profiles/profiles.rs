@@ -5,6 +5,7 @@ use anyhow::Context as _;
 // Only the legacy import, which eval builds compile out, materializes an ordered collection.
 #[cfg(not(feature = "agent_mode_evals"))]
 use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
 use settings::Setting as _;
 use uuid::Uuid;
 use warp_core::channel::ChannelState;
@@ -41,11 +42,14 @@ use crate::settings::{
 use crate::workspaces::user_workspaces::UserWorkspaces;
 use crate::{CloudModel, LaunchMode, TelemetryEvent, send_telemetry_from_ctx};
 
+const LOCAL_PROFILES_PREF_KEY: &str = "LocalAIExecutionProfiles";
+
 #[derive(Clone, Debug)]
 pub struct AIExecutionProfileInfo {
     id: ExecutionProfileId,
     #[cfg_attr(target_family = "wasm", allow(dead_code))]
     sync_id: Option<SyncId>,
+    local_id: Option<Uuid>,
     data: AIExecutionProfile,
 }
 
@@ -62,6 +66,18 @@ impl AIExecutionProfileInfo {
 
     pub fn data(&self) -> &AIExecutionProfile {
         &self.data
+    }
+
+    pub fn inference_profile_key(&self) -> String {
+        if self.data.is_default_profile {
+            ::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY.to_string()
+        } else if let Some(sync_id) = self.sync_id {
+            sync_id.to_string()
+        } else if let Some(local_id) = self.local_id {
+            format!("local-{local_id}")
+        } else {
+            format!("local-profile-{}", self.id)
+        }
     }
 }
 
@@ -95,6 +111,9 @@ enum ProfileSource {
 impl ProfileSource {
     /// Resolves the persistence backend for this launch.
     fn for_launch_mode(launch_mode: &LaunchMode) -> Self {
+        if ChannelState::is_local_only() {
+            return Self::LegacyCloudObjects;
+        }
         if !file_backed_execution_profiles_enabled(launch_mode) {
             return Self::LegacyCloudObjects;
         }
@@ -243,6 +262,7 @@ pub struct AIExecutionProfilesModel {
     default_profile_state: DefaultProfileState,
     /// Maps stable profile IDs to legacy cloud-object IDs for the rollback backend.
     profile_id_to_sync_id: HashMap<ExecutionProfileId, SyncId>,
+    local_profiles: HashMap<ExecutionProfileId, LocalAIExecutionProfile>,
     /// Only contains entries for non-default profiles.
     active_profiles_per_session: HashMap<EntityId, ExecutionProfileId>,
     session_computer_use: HashMap<EntityId, SessionComputerUse>,
@@ -250,6 +270,18 @@ pub struct AIExecutionProfilesModel {
 
 pub(crate) struct SessionComputerUse {
     pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LocalAIExecutionProfile {
+    id: Uuid,
+    profile: AIExecutionProfile,
+}
+
+impl LocalAIExecutionProfile {
+    fn inference_profile_key(&self) -> String {
+        format!("local-{}", self.id)
+    }
 }
 
 impl AIExecutionProfilesModel {
@@ -509,6 +541,7 @@ impl AIExecutionProfilesModel {
             last_settings_profiles,
             default_profile_state,
             profile_id_to_sync_id,
+            local_profiles: Self::load_local_profiles(ctx),
             active_profiles_per_session,
             session_computer_use: HashMap::new(),
         };
@@ -840,6 +873,58 @@ impl AIExecutionProfilesModel {
         }
     }
 
+    fn load_local_profiles(
+        ctx: &AppContext,
+    ) -> HashMap<ExecutionProfileId, LocalAIExecutionProfile> {
+        let profiles = match ctx
+            .private_user_preferences()
+            .read_value(LOCAL_PROFILES_PREF_KEY)
+        {
+            Ok(Some(json)) => match serde_json::from_str::<Vec<LocalAIExecutionProfile>>(&json) {
+                Ok(profiles) => profiles,
+                Err(error) => {
+                    log::warn!("Failed to parse local AI execution profiles: {error}");
+                    Vec::new()
+                }
+            },
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                log::warn!("Failed to read local AI execution profiles: {error}");
+                Vec::new()
+            }
+        };
+
+        profiles
+            .into_iter()
+            .filter(|profile| !profile.profile.is_default_profile)
+            .map(|profile| {
+                (
+                    ExecutionProfileId::parse(format!("profile-{}", profile.id))
+                        .expect("UUID is a valid profile key"),
+                    profile,
+                )
+            })
+            .collect()
+    }
+
+    fn save_local_profiles(&self, ctx: &AppContext) {
+        let mut profiles = self
+            .local_profiles
+            .values()
+            .cloned()
+            .collect::<Vec<LocalAIExecutionProfile>>();
+        profiles.sort_by_key(|profile| profile.id.to_string());
+        let Ok(json) = serde_json::to_string(&profiles) else {
+            return;
+        };
+        if let Err(error) = ctx
+            .private_user_preferences()
+            .write_value(LOCAL_PROFILES_PREF_KEY, json)
+        {
+            log::warn!("Failed to persist local AI execution profiles: {error}");
+        }
+    }
+
     pub fn create_profile(&mut self, ctx: &mut ModelContext<Self>) -> Option<ExecutionProfileId> {
         let profile_id = ExecutionProfileId::new();
         if self.settings_migration_state == SettingsMigrationState::PendingLegacyImport {
@@ -873,15 +958,27 @@ impl AIExecutionProfilesModel {
             return Some(profile_id);
         }
 
-        let Some(owner) = UserWorkspaces::as_ref(ctx).personal_drive(ctx) else {
-            report_error!("Failed to create AI execution profile: personal drive not available");
-            return None;
-        };
-
         let mut new_profile = self.default_profile(ctx).data().clone();
         new_profile.name = "".to_string();
         new_profile.is_default_profile = false;
         new_profile.autosync_plans_to_warp_drive = true;
+
+        let Some(owner) = UserWorkspaces::as_ref(ctx).personal_drive(ctx) else {
+            let local_profile = LocalAIExecutionProfile {
+                id: Uuid::new_v4(),
+                profile: new_profile,
+            };
+            let profile_id = ExecutionProfileId::parse(format!("profile-{}", local_profile.id))
+                .expect("UUID is a valid profile key");
+            self.local_profiles
+                .insert(profile_id.clone(), local_profile);
+            self.save_local_profiles(ctx);
+
+            send_telemetry_from_ctx!(TelemetryEvent::AIExecutionProfileCreated, ctx);
+            ctx.emit(AIExecutionProfilesModelEvent::ProfileCreated);
+
+            return Some(profile_id);
+        };
 
         let update_manager = UpdateManager::handle(ctx);
         let client_id = ClientId::default();
@@ -948,6 +1045,19 @@ impl AIExecutionProfilesModel {
             return;
         }
 
+        if let Some(local_profile) = self.local_profiles.remove(profile_id) {
+            self.active_profiles_per_session
+                .retain(|_, active_profile_id| active_profile_id != profile_id);
+            self.save_local_profiles(ctx);
+            ::ai::api_keys::ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                manager.remove_profile_settings(&local_profile.inference_profile_key(), ctx);
+            });
+
+            send_telemetry_from_ctx!(TelemetryEvent::AIExecutionProfileDeleted, ctx);
+            ctx.emit(AIExecutionProfilesModelEvent::ProfileDeleted);
+            return;
+        }
+
         let Some(sync_id) = self.profile_id_to_sync_id.get(profile_id).cloned() else {
             return;
         };
@@ -960,6 +1070,9 @@ impl AIExecutionProfilesModel {
         let update_manager = UpdateManager::handle(ctx);
         update_manager.update(ctx, |update_manager, ctx| {
             update_manager.delete_ai_execution_profile(sync_id, ctx);
+        });
+        ::ai::api_keys::ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+            manager.remove_profile_settings(&sync_id.to_string(), ctx);
         });
 
         send_telemetry_from_ctx!(TelemetryEvent::AIExecutionProfileDeleted, ctx);
@@ -1039,6 +1152,7 @@ impl AIExecutionProfilesModel {
             return AIExecutionProfileInfo {
                 id,
                 sync_id: None,
+                local_id: None,
                 data,
             };
         }
@@ -1047,6 +1161,7 @@ impl AIExecutionProfilesModel {
             DefaultProfileState::Unsynced { id, profile } => AIExecutionProfileInfo {
                 id: id.clone(),
                 sync_id: None,
+                local_id: None,
                 data: profile.clone(),
             },
             DefaultProfileState::Synced { id } => {
@@ -1057,6 +1172,7 @@ impl AIExecutionProfilesModel {
                     return AIExecutionProfileInfo {
                         id: id.clone(),
                         sync_id: None,
+                        local_id: None,
                         data: AIExecutionProfile::default(),
                     };
                 };
@@ -1071,12 +1187,14 @@ impl AIExecutionProfilesModel {
                 AIExecutionProfileInfo {
                     id: id.clone(),
                     sync_id: Some(*sync_id),
+                    local_id: None,
                     data,
                 }
             }
             DefaultProfileState::Cli { id, profile } => AIExecutionProfileInfo {
                 id: id.clone(),
                 sync_id: None,
+                local_id: None,
                 data: profile.clone(),
             },
         }
@@ -1144,6 +1262,7 @@ impl AIExecutionProfilesModel {
                 .map(|data| AIExecutionProfileInfo {
                     id: profile_id.clone(),
                     sync_id: None,
+                    local_id: None,
                     data,
                 });
         }
@@ -1155,11 +1274,21 @@ impl AIExecutionProfilesModel {
                     return Some(AIExecutionProfileInfo {
                         id: id.clone(),
                         sync_id: None,
+                        local_id: None,
                         data: profile.clone(),
                     });
                 }
             }
             DefaultProfileState::Synced { .. } => {}
+        }
+
+        if let Some(local_profile) = self.local_profiles.get(profile_id) {
+            return Some(AIExecutionProfileInfo {
+                id: profile_id.clone(),
+                sync_id: None,
+                local_id: Some(local_profile.id),
+                data: local_profile.profile.clone(),
+            });
         }
 
         // Handle all synced profiles (default and non-default)
@@ -1173,6 +1302,7 @@ impl AIExecutionProfilesModel {
         Some(AIExecutionProfileInfo {
             id: profile_id.clone(),
             sync_id: Some(*sync_id),
+            local_id: None,
             data,
         })
     }
@@ -1191,6 +1321,7 @@ impl AIExecutionProfilesModel {
                     .filter(|id| *id != &default_profile_id)
                     .cloned(),
             )
+            .chain(self.local_profiles.keys().cloned())
             .collect()
     }
 
@@ -1256,6 +1387,7 @@ impl AIExecutionProfilesModel {
         self.profile_id_to_sync_id
             .keys()
             .any(|id| id != &default_profile_id)
+            || !self.local_profiles.is_empty()
     }
 
     pub fn set_base_model(
@@ -2101,6 +2233,29 @@ impl AIExecutionProfilesModel {
             return true;
         }
 
+        if self.local_profiles.contains_key(profile_id) {
+            let value_changed = {
+                let local_profile = self
+                    .local_profiles
+                    .get_mut(profile_id)
+                    .expect("local profile must exist");
+                let mut data = local_profile.profile.clone();
+                let value_changed = edit_fn(&mut data);
+                if value_changed {
+                    local_profile.profile = data;
+                }
+                value_changed
+            };
+            if value_changed {
+                self.save_local_profiles(ctx);
+                log::info!("Edited local execution profile with id: {profile_id:?}");
+                ctx.emit(AIExecutionProfilesModelEvent::ProfileUpdated(
+                    profile_id.clone(),
+                ));
+            }
+            return value_changed;
+        }
+
         let mut value_changed = false;
         if let Some(sync_id) = self.profile_id_to_sync_id.get(profile_id) {
             let cloud_model = CloudModel::as_ref(ctx);
@@ -2338,6 +2493,9 @@ impl AIExecutionProfilesModel {
 
         if let Some(profile_id) = profile_id {
             self.profile_id_to_sync_id.remove(&profile_id);
+            ::ai::api_keys::ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                manager.remove_profile_settings(&sync_id.to_string(), ctx);
+            });
 
             // Also remove from active profiles per session
             self.active_profiles_per_session
@@ -2380,7 +2538,9 @@ impl AIExecutionProfilesModel {
 
         if let Some(profile_id) = profile_id {
             log::info!("Execution profile updated from server: {sync_id:?}");
-            ctx.emit(AIExecutionProfilesModelEvent::ProfileUpdated(profile_id));
+            ctx.emit(AIExecutionProfilesModelEvent::ProfileUpdated(
+                profile_id.clone(),
+            ));
         }
     }
 
@@ -2431,6 +2591,9 @@ impl AIExecutionProfilesModel {
             profile_id.clone()
         };
 
+        ::ai::api_keys::ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+            manager.rename_profile_settings(&client_id.to_string(), &server_id.to_string(), ctx);
+        });
         self.profile_id_to_sync_id.remove(&profile_id);
         self.profile_id_to_sync_id
             .insert(migrated_profile_id.clone(), server_id);

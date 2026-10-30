@@ -251,9 +251,13 @@ impl<T: ModeProvider> ToEscapeSequence<T> for KeystrokeWithDetails<'_> {
             return Some(csi_u);
         }
 
-        // Legacy encoding fallback.
-        // NOTE: Order matters! We assume all fn keystrokes have been handled by the
-        // time we reach meta_keystroke_to_escape_sequence.
+        self.to_legacy_escape_sequence(mode_provider)
+    }
+}
+
+impl KeystrokeWithDetails<'_> {
+    fn to_legacy_escape_sequence(&self, mode_provider: &impl ModeProvider) -> Option<Vec<u8>> {
+        // Meta encoding assumes function and navigation keys have already been handled.
         let keystroke = self.keystroke;
         fn_keystroke_to_escape_sequence(keystroke, mode_provider)
             .or_else(|| keystroke_to_c0_control_code(keystroke, mode_provider))
@@ -262,65 +266,50 @@ impl<T: ModeProvider> ToEscapeSequence<T> for KeystrokeWithDetails<'_> {
             .or_else(|| meta_keystroke_to_escape_sequence(keystroke, mode_provider))
             .or_else(|| backspace_keystroke_to_escape_sequence(keystroke))
     }
-}
 
-impl KeystrokeWithDetails<'_> {
-    /// Full keystroke → PTY bytes for a frontend that receives a single key
-    /// event per press — e.g. the headless TUI, whose crossterm input has no
-    /// separate typed-characters event and doesn't pre-encode `Ctrl+<letter>`.
-    /// (The GUI needs no equivalent: the OS hands it printable text as a
-    /// separate typed-characters event and `Ctrl+<letter>` already encoded as
-    /// its control byte.)
-    ///
-    /// Layers the frontend-agnostic fallbacks on top of
-    /// [`to_escape_sequence`](ToEscapeSequence::to_escape_sequence), in order:
-    /// 1. the shared encoder — kitty protocol, application-cursor mode,
-    ///    alt/meta ESC-prefixing, function/cursor keys, backspace, and the
-    ///    `Ctrl+<number>`/`Ctrl+space` C0 set;
-    /// 2. `Ctrl+<letter>` → its C0 byte (`Ctrl+A`..`Ctrl+Z` → `0x01`..`0x1A`),
-    ///    which the encoder leaves alone without the kitty protocol;
-    /// 3. printable text → its UTF-8 bytes (from `chars`);
-    /// 4. named control keys that carry no `chars` (enter/escape/tab/backspace)
-    ///    → their C0 bytes, so e.g. Escape can leave an editor's insert mode.
-    ///
+    /// Encodes a frontend key event without relying on separate OS text events.
+    /// Kitty encoding takes precedence over legacy Control, Meta, and named-key fallbacks.
     /// Returns `None` when the key produces nothing to send.
     pub fn to_pty_bytes<T: ModeProvider>(&self, mode_provider: &T) -> Option<Vec<u8>> {
-        if let Some(sequence) = self.to_escape_sequence(mode_provider) {
+        if let Some(sequence) = maybe_convert_keystroke_to_csi_u(
+            self.keystroke,
+            self.key_without_modifiers,
+            self.chars,
+            mode_provider,
+        ) {
             return Some(sequence);
         }
-        if let Some(control_byte) = ctrl_letter_to_c0(self.keystroke) {
-            return Some(control_byte);
+        if let Some(control_byte) = ctrl_character_to_c0(self.keystroke) {
+            let control_keystroke = Keystroke {
+                key: char::from(control_byte).to_string(),
+                ..self.keystroke.clone()
+            };
+            return meta_keystroke_to_escape_sequence(&control_keystroke, mode_provider)
+                .or_else(|| Some(vec![control_byte]));
         }
-        if let Some(chars) = self.chars.filter(|chars| !chars.is_empty()) {
-            return Some(chars.as_bytes().to_vec());
+        if self.keystroke.is_shift_tab() {
+            return Some(b"\x1b[Z".to_vec());
         }
-        named_control_key_to_c0(&self.keystroke.key)
+        self.to_legacy_escape_sequence(mode_provider)
+            .or_else(|| {
+                self.chars
+                    .filter(|chars| !chars.is_empty())
+                    .map(|chars| chars.as_bytes().to_vec())
+            })
+            .or_else(|| map_special_key_to_bytes(&self.keystroke.key).map(<[u8]>::to_vec))
     }
 }
 
-/// The C0 control byte for a `Ctrl+<letter>` combo (`Ctrl+A`..`Ctrl+Z` →
-/// `0x01`..`0x1A`). Returns `None` when Ctrl isn't held or the key isn't a
-/// single ASCII letter.
-fn ctrl_letter_to_c0(keystroke: &Keystroke) -> Option<Vec<u8>> {
+/// Encodes Control characters that the GUI's OS text events normally supply.
+fn ctrl_character_to_c0(keystroke: &Keystroke) -> Option<u8> {
     if !keystroke.ctrl {
         return None;
     }
     match keystroke.key.as_bytes() {
-        // `& 0x1f` folds a/A..z/Z onto 0x01..0x1A (Ctrl+A = 0x01, Ctrl+Z = 0x1A).
-        [byte] if byte.is_ascii_alphabetic() => Some(vec![byte.to_ascii_uppercase() & 0x1f]),
-        _ => None,
-    }
-}
-
-/// C0 bytes for named control keys that carry no `chars` and that the
-/// escape-sequence encoder leaves unmapped without the kitty protocol. The key
-/// strings match the crossterm→key-event conversion.
-fn named_control_key_to_c0(key: &str) -> Option<Vec<u8>> {
-    match key {
-        "enter" => Some(vec![C0::CR]),
-        "escape" => Some(vec![C0::ESC]),
-        "tab" => Some(vec![C0::HT]),
-        "backspace" => Some(vec![C0::DEL]),
+        [byte] if byte.is_ascii_alphabetic() || (b'@'..=b'_').contains(byte) => {
+            Some(byte.to_ascii_uppercase() & 0x1f)
+        }
+        [b'?'] => Some(C0::DEL),
         _ => None,
     }
 }
@@ -335,6 +324,7 @@ impl<T: ModeProvider> ToEscapeSequence<T> for MouseState {
             MouseButton::Left => (EscCodes::MOUSE_LEFT, 1),
             MouseButton::Right => (EscCodes::MOUSE_RIGHT, 1),
             MouseButton::LeftDrag => (EscCodes::MOUSE_DRAG, 1),
+            MouseButton::RightDrag => (EscCodes::MOUSE_DRAG | EscCodes::MOUSE_RIGHT, 1),
             MouseButton::Move => (EscCodes::MOUSE_MOVE, 1),
             MouseButton::Wheel => {
                 if let MouseAction::Scrolled { delta } = self.action() {

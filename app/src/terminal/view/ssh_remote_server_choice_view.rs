@@ -59,9 +59,18 @@ pub enum SshRemoteServerChoiceViewEvent {
     OpenWarpifySettings,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshRemoteServerChoiceViewMode {
+    InitialInstall,
+    UpdateRequired,
+    RetryAfterControlMasterError,
+    RetryAfterSetupFailure,
+}
+
 /// Choice block prompting the user to install the remote-server binary on the remote host or skip.
 pub struct SshRemoteServerChoiceView {
     session_id: SessionId,
+    mode: SshRemoteServerChoiceViewMode,
     buttons: ViewHandle<KeyboardNavigableButtons>,
     do_not_ask_again_mouse_state: MouseStateHandle,
     do_not_ask_again_label_mouse_state: MouseStateHandle,
@@ -72,26 +81,61 @@ pub struct SshRemoteServerChoiceView {
 
 impl SshRemoteServerChoiceView {
     pub fn new(session_id: SessionId, ctx: &mut ViewContext<Self>) -> Self {
+        Self::new_with_mode(
+            session_id,
+            SshRemoteServerChoiceViewMode::InitialInstall,
+            ctx,
+        )
+    }
+
+    pub fn new_with_mode(
+        session_id: SessionId,
+        mode: SshRemoteServerChoiceViewMode,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
+        let (install_title, install_description, skip_title, skip_description) = match mode {
+            SshRemoteServerChoiceViewMode::InitialInstall => (
+                "Install Warp's SSH extension",
+                "Install Warp's extension to enable agent features like file browsing, \
+                 code review, and intelligent command completions in this session.",
+                "Continue without installing",
+                "You'll still get a Warpified experience just without the coding features.",
+            ),
+            SshRemoteServerChoiceViewMode::UpdateRequired => (
+                "Update Warp's SSH extension",
+                "Update Warp's extension to restore agent features like file browsing, \
+                 code review, and intelligent command completions.",
+                "Continue without SSH extension",
+                "Keep this SSH shell running with advanced remote features disabled.",
+            ),
+            SshRemoteServerChoiceViewMode::RetryAfterControlMasterError => (
+                "Retry installing SSH extension",
+                "Reinstall and reconnect Warp's extension to restore agent features like file \
+                 browsing, code review, and intelligent command completions.",
+                "Continue without SSH extension",
+                "Keep this SSH shell running with advanced remote features disabled.",
+            ),
+            SshRemoteServerChoiceViewMode::RetryAfterSetupFailure => (
+                "Retry installing SSH extension",
+                "Reinstall and reconnect Warp's extension to restore agent features like file \
+                 browsing, code review, and intelligent command completions.",
+                "Continue without SSH extension",
+                "Keep this SSH shell running with advanced remote features disabled.",
+            ),
+        };
+
         let buttons = ctx.add_typed_action_view(|_| {
             KeyboardNavigableButtons::new(vec![
                 rich_navigation_button(
-                    "Install Warp's SSH extension".to_string(),
-                    Some(
-                        "Install Warp's extension to enable agent features like file browsing, \
-                         code review, and intelligent command completions in this session."
-                            .to_string(),
-                    ),
+                    install_title.to_string(),
+                    Some(install_description.to_string()),
                     /* recommended */ true,
                     MouseStateHandle::default(),
                     SshRemoteServerChoiceViewAction::Install,
                 ),
                 rich_navigation_button(
-                    "Continue without installing".to_string(),
-                    Some(
-                        "You'll still get a Warpified experience just without the coding \
-                         features."
-                            .to_string(),
-                    ),
+                    skip_title.to_string(),
+                    Some(skip_description.to_string()),
                     /* recommended */ false,
                     MouseStateHandle::default(),
                     SshRemoteServerChoiceViewAction::Skip,
@@ -101,6 +145,7 @@ impl SshRemoteServerChoiceView {
 
         Self {
             session_id,
+            mode,
             buttons,
             do_not_ask_again_mouse_state: MouseStateHandle::default(),
             do_not_ask_again_label_mouse_state: MouseStateHandle::default(),
@@ -121,7 +166,21 @@ impl SshRemoteServerChoiceView {
         // Match the Figma design: a plain title row, no icon / chevron /
         // action buttons. `HeaderConfig` without an `interaction_mode` set
         // renders exactly that.
-        HeaderConfig::new("Choose your experience for this remote session:", app)
+        let title = match self.mode {
+            SshRemoteServerChoiceViewMode::InitialInstall => {
+                "Choose your experience for this remote session:"
+            }
+            SshRemoteServerChoiceViewMode::UpdateRequired => {
+                "Warp's SSH extension is out of date on this host. Update it?"
+            }
+            SshRemoteServerChoiceViewMode::RetryAfterControlMasterError => {
+                "Warp's SSH extension hit an SSH channel error. Repair this session?"
+            }
+            SshRemoteServerChoiceViewMode::RetryAfterSetupFailure => {
+                "Warp couldn't connect to the SSH extension. Retry this session?"
+            }
+        };
+        HeaderConfig::new(title, app)
             .with_corner_radius_override(CornerRadius::with_top(Radius::Pixels(
                 PROMPT_BORDER_RADIUS,
             )))

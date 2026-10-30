@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -67,6 +68,12 @@ pub enum CloudViewModelEvent {
 
 impl CloudViewModel {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        if ChannelState::is_local_only() {
+            return Self {
+                folder_timestamp_cache: Default::default(),
+            };
+        }
+
         ctx.subscribe_to_model(&CloudModel::handle(ctx), Self::handle_cloud_model_event);
         ctx.subscribe_to_model(
             &UpdateManager::handle(ctx),

@@ -12,6 +12,7 @@ use ratatui::crossterm::event::{
 use crate::elements::tui::{TuiEvent, TuiPoint, TuiPointExt, TuiScrollDelta};
 use crate::event::{KeyEventDetails, KeyState, ModifiersState};
 use crate::keymap::Keystroke;
+use crate::platform::OperatingSystem;
 use crate::platform::keyboard::KeyCode as PhysicalKeyCode;
 
 /// Converts a raw crossterm event into the TUI event vocabulary, or
@@ -63,14 +64,23 @@ impl TryFrom<MouseEvent> for TuiEvent {
                 position,
                 modifiers,
             }),
+            MouseEventKind::Up(MouseButton::Right) => Ok(TuiEvent::RightMouseUp {
+                position,
+                modifiers,
+            }),
+            MouseEventKind::Drag(MouseButton::Right) => Ok(TuiEvent::RightMouseDragged {
+                position,
+                modifiers,
+            }),
             MouseEventKind::Moved => Ok(TuiEvent::MouseMoved {
                 position,
                 modifiers,
                 is_synthetic: false,
             }),
             // Add these variants when a concrete TUI consumer needs them.
-            MouseEventKind::Up(MouseButton::Middle | MouseButton::Right)
-            | MouseEventKind::Drag(MouseButton::Middle | MouseButton::Right) => Err(()),
+            MouseEventKind::Up(MouseButton::Middle) | MouseEventKind::Drag(MouseButton::Middle) => {
+                Err(())
+            }
         }
     }
 }
@@ -115,7 +125,9 @@ fn key_event_to_tui_event(event: KeyEvent) -> Option<TuiEvent> {
             alt: event.modifiers.contains(KeyModifiers::ALT),
             shift: event.modifiers.contains(KeyModifiers::SHIFT),
             cmd: event.modifiers.contains(KeyModifiers::SUPER),
-            meta: event.modifiers.contains(KeyModifiers::META),
+            // Terminal Alt already represents Meta; GUI Option composition is handled elsewhere.
+            meta: event.modifiers.contains(KeyModifiers::META)
+                || (OperatingSystem::get().is_mac() && event.modifiers.contains(KeyModifiers::ALT)),
             key,
         },
         chars: produced_chars(event, cfg!(windows)),

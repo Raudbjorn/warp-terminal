@@ -19,6 +19,7 @@ use super::user_workspaces::{
 use super::workspace::WorkspaceUid;
 use crate::ai::request_usage_model::AIRequestUsageModel;
 use crate::auth::AuthStateProvider;
+use crate::channel::ChannelState;
 use crate::cloud_object::CloudObjectEventEntrypoint;
 use crate::network::{NetworkStatus, NetworkStatusEvent, NetworkStatusKind};
 use crate::persistence::ModelEvent;
@@ -72,6 +73,16 @@ impl TeamUpdateManager {
         model_event_sender: Option<SyncSender<ModelEvent>>,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
+        if ChannelState::is_local_only() {
+            return Self {
+                team_client,
+                model_event_sender,
+                should_poll_for_workspace_metadata_updates: false,
+                next_poll_abort_handle: None,
+                in_flight_request_abort_handle: None,
+            };
+        }
+
         let network_status = NetworkStatus::handle(ctx);
         ctx.subscribe_to_model(&network_status, Self::handle_network_status_changed);
 

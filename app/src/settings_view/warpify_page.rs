@@ -13,7 +13,7 @@ use warpui::elements::{
 };
 use warpui::keymap::ContextPredicate;
 use warpui::presenter::ChildView;
-use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+use warpui::ui_components::components::{UiComponent, UiComponentStyles};
 use warpui::ui_components::switch::SwitchStateHandle;
 use warpui::{
     Action, AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View,
@@ -30,9 +30,10 @@ use super::{SettingsAction, SettingsSection, ToggleSettingActionPair, flags};
 use crate::appearance::Appearance;
 use crate::send_telemetry_from_ctx;
 use crate::server::telemetry::TelemetryEvent;
-use crate::settings::{ReuseExistingSshControlMaster, SshSettings};
+use crate::settings::SshSettings;
 use crate::terminal::warpify::settings::{
-    EnableSshWarpification, SshExtensionInstallMode, SshExtensionInstallModeSetting,
+    EnableSshRemoteServer, EnableSshWarpification, SshExtensionDownloadBaseUrl,
+    SshExtensionDownloadChannel, SshExtensionInstallMode, SshExtensionInstallModeSetting,
     WarpifySettings, WarpifySettingsChangedEvent,
 };
 use crate::ui_components::blended_colors;
@@ -57,6 +58,21 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             )),
             context,
             flags::SSH_WARPIFICATION_CONTEXT_FLAG,
+        ));
+    }
+
+    if FeatureFlag::SshRemoteServer.is_enabled()
+        && WarpifySettings::as_ref(app)
+            .enable_ssh_remote_server
+            .is_supported_on_current_platform()
+    {
+        toggle_binding_pairs.push(ToggleSettingActionPair::new(
+            "SSH Extension",
+            builder(SettingsAction::WarpifyPageToggle(
+                WarpifyPageAction::ToggleSshRemoteServer,
+            )),
+            context,
+            flags::SSH_REMOTE_SERVER_CONTEXT_FLAG,
         ));
     }
 
@@ -88,6 +104,8 @@ pub struct WarpifyPageView {
     add_denylisted_commands_editor: ViewHandle<SubmittableTextInput>,
 
     ssh_extension_install_mode_dropdown: ViewHandle<Dropdown<WarpifyPageAction>>,
+    ssh_extension_download_channel_dropdown: ViewHandle<Dropdown<WarpifyPageAction>>,
+    ssh_extension_download_base_url_editor: ViewHandle<SubmittableTextInput>,
 }
 
 impl WarpifyPageView {
@@ -102,6 +120,23 @@ impl WarpifyPageView {
                 WarpifySettingsChangedEvent::SshExtensionInstallModeSetting { .. }
             ) {
                 me.update_dropdown(ctx);
+            }
+            if matches!(
+                event,
+                WarpifySettingsChangedEvent::SshExtensionDownloadChannel { .. }
+            ) {
+                let channel = WarpifySettings::normalize_ssh_extension_download_channel(
+                    WarpifySettings::as_ref(ctx)
+                        .ssh_extension_download_channel
+                        .value(),
+                );
+                me.ssh_extension_download_channel_dropdown
+                    .update(ctx, |dropdown, ctx| {
+                        dropdown.set_selected_by_action(
+                            WarpifyPageAction::SetSshExtensionDownloadChannel(channel),
+                            ctx,
+                        );
+                    });
             }
             ctx.notify();
         });
@@ -134,6 +169,38 @@ impl WarpifyPageView {
         let ssh_extension_install_mode_dropdown =
             Self::create_ssh_extension_install_mode_dropdown(ctx);
 
+        let ssh_extension_download_channel_dropdown =
+            Self::create_ssh_extension_download_channel_dropdown(ctx);
+        let ssh_extension_download_base_url_editor = ctx.add_typed_action_view(|ctx| {
+            let input = SubmittableTextInput::new(ctx).validate_on_edit(|value| {
+                WarpifySettings::normalize_ssh_extension_download_base_url(value).is_ok()
+            });
+            let value = WarpifySettings::as_ref(ctx)
+                .ssh_extension_download_base_url
+                .value()
+                .clone();
+            input
+                .editor()
+                .update(ctx, |editor, ctx| editor.set_buffer_text(&value, ctx));
+            input
+        });
+        ctx.subscribe_to_view(
+            &ssh_extension_download_base_url_editor,
+            |_, _, event, ctx| match event {
+                SubmittableTextInputEvent::Submit(value) => {
+                    WarpifySettings::handle(ctx).update(ctx, |settings, ctx| {
+                        report_if_error!(
+                            WarpifySettings::normalize_ssh_extension_download_base_url(value)
+                                .and_then(|value| settings
+                                    .ssh_extension_download_base_url
+                                    .set_value(value, ctx))
+                        );
+                    });
+                }
+                SubmittableTextInputEvent::Escape => ctx.emit(SettingsPageEvent::FocusModal),
+            },
+        );
+
         let mut instance = Self {
             page: Self::build_page(ctx),
             remove_added_command_button_states: Default::default(),
@@ -141,6 +208,8 @@ impl WarpifyPageView {
             remove_denylisted_command_button_states: Default::default(),
             add_denylisted_commands_editor,
             ssh_extension_install_mode_dropdown,
+            ssh_extension_download_channel_dropdown,
+            ssh_extension_download_base_url_editor,
         };
 
         instance.update_button_states(warpify_settings_handle, ctx);
@@ -311,6 +380,58 @@ impl WarpifyPageView {
         })
     }
 
+    fn create_ssh_extension_download_channel_dropdown(
+        ctx: &mut ViewContext<Self>,
+    ) -> ViewHandle<Dropdown<WarpifyPageAction>> {
+        let items: Vec<DropdownItem<WarpifyPageAction>> = [
+            ("Stable", remote_server::setup::DOWNLOAD_CHANNEL_STABLE),
+            ("Preview", remote_server::setup::DOWNLOAD_CHANNEL_PREVIEW),
+            ("Dev", remote_server::setup::DOWNLOAD_CHANNEL_DEV),
+        ]
+        .into_iter()
+        .map(|(label, channel)| {
+            DropdownItem::new(
+                label,
+                WarpifyPageAction::SetSshExtensionDownloadChannel(channel.to_string()),
+            )
+        })
+        .collect();
+
+        let current_channel = WarpifySettings::normalize_ssh_extension_download_channel(
+            WarpifySettings::as_ref(ctx)
+                .ssh_extension_download_channel
+                .value(),
+        );
+
+        ctx.add_typed_action_view(move |ctx| {
+            let mut dropdown = Dropdown::new(ctx);
+            dropdown.set_top_bar_max_width(SSH_EXTENSION_DROPDOWN_WIDTH);
+            dropdown.set_menu_width(SSH_EXTENSION_DROPDOWN_WIDTH, ctx);
+            dropdown.add_items(items, ctx);
+            dropdown.set_selected_by_action(
+                WarpifyPageAction::SetSshExtensionDownloadChannel(current_channel),
+                ctx,
+            );
+            dropdown
+        })
+    }
+
+    fn render_ssh_extension_download_base_url_setting(
+        &self,
+        local_only_icon_state: LocalOnlyIconState,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        render_body_item::<WarpifyPageAction>(
+            "SSH extension download URL".into(),
+            None,
+            local_only_icon_state,
+            ToggleState::Enabled,
+            appearance,
+            ChildView::new(&self.ssh_extension_download_base_url_editor).finish(),
+            None,
+        )
+    }
+
     /// Renders a title, a list of items that can be removed, and an input field to add new items.
     fn build_input_list<
         ListItem: Display,
@@ -370,11 +491,13 @@ pub enum WarpifyPageAction {
     RemoveAddedCommand(usize),
     RemoveDenylistedCommand(usize),
     ToggleSshWarpification,
+    ToggleSshRemoteServer,
     /// Toggles whether the legacy SSH wrapper attaches to an existing
     /// ControlMaster for the destination host instead of creating its own.
     ToggleReuseSshControlMaster,
     /// Set the SSH extension installation mode (always ask / always install / always skip).
     SetSshExtensionInstallMode(SshExtensionInstallMode),
+    SetSshExtensionDownloadChannel(String),
     OpenUrl(String),
 }
 
@@ -412,6 +535,11 @@ impl TypedActionView for WarpifyPageView {
                         }
                     });
             }
+            ToggleSshRemoteServer => {
+                WarpifySettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.enable_ssh_remote_server.toggle_and_save_value(ctx));
+                });
+            }
             ToggleReuseSshControlMaster => {
                 SshSettings::handle(ctx).update(ctx, |ssh_settings, ctx| {
                     report_if_error!(
@@ -444,6 +572,14 @@ impl TypedActionView for WarpifyPageView {
                         },
                         ctx
                     );
+                });
+            }
+            SetSshExtensionDownloadChannel(channel) => {
+                WarpifySettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.ssh_extension_download_channel.set_value(
+                        WarpifySettings::normalize_ssh_extension_download_channel(channel),
+                        ctx,
+                    ));
                 });
             }
             OpenUrl(url) => {
@@ -604,6 +740,7 @@ impl SettingsWidget for SubshellsWidget {
 #[derive(Default)]
 struct SSHWidget {
     enable_ssh_warpification_switch_state: SwitchStateHandle,
+    enable_ssh_remote_server_switch_state: SwitchStateHandle,
     reuse_control_master_switch_state: SwitchStateHandle,
     local_only_icon_tooltip_states: RefCell<HashMap<String, MouseStateHandle>>,
 }
@@ -623,9 +760,6 @@ impl SettingsWidget for SSHWidget {
     ) -> Box<dyn Element> {
         let mut column = Flex::column();
         let ui_builder = appearance.ui_builder();
-        let description_text_color = appearance
-            .theme()
-            .sub_text_color(appearance.theme().surface_2());
 
         let enable_ssh_warpification = *WarpifySettings::as_ref(app)
             .enable_ssh_warpification
@@ -660,6 +794,29 @@ impl SettingsWidget for SSHWidget {
         );
 
         if FeatureFlag::SshRemoteServer.is_enabled() {
+            add_setting(
+                &mut column,
+                &WarpifySettings::as_ref(app).enable_ssh_remote_server,
+                || {
+                    render_body_item::<WarpifyPageAction>(
+                    "Enable SSH extension".into(),
+                    None,
+                    LocalOnlyIconState::for_setting(
+                        EnableSshRemoteServer::storage_key(),
+                        EnableSshRemoteServer::sync_to_cloud(),
+                        &mut self.local_only_icon_tooltip_states.borrow_mut(), app,
+                    ),
+                    ToggleState::Enabled,
+                    appearance,
+                    ui_builder.switch(self.enable_ssh_remote_server_switch_state.clone())
+                        .check(*WarpifySettings::as_ref(app).enable_ssh_remote_server.value())
+                        .build()
+                        .on_click(|ctx, _, _| ctx.dispatch_typed_action(WarpifyPageAction::ToggleSshRemoteServer))
+                        .finish(),
+                    Some("Enable advanced remote features in new SSH sessions. Installation follows the policy below.".into()),
+                )
+                },
+            );
             let label_color_override = if !enable_ssh_warpification {
                 Some(appearance.theme().disabled_ui_text_color())
             } else {
@@ -687,61 +844,46 @@ impl SettingsWidget for SSHWidget {
                     .finish()
                 },
             );
+            add_setting(
+                &mut column,
+                &WarpifySettings::as_ref(app).ssh_extension_download_base_url,
+                move || {
+                    view.render_ssh_extension_download_base_url_setting(
+                        LocalOnlyIconState::for_setting(
+                            SshExtensionDownloadBaseUrl::storage_key(),
+                            SshExtensionDownloadBaseUrl::sync_to_cloud(),
+                            &mut self.local_only_icon_tooltip_states.borrow_mut(),
+                            app,
+                        ),
+                        appearance,
+                    )
+                },
+            );
+            add_setting(
+                &mut column,
+                &WarpifySettings::as_ref(app).ssh_extension_download_channel,
+                move || {
+                    Container::new(render_dropdown_item(
+                        appearance,
+                        "SSH extension channel",
+                        Some(
+                            "Release channel remote hosts use to fetch the SSH extension tarball.",
+                        ),
+                        None,
+                        LocalOnlyIconState::for_setting(
+                            SshExtensionDownloadChannel::storage_key(),
+                            SshExtensionDownloadChannel::sync_to_cloud(),
+                            &mut self.local_only_icon_tooltip_states.borrow_mut(),
+                            app,
+                        ),
+                        None,
+                        &view.ssh_extension_download_channel_dropdown,
+                    ))
+                    .with_padding_bottom(HEADER_PADDING)
+                    .finish()
+                },
+            );
         }
-
-        let reuse_existing_control_master = *SshSettings::as_ref(app)
-            .reuse_existing_control_master
-            .value();
-        add_setting(
-            &mut column,
-            &SshSettings::as_ref(app).reuse_existing_control_master,
-            move || {
-                let mut column = Flex::column();
-                column.add_child(render_body_item::<WarpifyPageAction>(
-                    "Reuse existing SSH ControlMaster".into(),
-                    None,
-                    LocalOnlyIconState::for_setting(
-                        ReuseExistingSshControlMaster::storage_key(),
-                        ReuseExistingSshControlMaster::sync_to_cloud(),
-                        &mut self.local_only_icon_tooltip_states.borrow_mut(),
-                        app,
-                    ),
-                    enable_ssh_warpification.into(),
-                    appearance,
-                    ui_builder
-                        .switch(self.reuse_control_master_switch_state.clone())
-                        .check(reuse_existing_control_master)
-                        .with_disabled(!enable_ssh_warpification)
-                        .build()
-                        .on_click(move |ctx, _, _| {
-                            if !enable_ssh_warpification {
-                                return;
-                            }
-                            ctx.dispatch_typed_action(
-                                WarpifyPageAction::ToggleReuseSshControlMaster,
-                            );
-                        })
-                        .finish(),
-                    None,
-                ));
-                column.add_child(
-                    ui_builder
-                        .paragraph(SSH_REUSE_CONTROL_MASTER_DESCRIPTION.to_owned())
-                        .with_style(UiComponentStyles {
-                            font_color: Some(description_text_color.into_solid()),
-                            margin: Some(
-                                Coords::default()
-                                    .top(styles::DESCRIPTION_NEGATIVE_MARGIN_OFFSET)
-                                    .bottom(styles::DESCRIPTION_LINE_MARGIN_BOTTOM),
-                            ),
-                            ..Default::default()
-                        })
-                        .build()
-                        .finish(),
-                );
-                column.finish()
-            },
-        );
 
         column.finish()
     }
