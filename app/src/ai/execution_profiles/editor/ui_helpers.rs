@@ -1,3 +1,4 @@
+use ai::api_keys::ApiKeyManager;
 use pathfinder_geometry::vector::vec2f;
 use thousands::Separable;
 use uuid::Uuid;
@@ -16,23 +17,22 @@ use warpui::{AppContext, Element, SingletonEntity, ViewHandle};
 use super::{ExecutionProfileEditorView, ExecutionProfileEditorViewAction};
 use crate::ai::blocklist::BlocklistAIPermissions;
 use crate::ai::execution_profiles::{
-    long_context_pricing_warning_title, AIExecutionProfile, AIExecutionProfileAppExt as _,
-    ActionPermission,
+    AIExecutionProfile, AIExecutionProfileAppExt as _, ActionPermission,
+    long_context_pricing_warning_title,
 };
 use crate::editor::EditorView;
 #[cfg(not(target_family = "wasm"))]
 use crate::local_multi_agent::{
-    LocalMultiAgentManager, LocalMultiAgentStatus, LocalMultiAgentTestStatus, LOCAL_MODEL_ALIAS_IDS,
+    LOCAL_MODEL_ALIAS_IDS, LocalMultiAgentManager, LocalMultiAgentStatus, LocalMultiAgentTestStatus,
 };
 use crate::settings::AISettings;
 use crate::settings_view::render_model_chips;
 use crate::ui_components::icons::Icon;
 use crate::view_components::{
-    render_warning_box, Dropdown, DropdownItemAction, FilterableDropdown, SubmittableTextInput,
-    WarningBoxConfig,
+    Dropdown, DropdownItemAction, FilterableDropdown, SubmittableTextInput, WarningBoxConfig,
+    render_warning_box,
 };
 use crate::{Appearance, TemplatableMCPServerManager, UserWorkspaces};
-use ai::api_keys::ApiKeyManager;
 
 const CONTEXT_WINDOW_SLIDER_WIDTH: f32 = 220.;
 const CONTEXT_WINDOW_INPUT_BOX_WIDTH: f32 = 120.;
@@ -73,7 +73,7 @@ fn nice_step(raw: f64) -> f64 {
     nice * magnitude
 }
 
-use crate::settings_view::{render_input_list, render_separator, InputListItem};
+use crate::settings_view::{InputListItem, render_input_list, render_separator};
 
 pub const WORKSPACE_OVERRIDE_TOOLTIP_MESSAGE: &str =
     "This option is enforced by your organization's settings and cannot be customized.";
@@ -414,9 +414,8 @@ fn render_custom_endpoint_controls(
     view: &ExecutionProfileEditorView,
     app: &AppContext,
 ) -> Box<dyn Element> {
-    let is_enabled = FeatureFlag::CustomInferenceEndpoints.is_enabled()
-        && AISettings::as_ref(app).is_any_ai_enabled(app)
-        && UserWorkspaces::as_ref(app).is_custom_inference_enabled(app);
+    let is_enabled = AISettings::as_ref(app).is_any_ai_enabled(app)
+        && UserWorkspaces::as_ref(app).is_byo_endpoint_enabled_for_any_team(app);
     let Some(profile_key) = view.inference_profile_key(app) else {
         return Empty::new().finish();
     };
@@ -659,9 +658,7 @@ pub fn render_local_inference_section(
         ));
         column.add_child(render_local_agent_status_card(appearance, view, app));
 
-        if FeatureFlag::CustomInferenceEndpoints.is_enabled()
-            && UserWorkspaces::as_ref(app).is_custom_inference_enabled(app)
-        {
+        if UserWorkspaces::as_ref(app).is_byo_endpoint_enabled_for_any_team(app) {
             column.add_child(render_custom_endpoint_controls(appearance, view, app));
         }
 
@@ -815,8 +812,9 @@ fn render_context_window_row(
     let mut column = Flex::column()
         .with_child(Container::new(label_desc).with_margin_bottom(4.).finish())
         .with_child(slider_row);
+    let scope = view.team_context(app);
     if BlocklistAIPermissions::as_ref(app)
-        .permissions_profile_for_id(app, view.profile_id())
+        .permissions_profile_for_id(view.profile_id(), &scope, app)
         .should_show_long_context_pricing_warning(view.dragged_context_window_value, app)
     {
         column.add_child(render_long_context_pricing_warning(appearance));
@@ -836,6 +834,7 @@ pub fn render_permissions_section(
     app: &warpui::AppContext,
 ) -> Box<dyn Element> {
     let ai_settings = AISettings::as_ref(app);
+    let scope = view.team_context(app);
     let mut column = Flex::column().with_children([
         render_separator(appearance),
         render_section_label("PERMISSIONS", appearance),
@@ -845,7 +844,7 @@ pub fn render_permissions_section(
             "Apply code diffs",
             &view.apply_code_diffs_dropdown,
             profile_data.apply_code_diffs.description(),
-            !ai_settings.is_code_diffs_permissions_editable(app),
+            !ai_settings.is_code_diffs_permissions_editable(&scope, app),
             view.tooltip_mouse_state_handles
                 .apply_code_diffs_tooltip_mouse_state
                 .clone(),
@@ -856,7 +855,7 @@ pub fn render_permissions_section(
             "Read files",
             &view.read_files_dropdown,
             profile_data.read_files.description(),
-            !ai_settings.is_read_files_permissions_editable(app),
+            !ai_settings.is_read_files_permissions_editable(&scope, app),
             view.tooltip_mouse_state_handles
                 .read_files_tooltip_mouse_state
                 .clone(),
@@ -880,7 +879,7 @@ pub fn render_permissions_section(
         "Execute commands",
         &view.execute_commands_dropdown,
         profile_data.execute_commands.description(),
-        !ai_settings.is_execute_commands_permissions_editable(app),
+        !ai_settings.is_execute_commands_permissions_editable(&scope, app),
         view.tooltip_mouse_state_handles
             .execute_commands_tooltip_mouse_state
             .clone(),
@@ -917,7 +916,7 @@ pub fn render_permissions_section(
         "Interact with running commands",
         &view.write_to_pty_dropdown,
         profile_data.write_to_pty.description(),
-        !ai_settings.is_write_to_pty_permissions_editable(app),
+        !ai_settings.is_write_to_pty_permissions_editable(&scope, app),
         view.tooltip_mouse_state_handles
             .write_to_pty_tooltip_mouse_state
             .clone(),
@@ -930,7 +929,7 @@ pub fn render_permissions_section(
             "Computer use",
             &view.computer_use_dropdown,
             profile_data.computer_use.description(),
-            !ai_settings.is_computer_use_permissions_editable(app),
+            !ai_settings.is_computer_use_permissions_editable(&scope, app),
             view.tooltip_mouse_state_handles
                 .computer_use_tooltip_mouse_state
                 .clone(),
@@ -1107,7 +1106,8 @@ fn render_directory_allowlist_section(
     app: &warpui::AppContext,
 ) -> Box<dyn Element> {
     let ai_settings = AISettings::as_ref(app);
-    let is_editable = ai_settings.is_directory_allowlist_editable(app);
+    let scope = view.team_context(app);
+    let is_editable = ai_settings.is_directory_allowlist_editable(&scope, app);
 
     render_list_section(
         "Directory allowlist",
@@ -1132,7 +1132,8 @@ fn render_command_allowlist_section(
     app: &warpui::AppContext,
 ) -> Box<dyn Element> {
     let ai_settings = AISettings::as_ref(app);
-    let is_editable = ai_settings.is_command_allowlist_editable(app);
+    let scope = view.team_context(app);
+    let is_editable = ai_settings.is_command_allowlist_editable(&scope, app);
 
     render_list_section(
         "Command allowlist",
@@ -1160,7 +1161,8 @@ fn render_command_denylist_section(
     use crate::ai::blocklist::BlocklistAIPermissions;
 
     let ai_disabled = !AISettings::as_ref(app).is_any_ai_enabled(app);
-    let org_denylist = BlocklistAIPermissions::get_org_execute_commands_denylist(app);
+    let scope = view.team_context(app);
+    let org_denylist = BlocklistAIPermissions::get_org_execute_commands_denylist(&scope, app);
     let mut tooltip_idx = 0usize;
 
     let input_items: Vec<InputListItem<ExecutionProfileEditorViewAction>> = profile_data

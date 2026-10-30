@@ -114,7 +114,3 @@ pub async fn file_candidates_for_context(completion_context: &SessionContext) ->
         .map(|entry| entry.file_name.clone())
         .collect()
 }
-
-#[cfg(test)]
-#[path = "local_command_autocomplete_tests.rs"]
-mod tests;

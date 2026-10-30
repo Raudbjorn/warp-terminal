@@ -76,6 +76,9 @@ pub(crate) fn resolve_local_route(request: &api::Request) -> Option<LocalRoute> 
         .providers
         .iter()
         .find_map(|provider| {
+            if provider.schema != api::request::settings::custom_model_providers::CustomEndpointSchema::OpenaiChatCompletions as i32 {
+                return None;
+            }
             provider
                 .models
                 .iter()

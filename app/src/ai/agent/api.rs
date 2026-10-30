@@ -7,38 +7,44 @@ mod local_adapter;
 #[cfg(not(target_family = "wasm"))]
 mod local_route;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 pub use ai::agent::convert::ConvertToAPITypeError;
 use ai::api_keys::ApiKeyManager;
+pub(crate) use convert_from::convert_user_query_mode;
 pub use convert_from::{
-    user_inputs_from_messages, ConversionParams, ConvertAPIMessageToClientOutputMessage,
-    MaybeAIAgentOutputMessage, MessageToAIAgentOutputMessageError,
+    ConversionParams, ConvertAPIMessageToClientOutputMessage, MaybeAIAgentOutputMessage,
+    MessageToAIAgentOutputMessageError, user_inputs_from_messages,
 };
+#[cfg_attr(target_family = "wasm", allow(unused_imports))]
+pub(crate) use convert_to::serde_json_to_prost;
 use futures_lite::Stream;
-use mcp::TemplatableMCPServerInfo;
 pub use r#impl::generate_multi_agent_output;
+use mcp::TemplatableMCPServerInfo;
 use serde::Serialize;
-use warp_core::channel::ChannelState;
+use warp_core::channel::{Channel, ChannelState};
 use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
 use warp_core::user_preferences::GetUserPreferences;
 use warpui::{AppContext, EntityId, SingletonEntity as _};
 
-use super::{AIAgentInput, MCPContext, MCPServer, RequestMetadata, Suggestions};
+use super::{AIAgentInput, MCPContext, MCPServer, RequestMetadata, ServerOutputId, Suggestions};
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::{BlocklistAIPermissions, RequestInput, SessionContext};
-use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::execution_profiles::AIExecutionProfileAppExt;
-use crate::ai::llms::LLMId;
+use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
+use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::ai::mcp::TemplatableMCPServerManager;
+use crate::send_telemetry_from_app_ctx;
 use crate::server::server_api::AIApiError;
+use crate::server::telemetry::TelemetryEvent;
 use crate::settings::AISettings;
 use crate::terminal::safe_mode_settings::get_secret_obfuscation_mode;
-use crate::workspaces::user_workspaces::UserWorkspaces;
+use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
 
 /// Unique, server-generated conversation-scoped token to be roundtripped to the API when sending
 /// requests that follow-up within a given conversation.
@@ -62,6 +68,31 @@ impl ServerConversationToken {
         )
     }
 
+    pub fn debugging_payload(&self, request_id: Option<&ServerOutputId>) -> String {
+        self.debugging_payload_for_channel(request_id, ChannelState::channel())
+    }
+
+    fn debugging_payload_for_channel(
+        &self,
+        request_id: Option<&ServerOutputId>,
+        channel: Channel,
+    ) -> String {
+        if channel.is_dogfood() {
+            match request_id {
+                Some(request_id) => format!("{}?request={request_id}", self.debug_link()),
+                None => self.debug_link(),
+            }
+        } else {
+            match request_id {
+                Some(request_id) => format!(
+                    "{{\"request_id\":\"{request_id}\",\"conversation_id\":\"{}\"}}",
+                    self.as_str()
+                ),
+                None => format!("{{\"conversation_id\":\"{}\"}}", self.as_str()),
+            }
+        }
+    }
+
     pub fn conversation_link(&self) -> String {
         format!(
             "{}/conversation/{}",
@@ -71,6 +102,19 @@ impl ServerConversationToken {
     }
 }
 
+impl std::fmt::Display for ServerConversationToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+#[path = "api_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "api/injected_attribution_tests.rs"]
+mod injected_attribution_tests;
 impl From<ServerConversationToken> for String {
     fn from(value: ServerConversationToken) -> Self {
         value.0
@@ -116,15 +160,27 @@ pub struct RequestParams {
     pub planning_enabled: bool,
     should_redact_secrets: bool,
 
+    /// Whether `scope`'s team allows members to use their own provider credentials.
+    ///
+    /// A later mutation of [`Self::api_keys`] must gate on this, not on plan entitlement alone:
+    /// `api_keys` stays `Some(..)` for org-level credentials that survive the team's policy.
+    pub member_byo_credentials_allowed: bool,
     /// User-provided API keys for AI providers (BYO API Key).
     pub api_keys: Option<warp_multi_agent_api::request::settings::ApiKeys>,
     /// User-provided custom model providers (BYOK endpoints).
     pub custom_model_providers:
         Option<warp_multi_agent_api::request::settings::CustomModelProviders>,
+    /// User-defined custom model routers referenced by the current selection. Mirrors
+    /// `custom_model_providers`: the selected model's `config_key` indexes into this
+    /// registry. `None` when no custom router is selected.
+    pub custom_model_routers: Option<warp_multi_agent_api::request::settings::CustomModelRouters>,
     pub openai_base_url: Option<String>,
     pub local_multi_agent_server_root_url: Option<String>,
     pub local_model_aliases: Option<String>,
     pub allow_use_of_warp_credits: bool,
+    /// Asks the server not to attach the user's delegated ChatGPT token, so OpenAI requests run
+    /// on Warp's key. Set for the rest of a conversation after a token-sharing failure.
+    pub skip_chatgpt_subscription: bool,
     pub autonomy_level: warp_multi_agent_api::AutonomyLevel,
     pub isolation_level: warp_multi_agent_api::IsolationLevel,
     pub web_search_enabled: bool,
@@ -158,6 +214,7 @@ pub struct ConversationData {
     pub forked_from_conversation_token: Option<ServerConversationToken>,
     pub ambient_agent_task_id: Option<AmbientAgentTaskId>,
     pub existing_suggestions: Option<Suggestions>,
+    pub use_warp_credits_instead_of_chatgpt: bool,
 }
 
 /// oh-my-warp: the AI tools registered by JS plugins (`warp.ai.registerTool`), built as `rmcp`
@@ -186,12 +243,56 @@ fn plugin_ai_tools() -> Vec<rmcp::model::Tool> {
 const PLUGIN_TOOLS_SERVER_ID: &str = "0a0a0a0a-0b0b-4c0c-8d0d-0e0e0e0e0e0e";
 
 impl RequestParams {
-    pub fn new(
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            input: vec![],
+            conversation_token: None,
+            forked_from_conversation_token: None,
+            ambient_agent_task_id: None,
+            tasks: vec![],
+            existing_suggestions: None,
+            metadata: None,
+            session_context: SessionContext::new_for_test(),
+            model: LLMId::from("test-model"),
+            coding_model: LLMId::from("test-model"),
+            cli_agent_model: LLMId::from("test-model"),
+            computer_use_model: LLMId::from("test-model"),
+            is_memory_enabled: false,
+            warp_drive_context_enabled: false,
+            context_window_limit: None,
+            mcp_context: None,
+            planning_enabled: false,
+            should_redact_secrets: false,
+            member_byo_credentials_allowed: false,
+            api_keys: None,
+            custom_model_providers: None,
+            custom_model_routers: None,
+            openai_base_url: None,
+            local_multi_agent_server_root_url: None,
+            local_model_aliases: None,
+            allow_use_of_warp_credits: false,
+            skip_chatgpt_subscription: false,
+            autonomy_level: Default::default(),
+            isolation_level: Default::default(),
+            web_search_enabled: false,
+            computer_use_enabled: false,
+            ask_user_question_enabled: false,
+            research_agent_enabled: false,
+            orchestration_enabled: false,
+            supported_tools_override: None,
+            parent_agent_id: None,
+            agent_name: None,
+        }
+    }
+
+    pub(crate) fn new(
         terminal_view_id: Option<EntityId>,
         session_context: SessionContext,
         request_input: &RequestInput,
         conversation: ConversationData,
         metadata: Option<RequestMetadata>,
+        scope: &impl TeamScope,
         app: &AppContext,
     ) -> Self {
         let ai_settings = AISettings::as_ref(app);
@@ -226,6 +327,9 @@ impl RequestParams {
                     .values(),
             );
 
+            // Include built-in Warp-hosted servers (e.g. the Factory MCP).
+            active_servers.extend(templatable_manager.get_active_builtin_servers().values());
+
             #[cfg_attr(not(feature = "plugin_host"), allow(unused_mut))]
             let mut servers: Vec<MCPServer> = active_servers
                 .into_iter()
@@ -233,6 +337,7 @@ impl RequestParams {
                     name: server.name().to_string(),
                     description: server.description().unwrap_or_default().to_string(),
                     id: server.installation_id().to_string(),
+                    warp_id: server.warp_id().unwrap_or_default().to_string(),
                     resources: server.resources().to_vec(),
                     tools: server.tools().to_vec(),
                 })
@@ -248,6 +353,7 @@ impl RequestParams {
                         name: "oh-my-warp plugins".to_string(),
                         description: "Tools registered by oh-my-warp plugins".to_string(),
                         id: PLUGIN_TOOLS_SERVER_ID.to_string(),
+                        warp_id: String::new(),
                         resources: vec![],
                         tools: plugin_tools,
                     });
@@ -292,35 +398,41 @@ impl RequestParams {
         let active_profile =
             AIExecutionProfilesModel::as_ref(app).active_profile(terminal_view_id, app);
         let inference_profile_key = active_profile.inference_profile_key();
-        let is_byo_enabled = user_workspaces.is_byo_api_key_enabled(app);
+        // Bedrock and Gemini Enterprise are admin-configured host credentials rather than member
+        // BYO keys, so they deliberately skip this gate.
+        let member_byo_credentials_allowed = user_workspaces.are_member_byo_keys_allowed(scope);
+        let is_byo_enabled =
+            user_workspaces.is_byo_api_key_enabled(app) && member_byo_credentials_allowed;
         #[cfg(not(target_family = "wasm"))]
-        let geap_binding = crate::ai::geap_credentials::current_geap_policy(app).mint_binding();
+        let geap_binding =
+            crate::ai::geap_credentials::current_geap_policy(scope, app).mint_binding();
         #[cfg(target_family = "wasm")]
         let geap_binding: Option<::ai::api_keys::GeapMintBinding> = None;
-        let api_keys = api_key_manager.api_keys_for_request(
+        let api_keys = api_key_manager.api_keys_for_profile_request(
             &inference_profile_key,
             is_byo_enabled,
-            user_workspaces.is_aws_bedrock_credentials_enabled(app),
+            user_workspaces.is_aws_bedrock_credentials_enabled(scope, app),
             geap_binding,
         );
-        let is_custom_inference_enabled = user_workspaces.is_custom_inference_enabled(app);
-        let custom_model_providers = FeatureFlag::CustomInferenceEndpoints
-            .is_enabled()
-            .then(|| {
-                api_key_manager.custom_model_providers_for_request(
-                    &inference_profile_key,
-                    is_custom_inference_enabled,
-                )
-            })
-            .flatten();
+        let is_custom_inference_enabled = user_workspaces.is_byo_endpoint_enabled(app)
+            && user_workspaces.are_member_byo_endpoints_allowed(scope);
+        let custom_model_providers = api_key_manager.custom_model_providers_for_profile_request(
+            &inference_profile_key,
+            is_custom_inference_enabled,
+        );
+        let custom_model_routers = FeatureFlag::CustomModelRouters.is_enabled().then(|| {
+            LLMPreferences::as_ref(app).custom_model_routers_for_request(
+                &request_input.model_id,
+                &request_input.coding_model_id,
+            )
+        });
         #[cfg(not(target_family = "wasm"))]
         let local_multi_agent_server_root_url =
             crate::local_multi_agent::LocalMultiAgentManager::global_root_url()
                 .map(|url| url.to_string())
                 .or_else(|| {
-                    api_key_manager.local_multi_agent_server_root_url_for_profile(
-                        &inference_profile_key,
-                    )
+                    api_key_manager
+                        .local_multi_agent_server_root_url_for_profile(&inference_profile_key)
                 });
         #[cfg(target_family = "wasm")]
         let local_multi_agent_server_root_url =
@@ -354,12 +466,19 @@ impl RequestParams {
             .and_then(|s| s.parse().ok())
             .unwrap_or_default();
         let is_ambient_agent = conversation.ambient_agent_task_id.is_some();
-        let computer_use_enabled = FeatureFlag::AgentModeComputerUse.is_enabled()
+        let computer_use_requested = FeatureFlag::AgentModeComputerUse.is_enabled()
             && BlocklistAIPermissions::as_ref(app)
-                .get_computer_use_setting(app, terminal_view_id)
+                .get_computer_use_setting(terminal_view_id, scope, app)
                 .is_enabled()
-            && computer_use::is_supported_on_current_platform()
             && (FeatureFlag::LocalComputerUse.is_enabled() || is_ambient_agent);
+        let computer_use_supported = computer_use::is_supported_on_current_platform();
+        let computer_use_enabled = computer_use_requested && computer_use_supported;
+        if computer_use_requested
+            && !computer_use_supported
+            && let Some(task_id) = conversation.ambient_agent_task_id
+        {
+            report_computer_use_unavailable(task_id, app_execution_mode.is_sandboxed(), app);
+        }
         let ask_user_question_enabled = BlocklistAIPermissions::as_ref(app)
             .get_ask_user_question_setting(app, terminal_view_id)
             != crate::ai::execution_profiles::AskUserQuestionPermission::Never;
@@ -379,9 +498,7 @@ impl RequestParams {
         // server-side, drop the override; otherwise clamp it to the model's
         // current `[min, max]` range. This closes the window between an
         // in-flight model metadata refresh and the next request.
-        let context_window_limit = active_profile
-            .data()
-            .context_window_limit_for_request(app);
+        let context_window_limit = active_profile.data().context_window_limit_for_request(app);
 
         Self {
             input: request_input.all_inputs().cloned().collect(),
@@ -402,12 +519,15 @@ impl RequestParams {
             mcp_context,
             planning_enabled: true,
             should_redact_secrets,
+            member_byo_credentials_allowed,
             api_keys,
             custom_model_providers,
+            custom_model_routers,
             openai_base_url,
             local_multi_agent_server_root_url,
             local_model_aliases,
             allow_use_of_warp_credits,
+            skip_chatgpt_subscription: conversation.use_warp_credits_instead_of_chatgpt,
             autonomy_level,
             isolation_level,
             web_search_enabled,
@@ -420,6 +540,27 @@ impl RequestParams {
             agent_name: None,
         }
     }
+}
+
+/// Reports that computer use was enabled for a run but is unavailable on this host, at most once
+/// per run for the lifetime of the process. Request params are rebuilt for every request, so
+/// emitting unconditionally would produce one event per turn.
+fn report_computer_use_unavailable(task_id: AmbientAgentTaskId, sandboxed: bool, app: &AppContext) {
+    static REPORTED_TASKS: LazyLock<Mutex<HashSet<AmbientAgentTaskId>>> =
+        LazyLock::new(Default::default);
+    let newly_reported = REPORTED_TASKS
+        .lock()
+        .is_ok_and(|mut reported| reported.insert(task_id));
+    if !newly_reported {
+        return;
+    }
+    send_telemetry_from_app_ctx!(
+        TelemetryEvent::ComputerUseUnavailable {
+            ambient_agent_task_id: task_id,
+            sandboxed,
+        },
+        app
+    );
 }
 
 fn non_empty_string(value: String) -> Option<String> {

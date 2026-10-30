@@ -8,16 +8,18 @@ use std::time::Duration;
 use futures::channel::oneshot;
 use repo_metadata::RepoMetadataUpdate;
 use serde::Serialize;
+use warp_core::SessionId;
+use warp_core::channel::Channel;
 #[cfg(not(target_family = "wasm"))]
 use warp_core::channel::ChannelState;
-use warp_core::channel::Channel;
-use warp_core::SessionId;
+use warp_errors::report_error;
 use warp_util::remote_path::{RemoteNavigationResult, RemotePath};
 use warp_util::standardized_path::StandardizedPath;
 #[cfg(not(target_family = "wasm"))]
 use warpui_core::r#async::FutureExt as _;
 use warpui_core::{Entity, ModelContext, ModelSpawner, SingletonEntity};
 
+use crate::HostId;
 use crate::auth::RemoteServerAuthContext;
 #[cfg(not(target_family = "wasm"))]
 use crate::client::ClientEvent;
@@ -26,10 +28,9 @@ use crate::client::InitializeParams;
 use crate::client::RemoteServerClient;
 use crate::codebase_index_proto::RemoteCodebaseIndexStatus;
 use crate::proto::{
-    diff_state, get_diff_state_response, CodebaseIndexLimits, DiffMode, DiffState,
-    DiffStateErrorValue, DiffStateFileDelta, DiffStateMetadataUpdate, DiffStateSnapshot,
-    FileStatusInfo, GetDiffStateResponse, GitOpDelta, GitStatusMetadata, PrInfo, RepositoryInfo,
-    TextEdit,
+    CodebaseIndexLimits, DiffMode, DiffState, DiffStateErrorValue, DiffStateFileDelta,
+    DiffStateMetadataUpdate, DiffStateSnapshot, FileStatusInfo, GetDiffStateResponse, GitOpDelta,
+    GitStatusMetadata, PrInfo, RepositoryInfo, TextEdit, diff_state, get_diff_state_response,
 };
 use crate::repo_metadata_proto::proto_load_repo_metadata_directory_response_to_update;
 #[cfg(not(target_family = "wasm"))]
@@ -39,10 +40,9 @@ use crate::setup::RemoteOs;
 #[cfg(not(target_family = "wasm"))]
 use crate::setup::UnsupportedReason;
 use crate::setup::{PreinstallCheckResult, RemotePlatform, RemoteServerSetupState};
+use crate::transport::{BinaryCheckStatus, Error, InstallSource, RemoteTransport};
 #[cfg(not(target_family = "wasm"))]
-use crate::transport::Connection;
-use crate::transport::{BinaryCheckStatus, ControlPath, Error, InstallSource, RemoteTransport};
-use crate::HostId;
+use crate::transport::{Connection, ControlPath};
 
 /// Maximum number of reconnection attempts after a spontaneous disconnect.
 pub const MAX_RECONNECT_ATTEMPTS: u32 = 2;
@@ -355,7 +355,7 @@ fn client_event_kind(event: &ClientEvent) -> &'static str {
         ClientEvent::DiffStateSnapshotReceived { .. } => "diff_state_snapshot",
         ClientEvent::DiffStateMetadataUpdateReceived { .. } => "diff_state_metadata_update",
         ClientEvent::DiffStateFileDeltaReceived { .. } => "diff_state_file_delta",
-        ClientEvent::BundledSkillsSnapshotReceived { .. } => "bundled_skills_snapshot",
+        ClientEvent::RemoteAgentContextSnapshotReceived { .. } => "remote_agent_context_snapshot",
         ClientEvent::GitStatusPushReceived { .. } => "git_status_push",
         ClientEvent::GitHubPrInfoPushReceived { .. } => "github_pr_info_push",
         ClientEvent::GitHubRepositoryInfoPushReceived { .. } => "github_repository_info_push",
@@ -538,13 +538,10 @@ pub enum RemoteServerManagerEvent {
     /// The last session for this host was disconnected or deregistered.
     /// Downstream features should tear down per-host models.
     HostDisconnected { host_id: HostId },
-    /// The daemon pushed its pre-parsed bundled skill catalog. Sent after
-    /// a connection initializes (when the daemon has already parsed) and
-    /// broadcast when daemon-side parsing completes; a newer snapshot for
-    /// the same host replaces the previous one.
-    BundledSkillsSnapshot {
+    /// A newer full Agent Mode context snapshot published by the daemon host.
+    RemoteAgentContextSnapshot {
         host_id: HostId,
-        skills: Vec<crate::proto::BundledSkillProto>,
+        snapshot: crate::proto::RemoteAgentContextSnapshot,
     },
 
     // --- Repo metadata events (forwarded from ClientEvent push channel) ---
@@ -775,7 +772,7 @@ impl RemoteServerManagerEvent {
             | RemoteServerManagerEvent::GetBranchesResponse { session_id, .. } => Some(*session_id),
             RemoteServerManagerEvent::HostConnected { .. }
             | RemoteServerManagerEvent::HostDisconnected { .. }
-            | RemoteServerManagerEvent::BundledSkillsSnapshot { .. }
+            | RemoteServerManagerEvent::RemoteAgentContextSnapshot { .. }
             | RemoteServerManagerEvent::RepoMetadataSnapshot { .. }
             | RemoteServerManagerEvent::RepoMetadataUpdated { .. }
             | RemoteServerManagerEvent::RepoMetadataDirectoryLoaded { .. }
@@ -888,6 +885,20 @@ impl PendingHostRequest {
     }
 }
 
+/// Parameters for a host-scoped remote ripgrep search.
+pub struct RipgrepSearchParams {
+    /// Effective ripgrep pattern after applying the caller's regex settings.
+    pub pattern: String,
+    /// Absolute roots to search on the remote host.
+    pub roots: Vec<StandardizedPath>,
+    /// Whether matching should ignore case.
+    pub ignore_case: bool,
+    /// Whether matching should span multiple lines.
+    pub multiline: bool,
+    /// Maximum number of matches requested from the remote host.
+    pub max_matches: u32,
+}
+
 /// A host-scoped remote ripgrep search registered synchronously with
 /// [`RemoteServerManager`], whose typed result can be awaited off-thread.
 ///
@@ -932,6 +943,7 @@ fn ripgrep_search_result(
         }
         other => {
             log::error!("Unexpected response variant for RipgrepSearch: {other:?}");
+            report_error!("Unexpected response variant for RipgrepSearch");
             Err(HostRequestError::UnexpectedResponse)
         }
     }
@@ -990,6 +1002,25 @@ impl HostRequestHandle {
             ))
             .await?;
         crate::host_response::write_file_result(&msg).map_err(HostRequestError::OperationFailed)
+    }
+
+    /// Renames a remote file and saves its content using the host's native filesystem semantics.
+    pub async fn rename_file(
+        &self,
+        path: String,
+        new_path: String,
+        content: String,
+    ) -> Result<(), HostRequestError> {
+        let msg = self
+            .send(crate::proto::host_scoped_request::Message::RenameFile(
+                crate::proto::RenameFile {
+                    path,
+                    new_path,
+                    content,
+                },
+            ))
+            .await?;
+        crate::host_response::rename_file_result(&msg).map_err(HostRequestError::OperationFailed)
     }
 
     /// Deletes a file on the remote host.
@@ -1056,6 +1087,7 @@ impl HostRequestHandle {
             Some(crate::proto::server_message::Message::ReadFileContextResponse(resp)) => Ok(resp),
             other => {
                 log::error!("Unexpected response variant for ReadFileContext: {other:?}");
+                report_error!("Unexpected response variant for ReadFileContext");
                 Err(HostRequestError::UnexpectedResponse)
             }
         }
@@ -1096,6 +1128,7 @@ impl HostRequestHandle {
                 log::error!(
                     "Unexpected response variant for GetFragmentMetadataFromHash: {other:?}"
                 );
+                report_error!("Unexpected response variant for GetFragmentMetadataFromHash");
                 Err(HostRequestError::UnexpectedResponse)
             }
         }
@@ -1122,6 +1155,7 @@ impl HostRequestHandle {
             }
             other => {
                 log::error!("Unexpected response variant for UploadHandoffSnapshot: {other:?}");
+                report_error!("Unexpected response variant for UploadHandoffSnapshot");
                 Err(HostRequestError::UnexpectedResponse)
             }
         }
@@ -1177,6 +1211,7 @@ impl HostRequestHandle {
             }
             other => {
                 log::error!("Unexpected response variant for CommitChain: {other:?}");
+                report_error!("Unexpected response variant for CommitChain");
                 Err(HostRequestError::UnexpectedResponse)
             }
         }
@@ -1208,6 +1243,7 @@ impl HostRequestHandle {
             },
             other => {
                 log::error!("Unexpected response variant for Push: {other:?}");
+                report_error!("Unexpected response variant for Push");
                 Err(HostRequestError::UnexpectedResponse)
             }
         }
@@ -1245,6 +1281,7 @@ impl HostRequestHandle {
             }
             other => {
                 log::error!("Unexpected response variant for CreatePr: {other:?}");
+                report_error!("Unexpected response variant for CreatePr");
                 Err(HostRequestError::UnexpectedResponse)
             }
         }
@@ -1280,6 +1317,7 @@ impl HostRequestHandle {
             },
             other => {
                 log::error!("Unexpected response variant for GetCommittedBranchFiles: {other:?}");
+                report_error!("Unexpected response variant for GetCommittedBranchFiles");
                 Err(HostRequestError::UnexpectedResponse)
             }
         }
@@ -1318,6 +1356,7 @@ impl HostRequestHandle {
             }
             other => {
                 log::error!("Unexpected response variant for GenerateCommitMessage: {other:?}");
+                report_error!("Unexpected response variant for GenerateCommitMessage");
                 Err(HostRequestError::UnexpectedResponse)
             }
         }
@@ -1393,6 +1432,8 @@ pub struct RemoteServerManager {
     /// `host_response_rx`, or failed when all sessions for the host
     /// disconnect.
     pending_host_requests: HashMap<crate::protocol::RequestId, PendingHostRequest>,
+    /// Highest Agent Mode context snapshot revision accepted for each connected host.
+    remote_agent_context_snapshot_revisions: HashMap<HostId, u64>,
     /// Background executor used to schedule host-scoped request timeouts.
     /// Only used off-wasm (timers and detached tasks aren't available on
     /// wasm), so the field is allowed to be dead there.
@@ -1419,6 +1460,7 @@ impl RemoteServerManager {
             session_platforms: HashMap::new(),
             codebase_index_limits: None,
             pending_host_requests: HashMap::new(),
+            remote_agent_context_snapshot_revisions: HashMap::new(),
             executor: ctx.background_executor().clone(),
         }
     }
@@ -1451,10 +1493,10 @@ impl RemoteServerManager {
         host_id: &HostId,
         preferred_session: Option<SessionId>,
     ) -> Option<Arc<RemoteServerClient>> {
-        if let Some(session_id) = preferred_session {
-            if let Some(client) = self.client_for_session(session_id) {
-                return Some(client.clone());
-            }
+        if let Some(session_id) = preferred_session
+            && let Some(client) = self.client_for_session(session_id)
+        {
+            return Some(client.clone());
         }
         self.client_for_host(host_id).cloned()
     }
@@ -1675,12 +1717,24 @@ impl RemoteServerManager {
     pub fn start_ripgrep_search(
         &mut self,
         host_id: &HostId,
-        request: crate::proto::RipgrepSearchRequest,
+        params: RipgrepSearchParams,
     ) -> PendingRipgrepSearch {
         let request_id = crate::protocol::RequestId::new();
         let msg = crate::proto::ClientMessage::host_scoped(
             request_id.to_string(),
-            crate::proto::host_scoped_request::Message::RipgrepSearch(request),
+            crate::proto::host_scoped_request::Message::RipgrepSearch(
+                crate::proto::RipgrepSearchRequest {
+                    pattern: params.pattern,
+                    roots: params
+                        .roots
+                        .into_iter()
+                        .map(|path| path.to_string())
+                        .collect(),
+                    ignore_case: params.ignore_case,
+                    multiline: params.multiline,
+                    max_matches: params.max_matches,
+                },
+            ),
         );
         let response = self.send_host_request(host_id, msg);
         PendingRipgrepSearch {
@@ -2848,7 +2902,7 @@ impl RemoteServerManager {
         session_id: SessionId,
         path: String,
         ctx: &mut ModelContext<Self>,
-    ) -> impl Future<Output = Option<RemoteNavigationResult>> {
+    ) -> impl Future<Output = Option<RemoteNavigationResult>> + use<> {
         use futures::future::ready;
 
         match self.navigate_to_directory_impl(session_id, path, ctx) {
@@ -3104,7 +3158,7 @@ impl RemoteServerManager {
         ctx: &mut ModelContext<Self>,
     ) {
         use crate::proto::{
-            get_branches_response, host_scoped_request, ClientMessage, GetBranches,
+            ClientMessage, GetBranches, get_branches_response, host_scoped_request,
         };
 
         let session_id = match self.find_connected_session(&host_id) {
@@ -3186,7 +3240,7 @@ impl RemoteServerManager {
         mode: DiffMode,
         ctx: &mut ModelContext<Self>,
     ) {
-        use crate::proto::{host_scoped_request, ClientMessage, DiscardFilesRequest};
+        use crate::proto::{ClientMessage, DiscardFilesRequest, host_scoped_request};
 
         let request_id = crate::protocol::RequestId::new();
         let msg = ClientMessage::host_scoped(
@@ -3628,8 +3682,15 @@ impl RemoteServerManager {
                     delta,
                 });
             }
-            ClientEvent::BundledSkillsSnapshotReceived { skills } => {
-                ctx.emit(RemoteServerManagerEvent::BundledSkillsSnapshot { host_id, skills });
+            ClientEvent::RemoteAgentContextSnapshotReceived { snapshot } => {
+                if !self.accept_remote_agent_context_snapshot_revision(&host_id, snapshot.revision)
+                {
+                    return;
+                }
+                ctx.emit(RemoteServerManagerEvent::RemoteAgentContextSnapshot {
+                    host_id,
+                    snapshot,
+                });
             }
             ClientEvent::GitStatusPushReceived {
                 repo_path,
@@ -3662,6 +3723,24 @@ impl RemoteServerManager {
                 // Handled by the drain loop's completion callback.
             }
         }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn accept_remote_agent_context_snapshot_revision(
+        &mut self,
+        host_id: &HostId,
+        revision: u64,
+    ) -> bool {
+        if self
+            .remote_agent_context_snapshot_revisions
+            .get(host_id)
+            .is_some_and(|current| *current >= revision)
+        {
+            return false;
+        }
+        self.remote_agent_context_snapshot_revisions
+            .insert(host_id.clone(), revision);
+        true
     }
 
     /// Transitions a session from `Initializing` to `Connected`. Stores the
@@ -3778,17 +3857,17 @@ impl RemoteServerManager {
         // (Re-)send the SessionBootstrapped notification so the daemon
         // registers an executor for this session. This fires on both the
         // initial connect and every reconnect.
-        if let Some(info) = self.session_bootstrap_info.get(&session_id) {
-            if let Some(client) = self.client_for_session(session_id) {
-                log::info!(
-                    "Remote server sending SessionBootstrapped notification: session={session_id:?}"
-                );
-                client.notify_session_bootstrapped(
-                    session_id,
-                    &info.shell_type,
-                    info.shell_path.as_deref(),
-                );
-            }
+        if let Some(info) = self.session_bootstrap_info.get(&session_id)
+            && let Some(client) = self.client_for_session(session_id)
+        {
+            log::info!(
+                "Remote server sending SessionBootstrapped notification: session={session_id:?}"
+            );
+            client.notify_session_bootstrapped(
+                session_id,
+                &info.shell_type,
+                info.shell_path.as_deref(),
+            );
         }
     }
 
@@ -4157,6 +4236,7 @@ impl RemoteServerManager {
     /// fails any pending host-scoped requests that targeted this host.
     fn handle_host_disconnected(&mut self, host_id: &HostId, ctx: &mut ModelContext<Self>) {
         if !self.host_to_sessions.contains_key(host_id) {
+            self.remote_agent_context_snapshot_revisions.remove(host_id);
             ctx.emit(RemoteServerManagerEvent::HostDisconnected {
                 host_id: host_id.clone(),
             });

@@ -14,6 +14,7 @@ pub(super) mod browser_pane;
 pub(super) mod code_diff_pane;
 pub(super) mod code_diff_pane_model;
 pub(super) mod code_pane;
+pub(super) mod custom_router_editor_pane;
 pub(super) mod env_var_collection_pane;
 pub(crate) mod environment_management_pane;
 pub(super) mod execution_profile_editor_pane;
@@ -62,10 +63,10 @@ use crate::pane_group::pane::get_started_view::GetStartedView;
 use crate::server::network_log_view::NetworkLogView;
 use crate::server::telemetry::SharingDialogSource;
 use crate::settings::PaneSettings;
-use crate::settings_view::environments_page::EnvironmentsPageView;
 use crate::settings_view::SettingsView;
-use crate::terminal::available_shells::AvailableShell;
+use crate::settings_view::environments_page::EnvironmentsPageView;
 use crate::terminal::TerminalView;
+use crate::terminal::available_shells::AvailableShell;
 use crate::view_components::action_button::ActionButton;
 use crate::workflows::workflow_view::WorkflowView;
 
@@ -143,6 +144,7 @@ pub(crate) enum IPaneType {
     Settings,
     AIFact,
     AIDocument,
+    CustomRouterEditor,
     ExecutionProfileEditor,
     GetStarted,
     NetworkLog,
@@ -168,6 +170,7 @@ impl Display for IPaneType {
             IPaneType::Settings => write!(f, "Settings"),
             IPaneType::AIFact => write!(f, "AI Fact"),
             IPaneType::AIDocument => write!(f, "AI Document"),
+            IPaneType::CustomRouterEditor => write!(f, "Custom Router Editor"),
             IPaneType::ExecutionProfileEditor => write!(f, "Execution Profile Editor"),
             IPaneType::GetStarted => write!(f, "GetStarted"),
             IPaneType::NetworkLog => write!(f, "Network Log"),
@@ -252,6 +255,13 @@ impl PaneId {
     /// Creates a [`PaneId`] from a [`ViewContext<PaneView<AIDocumentView>>`]
     pub fn from_ai_document_pane_ctx(ctx: &ViewContext<PaneView<AIDocumentView>>) -> Self {
         Self::new_from_ctx(IPaneType::AIDocument, ctx)
+    }
+
+    /// Creates a [`PaneId`] from a [`ViewContext<PaneView<CustomRouterEditorView>>`]
+    pub fn from_custom_router_editor_pane_ctx(
+        ctx: &ViewContext<PaneView<crate::ai::custom_model_router_editor::CustomRouterEditorView>>,
+    ) -> Self {
+        Self::new_from_ctx(IPaneType::CustomRouterEditor, ctx)
     }
 
     /// Creates a [`PaneId`] from a [`ViewContext<PaneView<ExecutionProfileEditorView>>`]
@@ -347,6 +357,13 @@ impl PaneId {
         ai_document_pane_view: &ViewHandle<PaneView<AIDocumentView>>,
     ) -> Self {
         Self::new(IPaneType::AIDocument, ai_document_pane_view)
+    }
+
+    /// Creates a [`PaneId`] from a [`PaneView<CustomRouterEditorView>`] entity ID.
+    pub fn from_custom_router_editor_pane_view(
+        view: &ViewHandle<PaneView<crate::ai::custom_model_router_editor::CustomRouterEditorView>>,
+    ) -> Self {
+        Self::new(IPaneType::CustomRouterEditor, view)
     }
 
     /// Creates a [`PaneId`] from a [`PaneView<ExecutionProfileEditorView>`] entity ID.
@@ -482,6 +499,10 @@ impl PaneId {
             IPaneType::AIDocument => {
                 ChildView::<PaneView<AIDocumentView>>::with_id(self.0.pane_view_id).finish()
             }
+            IPaneType::CustomRouterEditor => ChildView::<
+                PaneView<crate::ai::custom_model_router_editor::CustomRouterEditorView>,
+            >::with_id(self.0.pane_view_id)
+            .finish(),
             IPaneType::ExecutionProfileEditor => {
                 ChildView::<PaneView<ExecutionProfileEditorView>>::with_id(self.0.pane_view_id)
                     .finish()
@@ -857,6 +878,10 @@ impl PaneConfiguration {
         ctx.emit(PaneConfigurationEvent::OpenSharingQrCode(source));
     }
 
+    pub fn notify_shared_session_link_changed(&mut self, ctx: &mut ModelContext<Self>) {
+        ctx.emit(PaneConfigurationEvent::SharedSessionLinkChanged);
+    }
+
     /// Notifies that the header content has changed and the pane header should re-render.
     /// Use this when the backing view's state has changed in a way that affects the header
     /// content returned by `render_header_content()`.
@@ -883,6 +908,7 @@ pub enum PaneConfigurationEvent {
     ShareableObjectChanged(Option<ShareableObject>),
     ToggleSharingDialog(SharingDialogSource),
     OpenSharingQrCode(SharingDialogSource),
+    SharedSessionLinkChanged,
     DimEvenIfFocusedUpdated,
     /// The header content has changed and should be re-rendered.
     /// This is used when the backing view's state changes in a way that
@@ -1133,10 +1159,18 @@ pub enum PaneEvent {
     ReplaceWithCodePane {
         path: LocalOrRemotePath,
         source: Option<crate::code::editor_management::CodeSource>,
+        /// Vertical scroll fraction (`0..=1`) captured from the outgoing pane, to restore on the
+        /// new pane. `None` scrolls to the top. Wrapped in `OrderedFloat` so `PaneEvent` can
+        /// still derive `Eq`.
+        scroll_fraction: Option<ordered_float::OrderedFloat<f32>>,
     },
     #[cfg(feature = "local_fs")]
     ReplaceWithFilePane {
         path: LocalOrRemotePath,
         source: Option<crate::code::editor_management::CodeSource>,
+        /// Vertical scroll fraction (`0..=1`) captured from the outgoing pane, to restore on the
+        /// new pane. `None` scrolls to the top. Wrapped in `OrderedFloat` so `PaneEvent` can
+        /// still derive `Eq`.
+        scroll_fraction: Option<ordered_float::OrderedFloat<f32>>,
     },
 }

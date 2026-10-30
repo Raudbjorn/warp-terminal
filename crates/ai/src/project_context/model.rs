@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use futures::future::BoxFuture;
+use warp_util::host_id::HostId;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warpui_core::{AppContext, Entity, ModelContext, SingletonEntity};
 
@@ -202,15 +203,34 @@ impl ProjectRules {
 pub struct ProjectContextModel {
     /// Mapping from directory path to list of rule files found in that directory
     path_to_rules: HashMap<LocalOrRemotePath, ProjectRules>,
-    /// Latest metadata-backed async refresh per exact repository identity.
-    /// This uses the same identifier carried by metadata events rather than an arbitrary file path.
+    /// Generation of the current (or most recently completed) refresh per repository. Guards
+    /// against applying a result for a repository that was removed, or otherwise invalidated,
+    /// while its refresh was in flight. The entry for a repository is cleared once its
+    /// current-generation refresh completes.
     #[cfg(feature = "local_fs")]
     rule_refresh_generations: HashMap<RepositoryIdentifier, u64>,
     #[cfg(feature = "local_fs")]
     next_rule_refresh_generation: u64,
+    /// Repositories with a rule-refresh read currently running in the background.
+    ///
+    /// The underlying file reads (`async_fs::read_to_string`, via a blocking thread pool) cannot
+    /// be cancelled once started, so aborting the outer future doesn't stop them. Instead, this
+    /// set is used to serialize refreshes per repository: while one is in flight, a superseding
+    /// request is recorded in `rule_refresh_pending` rather than spawning an overlapping read.
+    #[cfg(feature = "local_fs")]
+    rule_refresh_in_flight: HashSet<RepositoryIdentifier>,
+    /// Repositories that received a refresh request while a refresh was already in flight. The
+    /// in-flight read's completion consults this to run exactly one coalesced follow-up refresh
+    /// against the latest standing results, instead of one read per superseding event.
+    #[cfg(feature = "local_fs")]
+    rule_refresh_pending: HashSet<RepositoryIdentifier>,
     /// File-based global rules and their local watcher state. Kept separate
     /// from `path_to_rules`, which is project-scoped.
     pub(super) global_rules: GlobalRules,
+    /// File-based global rules published by connected remote hosts. Kept
+    /// separate from local globals so existing local Rules UI accessors remain
+    /// local-only.
+    remote_global_rules: HashMap<HostId, Vec<ProjectRule>>,
 }
 
 #[derive(Default, Debug)]
@@ -276,7 +296,7 @@ impl ProjectContextModel {
         let mut model = Self::default();
         #[cfg(feature = "local_fs")]
         {
-            ctx.subscribe_to_model(&RepoMetadataModel::handle(ctx), move |me, event, ctx| {
+            ctx.subscribe_to_model(&RepoMetadataModel::handle(ctx), move |me, _, event, ctx| {
                 match event {
                     RepoMetadataEvent::RepositoryUpdated { id } => {
                         me.refresh_project_rules_for_repo(
@@ -355,6 +375,11 @@ impl ProjectContextModel {
         Ok(())
     }
 
+    /// Requests a rule refresh for `repo_id`, reading the currently standing rule paths.
+    ///
+    /// If a refresh is already reading files for this repo, the request is coalesced: it is
+    /// recorded in `rule_refresh_pending` and a single follow-up refresh runs once the in-flight
+    /// read completes, instead of spawning a second, overlapping read.
     #[cfg(feature = "local_fs")]
     fn refresh_project_rules_for_repo(
         &mut self,
@@ -365,6 +390,25 @@ impl ProjectContextModel {
         if repo_id.to_local_or_remote_path().is_none() {
             return;
         };
+        if self.rule_refresh_in_flight.contains(&repo_id) {
+            self.rule_refresh_pending.insert(repo_id);
+            return;
+        }
+        self.start_rule_refresh(repo_id, project_rule_content_reader, ctx);
+    }
+
+    /// Spawns the background read for a rule refresh. Callers must first confirm via
+    /// `rule_refresh_in_flight` that no refresh is already running for `repo_id`.
+    #[cfg(feature = "local_fs")]
+    fn start_rule_refresh(
+        &mut self,
+        repo_id: RepositoryIdentifier,
+        project_rule_content_reader: ProjectRuleContentReader,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.rule_refresh_in_flight.insert(repo_id.clone());
+        self.rule_refresh_pending.remove(&repo_id);
+
         let rule_paths = standing_project_rule_paths(
             &repo_id,
             RepoMetadataModel::as_ref(ctx)
@@ -380,23 +424,32 @@ impl ProjectContextModel {
             .insert(repo_id.clone(), refresh_generation);
         let repo_id_for_result = repo_id.clone();
         ctx.spawn(read_rule_contents, move |me, result, ctx| {
-            if me.rule_refresh_generations.get(&repo_id_for_result) != Some(&refresh_generation) {
-                return;
-            }
-            match result {
-                Ok(contents) => {
-                    let Some(project_root) = repo_id_for_result.to_local_or_remote_path() else {
-                        return;
-                    };
-                    let existing_rules = me
-                        .path_to_rules
-                        .get(&project_root)
-                        .cloned()
-                        .unwrap_or_default();
-                    let rules = Self::reconcile_project_rules(rule_paths, contents, existing_rules);
-                    me.apply_project_rules(repo_id_for_result, rules, ctx);
+            me.rule_refresh_in_flight.remove(&repo_id_for_result);
+            // Guards against applying a result for a repository that was removed (or
+            // otherwise invalidated) while this refresh was reading files.
+            if me.rule_refresh_generations.get(&repo_id_for_result) == Some(&refresh_generation) {
+                me.rule_refresh_generations.remove(&repo_id_for_result);
+                match result {
+                    Ok(contents) => {
+                        if let Some(project_root) = repo_id_for_result.to_local_or_remote_path() {
+                            let existing_rules = me
+                                .path_to_rules
+                                .get(&project_root)
+                                .cloned()
+                                .unwrap_or_default();
+                            let rules =
+                                Self::reconcile_project_rules(rule_paths, contents, existing_rules);
+                            me.apply_project_rules(repo_id_for_result.clone(), rules, ctx);
+                        }
+                    }
+                    Err(error) => log::warn!("Failed to read project rules: {error}"),
                 }
-                Err(error) => log::warn!("Failed to read project rules: {error}"),
+            }
+            // A refresh requested while this read was in flight couldn't be served by it (the
+            // standing results may have changed since this read started), so run exactly one
+            // coalesced follow-up against the latest standing results.
+            if me.rule_refresh_pending.remove(&repo_id_for_result) {
+                me.start_rule_refresh(repo_id_for_result, project_rule_content_reader, ctx);
             }
         });
     }
@@ -422,6 +475,7 @@ impl ProjectContextModel {
         ctx: &mut ModelContext<Self>,
     ) {
         self.rule_refresh_generations.remove(repo_id);
+        self.rule_refresh_pending.remove(repo_id);
         let Some(project_root) = repo_id.to_local_or_remote_path() else {
             return;
         };
@@ -542,6 +596,15 @@ impl ProjectContextModel {
         // sorted by path — deterministic without needing a separate
         // ordering pass.
         let mut active_rules: Vec<ProjectRule> = self.global_rules.active_rules().collect();
+        if let Some(remote) = path.as_remote() {
+            active_rules.extend(
+                self.remote_global_rules
+                    .get(&remote.host_id)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+        }
         let (project_root, additional_rule_paths) = match project_result {
             Some(project) => {
                 active_rules.extend(project.active_rules);
@@ -555,8 +618,9 @@ impl ProjectContextModel {
         }
 
         // Use the indexed project root when available; otherwise fall back to
-        // the parent of the first global rule.
-        let root_path = project_root.or_else(|| self.global_rules.first_rule_parent())?;
+        // the parent of the first local or remote global rule.
+        let root_path =
+            project_root.or_else(|| active_rules.first().and_then(|rule| rule.path.parent()))?;
 
         Some(ProjectRulesResult {
             root_path,
@@ -607,6 +671,21 @@ impl ProjectContextModel {
     /// Iteration order is sorted by path because global rules are backed by a `BTreeMap`.
     pub fn global_rule_paths(&self) -> impl Iterator<Item = LocalOrRemotePath> + '_ {
         self.global_rules.paths()
+    }
+
+    /// Returns every indexed global rule with its cached content, sorted by path.
+    pub fn global_rules(&self) -> impl Iterator<Item = ProjectRule> + '_ {
+        self.global_rules.active_rules()
+    }
+    /// Replaces the file-based global rule catalog for one remote host.
+    pub fn set_remote_global_rules(&mut self, host_id: HostId, mut rules: Vec<ProjectRule>) {
+        rules.sort_by_key(|rule| rule.path.display_path());
+        self.remote_global_rules.insert(host_id, rules);
+    }
+
+    /// Removes the file-based global rule catalog for a disconnected remote host.
+    pub fn remove_remote_global_rules(&mut self, host_id: &HostId) {
+        self.remote_global_rules.remove(host_id);
     }
 
     /// Returns the rule file paths associated with a specific workspace root path.

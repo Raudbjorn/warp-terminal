@@ -21,7 +21,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use instant::Instant;
-
 use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
     Border, BoundsSink, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container, CornerRadius,
@@ -29,7 +28,7 @@ use warpui::elements::{
     MainAxisSize, MouseStateHandle, OffsetPositioning, ParentElement, PositionedElementAnchor,
     PositionedElementOffsetBounds, Radius, SavePosition, SizeSink, Stack,
 };
-use warpui::geometry::vector::{vec2f, Vector2F};
+use warpui::geometry::vector::{Vector2F, vec2f};
 use warpui::image_cache::StaticImage;
 use warpui::keymap::Keystroke;
 use warpui::text_layout::ClipConfig;
@@ -39,7 +38,7 @@ use warpui::{
     TypedActionView, View, ViewContext, ViewHandle,
 };
 
-use super::session::{load_config, BrowserCommand, BrowserSession, SessionUpdate, DEFAULT_URL};
+use super::session::{BrowserCommand, BrowserSession, DEFAULT_URL, SessionUpdate, load_config};
 use crate::appearance::Appearance;
 use crate::editor::{
     BaselinePositionComputationMethod, EditorView, Event as EditorEvent, SingleLineEditorOptions,
@@ -525,7 +524,7 @@ impl BrowserView {
                 }
                 DispatchEventResult::StopPropagation
             })
-            .on_right_mouse_down(move |ctx, _app, pos| {
+            .on_right_mouse_down(move |ctx, _app, pos, _modifiers| {
                 // Open the page context menu at the cursor.
                 ctx.dispatch_typed_action(BrowserViewAction::OpenContextMenu {
                     x: pos.x() as i32,
@@ -671,7 +670,9 @@ fn open_in_system_browser(url: &str) {
     } else if cfg!(target_os = "windows") {
         // `cmd /c start` searches `PATH` and respects the user's default-browser
         // association; quoting the URL defends against `&` in the string.
-        std::process::Command::new("cmd").args(["/c", "start", "", url]).spawn()
+        std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .spawn()
     } else {
         // Linux and other Unixes. `xdg-open` is the freedesktop standard.
         std::process::Command::new("xdg-open").arg(url).spawn()
@@ -681,7 +682,7 @@ fn open_in_system_browser(url: &str) {
     }
 }
 
- impl Entity for BrowserView {
+impl Entity for BrowserView {
     type Event = BrowserViewEvent;
 }
 

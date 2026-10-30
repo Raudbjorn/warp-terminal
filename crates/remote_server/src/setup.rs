@@ -344,7 +344,7 @@ pub fn parse_uname_output(
         other => {
             return Err(Error::UnsupportedOs {
                 os: other.to_string(),
-            })
+            });
         }
     };
 
@@ -354,7 +354,7 @@ pub fn parse_uname_output(
         other => {
             return Err(Error::UnsupportedArch {
                 arch: other.to_string(),
-            })
+            });
         }
     };
 
@@ -575,6 +575,16 @@ pub fn remote_server_artifact_version() -> &'static str {
 /// versioned asset.
 pub fn remote_server_artifact_is_moving_latest() -> bool {
     matches!(ChannelState::channel(), Channel::Oss) && ChannelState::app_version().is_none()
+}
+
+/// Returns the shared resource directory used by installed remote-server versions.
+pub fn remote_server_bundled_resources_dir() -> String {
+    format!("{}/{}", remote_server_dir(), BUNDLED_RESOURCES_DIR_NAME)
+}
+
+/// Removes the current binary while preserving resources used by running daemons.
+pub fn remote_server_removal_command() -> String {
+    format!("rm -f {}", remote_server_binary())
 }
 
 /// The install script template, loaded from a standalone `.sh` file for

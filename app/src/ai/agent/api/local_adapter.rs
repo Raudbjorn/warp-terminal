@@ -150,6 +150,9 @@ fn plan_agent_turn(
                         referenced_attachments: query.referenced_attachments.clone(),
                         mode: query.mode,
                         intended_agent: query.intended_agent,
+                        origin: query.origin.clone(),
+                        author: query.author.clone(),
+                        source_message: query.source_message.clone(),
                     }),
                 ));
             }
@@ -172,9 +175,9 @@ fn plan_agent_turn(
                         content: render_tool_result_text(&message_result),
                     });
                 } else {
-                    transcript.push(local_agent::ChatMessage::User(
-                        render_tool_result_text(&message_result),
-                    ));
+                    transcript.push(local_agent::ChatMessage::User(render_tool_result_text(
+                        &message_result,
+                    )));
                 }
                 input_echo_messages.push(new_task_message(
                     &root_task_id,
@@ -206,7 +209,8 @@ fn plan_agent_turn(
                                 }),
                             ));
                         }
-                        Some(api::passive_suggestion_result_type::Suggestion::CodeDiff(_)) | None => {
+                        Some(api::passive_suggestion_result_type::Suggestion::CodeDiff(_))
+                        | None => {
                             return Err(AdapterError::UnsupportedInput(
                                 "passive suggestion result without a prompt is not supported locally",
                             ));
@@ -390,6 +394,7 @@ fn new_task_message(task_id: &str, content: api::message::Message) -> api::Messa
         timestamp: None,
         server_message_data: String::new(),
         citations: vec![],
+        fetched_memories: vec![],
         message: Some(content),
     }
 }
@@ -557,6 +562,7 @@ pub(crate) struct ToolRegistry {
 
 #[derive(Clone)]
 struct McpToolBinding {
+    server_identity: Option<api::McpServerIdentity>,
     server_id: String,
     tool_name: String,
     description: String,
@@ -587,6 +593,7 @@ impl ToolRegistry {
                 mcp_tools.insert(
                     name,
                     McpToolBinding {
+                        server_identity: server.identity.clone(),
                         server_id: server.id.clone(),
                         tool_name: tool.name.clone(),
                         description: tool.description.clone(),
@@ -700,6 +707,7 @@ impl ToolRegistry {
                         .map(|file| api::message::tool_call::apply_file_diffs::NewFile {
                             file_path: file.file_path,
                             content: file.content,
+                            allow_overwrite: false,
                         })
                         .collect(),
                     deleted_files: args
@@ -733,6 +741,11 @@ impl ToolRegistry {
                 let args: ReadMcpResourceArgs = parse_args(call)?;
                 Tool::ReadMcpResource(api::message::tool_call::ReadMcpResource {
                     uri: args.uri,
+                    server_identity: self
+                        .mcp_tools
+                        .values()
+                        .find(|binding| binding.server_id == args.server_id)
+                        .and_then(|binding| binding.server_identity.clone()),
                     server_id: args.server_id,
                 })
             }
@@ -764,6 +777,7 @@ impl ToolRegistry {
                     name: binding.tool_name.clone(),
                     args: Some(json_map_to_prost_struct(arguments)),
                     server_id: binding.server_id.clone(),
+                    server_identity: binding.server_identity.clone(),
                 })
             }
         };
@@ -1189,36 +1203,44 @@ pub(crate) fn render_tool_result_text(result: &api::message::ToolCallResult) -> 
     };
     match result {
         Result::RunShellCommand(shell) => render_shell_result(shell),
-        Result::ReadFiles(read) => match read.result.as_ref() {
-            Some(api::read_files_result::Result::TextFilesSuccess(success)) => success
-                .files
-                .iter()
-                .map(render_file_content)
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-            Some(api::read_files_result::Result::AnyFilesSuccess(success)) => success
-                .files
-                .iter()
-                .map(|file| match file.content.as_ref() {
-                    Some(api::any_file_content::Content::TextContent(content)) => {
-                        render_file_content(content)
-                    }
-                    Some(api::any_file_content::Content::BinaryContent(content)) => {
-                        format!(
-                            "=== {} ===\n(binary file, {} bytes)",
-                            content.file_path,
-                            content.data.len()
-                        )
-                    }
-                    None => "(empty file entry)".to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-            Some(api::read_files_result::Result::Error(error)) => {
-                format!("Error: {}", error.message)
+        Result::ReadFiles(read) => {
+            match read.result.as_ref() {
+                Some(api::read_files_result::Result::TextFilesSuccess(success)) => success
+                    .files
+                    .iter()
+                    .map(render_file_content)
+                    .chain(success.failed_reads.iter().map(|failure| {
+                        format!("Error reading {}: {}", failure.path, failure.message)
+                    }))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                Some(api::read_files_result::Result::AnyFilesSuccess(success)) => success
+                    .files
+                    .iter()
+                    .map(|file| match file.content.as_ref() {
+                        Some(api::any_file_content::Content::TextContent(content)) => {
+                            render_file_content(content)
+                        }
+                        Some(api::any_file_content::Content::BinaryContent(content)) => {
+                            format!(
+                                "=== {} ===\n(binary file, {} bytes)",
+                                content.file_path,
+                                content.data.len()
+                            )
+                        }
+                        None => "(empty file entry)".to_string(),
+                    })
+                    .chain(success.failed_reads.iter().map(|failure| {
+                        format!("Error reading {}: {}", failure.path, failure.message)
+                    }))
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                Some(api::read_files_result::Result::Error(error)) => {
+                    format!("Error: {}", error.message)
+                }
+                None => "(no result)".to_string(),
             }
-            None => "(no result)".to_string(),
-        },
+        }
         Result::ApplyFileDiffs(apply) => match apply.result.as_ref() {
             Some(api::apply_file_diffs_result::Result::Success(success)) => {
                 let mut lines = vec!["Edits applied successfully.".to_string()];
@@ -1361,6 +1383,12 @@ fn render_shell_result(shell: &api::RunShellCommandResult) -> String {
         }
         Some(api::run_shell_command_result::Result::LongRunningCommandSnapshot(snapshot)) => {
             format!("The command is still running. Latest output snapshot:\n{snapshot:?}")
+        }
+        Some(api::run_shell_command_result::Result::TerminalBusy(busy)) => {
+            format!(
+                "The terminal is busy running command {}. This command was not started.",
+                busy.running_command_id
+            )
         }
         #[allow(deprecated)]
         None => format!(

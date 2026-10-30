@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use logging::initialize_logging;
 use warpui::r#async::executor::Background;
 
@@ -21,10 +21,10 @@ use self::plugin_caller::PluginCaller;
 use self::plugin_ref::PluginRef;
 use self::runner::PLUGIN_ENTRYPOINT_JS_FILE_NAME;
 use self::service_impl::CallJsFunctionServiceImpl;
+use super::PLUGIN_HOST_ADDRESS_ENV_VAR;
 use super::service::{
     PluginHostBootstrapRequest, PluginHostBootstrapResponse, PluginHostBootstrapService,
 };
-use super::PLUGIN_HOST_ADDRESS_ENV_VAR;
 use crate::plugin::host::runners::PluginRunners;
 
 pub fn run() -> Result<()> {
@@ -53,11 +53,6 @@ pub fn run() -> Result<()> {
         let (plugin_request_tx, plugin_request_rx) = async_channel::unbounded();
         let mut plugin_runners =
             PluginRunners::new(plugin_request_rx, client.clone(), executor.clone());
-
-        #[cfg(feature = "completions_v2")]
-        plugin_runners.run_plugin(PluginRef::BuiltIn(
-            plugin_ref::BuiltInPluginType::Completions,
-        ));
 
         for plugin_path in plugin_paths() {
             plugin_runners.run_plugin(PluginRef::Path(plugin_path));

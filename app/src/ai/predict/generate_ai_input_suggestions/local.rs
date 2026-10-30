@@ -13,8 +13,10 @@ use local_agent::{ChatMessage, LocalEndpointConfig};
 use warpui::{AppContext, EntityId, SingletonEntity};
 
 use super::{GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2};
+use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::llms::LLMPreferences;
 use crate::server::server_api::AIApiError;
+use crate::server::team_scope::RequestTeamScope;
 
 /// Resolves the local endpoint to use for a next-command prediction, or `None`
 /// to fall back to the server. Returns a config only when the active base model
@@ -22,15 +24,22 @@ use crate::server::server_api::AIApiError;
 pub(crate) fn resolve_local_input_endpoint(
     ctx: &AppContext,
     terminal_view_id: Option<EntityId>,
+    scope: &RequestTeamScope,
 ) -> Option<LocalEndpointConfig> {
     let active_model_id = LLMPreferences::as_ref(ctx)
-        .get_active_base_model(ctx, terminal_view_id)
+        .get_active_base_model_for_team_uid(scope.team_uid(), ctx, terminal_view_id)
         .id
         .as_str()
         .to_string();
+    let profile_key = AIExecutionProfilesModel::as_ref(ctx)
+        .active_profile(terminal_view_id, ctx)
+        .inference_profile_key();
     pick_custom_endpoint(
         &active_model_id,
-        &ApiKeyManager::as_ref(ctx).keys().custom_endpoints,
+        &ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&profile_key)
+            .custom_endpoints,
     )
 }
 

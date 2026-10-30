@@ -18,6 +18,10 @@ fn remote_proxy_command_quotes_identity_key() {
         PathBuf::from("/tmp/control-master.sock"),
         static_auth_context(),
         true,
+        InstallScriptOptions::new(
+            remote_server::setup::default_download_base_url(),
+            remote_server::setup::default_download_channel().to_string(),
+        ),
     );
 
     let command = transport.remote_proxy_command();
@@ -31,6 +35,7 @@ fn transport_does_not_trust_tagged_server_for_untagged_client_by_default() {
     let transport = SshTransport::new(
         PathBuf::from("/tmp/control-master.sock"),
         static_auth_context(),
+        true,
         InstallScriptOptions::new(
             remote_server::setup::default_download_base_url().to_string(),
             remote_server::setup::default_download_channel().to_string(),
@@ -45,6 +50,7 @@ fn transport_can_trust_tagged_server_after_user_approved_install() {
     let transport = SshTransport::new(
         PathBuf::from("/tmp/control-master.sock"),
         static_auth_context(),
+        true,
         InstallScriptOptions::new(
             remote_server::setup::default_download_base_url().to_string(),
             remote_server::setup::default_download_channel().to_string(),
@@ -90,10 +96,10 @@ fn protocol_check_rejects_missing_protocol_output() {
 
 #[test]
 fn protocol_check_accepts_current_protocol_output() {
-    assert!(classify_protocol_check_success(
-        remote_server::protocol::REMOTE_SERVER_PROTOCOL_VERSION
-    )
-    .is_ok());
+    assert!(
+        classify_protocol_check_success(remote_server::protocol::REMOTE_SERVER_PROTOCOL_VERSION)
+            .is_ok()
+    );
 }
 
 #[test]

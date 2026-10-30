@@ -10,18 +10,19 @@ use ::ai::index::full_source_code_embedding::manager::{
 use ::ai::index::full_source_code_embedding::{
     ContentHash, FragmentMetadata as LocalFragmentMetadata, NodeHash,
 };
+use ::ai::project_context::model::{ProjectContextModel, ProjectContextModelEvent};
 use remote_server::proto::OpenBufferSuccess;
 use repo_metadata::repositories::{DetectedRepositories, RepoDetectionSource};
 use repo_metadata::{RepoMetadataEvent, RepoMetadataModel, RepositoryIdentifier};
 use warp_core::channel::ChannelState;
-use warp_core::{safe_error, SessionId};
+use warp_core::{SessionId, safe_error};
 use warp_files::{FileModel, FileModelEvent};
 use warp_util::content_version::ContentVersion;
 use warp_util::file::FileId;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warp_util::standardized_path::StandardizedPath;
-use warpui::platform::TerminationMode;
 use warpui::r#async::{Spawnable, SpawnableOutput, SpawnedFutureHandle};
+use warpui::platform::TerminationMode;
 use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity};
 
 use super::codebase_index_status::{
@@ -33,18 +34,12 @@ use super::diff_state_tracker::{
     DiffModelKey, DiffStateUpdate, RemoteDiffStateManager, SubscribeOutcome,
 };
 use super::proto::{
-    client_message, delete_file_response, discard_files_response, get_diff_state_response,
-    get_fragment_metadata_from_hash_response, git_commit_chain_response, git_create_pr_response,
-    git_generate_commit_message_response, git_get_committed_branch_files_response,
-    git_push_response, host_scoped_request, notification, resolve_conflict_response,
-    run_command_response, save_buffer_response, server_message, session_scoped_request,
-    write_file_response, Abort, Authenticate, BranchInfo, BufferEdit, BufferUpdatedPush,
-    BundledSkillProto, BundledSkillsSnapshot, ClientMessage, CloseBuffer, CodebaseIndexLimits,
-    CodebaseIndexStatus, CodebaseIndexStatusUpdated, CodebaseIndexStatusesSnapshot,
-    CodebaseResyncMode, DeleteFile, DeleteFileResponse, DeleteFileSuccess, DiscardFilesError,
-    DiscardFilesResponse, DiscardFilesSuccess, DropCodebaseIndex, ErrorCode, ErrorResponse,
-    FailedFileRead, FileContextProto, FileOperationError,
-    FragmentMetadata as ProtoFragmentMetadata,
+    Abort, Authenticate, BranchInfo, BufferEdit, BufferUpdatedPush, ClientMessage, CloseBuffer,
+    CodebaseIndexLimits, CodebaseIndexStatus, CodebaseIndexStatusUpdated,
+    CodebaseIndexStatusesSnapshot, CodebaseResyncMode, DeleteFile, DeleteFileResponse,
+    DeleteFileSuccess, DiscardFilesError, DiscardFilesResponse, DiscardFilesSuccess,
+    DropCodebaseIndex, ErrorCode, ErrorResponse, FailedFileRead, FileContextProto,
+    FileOperationError, FragmentMetadata as ProtoFragmentMetadata,
     FragmentMetadataLookupError as ProtoFragmentMetadataLookupError,
     FragmentMetadataLookupErrorCode, GetBranchesError, GetBranchesResponse, GetBranchesSuccess,
     GetDiffStateResponse, GetFragmentMetadataFromHash, GetFragmentMetadataFromHashResponse,
@@ -53,14 +48,21 @@ use super::proto::{
     GitGenerateCommitMessageRequest, GitGenerateCommitMessageResponse,
     GitGetCommittedBranchFilesRequest, GitGetCommittedBranchFilesResponse,
     GitGetCommittedBranchFilesSuccess, GitHubPrInfoPush, GitHubRepositoryInfoPush, GitOpDelta,
-    GitOpError, GitPushRequest, GitPushResponse, GitStatusPush, IndexCodebase, Initialize,
-    InitializeResponse, MissingFragmentMetadata, NavigatedToDirectory,
+    GitOpError, GitPushRequest, GitPushResponse, GitStatusPush, HomeSkillMetadata, IndexCodebase,
+    Initialize, InitializeResponse, MissingFragmentMetadata, NavigatedToDirectory,
     NavigatedToDirectoryResponse, OpenBuffer, OpenBufferResponse, ReadFileContextResponse,
-    ResolveConflict, ResolveConflictResponse, ResolveConflictSuccess, ResyncCodebase,
-    RipgrepSearchRequest, RunCommandError, RunCommandErrorCode, RunCommandRequest,
-    RunCommandResponse, RunCommandSuccess, SaveBuffer, SaveBufferResponse, SaveBufferSuccess,
-    ServerMessage, SessionBootstrapped, TextEdit, UpdateGitHubPrInfo, UpdateGitHubRepoInfo,
-    UpdateGitStatus, UploadHandoffSnapshot, WriteFile, WriteFileResponse, WriteFileSuccess,
+    RemoteAgentContextSnapshot, RemoteContextFileProto, RemoteSkillProto, RenameFile,
+    RenameFileResponse, RenameFileSuccess, ResolveConflict, ResolveConflictResponse,
+    ResolveConflictSuccess, ResyncCodebase, RipgrepSearchRequest, RunCommandError,
+    RunCommandErrorCode, RunCommandRequest, RunCommandResponse, RunCommandSuccess, SaveBuffer,
+    SaveBufferResponse, SaveBufferSuccess, ServerMessage, SessionBootstrapped, TextEdit,
+    UpdateGitHubPrInfo, UpdateGitHubRepoInfo, UpdateGitStatus, UploadHandoffSnapshot, WriteFile,
+    WriteFileResponse, WriteFileSuccess, client_message, delete_file_response,
+    discard_files_response, get_diff_state_response, get_fragment_metadata_from_hash_response,
+    git_commit_chain_response, git_create_pr_response, git_generate_commit_message_response,
+    git_get_committed_branch_files_response, git_push_response, host_scoped_request, notification,
+    remote_skill_proto, rename_file_response, resolve_conflict_response, run_command_response,
+    save_buffer_response, server_message, session_scoped_request, write_file_response,
 };
 use super::server_buffer_tracker::{PendingBufferRequestKind, ServerBufferTracker};
 use super::{diff_state_proto, ripgrep_search};
@@ -85,8 +87,10 @@ pub type ConnectionId = uuid::Uuid;
 use super::protocol::RequestId;
 use crate::ai::agent::FileLocations;
 use crate::ai::blocklist::handoff::snapshot::upload_result_to_proto;
-use crate::ai::blocklist::{read_local_file_context, ReadFileContextResult};
-use crate::ai::skills::{bundled_skills_snapshot_protos, BundledSkill};
+use crate::ai::blocklist::{ReadFileContextResult, read_local_file_context};
+use crate::ai::skills::{
+    BundledSkill, SkillManager, SkillManagerEvent, bundled_skill_snapshot_protos,
+};
 use crate::auth::auth_state::{AuthState, AuthStateProvider};
 use crate::code_review::git_actions;
 use crate::features::FeatureFlag;
@@ -109,6 +113,40 @@ fn daemon_bundled_resources_dir() -> Option<PathBuf> {
     let suffix = dir.strip_prefix("~/")?;
     let dir = dirs::home_dir()?.join(suffix);
     dir.is_dir().then_some(dir)
+}
+fn remote_agent_context_snapshot(
+    revision: u64,
+    bundled_skills: &[RemoteSkillProto],
+    ctx: &warpui::AppContext,
+) -> RemoteAgentContextSnapshot {
+    let home_dir = dirs::home_dir()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut skills = bundled_skills.to_vec();
+    skills.extend(
+        SkillManager::as_ref(ctx)
+            .home_skills()
+            .map(|skill| RemoteSkillProto {
+                path: skill.path.display_path(),
+                content: skill.content.clone(),
+                source: Some(remote_skill_proto::Source::Home(HomeSkillMetadata {})),
+            }),
+    );
+    skills.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut global_rules = ProjectContextModel::as_ref(ctx)
+        .global_rules()
+        .map(|rule| RemoteContextFileProto {
+            path: rule.path.display_path(),
+            content: rule.content,
+        })
+        .collect::<Vec<_>>();
+    global_rules.sort_by(|a, b| a.path.cmp(&b.path));
+    RemoteAgentContextSnapshot {
+        revision,
+        home_dir,
+        skills,
+        global_rules,
+    }
 }
 
 /// Outcome of dispatching a request-style `ClientMessage`.
@@ -151,11 +189,12 @@ enum CodebaseIndexRequestPathKind {
     Requested,
 }
 
-/// Tracks an in-flight file write or delete so the async completion
+/// Tracks an in-flight file operation so the async completion
 /// event can be correlated back to the originating client request.
 enum FileOpKind {
     Write,
     Delete,
+    Rename,
 }
 
 struct PendingFileOp {
@@ -251,19 +290,15 @@ pub struct ServerModel {
     /// Returned in every `InitializeResponse` so clients can deduplicate
     /// host-scoped models.
     host_id: String,
-    /// The bundled skill catalog, pre-parsed and serialized for the
-    /// `BundledSkillsSnapshot` push. `None` until startup parsing completes
-    /// (or forever, when the global resources directory is absent).
-    bundled_skills: Option<Vec<BundledSkillProto>>,
-    /// Connections that have already received the `BundledSkillsSnapshot`
-    /// push, either from the parse-completion broadcast or during their
-    /// `Initialize` handshake. Prevents a duplicate push when parsing
-    /// completes between a connection registering its sender and its
-    /// `Initialize` being handled.
-    bundled_skills_sent: HashSet<ConnectionId>,
+    /// Bundled skill source entries detected and rendered on the daemon.
+    bundled_skills: Vec<RemoteSkillProto>,
+    /// Latest revisioned full replacement of all daemon-host Agent Mode context.
+    remote_agent_context_snapshot: RemoteAgentContextSnapshot,
+    /// Connections that have already received the current snapshot revision.
+    remote_agent_context_snapshot_sent: HashSet<ConnectionId>,
     /// Per-session command executors created from `SessionBootstrapped` notifications.
     executors: HashMap<SessionId, Arc<LocalCommandExecutor>>,
-    /// Tracks in-flight file write/delete operations and handles cleanup.
+    /// Tracks in-flight file operations and handles cleanup.
     pending_file_ops: PendingFileOps,
     /// Daemon-wide auth credentials and user identity.
     auth_state: Arc<AuthState>,
@@ -311,14 +346,17 @@ impl ServerModel {
             std::process::id(),
             host_id
         );
+        let bundled_skills = Vec::new();
+        let remote_agent_context_snapshot = remote_agent_context_snapshot(1, &bundled_skills, ctx);
         let mut model = Self {
             connection_senders: HashMap::new(),
             snapshot_sent_roots_by_connection: HashMap::new(),
             grace_timer_cancel: None,
             in_progress: HashMap::new(),
             host_id,
-            bundled_skills: None,
-            bundled_skills_sent: HashSet::new(),
+            bundled_skills,
+            remote_agent_context_snapshot,
+            remote_agent_context_snapshot_sent: HashSet::new(),
             executors: HashMap::new(),
             pending_file_ops: PendingFileOps::new(),
             auth_state: AuthStateProvider::as_ref(ctx).get().clone(),
@@ -335,7 +373,7 @@ impl ServerModel {
         // connected proxy sessions.
         {
             let file_model = FileModel::handle(ctx);
-            ctx.subscribe_to_model(&file_model, |me, event, ctx| {
+            ctx.subscribe_to_model(&file_model, |me, _, event, ctx| {
                 let file_id = event.file_id();
                 let Some(pending_kind) = me.pending_file_ops.get(&file_id).map(|op| &op.kind)
                 else {
@@ -352,6 +390,20 @@ impl ServerModel {
                             result: Some(delete_file_response::Result::Success(
                                 DeleteFileSuccess {},
                             )),
+                        })
+                    }
+                    (FileModelEvent::FileSaved { .. }, FileOpKind::Rename) => {
+                        server_message::Message::RenameFileResponse(RenameFileResponse {
+                            result: Some(rename_file_response::Result::Success(
+                                RenameFileSuccess {},
+                            )),
+                        })
+                    }
+                    (FileModelEvent::FailedToSave { error, .. }, FileOpKind::Rename) => {
+                        server_message::Message::RenameFileResponse(RenameFileResponse {
+                            result: Some(rename_file_response::Result::Error(FileOperationError {
+                                message: format!("{error}"),
+                            })),
                         })
                     }
                     (FileModelEvent::FailedToSave { error, .. }, FileOpKind::Write) => {
@@ -386,7 +438,7 @@ impl ServerModel {
         }
         {
             let repo_model = RepoMetadataModel::handle(ctx);
-            ctx.subscribe_to_model(&repo_model, |me, event, ctx| match event {
+            ctx.subscribe_to_model(&repo_model, |me, _, event, ctx| match event {
                 RepoMetadataEvent::IncrementalUpdateReady { update } => {
                     me.send_server_message(
                         None,
@@ -438,13 +490,13 @@ impl ServerModel {
             });
         }
         let index_manager = CodebaseIndexManager::handle(ctx);
-        ctx.subscribe_to_model(&index_manager, |me, event, ctx| {
+        ctx.subscribe_to_model(&index_manager, |me, _, event, ctx| {
             me.handle_codebase_index_manager_event(event, ctx);
         });
         // Subscribe to GlobalBufferModel events for server-local buffers.
         {
             let gbm = GlobalBufferModel::handle(ctx);
-            ctx.subscribe_to_model(&gbm, |me, event, ctx| match event {
+            ctx.subscribe_to_model(&gbm, |me, _, event, ctx| match event {
                 GlobalBufferModelEvent::BufferLoaded { file_id, .. } => {
                     // Complete all pending OpenBuffer requests for this file.
                     let pending = me.buffers.take_pending_by_kind(
@@ -529,7 +581,7 @@ impl ServerModel {
                         );
                     }
                 }
-                GlobalBufferModelEvent::FileSaved { file_id } => {
+                GlobalBufferModelEvent::FileSaved { file_id, .. } => {
                     for req in me.buffers.take_pending_by_kind(
                         file_id,
                         PendingBufferRequestKind::SaveBuffer,
@@ -623,8 +675,8 @@ impl ServerModel {
                     // When a file-watcher update couldn't be applied because
                     // the buffer has unsaved client edits, forward the conflict
                     // to connected clients so they can show a resolution banner.
-                    if !success {
-                        if let Some(conns) = me.buffers.connections_for_buffer(file_id) {
+                    if !success
+                        && let Some(conns) = me.buffers.connections_for_buffer(file_id) {
                             // Collect to break the immutable borrow on `me.buffers`
                             // before calling `me.send_server_message(&mut self)`.
                             let conns: Vec<_> = conns.iter().copied().collect();
@@ -641,18 +693,40 @@ impl ServerModel {
                                 );
                             }
                         }
-                    }
                 }
                 GlobalBufferModelEvent::RemoteBufferConflict { .. } => {
                     // Not relevant for server-local buffers.
                 }
             });
         }
+        {
+            let skill_manager = SkillManager::handle(ctx);
+            ctx.subscribe_to_model(&skill_manager, |me, _, event, ctx| match event {
+                SkillManagerEvent::SkillsChanged {
+                    home_skills_changed: true,
+                } => {
+                    me.refresh_remote_agent_context_snapshot(ctx);
+                }
+                SkillManagerEvent::SkillsChanged {
+                    home_skills_changed: false,
+                } => {}
+            });
+        }
+        {
+            let project_context = ProjectContextModel::handle(ctx);
+            ctx.subscribe_to_model(&project_context, |me, _, event, ctx| match event {
+                ProjectContextModelEvent::GlobalRulesChanged(_) => {
+                    me.refresh_remote_agent_context_snapshot(ctx);
+                }
+                ProjectContextModelEvent::PathIndexed
+                | ProjectContextModelEvent::KnownRulesChanged(_) => {}
+            });
+        }
         // Subscribe to diff state manager events — convert domain dispatches
         // to proto messages and send them to connected clients.
         {
             let diff_states = model.diff_states.clone();
-            ctx.subscribe_to_model(&diff_states, |me, dispatch, _ctx| {
+            ctx.subscribe_to_model(&diff_states, |me, _, dispatch, _ctx| {
                 me.handle_diff_state_update(dispatch);
             });
         }
@@ -666,11 +740,11 @@ impl ServerModel {
         if let Some(resources_dir) = daemon_bundled_resources_dir() {
             ctx.spawn(
                 BundledSkill::detect_in_resources_dir(resources_dir),
-                |me, catalog, _| {
-                    let skills = bundled_skills_snapshot_protos(&catalog);
+                |me, catalog, ctx| {
+                    let skills = bundled_skill_snapshot_protos(&catalog);
                     log::info!("Daemon parsed {} bundled skills", skills.len());
-                    me.bundled_skills = Some(skills);
-                    me.broadcast_bundled_skills_snapshot();
+                    me.bundled_skills = skills;
+                    me.refresh_remote_agent_context_snapshot(ctx);
                 },
             );
         } else {
@@ -688,38 +762,40 @@ impl ServerModel {
         model
     }
 
-    /// Broadcasts the parsed bundled skill catalog to all connections.
-    /// No-op until startup parsing has completed.
-    fn broadcast_bundled_skills_snapshot(&mut self) {
-        let Some(skills) = self.bundled_skills.clone() else {
-            return;
-        };
+    fn refresh_remote_agent_context_snapshot(&mut self, ctx: &warpui::AppContext) {
+        let revision = self
+            .remote_agent_context_snapshot
+            .revision
+            .saturating_add(1);
+        self.remote_agent_context_snapshot =
+            remote_agent_context_snapshot(revision, &self.bundled_skills, ctx);
+        self.broadcast_remote_agent_context_snapshot();
+    }
+
+    fn broadcast_remote_agent_context_snapshot(&mut self) {
         self.send_server_message(
             None,
             None,
-            server_message::Message::BundledSkillsSnapshot(BundledSkillsSnapshot { skills }),
+            server_message::Message::RemoteAgentContextSnapshot(
+                self.remote_agent_context_snapshot.clone(),
+            ),
         );
-        self.bundled_skills_sent
+        self.remote_agent_context_snapshot_sent
             .extend(self.connection_senders.keys().copied());
     }
 
-    /// Pushes the parsed bundled skill catalog to a single connection.
-    /// No-op until startup parsing has completed, or when the catalog was
-    /// already delivered to this connection (e.g. it registered before the
-    /// parse-completion broadcast fired).
-    fn send_bundled_skills_snapshot_to_connection(&mut self, conn_id: ConnectionId) {
-        if self.bundled_skills_sent.contains(&conn_id) {
+    fn send_remote_agent_context_snapshot_to_connection(&mut self, conn_id: ConnectionId) {
+        if self.remote_agent_context_snapshot_sent.contains(&conn_id) {
             return;
         }
-        let Some(skills) = self.bundled_skills.clone() else {
-            return;
-        };
         self.send_server_message(
             Some(conn_id),
             None,
-            server_message::Message::BundledSkillsSnapshot(BundledSkillsSnapshot { skills }),
+            server_message::Message::RemoteAgentContextSnapshot(
+                self.remote_agent_context_snapshot.clone(),
+            ),
         );
-        self.bundled_skills_sent.insert(conn_id);
+        self.remote_agent_context_snapshot_sent.insert(conn_id);
     }
 
     /// Called when a proxy connects.  Inserts `conn_tx` into the connection
@@ -749,7 +825,7 @@ impl ServerModel {
     /// and starts the grace timer if no connections remain.
     pub fn deregister_connection(&mut self, conn_id: ConnectionId, ctx: &mut ModelContext<Self>) {
         self.snapshot_sent_roots_by_connection.remove(&conn_id);
-        self.bundled_skills_sent.remove(&conn_id);
+        self.remote_agent_context_snapshot_sent.remove(&conn_id);
         // Guard against double-deregister (reader and writer tasks both call
         // this on connection close; the second call must be a safe no-op).
         if self.connection_senders.remove(&conn_id).is_none() {
@@ -843,6 +919,9 @@ impl ServerModel {
                     Some(host_scoped_request::Message::DeleteFile(m)) => {
                         self.handle_delete_file(m, &request_id, conn_id, ctx)
                     }
+                    Some(host_scoped_request::Message::RenameFile(m)) => {
+                        self.handle_rename_file(m, &request_id, conn_id, ctx)
+                    }
                     Some(host_scoped_request::Message::ReadFileContext(m)) => {
                         self.handle_read_file_context(m, &request_id, conn_id, ctx)
                     }
@@ -913,7 +992,7 @@ impl ServerModel {
                         self.handle_navigated_to_directory(m, &request_id, conn_id, ctx)
                     }
                     Some(session_scoped_request::Message::LoadRepoMetadataDirectory(m)) => {
-                        self.handle_load_repo_metadata_directory(m, &request_id, ctx)
+                        self.handle_load_repo_metadata_directory(m, &request_id, conn_id, ctx)
                     }
                     Some(session_scoped_request::Message::RunCommand(m)) => {
                         self.handle_run_command(m, &request_id, conn_id, ctx)
@@ -1563,11 +1642,9 @@ impl ServerModel {
 
     /// Handles `Initialize` by returning the server version and host id.
     ///
-    /// Also configures Sentry crash reporting based on the user's identity
-    /// and preferences supplied by the connecting client, and sends the
-    /// bundled skill catalog to the initializing connection when startup
-    /// parsing has already completed (otherwise the parse-completion
-    /// broadcast delivers it).
+    /// Also configures Sentry crash reporting based on the user's identity and
+    /// preferences supplied by the connecting client, and sends the latest
+    /// remote Agent Mode context snapshot to the initializing connection.
     #[cfg_attr(not(feature = "crash_reporting"), allow(unused_variables))]
     fn handle_initialize(
         &mut self,
@@ -1579,9 +1656,6 @@ impl ServerModel {
         log::info!("Handling Initialize (request_id={request_id})");
         self.apply_initialize_auth(&msg);
         Self::apply_codebase_index_limits(msg.codebase_index_limits.as_ref(), ctx);
-        CodebaseIndexManager::handle(ctx).update(ctx, |manager, ctx| {
-            manager.start_persisted_index_restore(ctx);
-        });
 
         // Update crash reporting based on client-supplied preferences.
         #[cfg(feature = "crash_reporting")]
@@ -1593,13 +1667,9 @@ impl ServerModel {
             }
         }
 
-        // Push the bundled skill catalog to this connection if it is already
-        // parsed and the parse-completion broadcast didn't already deliver it
-        // (parsing can complete between this connection registering its
-        // sender and its `Initialize` being handled). Enqueued on the same
-        // channel as the response below, so the client buffers it as a push
-        // event during the handshake.
-        self.send_bundled_skills_snapshot_to_connection(conn_id);
+        // Enqueued on the same channel as the response below, so the client
+        // buffers it as a push event during the handshake.
+        self.send_remote_agent_context_snapshot_to_connection(conn_id);
 
         let server_version = ChannelState::app_version().unwrap_or("").to_string();
         HandlerOutcome::Sync(server_message::Message::InitializeResponse(
@@ -2083,13 +2153,12 @@ impl ServerModel {
                                 },
                             ),
                         );
-                        if is_git {
-                            if let Some(sent_roots) = me
+                        if is_git
+                            && let Some(sent_roots) = me
                                 .snapshot_sent_roots_by_connection
                                 .get_mut(&conn_id_for_response)
-                            {
-                                sent_roots.insert(root_path);
-                            }
+                        {
+                            sent_roots.insert(root_path);
                         }
                     }
                 }
@@ -2100,11 +2169,12 @@ impl ServerModel {
     }
 
     /// Handles `LoadRepoMetadataDirectory` by loading a subdirectory on the
-    /// server's local model and returning the children synchronously.
+    /// server's local model and returning the children after the async load completes.
     fn handle_load_repo_metadata_directory(
         &mut self,
         msg: super::proto::LoadRepoMetadataDirectory,
         request_id: &RequestId,
+        conn_id: ConnectionId,
         ctx: &mut ModelContext<Self>,
     ) -> HandlerOutcome {
         log::info!(
@@ -2144,39 +2214,72 @@ impl ServerModel {
             }));
         }
 
-        // Load the directory on the server's local model.
-        let load_result = RepoMetadataModel::handle(ctx).update(ctx, |model, ctx| {
-            model.load_directory(&repo_path, &dir_path, ctx)
+        // Load the directory on the server's local model. The returned future resolves after the
+        // LocalRepoMetadataModel completion callback has applied or rejected the subtree.
+        let load_future = RepoMetadataModel::handle(ctx).update(ctx, |model, ctx| {
+            model.load_directory_with_completion(&repo_path, &dir_path, ctx)
         });
 
-        if let Err(e) = load_result {
-            log::warn!("LoadRepoMetadataDirectory failed: {e}");
-            return HandlerOutcome::Sync(server_message::Message::Error(ErrorResponse {
-                code: ErrorCode::Internal.into(),
-                message: format!("Failed to load directory: {e}"),
-            }));
-        }
+        let load_future = match load_future {
+            Ok(load_future) => load_future,
+            Err(e) => {
+                log::warn!("LoadRepoMetadataDirectory failed: {e}");
+                return HandlerOutcome::Sync(server_message::Message::Error(ErrorResponse {
+                    code: ErrorCode::Internal.into(),
+                    message: format!("Failed to load directory: {e}"),
+                }));
+            }
+        };
 
-        // Read back the loaded children and serialize them.
-        let id = RepositoryIdentifier::local(repo_path.clone());
-        let entries = RepoMetadataModel::handle(ctx)
-            .as_ref(ctx)
-            .get_repository(&id, ctx)
-            .map(|state| {
-                super::repo_metadata_proto::file_tree_children_to_proto_entries(
-                    &state.entry,
-                    &dir_path,
-                )
-            })
-            .unwrap_or_default();
+        let request_id_for_response = request_id.clone();
+        let repo_path_for_response = msg.repo_path;
+        let dir_path_for_response = msg.dir_path;
+        let handle = self.spawn_request_handler(
+            request_id.clone(),
+            load_future,
+            move |me, load_result, ctx| {
+                if let Err(e) = load_result {
+                    log::warn!("LoadRepoMetadataDirectory failed: {e}");
+                    me.send_server_message(
+                        Some(conn_id),
+                        Some(&request_id_for_response),
+                        server_message::Message::Error(ErrorResponse {
+                            code: ErrorCode::Internal.into(),
+                            message: format!("Failed to load directory: {e}"),
+                        }),
+                    );
+                    return;
+                }
 
-        HandlerOutcome::Sync(server_message::Message::LoadRepoMetadataDirectoryResponse(
-            super::proto::LoadRepoMetadataDirectoryResponse {
-                repo_path: msg.repo_path,
-                dir_path: msg.dir_path,
-                entries,
+                // Read back the loaded children and serialize them after the completion callback
+                // has inserted the subtree.
+                let id = RepositoryIdentifier::local(repo_path.clone());
+                let entries = RepoMetadataModel::handle(ctx)
+                    .as_ref(ctx)
+                    .get_repository(&id, ctx)
+                    .map(|state| {
+                        super::repo_metadata_proto::file_tree_children_to_proto_entries(
+                            &state.entry,
+                            &dir_path,
+                        )
+                    })
+                    .unwrap_or_default();
+
+                me.send_server_message(
+                    Some(conn_id),
+                    Some(&request_id_for_response),
+                    server_message::Message::LoadRepoMetadataDirectoryResponse(
+                        super::proto::LoadRepoMetadataDirectoryResponse {
+                            repo_path: repo_path_for_response,
+                            dir_path: dir_path_for_response,
+                            entries,
+                        },
+                    ),
+                );
             },
-        ))
+            ctx,
+        );
+        HandlerOutcome::Async(Some(handle))
     }
 
     /// Handles `WriteFile` by registering the path and triggering an async
@@ -2217,6 +2320,42 @@ impl ServerModel {
         }
 
         // Response sent asynchronously via the event subscription.
+        HandlerOutcome::Async(None)
+    }
+
+    fn handle_rename_file(
+        &mut self,
+        msg: RenameFile,
+        request_id: &RequestId,
+        conn_id: ConnectionId,
+        ctx: &mut ModelContext<Self>,
+    ) -> HandlerOutcome {
+        let (file_id, version) = self.pending_file_ops.insert(
+            Path::new(&msg.path),
+            request_id.clone(),
+            conn_id,
+            FileOpKind::Rename,
+            ctx,
+        );
+        let file_model = FileModel::handle(ctx);
+        if let Err(error) = file_model.update(ctx, |model, ctx| {
+            model.rename_and_save(
+                file_id,
+                PathBuf::from(msg.new_path),
+                msg.content,
+                version,
+                ctx,
+            )
+        }) {
+            self.pending_file_ops.remove(file_id, ctx);
+            return HandlerOutcome::Sync(server_message::Message::RenameFileResponse(
+                RenameFileResponse {
+                    result: Some(rename_file_response::Result::Error(FileOperationError {
+                        message: format!("Failed to initiate rename: {error}"),
+                    })),
+                },
+            ));
+        }
         HandlerOutcome::Async(None)
     }
 
@@ -2354,36 +2493,33 @@ impl ServerModel {
         // For force_reload on an already-tracked buffer, skip open_server_local
         // to avoid a spurious BufferLoaded event that would consume the pending
         // request before ServerLocalBufferUpdated can use it for exclusion.
-        if msg.force_reload {
-            if let Some(file_id) = self.buffers.file_id_for_path(&msg.path) {
-                self.buffers.add_connection(file_id, conn_id);
-                let gbm = GlobalBufferModel::handle(ctx);
+        if msg.force_reload
+            && let Some(file_id) = self.buffers.file_id_for_path(&msg.path)
+        {
+            self.buffers.add_connection(file_id, conn_id);
+            let gbm = GlobalBufferModel::handle(ctx);
 
-                self.buffers.insert_pending(
-                    file_id,
-                    request_id.clone(),
-                    conn_id,
-                    PendingBufferRequestKind::OpenBuffer,
-                );
-                if let Err(e) =
-                    gbm.update(ctx, |gbm, ctx| gbm.force_reload_server_local(file_id, ctx))
-                {
-                    self.buffers
-                        .take_pending_by_kind(&file_id, PendingBufferRequestKind::OpenBuffer);
-                    return HandlerOutcome::Sync(server_message::Message::OpenBufferResponse(
-                        OpenBufferResponse {
-                            result: Some(
-                                remote_server::proto::open_buffer_response::Result::Error(
-                                    FileOperationError { message: e },
-                                ),
-                            ),
-                        },
-                    ));
-                }
-                return HandlerOutcome::Async(None);
+            self.buffers.insert_pending(
+                file_id,
+                request_id.clone(),
+                conn_id,
+                PendingBufferRequestKind::OpenBuffer,
+            );
+            if let Err(e) = gbm.update(ctx, |gbm, ctx| gbm.force_reload_server_local(file_id, ctx))
+            {
+                self.buffers
+                    .take_pending_by_kind(&file_id, PendingBufferRequestKind::OpenBuffer);
+                return HandlerOutcome::Sync(server_message::Message::OpenBufferResponse(
+                    OpenBufferResponse {
+                        result: Some(remote_server::proto::open_buffer_response::Result::Error(
+                            FileOperationError { message: e },
+                        )),
+                    },
+                ));
             }
-            // Buffer not yet tracked — fall through to open_server_local below.
+            return HandlerOutcome::Async(None);
         }
+        // Buffer not yet tracked — fall through to open_server_local below.
 
         let path = PathBuf::from(&msg.path);
         let gbm = GlobalBufferModel::handle(ctx);
@@ -3405,7 +3541,7 @@ impl ServerModel {
         };
 
         let path_for_sub = repo_path.clone();
-        ctx.subscribe_to_model(&handle, move |me, _event, ctx| {
+        ctx.subscribe_to_model(&handle, move |me, _, _event, ctx| {
             let proto_metadata = {
                 let Some(handle) = me.git_status_models.get(&path_for_sub) else {
                     return;
@@ -3534,10 +3670,8 @@ impl ServerModel {
         };
         let already_tracked = self.github_repo_models.contains_key(&std_path);
         self.subscribe_to_github_info_updates(&std_path, ctx);
-        if already_tracked {
-            if let Some(handle) = self.github_repo_models.get(&std_path).cloned() {
-                handle.update(ctx, |model, ctx| model.refresh_pr_info(ctx));
-            }
+        if already_tracked && let Some(handle) = self.github_repo_models.get(&std_path).cloned() {
+            handle.update(ctx, |model, ctx| model.refresh_pr_info(ctx));
         }
     }
 
@@ -3558,10 +3692,8 @@ impl ServerModel {
         };
         let already_tracked = self.github_repo_models.contains_key(&std_path);
         self.subscribe_to_github_info_updates(&std_path, ctx);
-        if already_tracked {
-            if let Some(handle) = self.github_repo_models.get(&std_path).cloned() {
-                handle.update(ctx, |model, ctx| model.refresh_repository_info(ctx));
-            }
+        if already_tracked && let Some(handle) = self.github_repo_models.get(&std_path).cloned() {
+            handle.update(ctx, |model, ctx| model.refresh_repository_info(ctx));
         }
     }
 
@@ -3624,7 +3756,7 @@ impl ServerModel {
         };
 
         let path_for_sub = repo_path.clone();
-        ctx.subscribe_to_model(&handle, move |me, event, ctx| match event {
+        ctx.subscribe_to_model(&handle, move |me, _, event, ctx| match event {
             GitHubRepoEvent::PrInfoChanged => me.push_github_pr_info(&path_for_sub, ctx),
             GitHubRepoEvent::RepositoryInfoChanged => {
                 me.push_github_repository_info(&path_for_sub, ctx)
@@ -3784,12 +3916,12 @@ fn file_context_result_to_proto(result: ReadFileContextResult) -> ReadFileContex
         .collect();
 
     let failed_files = result
-        .missing_files
+        .failed_files
         .into_iter()
-        .map(|path| FailedFileRead {
-            path,
+        .map(|failed_file| FailedFileRead {
+            path: failed_file.path,
             error: Some(FileOperationError {
-                message: "File not found or could not be read".to_string(),
+                message: failed_file.message,
             }),
         })
         .collect();
