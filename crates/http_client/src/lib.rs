@@ -157,12 +157,6 @@ impl Client {
                 .http2_keep_alive_while_idle(true);
         }
 
-        // Enforce LocalOnly network policy across redirects
-        #[cfg(not(target_family = "wasm"))]
-        {
-            builder = builder.redirect(network_policy_redirect_policy());
-        }
-
         Self::from_client_builder(builder).expect("should not fail to create client")
     }
 
@@ -430,17 +424,6 @@ fn is_warp_server_origin(url: &reqwest::Url) -> bool {
     .any(|candidate| candidate.origin() == url.origin())
 }
 
-#[cfg(not(target_family = "wasm"))]
-fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
-    reqwest::redirect::Policy::custom(|attempt| {
-        match network_policy::check_url(attempt.url(), "redirect target") {
-            Ok(()) => attempt.follow(),
-            Err(err) => attempt.error(err),
-        }
-    })
-}
-
-
 impl<'a> RequestBuilder<'a> {
     pub fn build(self) -> reqwest::Result<Request> {
         self.build_split().1
@@ -688,13 +671,13 @@ fn denied_eventsource_stream()
 /// hops without consulting the URL — a loopback URL that passes the initial
 /// `check_url` could redirect to a public host and bypass LocalOnly
 /// restrictions. This policy refuses any redirect whose target is denied by
-/// the policy in effect at request time.
+/// the policy in effect at request time. A denied hop surfaces as a request
+/// error rather than silently returning the 3xx response.
 fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        if network_policy::check_url(attempt.url(), "redirect target").is_ok() {
-            attempt.follow()
-        } else {
-            attempt.stop()
+        match network_policy::check_url(attempt.url(), "redirect target") {
+            Ok(()) => attempt.follow(),
+            Err(err) => attempt.error(err),
         }
     })
 }

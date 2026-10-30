@@ -244,7 +244,7 @@ pub async fn spawn(
 /// emits it on a fresh line or appended to the first line of output.
 async fn read_announcement(
     mut stdout: async_process::ChildStdout,
-) -> Result<OpenCodeAnnouncement, OpenCodeError> {
+) -> Result<(OpenCodeAnnouncement, async_process::ChildStdout), OpenCodeError> {
     // Byte-at-a-time read so we can detect the announcement whether
     // the sidecar emits it on its own line, appended to the first
     // line of output, or right before EOF without a trailing
@@ -263,7 +263,7 @@ async fn read_announcement(
                 // the port line and exits without a trailing
                 // newline is still recognized.
                 if let Ok(ann) = try_parse_buffer(&buffer) {
-                    return Ok(ann);
+                    return Ok((ann, stdout));
                 }
                 break;
             }
@@ -368,10 +368,10 @@ async fn drain_sidecar(
 }
 
 /// Pool of `OpenCodeSidecar`s keyed by working directory. Cheap to clone;
-/// clones share the same backing map. The internal `tokio::sync::Mutex`
-/// is used (not `parking_lot::Mutex` nor `std::sync::Mutex`) so the
-/// guard is `Send + !Sync` and can be held across `.await` points in
-/// async callers.
+/// clones share the same backing map. The internal `parking_lot::Mutex` is
+/// only ever held for synchronous map lookups/inserts (never across an
+/// `.await`), so an async mutex is unnecessary — and a sync lock lets
+/// `clear()` run on the (non-Tokio) UI thread without spawning a task.
 #[derive(Clone, Default)]
 pub struct OpenCodeSidecarPool {
     inner: Arc<parking_lot::Mutex<HashMap<PathBuf, OpenCodeSidecar>>>,

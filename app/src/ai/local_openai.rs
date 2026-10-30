@@ -261,21 +261,18 @@ impl LocalOpenAIClient {
         let old_config = self.config.read().clone();
         let provider_kind = config.provider_kind;
         *self.config.write() = config;
-        // Provider switched away from OpenCode: drop cached sidecars
-        // so we do not leak a child that no caller will use. The
-        // pool's internal `tokio::sync::Mutex` lets us clear without
-        // holding an outer lock — we spawn the await to keep this
-        // setter sync (it is called from settings-event handlers).
-        if provider_kind != LocalProviderKind::OpenCode {
-            let pool = self.opencode_pool.clone();
-            // The spawned future is fire-and-forget; the `let _ =`
-            // suppresses the `must_use` warning. We deliberately do
-            // not block on it: any in-flight `get_or_spawn` call
-            // holds a clone of its sidecar handle, so the cleared
-            // entry will be dropped when that handle is released.
-            let _ = tokio::spawn(async move {
-                pool.clear().await;
-            });
+        // Clear the sidecar pool when:
+        // 1. Switching away from OpenCode (avoid leaking unused children), or
+        // 2. OpenCode settings change (command/args) so stale sidecars are dropped.
+        // `clear()` is synchronous (parking_lot lock) so this runs directly on
+        // the UI thread — no Tokio runtime required, and no fire-and-forget task
+        // that could be dropped before it runs.
+        let should_clear = provider_kind != LocalProviderKind::OpenCode
+            || (provider_kind == LocalProviderKind::OpenCode
+                && (old_config.opencode_command != self.config.read().opencode_command
+                    || old_config.opencode_args != self.config.read().opencode_args));
+        if should_clear {
+            self.opencode_pool.clear();
         }
     }
 
