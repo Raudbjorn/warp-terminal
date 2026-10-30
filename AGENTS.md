@@ -168,8 +168,6 @@ for itself.
   only need explain the *current state* of the code. Explanations of edits belong in pull
   request comments instead. You shouldn't add comments with phrases like, "this used to do
   so-and-so".
-- Do not remove existing comments when making unrelated changes. Only remove or modify a
-  comment if the logic it describes has changed.
 - The formatter (`./script/format`) is configured with a `max_width` (max line length) of
   100. Flow (reflow) comment line-wrapping to fill that full width rather than wrapping
   early at a narrower column, so comments span as few lines as possible.
@@ -191,18 +189,6 @@ for itself.
   #[path = "filename_tests.rs"]  // or "mod_test.rs"
   mod tests;
   ```
-
-**Pull Request Workflow**:
-- Follow the Implementation Validation Order before opening a PR or pushing a code update. Do not repeat validation when the candidate has not changed.
-- CI is the broad cross-platform and workspace gate. Push once the targeted tests and lint checks pass and the formatter has run; address a later CI failure as a new revision.
-- Do not create public pull requests or public issues that disclose a non-public security vulnerability. Refer users to `SECURITY.md` for the proper disclosure methods instead.
- - When opening PRs, use the PR template at `.github/pull_request_template.md`
- - Add changelog entries when appropriate using the format at the bottom of the PR template. Use the following prefixes (without the `{{}}` brackets):
-   - `CHANGELOG-NEW-FEATURE:` for new, relatively sizable features (use sparingly - these may get marketing/docs)
-   - `CHANGELOG-IMPROVEMENT:` for new functionality of existing features
-   - `CHANGELOG-BUG-FIX:` for fixes related to known bugs or regressions
-   - `CHANGELOG-IMAGE:` for GCP-hosted image URLs
-   - Leave changelog lines blank or remove them if no changelog entry is needed
 
 **Database**:
 - Uses Diesel ORM with SQLite
