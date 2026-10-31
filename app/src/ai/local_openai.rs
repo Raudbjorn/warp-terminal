@@ -753,11 +753,15 @@ fn chat_completions_url(base_url: &str) -> String {
 /// `chat_completions_url` so the two helpers stay in sync: the
 /// Responses API uses `/v1/responses` rather than
 /// `/v1/chat/completions`, and we accept either suffix or a bare
-/// `/v1` prefix.
+/// `/v1` prefix. A base URL that is a full chat-completions endpoint is
+/// rewritten to the sibling `/responses` endpoint rather than having
+/// `/v1/responses` appended after it.
 #[allow(dead_code)]
 fn responses_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.ends_with("/responses") {
+    if let Some(prefix) = trimmed.strip_suffix("/chat/completions") {
+        format!("{prefix}/responses")
+    } else if trimmed.ends_with("/responses") {
         trimmed.to_string()
     } else if trimmed.ends_with("/v1") {
         format!("{trimmed}/responses")
@@ -845,6 +849,29 @@ mod tests {
         assert_eq!(
             chat_completions_url("http://127.0.0.1:11434/v1/chat/completions"),
             "http://127.0.0.1:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalizes_responses_urls() {
+        for base in [
+            "http://127.0.0.1:11434",
+            "http://127.0.0.1:11434/v1",
+            "http://127.0.0.1:11434/v1/",
+            "http://127.0.0.1:11434/v1/responses",
+            "http://127.0.0.1:11434/v1/chat/completions",
+            "http://127.0.0.1:11434/v1/chat/completions/",
+        ] {
+            assert_eq!(
+                responses_url(base),
+                "http://127.0.0.1:11434/v1/responses",
+                "base url: {base}"
+            );
+        }
+        // A non-`/v1` prefix is preserved when rewriting the chat endpoint.
+        assert_eq!(
+            responses_url("https://example.test/api/chat/completions"),
+            "https://example.test/api/responses"
         );
     }
 
