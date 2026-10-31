@@ -90,11 +90,6 @@ fi
 # checksums for the source files, as we generate them above and there's not
 # much reason to generate the checksums and then verify them immediately
 # afterwards.
-if [ "${GITHUB_ACTIONS}" == "true" ]; then
-  # If we're running in a GitHub action, don't ask for confirmation before
-  # installing packages.
-  EXTRA_ARGS="--noconfirm"
-fi
 cd "$PKGDIR"
 PKGDEST="$OUT_DIR" CARCH="$ARCH" makepkg -cfrs --needed --skipchecksums "$EXTRA_ARGS"
 

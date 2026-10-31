@@ -84,7 +84,6 @@ pub const TERMINAL_KEYBINDINGS: &[&str] = &[
     "workspace:set_a11y_verbose_verbosity_level",
     "workspace:show_command_search",
     "workspace:show_keybinding_settings",
-    "workspace:show_settings_account_page",
     "workspace:show_settings",
     "workspace:toggle_command_palette",
     "workspace:toggle_launch_config_palette",
@@ -117,11 +116,6 @@ pub const FUNDAMENTALS_KEYBINDINGS: &[&str] = &[
 /// anywhere else in the code.
 pub fn get_additional_keybindings() -> Vec<CommandBinding> {
     vec![
-        CommandBinding::new(
-            "workspace:new_window".into(),
-            "Open New Window".into(),
-            Some(Keystroke::parse("cmd-n").expect("Valid keystroke")),
-        ),
         CommandBinding::new(
             "workspace:hide_warp".into(),
             "Hide Warp".into(),

@@ -3,9 +3,9 @@
 #![cfg_attr(feature = "release_bundle", windows_subsystem = "windows")]
 
 use anyhow::Result;
-use warp_core::{
-    channel::{Channel, ChannelConfig, ChannelState, OzConfig, ServicesMode, WarpServerConfig},
-    AppId,
+use warp_core::AppId;
+use warp_core::channel::{
+    Channel, ChannelConfig, ChannelState, OzConfig, ServicesMode, WarpServerConfig,
 };
 
 // Simple wrapper around warp::run() for Warp OSS builds.
@@ -19,7 +19,6 @@ fn main() -> Result<()> {
             oz_config: OzConfig::local_only(),
             services_mode: ServicesMode::LocalOnly,
             telemetry_config: None,
-            crash_reporting_config: None,
             autoupdate_config: None,
             mcp_static_config: None,
         },
@@ -42,7 +41,7 @@ embed_plist::embed_info_plist_bytes!(r#"
     <key>CFBundleDevelopmentRegion</key>
     <string>English</string>
     <key>CFBundleDisplayName</key>
-    <string>WarpOss</string>
+    <string>oh-my-warp</string>
     <key>CFBundleExecutable</key>
     <string>warp-oss</string>
     <key>CFBundleIdentifier</key>
@@ -50,7 +49,7 @@ embed_plist::embed_info_plist_bytes!(r#"
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>WarpOss</string>
+    <string>oh-my-warp</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

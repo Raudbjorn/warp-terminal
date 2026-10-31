@@ -30,6 +30,17 @@ pub struct NetworkPolicyDenied {
 }
 
 impl NetworkPolicyDenied {
+    /// Construct a `NetworkPolicyDenied` from a human-readable purpose and
+    /// the URL that was denied. Exposed so non-`network_policy` crates can
+    /// build denial errors for code paths (such as the HTTP redirect policy)
+    /// that consult the network policy indirectly.
+    pub fn new(purpose: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            purpose: purpose.into(),
+            url: url.into(),
+        }
+    }
+
     pub fn purpose(&self) -> &str {
         &self.purpose
     }
@@ -86,9 +97,18 @@ fn is_guarded_scheme(scheme: &str) -> bool {
 }
 
 fn is_loopback_url(url: &Url) -> bool {
+    // Use the url crate's Host enum rather than manual string parsing
+    // of the host. The url crate already parses IPv4 and IPv6 into
+    // standard library types with proper is_loopback() semantics,
+    // including the bracketed IPv6 form (e.g. [::1]) which the
+    // previous string-strip code happened to handle but only by
+    // accident.
     match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.to_ipv4().is_some_and(|v4| v4.is_loopback())
+        }
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         None => false,
     }
@@ -111,6 +131,21 @@ mod tests {
             assert_eq!(
                 check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
                 Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn local_only_allows_ipv4_mapped_loopback() {
+        for url in [
+            "http://[::ffff:127.0.0.1]:8080",
+            "http://[::ffff:7f00:1]:8080",
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert_eq!(
+                check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
+                Ok(()),
+                "expected {url} to be treated as loopback"
             );
         }
     }
@@ -146,4 +181,29 @@ mod tests {
             Ok(())
         );
     }
+
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_is_recognized() {
+        // IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1 should be treated as loopback
+        let url = Url::parse("http://[::ffff:127.0.0.1]:8080").unwrap();
+        assert!(is_loopback_url(&url));
+    }
+
+    #[test]
+    fn legacy_ipv4_compatible_ipv6_loopback_is_recognized() {
+        // Legacy IPv4-compatible IPv6 addresses (::a.b.c.d) are deprecated but
+        // still possible in the wild; `to_ipv4()` recognizes both this form
+        // and the IPv4-mapped form (::ffff:a.b.c.d), whereas `to_ipv4_mapped`
+        // only sees the latter.
+        let url = Url::parse("http://[::127.0.0.1]:8080").unwrap();
+        assert!(is_loopback_url(&url));
+    }
+
+    #[test]
+    fn ipv6_link_local_is_not_loopback() {
+        // Link-local addresses (fe80::/10) are NOT loopback
+        let url = Url::parse("http://[fe80::1]:8080").unwrap();
+        assert!(!is_loopback_url(&url));
+    }
+
 }

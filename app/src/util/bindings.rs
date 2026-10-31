@@ -3,7 +3,7 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use enum_iterator::{all, Sequence};
+use enum_iterator::{Sequence, all};
 use fuzzy_match::match_indices_case_insensitive;
 use itertools::Itertools;
 use lazy_static::lazy_static;
@@ -16,7 +16,7 @@ use warpui::keymap::{
 use warpui::platform::OperatingSystem;
 use warpui::{Action, AppContext, SingletonEntity};
 
-use crate::keyboard::{remove_custom_keybinding, write_custom_keybinding, UserDefinedKeybinding};
+use crate::keyboard::{UserDefinedKeybinding, remove_custom_keybinding, write_custom_keybinding};
 use crate::settings_view::keybindings::{KeybindingChangedEvent, KeybindingChangedNotifier};
 
 pub const MAC_MENUS_CONTEXT: DescriptionContext = DescriptionContext::Custom("mac_menus");
@@ -26,6 +26,8 @@ pub const MAC_MENUS_CONTEXT: DescriptionContext = DescriptionContext::Custom("ma
 #[repr(isize)]
 pub enum CustomAction {
     NewTab,
+    /// Open an embedded browser pane as a new tab (oh-my-warp).
+    NewWebTab,
     NewFile,
     ShowAboutWarp,
     ShowSettings,
@@ -188,11 +190,15 @@ lazy_static! {
     /// * `^_`: Unit Separator
     /// * `^?`: Delete
     ///
+    /// `ctrl-/` is reserved alongside these. It isn't caret notation for a distinct character, but
+    /// terminals have encoded it as the Unit Separator since xterm and editors bind against it.
+    /// See GH#4620.
+    ///
     /// ## Note
     /// Though caret notation uses uppercase letters (`^C` instead of `^c`), we validate using
     /// _lowercase_ characters because it is impossible to create a [`Keystroke`] of the form
     /// `ctrl-[A-Z]`. See [`Keystroke::parse`].
-    pub static ref CONTROL_CHARACTER_KEY_REGEX: Regex = Regex::new(r"^ctrl-[a-z@\[\\\]^_?]$").expect("should be able to construct regex");
+    pub static ref CONTROL_CHARACTER_KEY_REGEX: Regex = Regex::new(r"^ctrl-[a-z@\[\\\]^_?/]$").expect("should be able to construct regex");
 
     /// Set of actions on Mac that should be considered valid bindings even though they aren't PTY
     /// compliant. We weren't always diligent about avoiding bindings that could conflict with
@@ -213,7 +219,11 @@ lazy_static! {
         // on TerminalView on all platforms.
         Keystroke::parse("ctrl-c").expect("should be able to construct ctrl-c keystroke"),
         // The resume conversation binding uses cmd-shift-R on Mac and should be allowed
-        Keystroke::parse("cmd-shift-R").expect("should be able to construct cmd-shift-R keystroke")
+        Keystroke::parse("cmd-shift-R").expect("should be able to construct cmd-shift-R keystroke"),
+        // oh-my-warp: the tmux-style leader/prefix key (default ctrl-b) is
+        // intentionally captured from the PTY so it can begin a `<leader> <key>`
+        // chord. See `crate::util::leader`. Keep in sync with `leader::LEADER`.
+        Keystroke::parse("ctrl-b").expect("should be able to construct ctrl-b keystroke")
     ]);
 }
 
@@ -262,6 +272,7 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
     match custom.into() {
         CustomAction::FocusInput => Keystroke::parse(cmd_or_ctrl_shift("l")).ok(),
         CustomAction::NewTab => Keystroke::parse(cmd_or_ctrl_shift("t")).ok(),
+        CustomAction::NewWebTab => None,
         CustomAction::Cut => Keystroke::parse("cmdorctrl-x").ok(),
         CustomAction::Copy => Keystroke::parse(cmd_or_ctrl_shift("c")).ok(),
         CustomAction::Paste => Keystroke::parse(cmd_or_ctrl_shift("v")).ok(),
@@ -363,7 +374,10 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
         // differently compared to the app which saves the resulting character used with shift
         // TODO: resolve these keybinding differences
         CustomAction::ToggleResourceCenter => Keystroke::parse("ctrl-shift-/").ok(),
-        CustomAction::ToggleKeybindingsPage => Keystroke::parse("cmdorctrl-/").ok(),
+        // Set this to mac-only. On Linux/Windows `cmdorctrl-/` resolves to `ctrl-/`, which is
+        // reserved for the PTY: keybindings are dispatched before terminal input, so this
+        // swallowed the keystroke before the terminal ever saw it.
+        CustomAction::ToggleKeybindingsPage => mac_only_keystroke("cmd-/"),
         CustomAction::ScrollToTopOfSelectedBlocks => Keystroke::parse("cmdorctrl-shift-up").ok(),
         CustomAction::ScrollToBottomOfSelectedBlocks => {
             Keystroke::parse("cmdorctrl-shift-down").ok()
@@ -382,8 +396,6 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
                 Keystroke::parse("ctrl-alt-t").ok()
             }
         }
-
-        // This is one of the app's hardcoded keybindings.
         CustomAction::AddWindow => Keystroke::parse(cmd_or_ctrl_shift("n")).ok(),
         CustomAction::ToggleWarpDrive => {
             if OperatingSystem::get().is_mac() {
@@ -637,11 +649,7 @@ pub fn filter_bindings_including_keystroke<'a>(
                 let keystroke_search_score = if let Some(search_keystroke) = &search_keystroke {
                     binding.trigger.as_ref().and_then(|candidate_keystroke| {
                         let score = keystroke_includes(search_keystroke, candidate_keystroke);
-                        if score > 0 {
-                            Some(score)
-                        } else {
-                            None
-                        }
+                        if score > 0 { Some(score) } else { None }
                     })
                 } else {
                     None
@@ -807,6 +815,8 @@ pub enum BindingGroup {
     Notifications,
     EnvVarCollection,
     Terminal,
+    /// oh-my-warp: tmux-style leader/prefix chords (see `crate::util::leader`).
+    Leader,
 }
 
 impl BindingGroup {
@@ -825,6 +835,7 @@ impl BindingGroup {
             Self::Notifications => "notifications",
             Self::EnvVarCollection => "env_var_collections",
             Self::Terminal => "terminal",
+            Self::Leader => "leader",
         }
     }
 

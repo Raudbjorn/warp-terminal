@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "defaults": {
+    "HOST": "127.0.0.1",
+    "PORT": 8787,
+    "OPENAI_BASE_URL": "",
+    "OPENAI_MODEL": "",
+    "LOCAL_MODEL_ALIASES": "{\"auto-efficient\":\"Qwen/Qwen3.6-27B-FP8\",\"auto-coding\":\"Qwen/Qwen3.6-27B-FP8\",\"auto-autocomplete\":\"Qwen/Qwen3.6-27B-FP8\"}",
+    "LOCAL_MODEL_LIST": "Qwen/Qwen3.6-27B-FP8",
+    "LOCAL_ENABLE_TOOLS": true,
+    "LOCAL_MAX_HISTORY_MESSAGES": 80,
+    "LOCAL_MAX_COMPLETION_TOKENS": 2048,
+    "LOCAL_MODEL_CONTEXT_TOKENS": "",
+    "LOCAL_GRAPHQL_DB_PATH": "",
+    "LOG_LEVEL": "info",
+    "LOCAL_SERVICE_LOG_PATH": "",
+    "LOCAL_MULTI_AGENT_SYSTEM_PROMPT": "You are running as a local Warp-compatible agent endpoint."
+  }
+}

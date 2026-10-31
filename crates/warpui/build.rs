@@ -79,6 +79,13 @@ fn compile_metal_shaders() {
     let lib_path = out_path.join("shaders.metallib");
     let lib_path = lib_path.to_str().unwrap();
 
+    // LOCAL VERIFICATION ONLY (never commit): this machine has no Metal
+    // toolchain; an empty library satisfies `include_bytes!` for `cargo check`.
+    if env::var("WARP_LOCAL_SKIP_METAL").is_ok() {
+        std::fs::write(lib_path, b"").expect("write empty metallib");
+        return;
+    }
+
     println!("cargo:rerun-if-changed={header_path}");
     println!("cargo:rerun-if-changed={metal_path}");
     println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
@@ -107,6 +114,15 @@ fn compile_metal_shaders() {
         compile_args.push("-gline-tables-only");
     }
     let result = Command::new("xcrun")
+        // oh-my-warp: when building under nix/devenv, DEVELOPER_DIR points at the
+        // nix apple-sdk (which has no `metal`). If WARP_METAL_DEVELOPER_DIR is set
+        // (see devenv.nix), point xcrun at the system Xcode for the shader compile
+        // only, leaving the rest of the build on the nix toolchain.
+        .envs(
+            std::env::var("WARP_METAL_DEVELOPER_DIR")
+                .ok()
+                .map(|d| ("DEVELOPER_DIR", d)),
+        )
         .args(&compile_args)
         .output()
         .expect("error compiling metal shaders to .air");
@@ -117,6 +133,11 @@ fn compile_metal_shaders() {
     );
 
     let result = Command::new("xcrun")
+        .envs(
+            std::env::var("WARP_METAL_DEVELOPER_DIR")
+                .ok()
+                .map(|d| ("DEVELOPER_DIR", d)),
+        )
         .args(["-sdk", "macosx", "metallib", air_path, "-o", lib_path])
         .output()
         .expect("error compiling metal shaders to .metallib");

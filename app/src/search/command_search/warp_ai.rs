@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use serde_json::json;
+use warp_core::channel::ChannelState;
 use warp_core::ui::builder;
 use warpui::elements::{ConstrainedBox, Container, Text};
 use warpui::{AppContext, Element, SingletonEntity};
@@ -12,7 +13,7 @@ use warpui::{AppContext, Element, SingletonEntity};
 use super::workflows::{WorkflowIdentity, WorkflowSearchItem};
 use crate::ai::AIRequestUsageModel;
 use crate::ai_assistant::execution_context::WarpAiExecutionContext;
-use crate::ai_assistant::{GenerateCommandsFromNaturalLanguageError, AI_ASSISTANT_LOGO_COLOR};
+use crate::ai_assistant::{AI_ASSISTANT_LOGO_COLOR, GenerateCommandsFromNaturalLanguageError};
 use crate::appearance::Appearance;
 use crate::features::FeatureFlag;
 use crate::search::command_search::searcher::CommandSearchItemAction;
@@ -23,7 +24,7 @@ use crate::search::mixer::{
 };
 use crate::search::result_renderer::ItemHighlightState;
 use crate::search::workflows::fuzzy_match::FuzzyMatchWorkflowResult;
-use crate::server::server_api::ai::AIClient;
+use crate::server::server_api::ai::CommandGenerationClient;
 use crate::themes::theme::Blend;
 use crate::ui_components::icons::Icon as UIIcon;
 use crate::util::color::{ContrastingColor, MinimumAllowedContrast};
@@ -31,11 +32,15 @@ use crate::workflows::{AIWorkflowOrigin, WorkflowSource, WorkflowType};
 
 const OPEN_WARP_AI_ITEM_BODY_TEXT: &str = "Ask Warp AI for command suggestions";
 const TRANSLATE_WITH_WARP_AI_ITEM_BODY_TEXT: &str = "Translate into shell command using Warp AI";
+const TRANSLATE_WITH_LOCAL_AI_ITEM_BODY_TEXT: &str = "Generate command suggestions with Local AI";
 
 #[derive(Clone, Debug)]
 pub enum WarpAISearchItem {
     /// Translates the query within command search.
     Translate,
+
+    /// Translates the query within command search using the local AI provider.
+    TranslateLocal,
 
     /// Opens WarpAI with the query.
     Open,
@@ -45,6 +50,7 @@ impl WarpAISearchItem {
     fn item_body_text(&self) -> &'static str {
         match self {
             WarpAISearchItem::Translate => TRANSLATE_WITH_WARP_AI_ITEM_BODY_TEXT,
+            WarpAISearchItem::TranslateLocal => TRANSLATE_WITH_LOCAL_AI_ITEM_BODY_TEXT,
             WarpAISearchItem::Open => OPEN_WARP_AI_ITEM_BODY_TEXT,
         }
     }
@@ -67,7 +73,7 @@ impl SearchItem for WarpAISearchItem {
         };
 
         let icon = if FeatureFlag::AgentMode.is_enabled() {
-            UIIcon::Oz
+            UIIcon::Agent
                 .to_warpui_icon(
                     appearance
                         .theme()
@@ -120,20 +126,24 @@ impl SearchItem for WarpAISearchItem {
 
     fn accept_result(&self) -> CommandSearchItemAction {
         match self {
-            WarpAISearchItem::Translate => CommandSearchItemAction::TranslateUsingWarpAI,
+            WarpAISearchItem::Translate | WarpAISearchItem::TranslateLocal => {
+                CommandSearchItemAction::TranslateUsingWarpAI
+            }
             WarpAISearchItem::Open => CommandSearchItemAction::OpenWarpAI,
         }
     }
 
     fn execute_result(&self) -> CommandSearchItemAction {
         match self {
-            WarpAISearchItem::Translate => CommandSearchItemAction::TranslateUsingWarpAI,
+            WarpAISearchItem::Translate | WarpAISearchItem::TranslateLocal => {
+                CommandSearchItemAction::TranslateUsingWarpAI
+            }
             WarpAISearchItem::Open => CommandSearchItemAction::OpenWarpAI,
         }
     }
 
     fn accessibility_label(&self) -> String {
-        format!("Warp AI: {}", self.item_body_text())
+        format!("AI command search: {}", self.item_body_text())
     }
 }
 
@@ -145,13 +155,13 @@ impl SearchItem for WarpAISearchItem {
 /// and once as an async source. That way, the mixer will treat these as two separate
 /// data sources.
 pub struct WarpAIDataSource {
-    ai_client: Arc<dyn AIClient>,
+    ai_client: Arc<dyn CommandGenerationClient>,
     ai_execution_context: Option<WarpAiExecutionContext>,
 }
 
 impl WarpAIDataSource {
     pub fn new(
-        ai_client: Arc<dyn AIClient>,
+        ai_client: Arc<dyn CommandGenerationClient>,
         ai_execution_context: Option<WarpAiExecutionContext>,
     ) -> Self {
         Self {
@@ -169,6 +179,13 @@ impl SyncDataSource for WarpAIDataSource {
         query: &Query,
         _app: &AppContext,
     ) -> Result<Vec<QueryResult<Self::Action>>, DataSourceRunErrorWrapper> {
+        if ChannelState::is_local_only() {
+            if query.filters.is_empty() {
+                return Ok(vec![WarpAISearchItem::TranslateLocal.into()]);
+            }
+            return Ok(Vec::new());
+        }
+
         if query.filters.is_empty() {
             Ok(vec![WarpAISearchItem::Translate.into()])
         } else {
@@ -238,6 +255,15 @@ impl DataSourceRunError for GenerateCommandsFromNaturalLanguageError {
             Self::BadPrompt => "No results found. Please try again with a more specific query.",
             Self::AiProviderError => "Something went wrong. Please try again.",
             Self::RateLimited => "Looks like you're out of AI credits. Please try again later.",
+            Self::LocalProviderNotConfigured => {
+                "Configure a local OpenAI-compatible model to generate commands."
+            }
+            Self::LocalProviderError => {
+                "Could not reach the configured local AI provider. Check the endpoint and model."
+            }
+            Self::LocalProviderInvalidResponse => {
+                "The local AI provider returned a response Warp could not parse."
+            }
             Self::Other => "Something went wrong. Please try again.",
         }
         .to_string()

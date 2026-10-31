@@ -1,17 +1,18 @@
 use std::sync::Arc;
 use std::time::Duration;
+use warp_core::channel::ChannelState;
 
 use async_channel::Sender;
 pub use cloud_object_client::ObjectUpdateMessage;
 use futures_util::stream::AbortHandle;
 use instant::Instant;
+use warp_errors::report_error;
 use warpui::r#async::Timer;
-use warpui::{Entity, ModelContext, RequestState, SingletonEntity};
+use warpui::{Entity, ModelContext, ModelHandle, RequestState, SingletonEntity};
 
 use super::update_manager::UpdateManager;
 use crate::cloud_object::model::persistence::{CloudModel, CloudModelEvent};
 use crate::network::{NetworkStatus, NetworkStatusEvent, NetworkStatusKind};
-use crate::report_error;
 use crate::server::retry_strategies::LISTENER_RETRY_STRATEGY;
 use crate::server::server_api::object::ObjectClient;
 use crate::system::{SystemStats, SystemStatsEvent};
@@ -84,6 +85,10 @@ impl Listener {
             pending_refresh_abort_handle: None,
         };
 
+        if ChannelState::is_local_only() {
+            return listener;
+        }
+
         // When the websocket signals readiness, decide whether to refresh cloud objects
         // based on how long the connection was down.
         let _ = ctx.spawn_stream_local(
@@ -137,13 +142,14 @@ impl Listener {
     // If the user is part of a team, we should start subscribing for updates.
     fn handle_user_workspaces_event(
         &mut self,
+        _: ModelHandle<UserWorkspaces>,
         event: &UserWorkspacesEvent,
         ctx: &mut ModelContext<Self>,
     ) {
-        if let UserWorkspacesEvent::TeamsChanged = event {
-            if self.is_part_of_some_team(ctx) {
-                self.start_listener(ctx);
-            }
+        if let UserWorkspacesEvent::TeamsChanged = event
+            && self.is_part_of_some_team(ctx)
+        {
+            self.start_listener(ctx);
         }
     }
 
@@ -154,7 +160,12 @@ impl Listener {
     }
 
     // If the user has access to >= 1 cloud objects, we should subscribe for updates.
-    fn handle_cloud_model_event(&mut self, _event: &CloudModelEvent, ctx: &mut ModelContext<Self>) {
+    fn handle_cloud_model_event(
+        &mut self,
+        _: ModelHandle<CloudModel>,
+        _event: &CloudModelEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
         if self.has_non_welcome_cloud_objects(ctx) {
             self.start_listener(ctx);
         }
@@ -165,7 +176,12 @@ impl Listener {
     // To get around this, we manually abort the future (effectively closing the websocket)
     // when the CPU goes to sleep and restart it when it's awakened.
     // https://linear.app/warpdotdev/issue/CLD-172/websocket-hangs-when-closed-during-cpu-sleep
-    fn handle_cpu_event(&mut self, event: &SystemStatsEvent, ctx: &mut ModelContext<Self>) {
+    fn handle_cpu_event(
+        &mut self,
+        _: ModelHandle<SystemStats>,
+        event: &SystemStatsEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
         match event {
             SystemStatsEvent::CpuWasAwakened => {
                 if let Some(abort_handle) = self.current_subscription_abort_handle.take() {
@@ -192,6 +208,7 @@ impl Listener {
 
     fn handle_network_status_changed_event(
         &mut self,
+        _: ModelHandle<NetworkStatus>,
         event: &NetworkStatusEvent,
         ctx: &mut ModelContext<Self>,
     ) {
@@ -376,3 +393,61 @@ impl Entity for Listener {
 }
 
 impl SingletonEntity for Listener {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cloud_object_client::MockObjectClient;
+    use serial_test::serial;
+    use std::sync::Arc;
+    use warp_core::{
+        AppId,
+        channel::{Channel, ChannelConfig, OzConfig, ServicesMode, WarpServerConfig},
+    };
+    use warpui::App;
+
+    struct ChannelStateGuard;
+
+    impl Drop for ChannelStateGuard {
+        fn drop(&mut self) {
+            ChannelState::set(ChannelState::init());
+        }
+    }
+
+    fn set_local_only_channel_state() -> ChannelStateGuard {
+        ChannelState::set(ChannelState::new(
+            Channel::Oss,
+            ChannelConfig {
+                app_id: AppId::new("dev", "warp", "WarpOssTest"),
+                logfile_name: "warp-oss-test.log".into(),
+                server_config: WarpServerConfig::local_only(),
+                oz_config: OzConfig::local_only(),
+                services_mode: ServicesMode::LocalOnly,
+                telemetry_config: None,
+                autoupdate_config: None,
+                mcp_static_config: None,
+            },
+        ));
+        ChannelStateGuard
+    }
+
+    #[test]
+    #[serial]
+    fn test_local_only_listener_does_not_start_websocket() {
+        let _channel_state = set_local_only_channel_state();
+
+        App::test((), |app| async move {
+            let mut object_client = MockObjectClient::new();
+            object_client.expect_get_warp_drive_updates().times(0);
+
+            let listener =
+                app.add_singleton_model(|ctx| Listener::new(Arc::new(object_client), ctx));
+
+            listener.read(&app, |listener, _| {
+                assert!(!listener.should_subscribe_to_updates);
+                assert!(!listener.has_current_subscription_abort_handle());
+                assert!(listener.pending_refresh_abort_handle.is_none());
+            });
+        });
+    }
+}

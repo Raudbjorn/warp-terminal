@@ -108,6 +108,23 @@ impl From<AIGeneratedCommand> for Workflow {
     }
 }
 
+impl AIGeneratedCommand {
+    pub(crate) fn new(
+        command: String,
+        description: String,
+        parameters: Vec<(String, String)>,
+    ) -> Self {
+        Self {
+            command,
+            description,
+            parameters: parameters
+                .into_iter()
+                .map(|(id, description)| AIGeneratedCommandParameter { id, description })
+                .collect_vec(),
+        }
+    }
+}
+
 impl From<GeneratedCommand> for AIGeneratedCommand {
     fn from(value: GeneratedCommand) -> Self {
         AIGeneratedCommand {
@@ -130,6 +147,9 @@ pub enum GenerateCommandsFromNaturalLanguageError {
     BadPrompt,
     AiProviderError,
     RateLimited,
+    LocalProviderNotConfigured,
+    LocalProviderError,
+    LocalProviderInvalidResponse,
     Other,
 }
 
@@ -162,6 +182,8 @@ impl From<RequestLimitInfoGraphql> for RequestLimitInfo {
             is_unlimited: value.is_unlimited,
             limit: value.request_limit as usize,
             num_requests_used_since_refresh: value.requests_used_since_last_refresh as usize,
+            included_usage_cents: value.included_usage_cents,
+            usage_cents_used_since_last_refresh: value.usage_cents_used_since_last_refresh,
             next_refresh_time: value.next_refresh_time,
             request_limit_refresh_duration: value.request_limit_refresh_duration.into(),
             is_unlimited_voice: value.is_unlimited_voice,

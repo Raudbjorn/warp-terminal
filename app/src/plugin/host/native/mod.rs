@@ -1,5 +1,7 @@
+mod app_request;
 mod js_api;
 mod logging;
+mod manifest;
 mod plugin;
 mod plugin_caller;
 mod plugin_ref;
@@ -11,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use logging::initialize_logging;
 use warpui::r#async::executor::Background;
 
@@ -19,10 +21,10 @@ use self::plugin_caller::PluginCaller;
 use self::plugin_ref::PluginRef;
 use self::runner::PLUGIN_ENTRYPOINT_JS_FILE_NAME;
 use self::service_impl::CallJsFunctionServiceImpl;
+use super::PLUGIN_HOST_ADDRESS_ENV_VAR;
 use super::service::{
     PluginHostBootstrapRequest, PluginHostBootstrapResponse, PluginHostBootstrapService,
 };
-use super::PLUGIN_HOST_ADDRESS_ENV_VAR;
 use crate::plugin::host::runners::PluginRunners;
 
 pub fn run() -> Result<()> {
@@ -43,15 +45,14 @@ pub fn run() -> Result<()> {
         // process via `LogService`.
         initialize_logging(&client, &executor);
 
+        // Relay host→app requests (warp.ui.toast / warp.keymap.bind) via a background task, so the
+        // blocking IPC never runs on a plugin runner thread inside a JS callback.
+        app_request::initialize_app_request_relay(&client, &executor);
+
         // Spawn plugin runners for each plugin.
         let (plugin_request_tx, plugin_request_rx) = async_channel::unbounded();
         let mut plugin_runners =
             PluginRunners::new(plugin_request_rx, client.clone(), executor.clone());
-
-        #[cfg(feature = "completions_v2")]
-        plugin_runners.run_plugin(PluginRef::BuiltIn(
-            plugin_ref::BuiltInPluginType::Completions,
-        ));
 
         for plugin_path in plugin_paths() {
             plugin_runners.run_plugin(PluginRef::Path(plugin_path));

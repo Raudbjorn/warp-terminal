@@ -1,10 +1,11 @@
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
-use warpui::{Entity, EntityId, ModelContext, SingletonEntity};
+use warp_core::channel::ChannelState;
+use warpui::{Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
 
-use super::workflow::Workflow;
 use super::CloudWorkflowModel;
+use super::workflow::Workflow;
 use crate::cloud_object::model::persistence::CloudModel;
 use crate::cloud_object::{GenericCloudObject, Owner};
 use crate::drive::OpenWarpDriveObjectSettings;
@@ -13,9 +14,9 @@ use crate::server::cloud_objects::update_manager::{
     ObjectOperation, OperationSuccessType, UpdateManager, UpdateManagerEvent,
 };
 use crate::server::ids::{ClientId, SyncId};
-use crate::workflows::workflow_view::WorkflowView;
 use crate::workflows::WorkflowViewMode;
-use crate::{safe_warn, PaneViewLocator, WindowId};
+use crate::workflows::workflow_view::WorkflowView;
+use crate::{PaneViewLocator, WindowId, safe_warn};
 
 pub struct WorkflowManager {
     panes_by_hashed_id: HashMap<String, WorkflowPaneData>,
@@ -45,6 +46,12 @@ pub enum WorkflowOpenSource {
 
 impl WorkflowManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        if ChannelState::is_local_only() {
+            return WorkflowManager {
+                panes_by_hashed_id: HashMap::new(),
+            };
+        }
+
         ctx.subscribe_to_model(
             &UpdateManager::handle(ctx),
             Self::handle_update_manager_event,
@@ -179,6 +186,7 @@ impl WorkflowManager {
 
     fn handle_update_manager_event(
         &mut self,
+        _: ModelHandle<UpdateManager>,
         event: &UpdateManagerEvent,
         ctx: &mut ModelContext<Self>,
     ) {

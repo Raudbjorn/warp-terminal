@@ -9,29 +9,34 @@ use itertools::Itertools;
 #[cfg_attr(not(feature = "local_fs"), allow(unused_imports))]
 use parking_lot::{FairMutex, Mutex};
 use warp_completer::completer::{
-    self, expand_command_aliases, AliasExpansionResult, CompleterOptions,
-    CompletionsFallbackStrategy, MatchStrategy,
+    self, AliasExpansionResult, CompleterOptions, CompletionsFallbackStrategy, MatchStrategy,
+    expand_command_aliases,
 };
 use warp_completer::meta::Spanned;
-use warp_completer::parsers::hir::{Command, Expression, FlagType};
 use warp_completer::parsers::ParsedExpression;
+use warp_completer::parsers::hir::{Command, Expression, FlagType};
+#[cfg(feature = "local_fs")]
+use warp_core::command::ExitCode;
 use warp_core::features::FeatureFlag;
 #[cfg(feature = "local_fs")]
 use warpui::r#async::FutureExt;
-use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
+use warpui::{AppContext, Entity, EntityId, ModelContext, ModelHandle, SingletonEntity};
 
 use super::generate_ai_input_suggestions::{
-    create_generate_ai_input_suggestions_request, get_context_messages,
     GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2, NextCommandContext,
+    create_generate_ai_input_suggestions_request, get_context_messages,
 };
 use crate::ai::block_context::BlockContext;
+use crate::ai::blocklist::BlocklistAIController;
 use crate::ai_assistant::execution_context::WarpAiExecutionContext;
 use crate::completer::SessionContext;
 #[cfg(feature = "local_fs")]
-use crate::persistence::{database_file_path_for_scope, establish_ro_connection, PersistenceScope};
-use crate::report_error;
+use crate::persistence::{database_file_path_for_current_scope, establish_ro_connection};
 use crate::server::server_api::{AIApiError, ServerApi};
+use crate::server::team_scope::RequestTeamScope;
 use crate::settings::AISettings;
+#[cfg(feature = "local_fs")]
+use crate::terminal::ShellHost;
 use crate::terminal::event::UserBlockCompleted;
 use crate::terminal::input::{CompleterData, IntelligentAutosuggestionResult};
 use crate::terminal::model::session::Sessions;
@@ -60,6 +65,28 @@ const ARG_GENERATOR_VALIDATION_TIMEOUT: Duration = Duration::from_millis(150);
 pub fn is_next_command_enabled(app: &warpui::AppContext) -> bool {
     AISettings::as_ref(app).is_intelligent_autosuggestions_enabled(app)
         && UserWorkspaces::as_ref(app).is_next_command_enabled()
+}
+
+/// Fetches AI input suggestions, routing to the user's custom endpoint when one
+/// was resolved (local agent loop) and otherwise to the Warp server. Resolution
+/// happens on the main thread before spawning; `local_endpoint` carries the
+/// result into the async task.
+async fn fetch_input_suggestions(
+    server_api: &ServerApi,
+    #[cfg(not(target_family = "wasm"))] local_endpoint: &Option<local_agent::LocalEndpointConfig>,
+    request: &GenerateAIInputSuggestionsRequest,
+    team_scope: RequestTeamScope,
+) -> Result<GenerateAIInputSuggestionsResponseV2, AIApiError> {
+    #[cfg(not(target_family = "wasm"))]
+    if let Some(endpoint) = local_endpoint {
+        return super::generate_ai_input_suggestions::local::generate_local_input_suggestions(
+            request, endpoint,
+        )
+        .await;
+    }
+    server_api
+        .generate_ai_input_suggestions(request, team_scope)
+        .await
 }
 
 /// Information about an autosuggestion that would have been made if purely based off history.
@@ -133,6 +160,9 @@ pub struct NextCommandModel {
     sessions: ModelHandle<Sessions>,
     model: Arc<FairMutex<TerminalModel>>,
     server_api: Arc<ServerApi>,
+    /// The window's Agent Mode controller, consulted for the team the window is scoped to
+    /// so next-command requests resolve against that team rather than the server's default.
+    ai_controller: ModelHandle<BlocklistAIController>,
     #[cfg(feature = "local_fs")]
     conn: Option<Arc<Mutex<SqliteConnection>>>,
 
@@ -157,9 +187,10 @@ impl NextCommandModel {
         sessions: ModelHandle<Sessions>,
         model: Arc<FairMutex<TerminalModel>>,
         server_api: Arc<ServerApi>,
+        ai_controller: ModelHandle<BlocklistAIController>,
     ) -> Self {
         #[cfg(feature = "local_fs")]
-        let conn = database_file_path_for_scope(&PersistenceScope::App)
+        let conn = database_file_path_for_current_scope()
             .to_str()
             .and_then(|db_url| {
                 establish_ro_connection(db_url)
@@ -170,6 +201,7 @@ impl NextCommandModel {
             sessions,
             model,
             server_api,
+            ai_controller,
             #[cfg(feature = "local_fs")]
             conn,
             next_command_state: NextCommandSuggestionState::None,
@@ -179,22 +211,33 @@ impl NextCommandModel {
         }
     }
 
-    /// Returns snippets of command history (HistoryContext) that are similar to the completed_block.
-    /// Each HistoryContext contains some sequential commands run in the same session,
-    /// where the last element of HistoryContext.previous_commands is the same as completed_block.
+    /// Returns snippets of command history (HistoryContext) that are similar to a completed
+    /// block's `command`/`pwd`/`exit_code`/`shell_host`. Each HistoryContext contains some
+    /// sequential commands run in the same session, where the last element of
+    /// HistoryContext.previous_commands is the same as `command`.
     /// Returns None if there was a connection issue, and Some(empty vec)
     /// if there is no similar historical context.
+    ///
+    /// Callers resolve these fields ahead of time (rather than taking `&UserBlockCompleted` and a
+    /// `&BlockList` directly) so this can be used from contexts, such as spawned futures, that
+    /// don't have synchronous access to the terminal model.
     #[cfg(feature = "local_fs")]
     pub fn get_similar_history_context(
         conn: &mut SqliteConnection,
-        completed_block: &UserBlockCompleted,
+        command: &str,
+        pwd: &Option<String>,
+        exit_code: ExitCode,
+        shell_host: Option<&ShellHost>,
         num_additional_preceding_commands: usize,
     ) -> Vec<crate::ai::predict::generate_ai_input_suggestions::HistoryContext> {
         // The number of commands from history affects how quickly we "learn" new patterns, the lower the faster.
         let Ok(same_commands_from_history) =
             crate::persistence::commands::get_same_commands_from_history(
                 conn,
-                completed_block,
+                command,
+                pwd,
+                exit_code,
+                shell_host,
                 MAX_NUM_SIMILAR_HISTORY_CONTEXT,
             )
         else {
@@ -272,9 +315,20 @@ impl NextCommandModel {
         #[cfg(feature = "local_fs")]
         if let Some(conn) = conn {
             let mut conn = conn.lock();
+            let serialized_block = block_completed.serialized_block.get_with(|compute| {
+                let model = terminal_model.lock();
+                compute(model.block_list())
+            });
+            let command = block_completed.command.get_with(|compute| {
+                let model = terminal_model.lock();
+                compute(model.block_list())
+            });
             history_contexts = Self::get_similar_history_context(
                 &mut conn,
-                block_completed,
+                command,
+                &serialized_block.pwd,
+                serialized_block.exit_code,
+                serialized_block.shell_host.as_ref(),
                 NUM_ADDITIONAL_PREV_COMMAND_CONTEXT_LLM,
             );
         }
@@ -293,6 +347,7 @@ impl NextCommandModel {
         completer_data: CompleterData,
         block_context: Option<Box<BlockContext>>,
         previous_result: Option<IntelligentAutosuggestionResult>,
+        terminal_view_id: Option<EntityId>,
         ctx: &mut ModelContext<Self>,
     ) {
         // Clear the cached next command context so we don't use stale data.
@@ -305,6 +360,7 @@ impl NextCommandModel {
             completer_data,
             block_context,
             previous_result,
+            terminal_view_id,
             ctx,
         );
     }
@@ -331,6 +387,9 @@ impl NextCommandModel {
 
     /// Generates a next command suggestion with a prefix in the input.
     #[cfg_attr(not(feature = "local_fs"), allow(unused_variables))]
+    // `terminal_view_id` is only consumed by the local-endpoint resolver, which
+    // is compiled out on wasm.
+    #[cfg_attr(target_family = "wasm", allow(unused_variables))]
     #[expect(clippy::too_many_arguments)]
     pub fn generate_next_command_suggestion_with_prefix(
         &mut self,
@@ -340,9 +399,23 @@ impl NextCommandModel {
         completer_data: CompleterData,
         block_context: Option<Box<BlockContext>>,
         previous_result: Option<IntelligentAutosuggestionResult>,
+        terminal_view_id: Option<EntityId>,
         ctx: &mut ModelContext<Self>,
     ) {
         let server_api = self.server_api.clone();
+        let team_scope =
+            RequestTeamScope::from_scope(&self.ai_controller.as_ref(ctx).team_context(ctx));
+
+        // Resolve whether this prediction should run against the user's custom
+        // endpoint instead of the Warp server. Must happen here (with `ctx`)
+        // before spawning the request task.
+        #[cfg(not(target_family = "wasm"))]
+        let local_endpoint =
+            super::generate_ai_input_suggestions::local::resolve_local_input_endpoint(
+                ctx,
+                terminal_view_id,
+                &team_scope,
+            );
         let terminal_model = self.model.clone();
         let cached_next_command_context = self.cached_zerostate_next_command_context.clone();
 
@@ -466,7 +539,14 @@ impl NextCommandModel {
                     // For zero-state next command suggestions, return the result immediately.
                     let Some(prefix) = prefix else {
                         return (
-                            server_api.generate_ai_input_suggestions(&request).await,
+                            fetch_input_suggestions(
+                                &server_api,
+                                #[cfg(not(target_family = "wasm"))]
+                                &local_endpoint,
+                                &request,
+                                team_scope,
+                            )
+                            .await,
                             request,
                             true,
                             start_ts_ms,
@@ -527,8 +607,8 @@ impl NextCommandModel {
                             })
                         });
 
-                        if let Some(autosuggestion) = autosuggestion {
-                            if is_command_valid(&autosuggestion, Some(&completion_context), session_env_vars.as_ref()).await {
+                        if let Some(autosuggestion) = autosuggestion
+                            && is_command_valid(&autosuggestion, Some(&completion_context), session_env_vars.as_ref()).await {
                                 return (
                                     Ok(GenerateAIInputSuggestionsResponseV2 {
                                         commands: vec![autosuggestion.clone()],
@@ -543,11 +623,17 @@ impl NextCommandModel {
                                     next_command_context,
                                 );
                             }
-                        }
                     };
 
                     // Only if we have no commands from history and no completions, use the LLM to generate a partial suggestion.
-                    let response = server_api.generate_ai_input_suggestions(&request).await;
+                    let response = fetch_input_suggestions(
+                        &server_api,
+                        #[cfg(not(target_family = "wasm"))]
+                        &local_endpoint,
+                        &request,
+                                team_scope,
+                    )
+                    .await;
                     (
                         response,
                         request,
@@ -627,9 +713,7 @@ impl NextCommandModel {
                 ctx.emit(NextCommandModelEvent::NextCommandSuggestionReady);
             }
             Err(err) => {
-                report_error!(
-                    anyhow::anyhow!(err).context("Failed to generate Next Command suggestion")
-                );
+                log::error!("Failed to generate Next Command suggestion: {err:#}");
             }
         };
     }
@@ -664,22 +748,20 @@ async fn is_arg_valid(
                 match arg_type {
                     ArgType::File => {
                         let mut path_arg = PathBuf::from(arg.value().as_str());
-                        if path_arg.is_relative() {
-                            if let Ok(working_dir) = PathBuf::try_from(ctx.current_working_directory.clone()) {
+                        if path_arg.is_relative()
+                            && let Ok(working_dir) = PathBuf::try_from(ctx.current_working_directory.clone()) {
                                 path_arg = working_dir.join(path_arg);
                             }
-                        }
                         if path_arg.is_file() {
                             return true;
                         }
                     }
                     ArgType::Folder => {
                         let mut path_arg = PathBuf::from(arg.value().as_str());
-                        if path_arg.is_relative() {
-                            if let Ok(working_dir) = PathBuf::try_from(ctx.current_working_directory.clone()) {
+                        if path_arg.is_relative()
+                            && let Ok(working_dir) = PathBuf::try_from(ctx.current_working_directory.clone()) {
                                 path_arg = working_dir.join(path_arg);
                             }
-                        }
                         if path_arg.is_dir() {
                             return true;
                         }
@@ -789,10 +871,10 @@ pub async fn is_command_valid(
     }
     if let Some(flags) = shell_command.args.flags {
         for flag in flags.iter() {
-            if let FlagType::Argument { value } = &flag.flag_type {
-                if !is_arg_valid(&expanded_command_line, value, ctx, session_env_vars).await {
-                    return false;
-                }
+            if let FlagType::Argument { value } = &flag.flag_type
+                && !is_arg_valid(&expanded_command_line, value, ctx, session_env_vars).await
+            {
+                return false;
             }
         }
     }

@@ -1,0 +1,298 @@
+From dba31b0d4c956ee267f808ab0b0314cd52cbd043 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Fri, 22 May 2026 00:02:51 -0400
+Subject: [PATCH 27/48] Add warp.ui.showMarkdown: render plugin markdown in a
+ modal panel (oh-my-warp)
+
+---
+ app/src/plugin/app/mod.rs                     | 15 +++-
+ app/src/plugin/app_requests.rs                |  2 +
+ app/src/plugin/host/native/js_api/mod.rs      |  9 +++
+ app/src/plugin/mod.rs                         |  2 +-
+ app/src/workspace/view.rs                     | 68 +++++++++++++++++++
+ .../workspace/view/plugin_markdown_modal.rs   | 65 ++++++++++++++++++
+ 6 files changed, 159 insertions(+), 2 deletions(-)
+ create mode 100644 app/src/workspace/view/plugin_markdown_modal.rs
+
+diff --git a/app/src/plugin/app/mod.rs b/app/src/plugin/app/mod.rs
+index 9b93c90d..55cfc82c 100644
+--- a/app/src/plugin/app/mod.rs
++++ b/app/src/plugin/app/mod.rs
+@@ -168,10 +168,23 @@ impl PluginHost {
+                 .with_key_binding(keys);
+                 ctx.register_editable_bindings([binding]);
+             }
++            PluginAppRequest::ShowMarkdown { title, markdown } => {
++                // The Workspace owns the modal; emit an event it subscribes to (it has the window
++                // context to open the modal). See `workspace::view`.
++                ctx.emit(PluginHostEvent::ShowMarkdown { title, markdown });
++            }
+         }
+     }
+ }
+ 
++/// Events emitted by the [`PluginHost`] singleton for the `Workspace` to act on (it has the
++/// window/view context that some plugin UI requests need). See PLUGIN_SPEC.md (M4).
++#[derive(Clone, Debug)]
++pub enum PluginHostEvent {
++    /// Show a markdown panel (`warp.ui.showMarkdown`).
++    ShowMarkdown { title: String, markdown: String },
++}
++
+ impl Drop for PluginHost {
+     fn drop(&mut self) {
+         if let Some(mut host_process) = self.host_process.take() {
+@@ -192,7 +205,7 @@ impl Drop for PluginHost {
+ }
+ 
+ impl Entity for PluginHost {
+-    type Event = ();
++    type Event = PluginHostEvent;
+ }
+ 
+ impl SingletonEntity for PluginHost {}
+diff --git a/app/src/plugin/app_requests.rs b/app/src/plugin/app_requests.rs
+index 96e51bb2..7724b1d5 100644
+--- a/app/src/plugin/app_requests.rs
++++ b/app/src/plugin/app_requests.rs
+@@ -28,6 +28,8 @@ pub enum PluginAppRequest {
+     ShowToast { message: String, kind: ToastKind },
+     /// Bind a key sequence to a registered plugin command (`warp.keymap.bind`).
+     BindKey { keys: String, command_id: String },
++    /// Show a markdown panel (`warp.ui.showMarkdown`).
++    ShowMarkdown { title: String, markdown: String },
+ }
+ 
+ static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index ec8e5c08..23434bd0 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -270,6 +270,15 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+             super::app_request::send_app_request(PluginAppRequest::ShowToast { message, kind });
+         }),
+     )?;
++    ui.set(
++        "showMarkdown",
++        Function::new(ctx, |title: String, markdown: String| {
++            super::app_request::send_app_request(PluginAppRequest::ShowMarkdown {
++                title,
++                markdown,
++            });
++        }),
++    )?;
+     Ok(ui)
+ }
+ 
+diff --git a/app/src/plugin/mod.rs b/app/src/plugin/mod.rs
+index 487d34b1..3ad691e0 100644
+--- a/app/src/plugin/mod.rs
++++ b/app/src/plugin/mod.rs
+@@ -11,7 +11,7 @@ pub(crate) mod service;
+ #[cfg_attr(target_family = "wasm", path = "host/wasm/mod.rs")]
+ mod host;
+ 
+-pub(crate) use app::PluginHost;
++pub(crate) use app::{PluginHost, PluginHostEvent};
+ pub use host::run as run_plugin_host;
+ 
+ /// Flag to be passed to the warp executable when executing the warp binary as the plugin host
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index 5c2b57ba..79b49690 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -11,6 +11,7 @@ pub(crate) mod left_panel;
+ pub(crate) mod onboarding;
+ pub(crate) mod openwarp_launch_modal;
+ pub(crate) mod orchestration_launch_modal;
++mod plugin_markdown_modal;
+ pub(crate) mod right_panel;
+ mod startup_directory;
+ mod tab_grouping;
+@@ -499,6 +500,7 @@ use crate::workspace::view::openwarp_launch_modal::{
+ use crate::workspace::view::orchestration_launch_modal::{
+     OrchestrationLaunchModal, OrchestrationLaunchModalEvent,
+ };
++use crate::workspace::view::plugin_markdown_modal::PluginMarkdownModal;
+ use crate::workspace::view::right_panel::{RightPanelEvent, RightPanelView};
+ use crate::workspace::{ForkFromExchange, ForkedConversationDestination};
+ use crate::workspaces::user_workspaces::UserWorkspaces;
+@@ -1027,6 +1029,8 @@ pub struct Workspace {
+     pending_session_config_tab_config_chip_tutorial:
+         Option<PendingSessionConfigTabConfigChipTutorial>,
+     new_worktree_modal: ModalViewState<Modal<NewWorktreeModal>>,
++    // oh-my-warp: modal that renders markdown a plugin requested via `warp.ui.showMarkdown` (M4).
++    plugin_markdown_modal: ModalViewState<Modal<PluginMarkdownModal>>,
+     close_session_confirmation_dialog: ViewHandle<CloseSessionConfirmationDialog>,
+     rewind_confirmation_dialog: ViewHandle<RewindConfirmationDialog>,
+     delete_conversation_confirmation_dialog: ViewHandle<DeleteConversationConfirmationDialog>,
+@@ -2067,6 +2071,60 @@ impl Workspace {
+         ModalViewState::new(modal)
+     }
+ 
++    // oh-my-warp: builds the modal that renders plugin-supplied markdown (`warp.ui.showMarkdown`).
++    fn build_plugin_markdown_modal(
++        ctx: &mut ViewContext<Self>,
++    ) -> ModalViewState<Modal<PluginMarkdownModal>> {
++        let body = ctx.add_view(PluginMarkdownModal::new);
++        let modal = ctx.add_typed_action_view(|ctx| {
++            Modal::new(Some("Plugin".to_string()), body, ctx)
++                .with_dismiss_on_click()
++                .with_modal_style(UiComponentStyles {
++                    width: Some(560.),
++                    height: Some(520.),
++                    ..Default::default()
++                })
++        });
++        ctx.subscribe_to_view(&modal, |me, _, event, ctx| {
++            if matches!(event, ModalEvent::Close) {
++                me.plugin_markdown_modal.close();
++                ctx.notify();
++            }
++        });
++        ModalViewState::new(modal)
++    }
++
++    /// Opens the plugin markdown modal with the given title/body (`warp.ui.showMarkdown`, M4).
++    #[cfg(feature = "plugin_host")]
++    fn show_plugin_markdown(
++        &mut self,
++        title: String,
++        markdown: String,
++        ctx: &mut ViewContext<Self>,
++    ) {
++        self.plugin_markdown_modal.view.update(ctx, |modal, ctx| {
++            modal.set_title(Some(title));
++            modal.body().update(ctx, |body, ctx| {
++                body.set_markdown(&markdown, ctx);
++            });
++        });
++        self.plugin_markdown_modal.open();
++        ctx.focus(&self.plugin_markdown_modal.view);
++        ctx.notify();
++    }
++
++    /// Subscribes to [`crate::plugin::PluginHostEvent`]s so plugin UI requests can open
++    /// workspace-owned surfaces (e.g. the markdown modal). See PLUGIN_SPEC.md (M4).
++    #[cfg(feature = "plugin_host")]
++    fn subscribe_to_plugin_host(ctx: &mut ViewContext<Self>) {
++        let plugin_host = crate::plugin::PluginHost::handle(ctx);
++        ctx.subscribe_to_model(&plugin_host, |me, _, event, ctx| match event {
++            crate::plugin::PluginHostEvent::ShowMarkdown { title, markdown } => {
++                me.show_plugin_markdown(title.clone(), markdown.clone(), ctx);
++            }
++        });
++    }
++
+     fn build_new_worktree_modal(
+         ctx: &mut ViewContext<Self>,
+     ) -> ModalViewState<Modal<NewWorktreeModal>> {
+@@ -2883,6 +2941,7 @@ impl Workspace {
+ 
+         let tab_config_params_modal = Self::build_tab_config_params_modal(ctx);
+         let new_worktree_modal = Self::build_new_worktree_modal(ctx);
++        let plugin_markdown_modal = Self::build_plugin_markdown_modal(ctx);
+ 
+         let session_config_modal = Self::build_session_config_modal(ctx);
+ 
+@@ -3129,6 +3188,9 @@ impl Workspace {
+         Self::observe_server_api(ctx);
+ 
+         Self::subscribe_to_workspace_toast_stack(toast_stack.clone(), ctx);
++        // oh-my-warp: open plugin UI surfaces (markdown panel) on PluginHost events (M4).
++        #[cfg(feature = "plugin_host")]
++        Self::subscribe_to_plugin_host(ctx);
+         Self::subscribe_to_tab_config_errors(toast_stack.clone(), ctx);
+         Self::subscribe_to_settings_errors(ctx);
+         Self::subscribe_to_shared_session_manager(ctx);
+@@ -3272,6 +3334,7 @@ impl Workspace {
+             show_session_config_tab_config_chip: false,
+             pending_session_config_tab_config_chip_tutorial: None,
+             new_worktree_modal,
++            plugin_markdown_modal,
+             close_session_confirmation_dialog,
+             rewind_confirmation_dialog,
+             delete_conversation_confirmation_dialog,
+@@ -25908,6 +25971,11 @@ impl View for Workspace {
+             stack.add_child(self.new_worktree_modal.render());
+         }
+ 
++        // oh-my-warp: plugin markdown modal (`warp.ui.showMarkdown`, M4).
++        if self.plugin_markdown_modal.is_open() {
++            stack.add_child(self.plugin_markdown_modal.render());
++        }
++
+         if self.workflow_modal.as_ref(app).is_open() {
+             stack.add_child(ChildView::new(&self.workflow_modal).finish());
+         }
+diff --git a/app/src/workspace/view/plugin_markdown_modal.rs b/app/src/workspace/view/plugin_markdown_modal.rs
+new file mode 100644
+index 00000000..21b33772
+--- /dev/null
++++ b/app/src/workspace/view/plugin_markdown_modal.rs
+@@ -0,0 +1,65 @@
++//! oh-my-warp: body view for the modal that renders markdown a plugin asked to show via
++//! `warp.ui.showMarkdown(title, markdown)`. The `Workspace` wraps this in a [`crate::modal::Modal`]
++//! and opens it when a `PluginHostEvent::ShowMarkdown` arrives. See PLUGIN_SPEC.md (M4).
++
++use std::collections::VecDeque;
++
++use markdown_parser::{parse_markdown, FormattedText};
++use warpui::elements::{Container, Element, FormattedTextElement, HighlightedHyperlink};
++use warpui::{AppContext, Entity, SingletonEntity, View, ViewContext};
++
++use crate::appearance::Appearance;
++
++/// Renders the most recent markdown a plugin asked to show.
++pub struct PluginMarkdownModal {
++    formatted: Option<FormattedText>,
++    link_state: HighlightedHyperlink,
++}
++
++impl PluginMarkdownModal {
++    pub fn new(_ctx: &mut ViewContext<Self>) -> Self {
++        Self {
++            formatted: None,
++            link_state: HighlightedHyperlink::default(),
++        }
++    }
++
++    /// Parses and stores `markdown` for rendering. Call before opening the modal.
++    pub fn set_markdown(&mut self, markdown: &str, ctx: &mut ViewContext<Self>) {
++        self.formatted = parse_markdown(markdown).ok();
++        ctx.notify();
++    }
++}
++
++impl Entity for PluginMarkdownModal {
++    type Event = ();
++}
++
++impl View for PluginMarkdownModal {
++    fn ui_name() -> &'static str {
++        "PluginMarkdownModal"
++    }
++
++    fn render(&self, app: &AppContext) -> Box<dyn Element> {
++        let appearance = Appearance::as_ref(app);
++        let formatted = self
++            .formatted
++            .clone()
++            .unwrap_or_else(|| FormattedText::new(VecDeque::new()));
++        Container::new(
++            FormattedTextElement::new(
++                formatted,
++                14.0,
++                appearance.ui_font_family(),
++                appearance.monospace_font_family(),
++                appearance
++                    .theme()
++                    .main_text_color(appearance.theme().surface_2())
++                    .into_solid(),
++                self.link_state.clone(),
++            )
++            .finish(),
++        )
++        .finish()
++    }
++}

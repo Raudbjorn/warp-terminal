@@ -10,9 +10,11 @@
 //! used to render a [`PaneView`] which internally renders the pane, including the [`BackingView`].
 pub(super) mod ai_document_pane;
 pub(super) mod ai_fact_pane;
+pub(super) mod browser_pane;
 pub(super) mod code_diff_pane;
 pub(super) mod code_diff_pane_model;
 pub(super) mod code_pane;
+pub(super) mod custom_router_editor_pane;
 pub(super) mod env_var_collection_pane;
 pub(crate) mod environment_management_pane;
 pub(super) mod execution_profile_editor_pane;
@@ -47,6 +49,7 @@ use crate::ai::ai_document_view::AIDocumentView;
 use crate::ai::blocklist::inline_action::code_diff_view::CodeDiffView;
 use crate::ai::execution_profiles::editor::ExecutionProfileEditorView;
 use crate::ai::facts::AIFactView;
+use crate::browser::view::BrowserView;
 #[cfg(feature = "local_fs")]
 use crate::code::buffer_location::LocalOrRemotePath;
 use crate::code::view::CodeView;
@@ -60,10 +63,10 @@ use crate::pane_group::pane::get_started_view::GetStartedView;
 use crate::server::network_log_view::NetworkLogView;
 use crate::server::telemetry::SharingDialogSource;
 use crate::settings::PaneSettings;
-use crate::settings_view::environments_page::EnvironmentsPageView;
 use crate::settings_view::SettingsView;
-use crate::terminal::available_shells::AvailableShell;
+use crate::settings_view::environments_page::EnvironmentsPageView;
 use crate::terminal::TerminalView;
+use crate::terminal::available_shells::AvailableShell;
 use crate::view_components::action_button::ActionButton;
 use crate::workflows::workflow_view::WorkflowView;
 
@@ -141,9 +144,12 @@ pub(crate) enum IPaneType {
     Settings,
     AIFact,
     AIDocument,
+    CustomRouterEditor,
     ExecutionProfileEditor,
     GetStarted,
     NetworkLog,
+    Browser,
+    Welcome,
     DeferredPlaceholder,
     /// A pane type only for tests.
     #[cfg(test)]
@@ -164,9 +170,12 @@ impl Display for IPaneType {
             IPaneType::Settings => write!(f, "Settings"),
             IPaneType::AIFact => write!(f, "AI Fact"),
             IPaneType::AIDocument => write!(f, "AI Document"),
+            IPaneType::CustomRouterEditor => write!(f, "Custom Router Editor"),
             IPaneType::ExecutionProfileEditor => write!(f, "Execution Profile Editor"),
             IPaneType::GetStarted => write!(f, "GetStarted"),
             IPaneType::NetworkLog => write!(f, "Network Log"),
+            IPaneType::Browser => write!(f, "Browser"),
+            IPaneType::Welcome => write!(f, "Welcome"),
             IPaneType::DeferredPlaceholder => write!(f, "Placeholder"),
             #[cfg(test)]
             IPaneType::Dummy => write!(f, "Dummy"),
@@ -248,6 +257,13 @@ impl PaneId {
         Self::new_from_ctx(IPaneType::AIDocument, ctx)
     }
 
+    /// Creates a [`PaneId`] from a [`ViewContext<PaneView<CustomRouterEditorView>>`]
+    pub fn from_custom_router_editor_pane_ctx(
+        ctx: &ViewContext<PaneView<crate::ai::custom_model_router_editor::CustomRouterEditorView>>,
+    ) -> Self {
+        Self::new_from_ctx(IPaneType::CustomRouterEditor, ctx)
+    }
+
     /// Creates a [`PaneId`] from a [`ViewContext<PaneView<ExecutionProfileEditorView>>`]
     pub fn from_execution_profile_editor_pane_ctx(
         ctx: &ViewContext<PaneView<ExecutionProfileEditorView>>,
@@ -262,6 +278,11 @@ impl PaneId {
     /// Creates a [`PaneId`] from a [`ViewContext<PaneView<NetworkLogView>>`].
     pub fn from_network_log_pane_ctx(ctx: &ViewContext<PaneView<NetworkLogView>>) -> Self {
         Self::new_from_ctx(IPaneType::NetworkLog, ctx)
+    }
+
+    /// Creates a [`PaneId`] from a [`ViewContext<PaneView<BrowserView>>`].
+    pub fn from_browser_pane_ctx(ctx: &ViewContext<PaneView<BrowserView>>) -> Self {
+        Self::new_from_ctx(IPaneType::Browser, ctx)
     }
 
     /// Creates a [`PaneId`] from a [`PaneView<TerminalView>`] entity ID.
@@ -338,6 +359,13 @@ impl PaneId {
         Self::new(IPaneType::AIDocument, ai_document_pane_view)
     }
 
+    /// Creates a [`PaneId`] from a [`PaneView<CustomRouterEditorView>`] entity ID.
+    pub fn from_custom_router_editor_pane_view(
+        view: &ViewHandle<PaneView<crate::ai::custom_model_router_editor::CustomRouterEditorView>>,
+    ) -> Self {
+        Self::new(IPaneType::CustomRouterEditor, view)
+    }
+
     /// Creates a [`PaneId`] from a [`PaneView<ExecutionProfileEditorView>`] entity ID.
     pub fn from_execution_profile_editor_pane_view(
         execution_profile_editor_pane_view: &ViewHandle<PaneView<ExecutionProfileEditorView>>,
@@ -359,6 +387,11 @@ impl PaneId {
         network_log_pane_view: &ViewHandle<PaneView<NetworkLogView>>,
     ) -> Self {
         Self::new(IPaneType::NetworkLog, network_log_pane_view)
+    }
+
+    /// Creates a [`PaneId`] from a [`PaneView<BrowserView>`] entity ID.
+    pub fn from_browser_pane_view(browser_pane_view: &ViewHandle<PaneView<BrowserView>>) -> Self {
+        Self::new(IPaneType::Browser, browser_pane_view)
     }
 
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
@@ -466,6 +499,10 @@ impl PaneId {
             IPaneType::AIDocument => {
                 ChildView::<PaneView<AIDocumentView>>::with_id(self.0.pane_view_id).finish()
             }
+            IPaneType::CustomRouterEditor => ChildView::<
+                PaneView<crate::ai::custom_model_router_editor::CustomRouterEditorView>,
+            >::with_id(self.0.pane_view_id)
+            .finish(),
             IPaneType::ExecutionProfileEditor => {
                 ChildView::<PaneView<ExecutionProfileEditorView>>::with_id(self.0.pane_view_id)
                     .finish()
@@ -476,11 +513,21 @@ impl PaneId {
             IPaneType::NetworkLog => {
                 ChildView::<PaneView<NetworkLogView>>::with_id(self.0.pane_view_id).finish()
             }
+            IPaneType::Browser => {
+                ChildView::<PaneView<BrowserView>>::with_id(self.0.pane_view_id).finish()
+            }
+            IPaneType::Welcome => warpui::elements::Empty::new().finish(),
             IPaneType::DeferredPlaceholder => warpui::elements::Empty::new().finish(),
             #[cfg(test)]
             IPaneType::Dummy => warpui::elements::Empty::new().finish(),
         };
-        if *PaneSettings::as_ref(app).focus_panes_on_hover {
+        // oh-my-warp: the browser pane is focused on click only, never on hover.
+        // Focus-follows-mouse here would re-grab keyboard whenever the cursor is
+        // over the pane and forward keystrokes into the web page — jarring, and it
+        // prevents focus from staying on a sibling pane the user clicked.
+        if *PaneSettings::as_ref(app).focus_panes_on_hover
+            && !matches!(self.0.pane_type, IPaneType::Browser)
+        {
             element = EventHandler::new(element)
                 .on_mouse_in(
                     move |ctx, _, _| {
@@ -831,6 +878,10 @@ impl PaneConfiguration {
         ctx.emit(PaneConfigurationEvent::OpenSharingQrCode(source));
     }
 
+    pub fn notify_shared_session_link_changed(&mut self, ctx: &mut ModelContext<Self>) {
+        ctx.emit(PaneConfigurationEvent::SharedSessionLinkChanged);
+    }
+
     /// Notifies that the header content has changed and the pane header should re-render.
     /// Use this when the backing view's state has changed in a way that affects the header
     /// content returned by `render_header_content()`.
@@ -857,6 +908,7 @@ pub enum PaneConfigurationEvent {
     ShareableObjectChanged(Option<ShareableObject>),
     ToggleSharingDialog(SharingDialogSource),
     OpenSharingQrCode(SharingDialogSource),
+    SharedSessionLinkChanged,
     DimEvenIfFocusedUpdated,
     /// The header content has changed and should be re-rendered.
     /// This is used when the backing view's state changes in a way that
@@ -1107,10 +1159,18 @@ pub enum PaneEvent {
     ReplaceWithCodePane {
         path: LocalOrRemotePath,
         source: Option<crate::code::editor_management::CodeSource>,
+        /// Vertical scroll fraction (`0..=1`) captured from the outgoing pane, to restore on the
+        /// new pane. `None` scrolls to the top. Wrapped in `OrderedFloat` so `PaneEvent` can
+        /// still derive `Eq`.
+        scroll_fraction: Option<ordered_float::OrderedFloat<f32>>,
     },
     #[cfg(feature = "local_fs")]
     ReplaceWithFilePane {
         path: LocalOrRemotePath,
         source: Option<crate::code::editor_management::CodeSource>,
+        /// Vertical scroll fraction (`0..=1`) captured from the outgoing pane, to restore on the
+        /// new pane. `None` scrolls to the top. Wrapped in `OrderedFloat` so `PaneEvent` can
+        /// still derive `Eq`.
+        scroll_fraction: Option<ordered_float::OrderedFloat<f32>>,
     },
 }

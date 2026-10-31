@@ -3,8 +3,8 @@ use std::collections::HashMap;
 use warpui::{Entity, EntityId, ModelContext, SingletonEntity, ViewHandle, WindowId};
 
 use super::SettingsView;
-use crate::pane_group::{PaneContent, PaneId, SettingsPane};
 use crate::PaneViewLocator;
+use crate::pane_group::{PaneContent, PaneId, SettingsPane};
 struct SettingsPaneData {
     locator: Option<PaneViewLocator>,
     settings_view: ViewHandle<SettingsView>,
@@ -65,6 +65,14 @@ impl SettingsPaneManager {
         } else {
             log::warn!("Settings view should already exist for settings pane");
         }
+    }
+
+    #[cfg(test)]
+    pub fn set_locator_for_test(&mut self, window_id: WindowId, locator: PaneViewLocator) {
+        let Some(data) = self.panes.get_mut(&window_id) else {
+            panic!("Window should have corresponding settings view");
+        };
+        data.locator = Some(locator);
     }
 
     pub fn deregister_pane(

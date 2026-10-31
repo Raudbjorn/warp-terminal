@@ -76,6 +76,7 @@ define_settings_group!(SafeModeSettings, settings: [
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "privacy.secret_redaction.enabled",
         description: "Whether secret redaction is enabled to detect and obscure secrets in terminal output.",
@@ -85,6 +86,7 @@ define_settings_group!(SafeModeSettings, settings: [
         default: SecretDisplayMode::Strikethrough,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "privacy.secret_redaction.secret_display_mode_setting",
         description: "Controls how detected secrets are visually displayed in the terminal.",
@@ -95,6 +97,7 @@ define_settings_group!(SafeModeSettings, settings: [
         default: false,
         supported_platforms: SupportedPlatforms::ALL,
         sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "privacy.secret_redaction.hide_secrets_in_block_list",
         description: "Whether to hide detected secrets in the block list using asterisks.",
@@ -103,6 +106,9 @@ define_settings_group!(SafeModeSettings, settings: [
 
 /// Returns whether the rendering should obfuscate secrets given the current safe mode settings.
 pub fn get_secret_obfuscation_mode(app: &AppContext) -> ObfuscateSecrets {
+    // NOTE: do not short-circuit to `ObfuscateSecrets::No` in local-only mode — secret
+    // obfuscation is a local, settings-driven safety feature and must keep honouring the
+    // user's redaction preferences regardless of services mode.
     let safe_mode_settings = SafeModeSettings::as_ref(app);
     let is_enterprise_secret_redaction_enabled =
         UserWorkspaces::as_ref(app).is_enterprise_secret_redaction_enabled();
