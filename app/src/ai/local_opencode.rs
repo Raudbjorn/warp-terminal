@@ -53,11 +53,19 @@ pub const DEFAULT_OPENCODE_ARGS: &[&str] = &["serve", "--port", "0"];
 /// start (database migration) has been observed to take ~20s.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Longest startup line buffered while waiting for the port announcement. The
+/// announcement itself is a short line, so a sidecar that writes this much
+/// without a newline is not announcing anything.
+const MAX_ANNOUNCEMENT_LINE_BYTES: u64 = 64 * 1024;
+
 /// Environment variables OpenCode reads its Basic-auth credentials from. The
 /// username is pinned so an `OPENCODE_SERVER_USERNAME` in the user's own
-/// environment cannot make our requests fail with 401.
+/// environment cannot make our requests fail with 401. OpenCode reads
+/// `OPENCODE_PASSWORD` first and only then `OPENCODE_SERVER_PASSWORD`, so the
+/// generated password goes into both: an inherited `OPENCODE_PASSWORD` would
+/// otherwise win and every request would be rejected.
 const SERVER_USERNAME_ENV: &str = "OPENCODE_SERVER_USERNAME";
-const SERVER_PASSWORD_ENV: &str = "OPENCODE_SERVER_PASSWORD";
+const SERVER_PASSWORD_ENVS: [&str; 2] = ["OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD"];
 const SERVER_USERNAME: &str = "opencode";
 
 /// Longest slice of an unparseable error body we echo into an error message.
@@ -253,19 +261,21 @@ pub async fn spawn(
     }
 
     let password = generate_password();
-    let mut process = async_process::Command::new(command)
+    let mut sidecar_command = async_process::Command::new(command);
+    sidecar_command
         .args(args)
         .current_dir(working_dir)
         .env(SERVER_USERNAME_ENV, SERVER_USERNAME)
-        .env(SERVER_PASSWORD_ENV, &password)
         .stdout(async_process::Stdio::piped())
         .stderr(async_process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => OpenCodeError::BinaryNotFound(command.to_string()),
-            _ => OpenCodeError::Io(err),
-        })?;
+        .kill_on_drop(true);
+    for name in SERVER_PASSWORD_ENVS {
+        sidecar_command.env(name, &password);
+    }
+    let mut process = sidecar_command.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => OpenCodeError::BinaryNotFound(command.to_string()),
+        _ => OpenCodeError::Io(err),
+    })?;
 
     let stdout = process
         .stdout
@@ -320,7 +330,9 @@ pub async fn spawn(
 
 /// Read `stdout` line by line until one parses as a port announcement.
 /// Lines are read as raw bytes (not `String`s) so a non-UTF-8 log line is
-/// skipped by `try_parse_buffer` rather than failing the whole startup.
+/// skipped by `try_parse_buffer` rather than failing the whole startup. A
+/// line longer than `MAX_ANNOUNCEMENT_LINE_BYTES` fails the startup instead of
+/// growing the buffer until the timeout.
 async fn read_announcement(
     stdout: async_process::ChildStdout,
 ) -> Result<(OpenCodeAnnouncement, async_process::ChildStdout), OpenCodeError> {
@@ -330,8 +342,17 @@ async fn read_announcement(
         // Only ever parse the current line, so a preceding log line cannot
         // poison the parse and nothing is re-parsed.
         line.clear();
-        match reader.read_until(b'\n', &mut line).await {
+        let read = (&mut reader)
+            .take(MAX_ANNOUNCEMENT_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+            .await;
+        match read {
             Ok(0) => break, // EOF before announcement
+            Ok(_) if !line.ends_with(b"\n") && line.len() as u64 >= MAX_ANNOUNCEMENT_LINE_BYTES => {
+                return Err(OpenCodeError::BadAnnouncement(format!(
+                    "startup line longer than {MAX_ANNOUNCEMENT_LINE_BYTES} bytes"
+                )));
+            }
             Ok(_) => {
                 if let Ok(ann) = try_parse_buffer(&line) {
                     // Hand stdout back so the caller can keep draining it;
@@ -463,9 +484,9 @@ struct ErrorBody {
 /// Create a session, generate once, delete the session. Split out from
 /// `OpenCodeSidecar::generate` so tests can point it at a mock server.
 ///
-/// A fresh session per request keeps requests from sharing context. If the
-/// returned future is dropped between create and delete, the session is left
-/// behind until the sidecar exits.
+/// A fresh session per request keeps requests from sharing context. The
+/// session is deleted on every exit, including when the returned future is
+/// dropped mid-request (see `SessionCleanup`).
 async fn generate_via_session(
     client: &http_client::Client,
     base_url: &str,
@@ -476,6 +497,14 @@ async fn generate_via_session(
     timeout: Duration,
 ) -> Result<String, OpenCodeError> {
     let (provider_id, model_id) = parse_model_ref(model)?;
+    // The directory travels as JSON, which cannot carry arbitrary bytes. A
+    // lossy conversion would name a different directory than the one asked for.
+    let directory = working_dir.to_str().ok_or_else(|| {
+        OpenCodeError::Request(format!(
+            "working directory is not valid UTF-8: {}",
+            working_dir.display()
+        ))
+    })?;
 
     // Deny every permission: OpenCode is an agent with file and shell tools,
     // and this path only ever wants text back.
@@ -484,7 +513,7 @@ async fn generate_via_session(
         .basic_auth(SERVER_USERNAME, Some(password))
         .timeout(timeout)
         .json(&serde_json::json!({
-            "location": { "directory": working_dir.to_string_lossy() },
+            "location": { "directory": directory },
             "model": { "id": model_id, "providerID": provider_id },
             "permissions": [{ "action": "*", "resource": "*", "effect": "deny" }],
         }));
@@ -494,6 +523,11 @@ async fn generate_via_session(
         .await
         .map_err(|err| OpenCodeError::Request(err.to_string()))?;
     let session_id = session.data.id;
+    let mut cleanup = SessionCleanup::new(
+        format!("{base_url}/api/session/{session_id}"),
+        password,
+        timeout,
+    );
 
     let generate = client
         .post(format!("{base_url}/api/session/{session_id}/generate"))
@@ -510,21 +544,96 @@ async fn generate_via_session(
     }
     .await;
 
-    // Best effort: the sidecar goes away with its pool entry, so a failed
-    // delete only leaves one idle session behind.
-    let delete = client
-        .delete(format!("{base_url}/api/session/{session_id}"))
-        .basic_auth(SERVER_USERNAME, Some(password))
-        .timeout(timeout);
-    if let Err(err) = send_checked(delete).await {
-        log::debug!("failed to delete OpenCode session {session_id}: {err}");
-    }
+    cleanup.delete(client).await;
 
     let text = generated?;
     if text.trim().is_empty() {
         return Err(OpenCodeError::EmptyResponse);
     }
     Ok(text)
+}
+
+/// Deletes one OpenCode session. A pooled sidecar outlives its requests, so a
+/// session that is not deleted stays on it, with the prompt it was given,
+/// until the sidecar exits or the pool is cleared.
+///
+/// Two paths leave a session behind: the request future being dropped after
+/// the session was created (a superseded prediction is aborted this way), and
+/// the DELETE itself failing. `delete` handles the normal exit; if it did not
+/// succeed, `Drop` makes one more attempt in the background.
+struct SessionCleanup {
+    delete_url: String,
+    password: String,
+    timeout: Duration,
+    /// Captured while the request runs: `Drop` may run on a thread with no
+    /// Tokio context, such as the UI thread aborting a prediction.
+    runtime: Option<tokio::runtime::Handle>,
+    armed: bool,
+}
+
+impl SessionCleanup {
+    fn new(delete_url: String, password: &str, timeout: Duration) -> Self {
+        Self {
+            delete_url,
+            password: password.to_string(),
+            timeout,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            armed: true,
+        }
+    }
+
+    /// Delete the session now. Stays armed on failure so `Drop` retries.
+    async fn delete(&mut self, client: &http_client::Client) {
+        match delete_session(client, &self.delete_url, &self.password, self.timeout).await {
+            Ok(()) => self.armed = false,
+            Err(err) => log::warn!(
+                "failed to delete OpenCode session {}, retrying once: {err}",
+                self.delete_url
+            ),
+        }
+    }
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(runtime) = self.runtime.take() else {
+            log::warn!(
+                "no async runtime to delete OpenCode session {}; it stays until the sidecar exits",
+                self.delete_url
+            );
+            return;
+        };
+        let delete_url = std::mem::take(&mut self.delete_url);
+        let password = std::mem::take(&mut self.password);
+        let timeout = self.timeout;
+        runtime.spawn(async move {
+            // `http_client::Client` is not `Clone` and the request's client is
+            // borrowed, so the cleanup brings its own. It sends no Warp headers
+            // to the sidecar.
+            let client = http_client::Client::new_external();
+            if let Err(err) = delete_session(&client, &delete_url, &password, timeout).await {
+                log::warn!(
+                    "failed to delete OpenCode session {delete_url}: {err}; it stays until the sidecar exits"
+                );
+            }
+        });
+    }
+}
+
+async fn delete_session(
+    client: &http_client::Client,
+    delete_url: &str,
+    password: &str,
+    timeout: Duration,
+) -> Result<(), OpenCodeError> {
+    let request = client
+        .delete(delete_url.to_string())
+        .basic_auth(SERVER_USERNAME, Some(password))
+        .timeout(timeout);
+    send_checked(request).await.map(|_| ())
 }
 
 /// Send the request and turn a non-2xx response into an `OpenCodeError`
@@ -763,6 +872,28 @@ mod tests {
         assert_ne!(first, generate_password());
     }
 
+    #[test]
+    fn readiness_rule_agrees_with_request_time_parsing() {
+        use crate::settings::LocalProviderKind;
+        for model in [
+            "ollama/m",
+            " ollama/m ",
+            "a/b/c",
+            "",
+            "  ",
+            "bare",
+            "ollama/",
+            "/m",
+            "/",
+        ] {
+            assert_eq!(
+                LocalProviderKind::OpenCode.accepts_model(model),
+                parse_model_ref(model).is_ok(),
+                "{model:?}"
+            );
+        }
+    }
+
     const TEST_PASSWORD: &str = "test-password";
     // base64("opencode:test-password")
     const TEST_BASIC_AUTH: &str = "Basic b3BlbmNvZGU6dGVzdC1wYXNzd29yZA==";
@@ -986,5 +1117,222 @@ mod tests {
             .expect("startup must not hang on an undrained stderr pipe");
 
         assert!(spawned.unwrap().is_alive());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sidecar_password_is_set_under_both_env_names() {
+        // OpenCode reads OPENCODE_PASSWORD before OPENCODE_SERVER_PASSWORD, so
+        // setting only the second lets an inherited first one win.
+        let out = std::env::temp_dir().join(format!("opencode-env-{}", uuid::Uuid::new_v4()));
+        let args = announce_then_sleep(&format!(
+            "printf '%s\\n%s' \"$OPENCODE_PASSWORD\" \"$OPENCODE_SERVER_PASSWORD\" > '{}';",
+            out.display()
+        ));
+
+        let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
+
+        let written = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        let password = &sidecar.inner.password;
+        assert_eq!(written, format!("{password}\n{password}"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_rejects_a_line_that_never_ends() {
+        // Twice the cap with no newline, then the process stays alive. Without
+        // a cap the buffer grows until READY_TIMEOUT instead of failing fast.
+        let args = vec![
+            "-c".to_string(),
+            "head -c 140000 /dev/zero | tr '\\0' x; sleep 30".to_string(),
+        ];
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            spawn("sh", &args, &std::env::temp_dir()),
+        )
+        .await
+        .expect("an unterminated line must fail startup instead of waiting for the timeout");
+
+        assert!(
+            matches!(&result, Err(OpenCodeError::BadAnnouncement(m)) if m.contains("longer than")),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_working_dir_is_rejected_before_any_request() {
+        use std::os::unix::ffi::OsStrExt;
+        // No mocks registered: any request would fail the test with a 501.
+        let server = mockito::Server::new_async().await;
+        let dir = Path::new(std::ffi::OsStr::from_bytes(b"/work/\xff"));
+
+        let err = generate_via_session(
+            &http_client::Client::new(),
+            &server.url(),
+            TEST_PASSWORD,
+            dir,
+            "ollama/m",
+            "list files",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, OpenCodeError::Request(m) if m.contains("UTF-8")),
+            "{err:?}"
+        );
+    }
+
+    /// Minimal HTTP server for what mockito cannot produce: a generate call
+    /// that never answers, and DELETEs that fail before one succeeds.
+    struct RawServer {
+        url: String,
+        generate_started: Arc<tokio::sync::Notify>,
+        deletes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn raw_server(hang_on_generate: bool, failing_deletes: usize) -> RawServer {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = RawServer {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            generate_started: Arc::default(),
+            deletes: Arc::default(),
+        };
+        let started = Arc::clone(&server.generate_started);
+        let deletes = Arc::clone(&server.deletes);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let started = Arc::clone(&started);
+                let deletes = Arc::clone(&deletes);
+                tokio::spawn(async move {
+                    // Read the headers, then the body they announce, so closing
+                    // the socket never resets a request that is still arriving.
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head_len, body_len) = loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
+                            let body_len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (at + 4, body_len);
+                        }
+                    };
+                    while request.len() < head_len + body_len {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    let request_line = text.lines().next().unwrap_or_default();
+                    let (status, body) = if request_line.starts_with("POST /api/session ") {
+                        (200, r#"{"data":{"id":"ses_1"}}"#)
+                    } else if request_line.contains("/generate") {
+                        started.notify_one();
+                        if hang_on_generate {
+                            std::future::pending::<()>().await;
+                        }
+                        (200, r#"{"data":{"text":"ls"}}"#)
+                    } else if request_line.starts_with("DELETE ") {
+                        let seen = deletes.fetch_add(1, Ordering::SeqCst);
+                        if seen < failing_deletes {
+                            (500, r#"{"message":"boom"}"#)
+                        } else {
+                            (204, "")
+                        }
+                    } else {
+                        (404, "")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        server
+    }
+
+    async fn wait_for_deletes(server: &RawServer, count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.deletes.load(Ordering::SeqCst) < count {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected {count} DELETE(s), saw {}",
+                server.deletes.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn run_raw_generate(server: &RawServer) -> Result<String, OpenCodeError> {
+        let client = http_client::Client::new();
+        generate_via_session(
+            &client,
+            &server.url,
+            TEST_PASSWORD,
+            Path::new("/work/repo"),
+            "ollama/m",
+            "list files",
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_still_deletes_its_session() {
+        let server = raw_server(true, 0).await;
+
+        // Drop the request once the generate call is in flight, as aborting a
+        // superseded prediction does.
+        tokio::select! {
+            _ = run_raw_generate(&server) => panic!("generate never answers"),
+            _ = server.generate_started.notified() => {}
+        }
+
+        wait_for_deletes(&server, 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(server.deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_delete_is_retried_once_in_the_background() {
+        let server = raw_server(false, 1).await;
+
+        // The request succeeds even though its inline DELETE got a 500.
+        assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
+
+        wait_for_deletes(&server, 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(server.deletes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_delete_is_not_repeated() {
+        let server = raw_server(false, 0).await;
+
+        assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(server.deletes.load(Ordering::SeqCst), 1);
     }
 }

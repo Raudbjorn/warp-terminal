@@ -1143,6 +1143,21 @@ impl LocalProviderKind {
             Self::OpenCode => "OpenCode sidecar",
         }
     }
+
+    /// Whether `model` can be sent through this provider: any non-blank name
+    /// for an OpenAI-compatible endpoint, `providerID/modelID` for OpenCode.
+    /// Mirrors `local_opencode::parse_model_ref`, which rejects anything else
+    /// at request time.
+    pub(crate) fn accepts_model(self, model: &str) -> bool {
+        let model = model.trim();
+        match self {
+            Self::OpenAICompatible => !model.is_empty(),
+            Self::OpenCode => matches!(
+                model.split_once('/'),
+                Some((provider_id, model_id)) if !provider_id.is_empty() && !model_id.is_empty()
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2449,7 +2464,9 @@ impl AISettings {
     pub(crate) fn is_local_openai_prediction_enabled(&self) -> bool {
         ChannelState::is_local_only()
             && self.is_local_openai_provider_configured()
-            && !self.local_openai_prediction_model.value().trim().is_empty()
+            && self
+                .local_provider_kind()
+                .accepts_model(self.local_openai_prediction_model.value())
     }
 
     pub(crate) fn is_local_ai_enabled(&self) -> bool {
@@ -2462,7 +2479,9 @@ impl AISettings {
             // an enabled-but-unconfigured provider would fail every request.
             self.is_local_ai_enabled()
                 && self.local_openai_endpoint_configured()
-                && !self.local_openai_command_model.value().trim().is_empty()
+                && self
+                    .local_provider_kind()
+                    .accepts_model(self.local_openai_command_model.value())
         } else {
             self.is_any_ai_enabled(app)
         }

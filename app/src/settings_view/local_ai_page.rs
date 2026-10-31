@@ -503,7 +503,7 @@ impl SettingsWidget for LocalAIProviderWidget {
             LocalProviderKind::OpenCode => column
                 .with_child(Self::render_description(
                     appearance,
-                    "OpenCode sidecar: Warp starts `opencode serve` in its own working directory on a random loopback port, protected by a per-process password. Each request runs in a short-lived session with every tool permission denied. Set `OpenCode Command` to the binary name or an absolute path; the default `opencode` resolves from `$PATH`. Arguments are split shell-style.",
+                    "OpenCode sidecar: Warp starts `opencode serve` in its own working directory on a random loopback port, protected by a per-process password. Each request runs in a short-lived session with every tool permission denied. Set `OpenCode Command` to the binary name or an absolute path; the default `opencode` resolves from `$PATH`. Arguments are split shell-style. Needs an OpenCode that serves the `/api/session` API (checked against 2.2).",
                 ))
                 .with_child(Self::render_input(
                     appearance,
@@ -537,20 +537,6 @@ impl SettingsWidget for LocalAIProviderWidget {
                     appearance,
                     "Timeout (ms)",
                     self.timeout_ms_editor.clone(),
-                ))
-                .with_child(Self::render_description(
-                    appearance,
-                    "OpenCode sidecar: route requests through a locally-spawned OpenCode process bound to the working directory. The sidecar exposes an OpenAI-compatible endpoint on a random loopback port; we read the port from its startup announcement. Set `OpenCode Command` to the binary name or absolute path; the default `opencode` resolves from `$PATH`.",
-                ))
-                .with_child(Self::render_input(
-                    appearance,
-                    "OpenCode Command",
-                    self.opencode_command_editor.clone(),
-                ))
-                .with_child(Self::render_input(
-                    appearance,
-                    "OpenCode Args",
-                    self.opencode_args_editor.clone(),
                 ))
                 .finish(),
         )
