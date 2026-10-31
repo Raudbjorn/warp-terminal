@@ -18,7 +18,6 @@ pub mod tui_onboarding;
 pub mod workspace;
 
 use std::ops::Deref;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -504,13 +503,9 @@ impl ServerApi {
             client.set_iap_token_provider(state.clone());
             state as Arc<dyn http_client::iap::IapTokenProvider>
         });
-        let mut telemetry_api = TelemetryApi::new();
         if ContextFlag::NetworkLogConsole.is_enabled() {
             NetworkLogModel::handle(ctx).update(ctx, |model, model_ctx| {
-                model.install_on_clients(
-                    [&mut client, &mut external_client, &mut telemetry_api.client],
-                    model_ctx,
-                );
+                model.install_on_clients([&mut client, &mut external_client], model_ctx);
             });
         }
         Self::new_with_parts(
@@ -520,7 +515,7 @@ impl ServerApi {
             event_sender,
             agent_source,
             iap_token_provider,
-            telemetry_api,
+            TelemetryApi::new(),
         )
     }
 
@@ -1179,7 +1174,7 @@ impl ServerApi {
         }
     }
 
-    /// Synchronously sends a [`TelemetryEvent`] to the Rudderstack API. Prefer not to call this
+    /// Immediately records a [`TelemetryEvent`] (local-only; see [`TelemetryApi`]). Prefer not to call this
     /// directly, use the macros defined in crate::server::telemetry::macros. If telemetry is
     /// disabled, this is a no-op.
     pub async fn send_telemetry_event(
@@ -1232,10 +1227,9 @@ impl ServerApi {
         }
     }
 
-    /// Drains all queued [`TelemetryEvent`]s into Rudderstack requests containing the corresponding
-    /// batch of events. Events are queued using the [`send_telemetry_from_ctx`] or
+    /// Drains all queued [`TelemetryEvent`]s (local-only; see [`TelemetryApi`]). Events are queued using the [`send_telemetry_from_ctx`] or
     /// [`send_telemetry_from_app_ctx`] macros. If telemetry is disabled for the user, this flushes
-    /// the UI framework event queue and does nothing with them (no request is made).
+    /// the UI framework event queue and does nothing with them.
     ///
     /// Returns the number of events that were flushed.
     pub async fn flush_telemetry_events(
@@ -1246,34 +1240,6 @@ impl ServerApi {
             return Ok(0);
         }
         self.telemetry_api.flush_events(settings_snapshot).await
-    }
-
-    /// Sends a batched Rudder request containing events written to the file at `path`. This is a
-    /// no-op if telemetry is disabled.
-    pub async fn flush_persisted_events_to_rudder(
-        &self,
-        path: &Path,
-        settings_snapshot: PrivacySettingsSnapshot,
-    ) -> Result<()> {
-        if warp_api_disabled() {
-            return Ok(());
-        }
-        self.telemetry_api
-            .flush_persisted_events_to_rudder(path, settings_snapshot)
-            .await
-    }
-
-    /// Writes all queued [`TelemetryEvent`]s to a file, limiting the number of written
-    /// events to `max_events`. Events are queued using the [`send_telemetry_from_ctx`] or
-    /// [`send_telemetry_from_app_ctx`] macros. If telemetry is disabled, no events are written to
-    /// disk.
-    pub fn persist_telemetry_events(
-        &self,
-        max_event_count: usize,
-        settings_snapshot: PrivacySettingsSnapshot,
-    ) -> Result<()> {
-        self.telemetry_api
-            .flush_and_persist_events(max_event_count, settings_snapshot)
     }
 
     /// Hits the /ai/generate_input_suggestions endpoint to get the predicted next action, based on past context.
@@ -1549,13 +1515,8 @@ impl ServerApi {
     /// Fetches updated Warp Channel Versions from Warp Server. If it is the first such request of
     /// the current calendar day, first attempts to call the '/client_version/daily'. If that call
     /// fails or if it not the first request of the calendar day, returns the result of a call to
-    /// `/client_version'. The caller can specify whether or not changelog information should be
-    /// included in the response based on whether or not it will be used.
-    pub async fn fetch_channel_versions(
-        &self,
-        include_changelogs: bool,
-        is_daily: bool,
-    ) -> Result<ChannelVersions> {
+    /// `/client_version'.
+    pub async fn fetch_channel_versions(&self, is_daily: bool) -> Result<ChannelVersions> {
         if warp_api_disabled() {
             return Err(warp_api_disabled_error());
         }
@@ -1566,14 +1527,11 @@ impl ServerApi {
         } else {
             url.set_path("/client_version");
         }
+        // This fork has no changelog surface, so never ask the server for one.
         url.query_pairs_mut()
-            .append_pair("include_changelogs", &include_changelogs.to_string());
+            .append_pair("include_changelogs", "false");
 
-        if include_changelogs {
-            log::info!("Fetching channel versions and changelogs from Warp server");
-        } else {
-            log::info!("Fetching channel versions (without changelogs) from Warp server");
-        }
+        log::info!("Fetching channel versions from Warp server");
 
         let mut request_builder = self
             .base_client
@@ -1831,7 +1789,7 @@ mod fully_local_tests {
 
         // fetch_channel_versions early-returns the disabled error rather than
         // building a request to the Warp server.
-        let result = block_on(api.fetch_channel_versions(false, false));
+        let result = block_on(api.fetch_channel_versions(false));
 
         let err = result.expect_err("fully-local mode must block the channel-version fetch");
         assert!(

@@ -1,8 +1,5 @@
 pub mod overrides;
 
-use std::collections::HashMap;
-use std::fmt::Write;
-
 use anyhow::{Context, Result};
 use chrono::{DateTime, FixedOffset, NaiveDateTime};
 use lazy_static::lazy_static;
@@ -16,8 +13,6 @@ pub struct ChannelVersions {
     pub dev: ChannelVersion,
     pub preview: ChannelVersion,
     pub stable: ChannelVersion,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub changelogs: Option<ChannelChangelogs>,
 }
 
 impl std::fmt::Display for ChannelVersions {
@@ -164,87 +159,6 @@ impl VersionInfo {
     /// Returns the TUI version, falling back to the app version if not set.
     pub fn tui_version(&self) -> &str {
         self.tui_version.as_deref().unwrap_or(&self.version)
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug)]
-pub struct ChannelChangelogs {
-    // Maps of changelogs by version
-    pub dev: HashMap<String, Changelog>,
-    pub preview: HashMap<String, Changelog>,
-    pub stable: HashMap<String, Changelog>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct Changelog {
-    pub date: DateTime<FixedOffset>,
-    pub sections: Vec<Section>,
-    #[serde(default = "default_markdown_sections")]
-    pub markdown_sections: Vec<MarkdownSection>,
-    #[serde(default)]
-    pub image_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub oz_updates: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tui_updates: Vec<String>,
-}
-
-// Default value for when the changelog JSON doesn't have the markdown_sections field
-fn default_markdown_sections() -> Vec<MarkdownSection> {
-    vec![
-        MarkdownSection {
-            title: "New features".to_string(),
-            markdown: "".to_string(),
-        },
-        MarkdownSection {
-            title: "Improvements".to_string(),
-            markdown: "".to_string(),
-        },
-        MarkdownSection {
-            title: "Coming soon".to_string(),
-            markdown: "".to_string(),
-        },
-    ]
-}
-
-impl std::fmt::Display for Changelog {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            self.sections
-                .iter()
-                .fold(String::new(), |mut output, item| {
-                    let _ = write!(output, "{item}\n\n");
-                    output
-                })
-        )
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct Section {
-    pub title: String,
-    pub items: Vec<String>,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
-pub struct MarkdownSection {
-    pub title: String,
-    pub markdown: String,
-}
-
-impl std::fmt::Display for Section {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}:\n{}",
-            self.title,
-            self.items.iter().fold(String::new(), |mut output, item| {
-                let _ = writeln!(output, "- {item}");
-                output
-            })
-        )
     }
 }
 

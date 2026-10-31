@@ -119,6 +119,7 @@ fn replace_byte_ranges_with_asterisks(input: &mut String, mut ranges: Vec<Range<
 }
 /// Walks a [`Value`] and runs [`redact_secrets_in_string`] on every string within
 /// it. Non-string scalars (numbers, booleans, nulls) are left untouched.
+#[allow(dead_code)]
 pub fn redact_secrets_in_value(value: &mut Value) {
     match value {
         Value::String(s) => redact_secrets_in_string(s),
