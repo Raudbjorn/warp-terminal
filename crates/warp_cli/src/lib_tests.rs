@@ -790,19 +790,49 @@ fn args(args: &[&str]) -> Vec<String> {
     args.iter().map(ToString::to_string).collect()
 }
 
+fn real_command() -> clap::Command {
+    <Args as CommandFactory>::command()
+}
+
+/// A top-level command with a flag and a value-taking option that both have short forms, which the
+/// real CLI does not have today.
+fn command_with_short_options() -> clap::Command {
+    clap::Command::new("warp")
+        .arg(
+            clap::Arg::new("verbose")
+                .short('v')
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(clap::Arg::new("opt").short('o').long("opt").alias("option"))
+        .arg(
+            clap::Arg::new("eq")
+                .long("eq")
+                .require_equals(true)
+                .action(clap::ArgAction::Set),
+        )
+        .subcommand(clap::Command::new("agent"))
+        .subcommand(clap::Command::new("run").alias("task"))
+}
+
 #[test]
 fn disabled_subcommand_detects_command_after_global_flag() {
     assert_eq!(
         Some("agent"),
-        disabled_subcommand(&args(&["warp", "--debug", "agent"]), &["agent"])
+        disabled_subcommand(
+            &real_command(),
+            &args(&["warp", "--debug", "agent"]),
+            &["agent"]
+        )
     );
 }
 
 #[test]
 fn disabled_subcommand_skips_global_option_values() {
+    let command = real_command();
     assert_eq!(
         Some("login"),
         disabled_subcommand(
+            &command,
             &args(&[
                 "warp",
                 "--server-root-url",
@@ -814,75 +844,210 @@ fn disabled_subcommand_skips_global_option_values() {
     );
     assert_eq!(
         None,
-        disabled_subcommand(&args(&["warp", "--api-key", "agent", "mcp"]), &["agent"])
+        disabled_subcommand(
+            &command,
+            &args(&["warp", "--api-key", "agent", "mcp"]),
+            &["agent"]
+        )
     );
 }
 
 #[test]
-fn value_taking_top_level_options_are_known_to_subcommand_gating() {
-    // `disabled_subcommand` scans raw argv, so it has to know which options consume the next
-    // token. Skipping an unknown one would make its value look like the subcommand and bypass the
-    // local-only gate. No such option has a short form today; `-x` is treated as a bare flag.
-    let mut command = <Args as CommandFactory>::command();
-    command.build();
+fn leading_positionals_follow_the_option_definitions() {
+    // Every top-level option is read from the clap definition: one that takes a value must hide
+    // that value from the scan, and a flag must not. This would catch a new option that the scan
+    // handles wrongly, with no list to keep in step.
+    let command = real_command();
     for arg in command.get_arguments() {
         let Some(long) = arg.get_long() else {
             continue;
         };
-        if !arg.get_num_args().is_some_and(|n| n.takes_values()) {
-            continue;
+        let option = format!("--{long}");
+        let argv = args(&["warp", &option, "agent"]);
+        let found = leading_positionals(&command, &argv, 2);
+        if arg.get_action().takes_values() {
+            assert!(
+                found.is_empty(),
+                "`{option}` takes a value, which is not a subcommand: {found:?}"
+            );
+        } else {
+            assert_eq!(found, ["agent"], "`{option}` is a flag");
         }
+    }
+}
+
+#[test]
+fn top_level_options_take_zero_or_one_value() {
+    // `leading_positionals` skips one argument for an option that takes a value. An option with
+    // several values would need more.
+    let mut command = real_command();
+    command.build();
+    for arg in command.get_arguments().filter(|arg| !arg.is_positional()) {
+        let values = arg
+            .get_num_args()
+            .unwrap_or_else(|| panic!("{} has no value count after build", arg.get_id()));
         assert!(
-            arg.get_short().is_none(),
-            "`--{long}` takes a value and has a short form, which `disabled_subcommand` skips as a bare flag"
+            values.max_values() <= 1,
+            "`{}` takes up to {} values; teach `leading_positionals` about it",
+            arg.get_id(),
+            values.max_values()
         );
-        assert!(
-            GLOBAL_OPTIONS_WITH_VALUES.contains(&format!("--{long}").as_str()),
-            "`--{long}` takes a value but is missing from GLOBAL_OPTIONS_WITH_VALUES"
+    }
+}
+
+#[test]
+fn disabled_subcommand_follows_short_options_from_the_definition() {
+    let command = command_with_short_options();
+    let disabled = ["agent", "run"];
+    for (argv, expected) in [
+        (vec!["warp", "agent"], Some("agent")),
+        // `-v` is a flag; `-o` takes the next argument, as does `--opt` and its alias.
+        (vec!["warp", "-v", "agent"], Some("agent")),
+        (vec!["warp", "-o", "x", "agent"], Some("agent")),
+        (vec!["warp", "--opt", "x", "agent"], Some("agent")),
+        (vec!["warp", "--option", "x", "agent"], Some("agent")),
+        (vec!["warp", "--opt=x", "agent"], Some("agent")),
+        // The value of `-o` is `agent`, so the subcommand is `mcp`.
+        (vec!["warp", "-o", "agent", "mcp"], None),
+        (vec!["warp", "--opt", "agent", "mcp"], None),
+        // Clusters: `-ox` and `-ov` carry their value in the same argument; `-vo` takes the next.
+        (vec!["warp", "-ox", "agent"], Some("agent")),
+        (vec!["warp", "-ov", "agent"], Some("agent")),
+        (vec!["warp", "-vo", "x", "agent"], Some("agent")),
+        (vec!["warp", "-vo", "agent", "mcp"], None),
+        // An option that needs `=` does not take the next argument.
+        (vec!["warp", "--eq", "agent"], Some("agent")),
+        (vec!["warp", "--eq=x", "agent"], Some("agent")),
+        // Anything after `--` is not a subcommand.
+        (vec!["warp", "--", "agent"], None),
+        (vec!["warp", "-"], None),
+    ] {
+        assert_eq!(
+            expected,
+            disabled_subcommand(&command, &args(&argv), &disabled),
+            "{argv:?}"
         );
     }
 }
 
 #[test]
 fn disabled_subcommand_detects_help_target_and_aliases() {
+    let command = command_with_short_options();
     assert_eq!(
         Some("agent"),
-        disabled_subcommand(&args(&["warp", "help", "agent"]), &["agent"])
+        disabled_subcommand(&command, &args(&["warp", "help", "agent"]), &["agent"])
+    );
+    assert_eq!(
+        Some("agent"),
+        disabled_subcommand(
+            &command,
+            &args(&["warp", "-v", "help", "-o", "x", "agent"]),
+            &["agent"]
+        )
+    );
+    // An alias is reported as typed and matched through its canonical name.
+    assert_eq!(
+        Some("task"),
+        disabled_subcommand(&command, &args(&["warp", "task", "list"]), &["run"])
     );
     assert_eq!(
         Some("task"),
-        disabled_subcommand(&args(&["warp", "task", "list"]), &["run", "task"])
+        disabled_subcommand(&command, &args(&["warp", "help", "task"]), &["run"])
     );
+    // Plain help is never gated.
+    for argv in [&["warp", "help"][..], &["warp", "--help"], &["warp"]] {
+        assert_eq!(
+            None,
+            disabled_subcommand(&command, &args(argv), &["agent", "run"])
+        );
+    }
 }
 
 #[test]
-fn local_only_help_hides_every_listed_subcommand_without_panicking() {
-    let command = apply_local_only_help(<Args as CommandFactory>::command());
-    for name in LOCAL_ONLY_HIDDEN_SUBCOMMANDS {
+fn local_only_mode_refuses_every_online_command_however_it_is_spelled() {
+    let command = real_command();
+    for argv in [
+        &["warp", "agent"][..],
+        &["warp", "--debug", "agent"],
+        &["warp", "--output-format", "json", "agent"],
+        &["warp", "--output-format=json", "agent"],
+        &["warp", "help", "agent"],
+        &["warp", "agent", "--help"],
+        &["warp", "task"],
+        &["warp", "help", "task"],
+    ] {
+        assert!(
+            disabled_subcommand(&command, &args(argv), LOCAL_ONLY_DISABLED_SUBCOMMANDS).is_some(),
+            "{argv:?} should be refused"
+        );
+    }
+}
+
+#[test]
+fn local_only_mode_still_allows_everything_else() {
+    let command = real_command();
+    for argv in [
+        &["warp", "--help"][..],
+        &["warp", "help"],
+        &["warp", "--version"],
+        &["warp"],
+    ] {
+        assert_eq!(
+            None,
+            disabled_subcommand(&command, &args(argv), LOCAL_ONLY_DISABLED_SUBCOMMANDS),
+            "{argv:?}"
+        );
+    }
+    for subcommand in command.get_subcommands() {
+        let name = subcommand.get_name();
+        if LOCAL_ONLY_DISABLED_SUBCOMMANDS.contains(&name) {
+            continue;
+        }
+        for argv in [vec!["warp", name], vec!["warp", "help", name]] {
+            assert_eq!(
+                None,
+                disabled_subcommand(&command, &args(&argv), LOCAL_ONLY_DISABLED_SUBCOMMANDS),
+                "`{name}` is allowed in local-only mode: {argv:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn local_only_disabled_subcommands_are_canonical_names_and_get_hidden() {
+    // `Command::mut_subcommand` panics on an alias, so a name that is only an alias fails here
+    // rather than at startup.
+    let command = apply_local_only_help(real_command());
+    for name in LOCAL_ONLY_DISABLED_SUBCOMMANDS {
         let subcommand = command
-            .find_subcommand(name)
-            .unwrap_or_else(|| panic!("`{name}` is not a subcommand"));
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == *name)
+            .unwrap_or_else(|| panic!("`{name}` is not a canonical subcommand name"));
         assert!(subcommand.is_hide_set(), "`{name}` should be hidden");
     }
 }
 
 #[test]
-fn local_only_hidden_subcommands_exclude_aliases() {
-    // `Command::mut_subcommand` panics on an alias, so aliases may only be in the disabled list.
-    let command = <Args as CommandFactory>::command();
-    let aliases: Vec<_> = command
-        .get_subcommands()
-        .flat_map(|subcommand| subcommand.get_all_aliases())
-        .collect();
-    assert!(aliases.contains(&"task"), "expected `task` to be an alias");
-    for alias in aliases {
+fn parsed_subcommand_is_refused_even_if_the_scan_missed_it() {
+    // What clap parsed has the last word: `ArgMatches` names the subcommand canonically, so an
+    // alias is refused too, whatever the argv scan made of the arguments.
+    let command = command_with_short_options();
+    for argv in [
+        &["warp", "agent"][..],
+        &["warp", "task"],
+        &["warp", "-o", "x", "task"],
+    ] {
+        let matches = command.clone().try_get_matches_from(argv).unwrap();
         assert!(
-            !LOCAL_ONLY_HIDDEN_SUBCOMMANDS.contains(&alias),
-            "`{alias}` is an alias and can't be hidden with `mut_subcommand`"
+            parsed_disabled_subcommand(&matches, &["agent", "run"]).is_some(),
+            "{argv:?}"
         );
     }
-    assert!(LOCAL_ONLY_DISABLED_SUBCOMMANDS.contains(&"task"));
-    assert!(LOCAL_ONLY_HIDDEN_SUBCOMMANDS.contains(&"run"));
+    let matches = command.clone().try_get_matches_from(["warp"]).unwrap();
+    assert_eq!(
+        None,
+        parsed_disabled_subcommand(&matches, &["agent", "run"])
+    );
 }
 
 #[test]
