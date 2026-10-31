@@ -59,9 +59,9 @@ pub fn warp<'js>(
         }),
     )?;
 
-    // Capability-gated namespaces (PLUGIN_SPEC.md §7). A legacy (no-`plugin.json`) plugin is
-    // granted everything for back-compat; a manifest plugin gets only what it declares in
-    // `permissions`. `keymap` rides with `commands` (it binds command ids to keys).
+    // Capability-gated namespaces (PLUGIN_SPEC.md §7). A plugin gets only what it declares in
+    // `permissions`; without a `plugin.json` that is nothing. `keymap` rides with `commands` (it
+    // binds command ids to keys).
     if manifest.permits("commands") {
         api.set("commands", commands(plugin.clone(), ctx)?)?;
         api.set("keymap", keymap(ctx)?)?;

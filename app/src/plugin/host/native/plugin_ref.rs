@@ -29,7 +29,7 @@ impl PluginRef {
     }
 
     /// Loads this plugin's [`Manifest`] (`plugin.json`). Bare `main.js` directories
-    /// yield a legacy manifest (full pre-M4 surface, any API version).
+    /// yield a manifest with no permissions (see [`Manifest::load`]).
     pub(super) fn manifest(&self) -> Manifest {
         match self {
             PluginRef::Path(path) => Manifest::load(path),

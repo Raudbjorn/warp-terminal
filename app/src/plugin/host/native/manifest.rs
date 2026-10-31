@@ -15,8 +15,8 @@ pub(super) const PLUGIN_MANIFEST_FILE_NAME: &str = "plugin.json";
 
 /// A parsed `plugin.json`. Every field is optional (via `#[serde(default)]`) so a minimal manifest
 /// — or none at all — still yields a usable value. A directory with only `main.js` (no manifest)
-/// is represented by [`Manifest::legacy`]: back-compat with the pre-M4 surface (all namespaces, any
-/// API version).
+/// is represented by `Manifest::default()`: no permissions, so only the always-on base surface, and
+/// any API version.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub(super) struct Manifest {
@@ -31,11 +31,6 @@ pub(super) struct Manifest {
     #[serde(rename = "activationEvents")]
     pub activation_events: Vec<String>,
     pub contributes: Contributes,
-
-    /// `true` when there is no `plugin.json` at all (bare `main.js`). Not deserialized; set by
-    /// [`Manifest::legacy`]. Legacy plugins keep the full pre-M4 surface for back-compat.
-    #[serde(skip)]
-    pub legacy: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -71,19 +66,18 @@ pub(super) struct KeybindingContribution {
 }
 
 impl Manifest {
-    /// Loads `<dir>/plugin.json`. A missing file yields a [`legacy`](Self::legacy) manifest
-    /// (back-compat); a malformed file is logged and also treated as legacy so a typo never
-    /// silently strips a plugin's capabilities without explanation.
+    /// Loads `<dir>/plugin.json`. A missing file yields the default manifest: no permissions, any
+    /// API version. A malformed file is logged and yields the same, so a typo can only take
+    /// capabilities away, never grant them.
     pub(super) fn load(dir: &Path) -> Self {
         let path = dir.join(PLUGIN_MANIFEST_FILE_NAME);
         match fs::read_to_string(&path) {
             Ok(text) => match serde_json::from_str::<Manifest>(&text) {
                 Ok(manifest) => manifest,
                 Err(e) => {
-                    // A malformed manifest must NOT escalate to the legacy
-                    // full-permission surface. Treat it as a restricted plugin
-                    // (no permissions, no capabilities) so a hostile or broken
-                    // `plugin.json` cannot silently grant all capabilities.
+                    // A malformed manifest must never grant anything. Treat it as a
+                    // restricted plugin (no permissions, no capabilities) so a hostile or
+                    // broken `plugin.json` cannot silently grant all capabilities.
                     log::warn!(
                         "Invalid plugin manifest {path:?}: {e}; loading with zero permissions."
                     );
@@ -91,15 +85,6 @@ impl Manifest {
                 }
             },
             Err(_) => Self::default(),
-        }
-    }
-
-    /// A manifest for a bare `main.js` plugin (or a built-in): full pre-M4 surface, any API
-    /// version.
-    pub(super) fn legacy() -> Self {
-        Self {
-            legacy: true,
-            ..Default::default()
         }
     }
 
@@ -113,17 +98,17 @@ impl Manifest {
         })
     }
 
-    /// Whether the plugin was granted `permission`. Legacy (no-manifest) plugins are granted
-    /// everything for back-compat; manifest plugins get exactly what they declare.
+    /// Whether the plugin was granted `permission`: exactly the permissions it declares, so a
+    /// plugin without a manifest has none.
     pub(super) fn permits(&self, permission: &str) -> bool {
-        self.legacy || self.permissions.iter().any(|p| p == permission)
+        self.permissions.iter().any(|p| p == permission)
     }
 
     /// Checks the plugin's `engines.warp` range against [`PLUGIN_API_VERSION`].
     ///
     /// Returns `Err(reason)` if the plugin targets an API version this host does not provide, so
     /// the caller can skip it with a logged, user-facing reason rather than load it half-broken.
-    /// Legacy plugins and a missing range default to `"*"` (always compatible).
+    /// A missing range, which includes a missing manifest, defaults to `"*"` (always compatible).
     pub(super) fn check_engine_compatibility(&self) -> Result<(), String> {
         let range = self.engines.warp.clone().unwrap_or_else(|| "*".to_string());
         let req = semver::VersionReq::parse(&range)
@@ -139,3 +124,7 @@ impl Manifest {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "manifest_tests.rs"]
+mod tests;
