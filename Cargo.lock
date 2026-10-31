@@ -16389,6 +16389,7 @@ dependencies = [
  "warp_util",
  "warpui_core",
  "wasm-bindgen-futures",
+ "web-sys",
  "woothee",
 ]
 
