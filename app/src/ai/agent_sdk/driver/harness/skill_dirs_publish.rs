@@ -105,14 +105,16 @@ pub(super) fn publish_skills_for_harness(
         ));
     }
     let configured_skill_dirs = skill_dirs_from_source_dirs(&source_dirs);
-    let deferred_skill_dir = if factory_repository_contract {
-        Some(
-            factory_deferred_repositories_skill_path()
-                .context("bundled deferred repositories skill is unavailable")?,
-        )
-    } else {
-        None
-    };
+    // This fork does not ship the `factory-deferred-repositories` skill (Warp
+    // Factory is a cloud feature it has no access to), so treat an absent skill
+    // as "nothing to publish" rather than a hard setup failure. Without the
+    // existence check, any debug build — where `FactoryDeferredRepositories` is
+    // on via DEBUG_FLAGS — would fail harness startup with
+    // HarnessConfigSetupFailed as soon as WARP_FACTORY_ID was set.
+    let deferred_skill_dir = factory_repository_contract
+        .then(factory_deferred_repositories_skill_path)
+        .flatten()
+        .filter(|path| path.join("SKILL.md").is_file());
     publish_skill_sources(
         skill_root,
         &configured_skill_dirs,
