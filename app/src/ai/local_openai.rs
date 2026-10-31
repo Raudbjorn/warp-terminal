@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use parking_lot::{Mutex, RwLock};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -21,6 +16,10 @@ use crate::{
     settings::{LocalOpenAISettingsSnapshot, LocalProviderKind},
 };
 
+mod reasoning;
+
+use reasoning::{ReasoningCache, ReasoningItem};
+
 #[derive(Clone)]
 pub(crate) struct LocalOpenAIClient {
     config: Arc<RwLock<LocalOpenAISettingsSnapshot>>,
@@ -31,15 +30,10 @@ pub(crate) struct LocalOpenAIClient {
     /// request time". A future refactor can wire this through to a
     /// per-tab working directory.
     opencode_working_dir: Arc<RwLock<Option<PathBuf>>>,
-    /// Per-conversation Responses-API reasoning-item carryover. The
-    /// key is the conversation identifier supplied by the caller;
-    /// the value is the running list of reasoning items the local
-    /// provider returned and that the next turn must round-trip.
-    /// A new entry is created lazily on the first request for a
-    /// given key; an entry is dropped when the caller invokes
-    /// [`LocalOpenAIClient::clear_reasoning_state`].
-    #[allow(dead_code)]
-    reasoning_cache: Arc<Mutex<HashMap<String, Vec<ReasoningItem>>>>,
+    /// Per-conversation Responses-API reasoning-item carryover, bounded in conversations and in
+    /// items per conversation (see [`reasoning`]). An entry is replaced by each response for its
+    /// conversation and dropped by [`LocalOpenAIClient::clear_reasoning_state`].
+    reasoning_cache: Arc<Mutex<ReasoningCache>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -59,7 +53,6 @@ pub(crate) enum LocalOpenAIError {
     #[error("OpenCode provider failed: {0}")]
     OpenCode(#[from] OpenCodeError),
     #[error("local OpenAI-compatible provider's Responses API response was malformed: {0}")]
-    #[allow(dead_code)]
     ResponsesShape(String),
 }
 
@@ -82,7 +75,6 @@ struct ChatMessage {
 /// Responses API round-trips reasoning items as peers of messages;
 /// a plain `Vec<ChatMessage>` would lose the reasoning side.
 #[derive(Serialize)]
-#[allow(dead_code)]
 struct ResponsesApiRequest {
     model: String,
     input: Vec<InputItem>,
@@ -98,11 +90,8 @@ struct ResponsesApiRequest {
 /// can be added when callers need them.
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[allow(dead_code)]
 enum InputItem {
-    /// `{"type": "message", "role": "user", "content": "..."}`.
-    /// The role is currently always `user`; system prompts are
-    /// inlined as a leading `user` message in this implementation.
+    /// `{"type": "message", "role": "system" | "user" | "assistant", "content": "..."}`.
     Message { role: String, content: String },
     /// `{"type": "reasoning", "id": "rs_...", "encrypted_content": "..."}`.
     /// Round-tripped from the previous turn's `output` array so the
@@ -123,25 +112,10 @@ enum InputItem {
     },
 }
 
-/// A reasoning item returned by a Responses API provider.
-/// Stored in the per-conversation cache and round-tripped on the
-/// next turn.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[allow(dead_code)]
-pub(crate) struct ReasoningItem {
-    pub id: String,
-    /// Encrypted content is opaque; we forward it verbatim on the
-    /// next turn. `None` is allowed for providers that surface only
-    /// the reasoning identifier and expect us to drop the
-    /// reasoning chain.
-    pub encrypted_content: Option<String>,
-}
-
 /// Response body for the OpenAI Responses API. We only model the
 /// fields we use; unknown fields are silently ignored so that
 /// future Responses API additions do not break parsing.
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct ResponsesApiResponse {
     /// The `output` array, which is the Responses API's analogue of
     /// `choices`. The model places the assistant's reply and any
@@ -149,11 +123,9 @@ struct ResponsesApiResponse {
     output: Vec<ResponsesOutputItem>,
 }
 
-/// One entry in the Responses API `output` array. The only shape
-/// we currently handle is the reasoning item; the assistant's
-/// text reply is left for callers that need it.
+/// One entry in the Responses API `output` array: either a reasoning item (`id`,
+/// `encrypted_content`) or a message whose `content` blocks hold the assistant's text.
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct ResponsesOutputItem {
     #[serde(rename = "type")]
     kind: String,
@@ -161,16 +133,13 @@ struct ResponsesOutputItem {
     id: Option<String>,
     #[serde(default)]
     encrypted_content: Option<String>,
-    /// Plain text content for non-reasoning output items. We
-    /// currently only look at reasoning items; this field is
-    /// parsed for forward-compat.
+    /// Content blocks of a message item; empty for reasoning items.
     #[serde(default)]
     content: Vec<ResponsesOutputContent>,
 }
 
 /// A content entry in a Responses API output item.
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct ResponsesOutputContent {
     #[serde(rename = "type")]
     kind: String,
@@ -274,7 +243,7 @@ impl LocalOpenAIClient {
             config: Arc::new(RwLock::new(config)),
             opencode_pool: OpenCodeSidecarPool::new(),
             opencode_working_dir: Arc::new(RwLock::new(None)),
-            reasoning_cache: Arc::new(Mutex::new(HashMap::new())),
+            reasoning_cache: Arc::new(Mutex::new(ReasoningCache::default())),
         }
     }
 
@@ -483,6 +452,20 @@ impl LocalOpenAIClient {
                 .await;
         }
 
+        // With `use_responses_api` on, the same transcript goes to `/v1/responses` instead. These
+        // single-shot callers have no conversation, so no reasoning items are carried over.
+        if config.use_responses_api {
+            let input = messages
+                .into_iter()
+                .map(|message| InputItem::Message {
+                    role: message.role.to_string(),
+                    content: message.content,
+                })
+                .collect();
+            let response = Self::responses_request(http_client, config, model, input).await?;
+            return first_output_text(response.output);
+        }
+
         let mut request_builder = http_client
             .post(chat_completions_url(&config.base_url))
             .timeout(Duration::from_millis(config.timeout_ms))
@@ -562,14 +545,43 @@ impl LocalOpenAIClient {
         Err(OpenCodeError::Unsupported.into())
     }
 
-    /// Issue a Responses API request to the local provider, optionally
-    /// carrying forward reasoning items from prior turns for the
-    /// same conversation.
+    /// Sends `input` to the provider's Responses API (`POST /v1/responses`).
+    async fn responses_request(
+        http_client: &http_client::Client,
+        config: &LocalOpenAISettingsSnapshot,
+        model: String,
+        input: Vec<InputItem>,
+    ) -> Result<ResponsesApiResponse, LocalOpenAIError> {
+        let (base_url, api_key) = Self::responses_endpoint(config)?;
+        let mut request_builder = http_client
+            .post(responses_url(&base_url))
+            .timeout(Duration::from_millis(config.timeout_ms))
+            .json(&ResponsesApiRequest {
+                model,
+                input,
+                temperature: 0.2,
+                stream: false,
+            });
+        if !api_key.trim().is_empty() {
+            request_builder = request_builder.bearer_auth(api_key.trim());
+        }
+        Ok(request_builder
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Issues a Responses API request for one turn of a conversation, sending back the reasoning
+    /// items the provider returned for the previous turn.
     ///
-    /// Returns the assistant's plain text reply. Reasoning items
-    /// returned by the provider are stored in the per-conversation
-    /// cache for the next call.
-    #[allow(dead_code)]
+    /// Returns the assistant's plain text reply. The reasoning items of this response replace the
+    /// conversation's cached ones; call [`Self::clear_reasoning_state`] when the conversation ends.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no in-app multi-turn caller of the Responses API yet")
+    )]
     pub(crate) async fn chat_completion_responses(
         &self,
         http_client: &http_client::Client,
@@ -584,116 +596,47 @@ impl LocalOpenAIClient {
             ));
         }
 
-        let (base_url, api_key) = Self::responses_endpoint(&config)?;
-
-        // Build the input list: system prompt (if any) -> cached
-        // reasoning items -> user message. The Responses API treats
-        // system prompts as a leading user message with developer
-        // role, but for cross-provider compatibility we just inline
-        // the system text as a user message; local providers
-        // generally do not honor the `developer` role anyway.
+        // System prompt, then last turn's reasoning items, then the new user message.
         let mut input: Vec<InputItem> = Vec::new();
         if let Some(system) = system_message {
             input.push(InputItem::Message {
-                role: "user".to_string(),
+                role: "system".to_string(),
                 content: system,
             });
         }
-        {
-            let cache = self.reasoning_cache.lock();
-            if let Some(items) = cache.get(conversation_id) {
-                for item in items {
-                    input.push(InputItem::Reasoning {
-                        id: item.id.clone(),
-                        encrypted_content: item.encrypted_content.clone(),
-                    });
-                }
-            }
-        }
+        let cached = self.reasoning_cache.lock().items(conversation_id);
+        input.extend(cached.into_iter().map(|item| InputItem::Reasoning {
+            id: item.id,
+            encrypted_content: item.encrypted_content,
+        }));
         input.push(InputItem::Message {
             role: "user".to_string(),
             content: user_message,
         });
 
-        let mut request_builder = http_client
-            .post(responses_url(&base_url))
-            .timeout(Duration::from_millis(config.timeout_ms))
-            .json(&ResponsesApiRequest {
-                model: config.command_model.clone(),
-                input,
-                temperature: 0.2,
-                stream: false,
-            });
-
-        if !api_key.trim().is_empty() {
-            request_builder = request_builder.bearer_auth(api_key.trim());
-        }
-
-        let response: ResponsesApiResponse = request_builder
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
-
-        // Update the cache with any reasoning items the server
-        // returned. Old reasoning items are kept alongside new ones
-        // so the conversation's full chain is preserved; providers
-        // that trim their own output are responsible for not
-        // returning stale items.
-        let new_items: Vec<ReasoningItem> = response
-            .output
-            .iter()
-            .filter_map(|item| {
-                if item.kind == "reasoning" {
-                    item.id.as_ref().map(|id| ReasoningItem {
-                        id: id.clone(),
-                        encrypted_content: item.encrypted_content.clone(),
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect();
-        if !new_items.is_empty() {
-            self.reasoning_cache
-                .lock()
-                .entry(conversation_id.to_string())
-                .or_default()
-                .extend(new_items);
-        }
-
-        // Extract the first text reply from the output array. The
-        // Responses API places non-reasoning items in `output[i]`
-        // with `content` blocks; we look for the first text content.
-        response
-            .output
-            .into_iter()
-            .find_map(|item| {
-                item.content.into_iter().find_map(|c| match (c.kind.as_str(), c.text) {
-                    ("output_text", Some(text)) => Some(text),
-                    _ => None,
-                })
-            })
-            .ok_or_else(|| {
-                LocalOpenAIError::ResponsesShape(
-                    "responses API output had no `output_text` content".to_string(),
-                )
-            })
+        let response =
+            Self::responses_request(http_client, &config, config.command_model.clone(), input)
+                .await?;
+        self.reasoning_cache
+            .lock()
+            .replace(conversation_id, reasoning_items(&response.output));
+        first_output_text(response.output)
     }
 
-    /// Drop the cached reasoning items for a conversation. Callers
-    /// should invoke this when a conversation ends or is reset.
-    #[allow(dead_code)]
+    /// Drops the cached reasoning items of a conversation. Callers should invoke this when a
+    /// conversation ends or is reset.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no in-app multi-turn caller of the Responses API yet")
+    )]
     pub(crate) fn clear_reasoning_state(&self, conversation_id: &str) {
-        self.reasoning_cache.lock().remove(conversation_id);
+        self.reasoning_cache.lock().clear(conversation_id);
     }
 
     /// Resolve the base URL and API key for a Responses API request.
     /// OpenCode is driven through its session API (see
     /// [`Self::opencode_completion`]) and has no `/v1/responses` endpoint, so
     /// only an OpenAI-compatible provider qualifies.
-    #[allow(dead_code)]
     fn responses_endpoint(
         config: &LocalOpenAISettingsSnapshot,
     ) -> Result<(String, String), LocalOpenAIError> {
@@ -786,7 +729,6 @@ fn chat_completions_url(base_url: &str) -> String {
 /// `/v1` prefix. A base URL that is a full chat-completions endpoint is
 /// rewritten to the sibling `/responses` endpoint rather than having
 /// `/v1/responses` appended after it.
-#[allow(dead_code)]
 fn responses_url(base_url: &str) -> String {
     let trimmed = base_url.trim().trim_end_matches('/');
     if let Some(prefix) = trimmed.strip_suffix("/chat/completions") {
@@ -798,6 +740,39 @@ fn responses_url(base_url: &str) -> String {
     } else {
         format!("{trimmed}/v1/responses")
     }
+}
+
+/// The reasoning items in a Responses API `output` array.
+fn reasoning_items(output: &[ResponsesOutputItem]) -> Vec<ReasoningItem> {
+    output
+        .iter()
+        .filter(|item| item.kind == "reasoning")
+        .filter_map(|item| {
+            item.id.as_ref().map(|id| ReasoningItem {
+                id: id.clone(),
+                encrypted_content: item.encrypted_content.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The first `output_text` block of a Responses API `output` array.
+fn first_output_text(output: Vec<ResponsesOutputItem>) -> Result<String, LocalOpenAIError> {
+    output
+        .into_iter()
+        .find_map(|item| {
+            item.content
+                .into_iter()
+                .find_map(|content| match (content.kind.as_str(), content.text) {
+                    ("output_text", Some(text)) => Some(text),
+                    _ => None,
+                })
+        })
+        .ok_or_else(|| {
+            LocalOpenAIError::ResponsesShape(
+                "responses API output had no `output_text` content".to_string(),
+            )
+        })
 }
 
 fn parse_json_content<T: DeserializeOwned>(content: &str) -> Result<T, serde_json::Error> {
@@ -863,148 +838,5 @@ impl From<LocalOpenAIError> for crate::drive::workflows::ai_assist::GeneratedCom
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn normalizes_chat_completion_urls() {
-        assert_eq!(
-            chat_completions_url("http://127.0.0.1:11434/v1"),
-            "http://127.0.0.1:11434/v1/chat/completions"
-        );
-        assert_eq!(
-            chat_completions_url("http://127.0.0.1:11434"),
-            "http://127.0.0.1:11434/v1/chat/completions"
-        );
-        assert_eq!(
-            chat_completions_url("http://127.0.0.1:11434/v1/chat/completions"),
-            "http://127.0.0.1:11434/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn normalizes_responses_urls() {
-        for base in [
-            "http://127.0.0.1:11434",
-            "http://127.0.0.1:11434/v1",
-            "http://127.0.0.1:11434/v1/",
-            "http://127.0.0.1:11434/v1/responses",
-            "http://127.0.0.1:11434/v1/chat/completions",
-            "http://127.0.0.1:11434/v1/chat/completions/",
-        ] {
-            assert_eq!(
-                responses_url(base),
-                "http://127.0.0.1:11434/v1/responses",
-                "base url: {base}"
-            );
-        }
-        // A non-`/v1` prefix is preserved when rewriting the chat endpoint.
-        assert_eq!(
-            responses_url("https://example.test/api/chat/completions"),
-            "https://example.test/api/responses"
-        );
-    }
-
-    #[test]
-    fn parses_fenced_json_content() {
-        let parsed: PredictionJson =
-            parse_json_content("```json\n{\"suggestion\":\"git status\"}\n```").unwrap();
-        assert_eq!(parsed.into_string(), "git status");
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[test]
-    fn flattens_chat_messages_into_one_prompt() {
-        let messages = vec![
-            ChatMessage {
-                role: "system",
-                content: "Reply with one shell command.\n".to_string(),
-            },
-            ChatMessage {
-                role: "user",
-                content: "list files".to_string(),
-            },
-        ];
-        assert_eq!(
-            flatten_messages(&messages),
-            "System:\nReply with one shell command.\n\nUser:\nlist files"
-        );
-    }
-
-    fn client(
-        provider_kind: LocalProviderKind,
-        base_url: &str,
-        opencode_command: &str,
-    ) -> LocalOpenAIClient {
-        LocalOpenAIClient::new(LocalOpenAISettingsSnapshot {
-            enabled: true,
-            base_url: base_url.to_string(),
-            command_model: "model".to_string(),
-            prediction_model: "model".to_string(),
-            timeout_ms: 1_000,
-            provider_kind,
-            opencode_command: opencode_command.to_string(),
-            ..Default::default()
-        })
-    }
-
-    #[test]
-    fn opencode_needs_its_command_not_a_base_url() {
-        let runnable = client(LocalProviderKind::OpenCode, "", "opencode");
-        assert!(runnable.configured_for_command().is_ok());
-        assert!(runnable.configured_for_prediction().is_ok());
-
-        let missing_binary = client(LocalProviderKind::OpenCode, "http://127.0.0.1:1/v1", "  ");
-        assert!(matches!(
-            missing_binary.configured_for_command(),
-            Err(LocalOpenAIError::NotConfigured)
-        ));
-        assert!(matches!(
-            missing_binary.configured_for_prediction(),
-            Err(LocalOpenAIError::NotConfigured)
-        ));
-    }
-
-    #[test]
-    fn openai_compatible_needs_a_base_url_not_the_opencode_command() {
-        let runnable = client(
-            LocalProviderKind::OpenAICompatible,
-            "http://127.0.0.1:1234/v1",
-            "",
-        );
-        assert!(runnable.configured_for_command().is_ok());
-        assert!(runnable.configured_for_prediction().is_ok());
-
-        let missing_url = client(LocalProviderKind::OpenAICompatible, " ", "opencode");
-        assert!(matches!(
-            missing_url.configured_for_command(),
-            Err(LocalOpenAIError::NotConfigured)
-        ));
-        assert!(matches!(
-            missing_url.configured_for_prediction(),
-            Err(LocalOpenAIError::NotConfigured)
-        ));
-    }
-
-    #[test]
-    fn responses_endpoint_is_openai_compatible_only() {
-        let compatible = LocalOpenAISettingsSnapshot {
-            base_url: "http://127.0.0.1:1234/v1".to_string(),
-            api_key: "key".to_string(),
-            ..Default::default()
-        };
-        assert_eq!(
-            LocalOpenAIClient::responses_endpoint(&compatible).unwrap(),
-            ("http://127.0.0.1:1234/v1".to_string(), "key".to_string())
-        );
-
-        let opencode = LocalOpenAISettingsSnapshot {
-            provider_kind: LocalProviderKind::OpenCode,
-            ..Default::default()
-        };
-        assert!(matches!(
-            LocalOpenAIClient::responses_endpoint(&opencode),
-            Err(LocalOpenAIError::ResponsesShape(_))
-        ));
-    }
-}
+#[path = "local_openai_tests.rs"]
+mod tests;
