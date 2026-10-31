@@ -152,6 +152,22 @@ pub fn apply_to_client_builder(builder: reqwest::ClientBuilder) -> reqwest::Clie
     }
 }
 
+/// [`apply_to_client_builder`] for a [`reqwest::blocking::ClientBuilder`]: the same redirect
+/// re-validation and, in local-only mode, no proxies.
+///
+/// This replaces any redirect or proxy setting already on `builder`.
+#[cfg(not(target_family = "wasm"))]
+pub fn apply_to_blocking_client_builder(
+    builder: reqwest::blocking::ClientBuilder,
+) -> reqwest::blocking::ClientBuilder {
+    let builder = builder.redirect(redirect_policy());
+    if is_local_only() {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
 fn is_guarded_scheme(scheme: &str) -> bool {
     matches!(scheme, "http" | "https" | "ws" | "wss")
 }
