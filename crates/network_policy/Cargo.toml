@@ -10,3 +10,7 @@ license.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 url.workspace = true
+
+# `reqwest::redirect` is not available on wasm, where the browser follows redirects itself.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+reqwest.workspace = true

@@ -63,9 +63,21 @@ pub fn is_local_only() -> bool {
 }
 
 pub fn check_url_str(url: &str, purpose: &str) -> Result<(), NetworkPolicyDenied> {
+    check_url_str_for_mode(services_mode(), url, purpose)
+}
+
+/// Like [`check_url_for_mode`], but for unparsed URLs. In local-only mode a URL that fails to
+/// parse is denied: it can't be classified as loopback, and some are not actually local. For
+/// example, the protocol-relative `//example.com/ws` fails to parse without a base, but a browser
+/// resolves it against the page's scheme and connects to `example.com`.
+pub fn check_url_str_for_mode(
+    mode: ServicesMode,
+    url: &str,
+    purpose: &str,
+) -> Result<(), NetworkPolicyDenied> {
     match Url::parse(url) {
-        Ok(url) => check_url(&url, purpose),
-        Err(_) if is_local_only() => Err(NetworkPolicyDenied {
+        Ok(url) => check_url_for_mode(mode, &url, purpose),
+        Err(_) if mode == ServicesMode::LocalOnly => Err(NetworkPolicyDenied {
             purpose: purpose.to_owned(),
             url: url.to_owned(),
         }),
@@ -90,6 +102,54 @@ pub fn check_url_for_mode(
         purpose: purpose.to_owned(),
         url: url.as_str().to_owned(),
     })
+}
+
+/// Maximum number of redirects followed by [`redirect_policy`]. Matches reqwest's default limit.
+#[cfg(not(target_family = "wasm"))]
+const MAX_REDIRECTS: usize = 10;
+
+/// A reqwest redirect policy that re-validates every redirect target against the network policy.
+///
+/// [`check_url`] only sees the URL a request starts with. reqwest's default policy then follows up
+/// to 10 redirects without consulting it, so in local-only mode a loopback URL could redirect to a
+/// public host and leave the machine. Any client that may reach a non-allowlisted host must use
+/// this policy. A denied target fails the request with [`NetworkPolicyDenied`] as the error
+/// source, rather than handing the 3xx response back to the caller as if it were the result.
+///
+/// Unlike [`reqwest::redirect::Policy::custom`] on its own, this keeps reqwest's default hop limit.
+#[cfg(not(target_family = "wasm"))]
+pub fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        // `previous` includes the initial URL, which is not a redirect. This mirrors the check in
+        // `Policy::limited`.
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        match check_url(attempt.url(), "redirect target") {
+            Ok(()) => attempt.follow(),
+            Err(err) => attempt.error(err),
+        }
+    })
+}
+
+/// Applies the network policy to a reqwest client builder: re-validates redirects (see
+/// [`redirect_policy`]) and, in local-only mode, disables proxies.
+///
+/// The loopback check only looks at the request URL, not the route. With `HTTP_PROXY` set, reqwest
+/// would send an allowed `http://localhost:11434` request to the proxy, which leaks the
+/// destination off-machine and can't reach this machine's loopback anyway. Local-only mode only
+/// permits loopback, so there is never a reason to proxy. The mode is fixed at startup by
+/// `ChannelState::set`, so reading it when the client is built is enough.
+///
+/// This replaces any redirect or proxy setting already on `builder`.
+#[cfg(not(target_family = "wasm"))]
+pub fn apply_to_client_builder(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let builder = builder.redirect(redirect_policy());
+    if is_local_only() {
+        builder.no_proxy()
+    } else {
+        builder
+    }
 }
 
 fn is_guarded_scheme(scheme: &str) -> bool {
@@ -168,6 +228,22 @@ mod tests {
             let url = Url::parse(url).unwrap();
             assert_eq!(
                 check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn local_only_denies_unparseable_urls() {
+        // Relative and protocol-relative URLs must not be waved through: a browser resolves
+        // `//example.com/ws` to a public host.
+        for url in ["/ws", "//example.com/ws", "example.com/ws", ""] {
+            assert!(
+                check_url_str_for_mode(ServicesMode::LocalOnly, url, "test").is_err(),
+                "{url:?} should be denied"
+            );
+            assert_eq!(
+                check_url_str_for_mode(ServicesMode::Online, url, "test"),
                 Ok(())
             );
         }
