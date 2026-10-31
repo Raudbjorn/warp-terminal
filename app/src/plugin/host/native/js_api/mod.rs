@@ -1,3 +1,6 @@
+use std::io::Read as _;
+use std::time::Duration;
+
 use rquickjs::function::Opt;
 use rquickjs::prelude::MutFn;
 use rquickjs::{Ctx, Function, Object};
@@ -222,35 +225,74 @@ fn process_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
     Ok(process)
 }
 
+/// Request timeout for `warp.network.fetch`. `reqwest::blocking` has no default, so a hung or
+/// unrouteable host would freeze the plugin runner thread (and the IPC relay it services)
+/// indefinitely. 10s is long enough for slow remote APIs and short enough that one stuck request
+/// can't wedge the host.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest response body `warp.network.fetch` hands to a plugin. A larger one fails the call
+/// instead of being read into the plugin host's memory.
+const MAX_FETCH_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
+struct FetchResponse {
+    status: u16,
+    body: String,
+}
+
+/// Blocking `GET` behind `warp.network.fetch`, subject to the network policy like every other
+/// client in the app: in local-only mode only loopback URLs are fetched, redirects are checked
+/// hop by hop, and proxies are not used. `Err` is the message of the JS exception to throw.
+///
+/// The body is decoded as UTF-8, with invalid bytes replaced.
+fn fetch_url(url: &str) -> Result<FetchResponse, String> {
+    network_policy::check_url_str(url, "plugin network fetch")
+        .map_err(|denied| denied.to_string())?;
+    let client = network_policy::apply_to_blocking_client_builder(
+        reqwest::blocking::Client::builder().timeout(FETCH_TIMEOUT),
+    )
+    .build()
+    .map_err(|err| format!("failed to build client: {err}"))?;
+    let response = client.get(url).send().map_err(|err| {
+        // A redirect the policy refused is the policy's own error, not a network failure.
+        http_client::redirect_denial_from(&err).map_or_else(|| err.to_string(), |d| d.to_string())
+    })?;
+
+    let status = response.status().as_u16();
+    // One byte past the limit tells "exactly at the limit" from "over it".
+    let mut body = Vec::new();
+    response
+        .take(MAX_FETCH_BODY_BYTES + 1)
+        .read_to_end(&mut body)
+        .map_err(|err| format!("failed to read the response: {err}"))?;
+    if body.len() as u64 > MAX_FETCH_BODY_BYTES {
+        return Err(format!(
+            "response body is larger than {MAX_FETCH_BODY_BYTES} bytes"
+        ));
+    }
+    Ok(FetchResponse {
+        status,
+        body: String::from_utf8_lossy(&body).into_owned(),
+    })
+}
+
 /// Returns the `warp.network` namespace (capability-gated; requires `network`).
 ///
-/// `fetch(url) -> { status, body }` — performs a blocking HTTP GET. Runs synchronously in the
-/// plugin host; errors throw a catchable JS exception. Every request is logged.
+/// `fetch(url) -> { status, body }` — performs a blocking HTTP GET (see [`fetch_url`] for the
+/// network policy, timeout and size limit that apply). Runs synchronously in the plugin host;
+/// errors, including a policy denial, throw a catchable JS exception. Every request is logged.
 fn network_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
     let network = Object::new(ctx)?;
     network.set(
         "fetch",
-        // `reqwest::blocking::get` has no default timeout, so a hung or unrouteable host would
-        // freeze the plugin runner thread (and the IPC relay it services) indefinitely. Build a
-        // dedicated client with a 10s request timeout — long enough for slow remote APIs, short
-        // enough that one stuck request can't wedge the host. The 10s cap matches our network
-        // policy's max request window, so a plugin can't bypass the policy via `warp.network.fetch`.
         Function::new(ctx, move |url: String| -> rquickjs::Result<Object<'js>> {
             log::info!("plugin warp.network.fetch {url:?}");
-            let client = reqwest::blocking::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .map_err(|e| {
-                    rquickjs::Exception::throw_message(ctx, &format!("failed to build client: {e}"))
-                })?;
-            let response = client.get(&url).send().map_err(|e| {
-                rquickjs::Exception::throw_message(ctx, &format!("fetch {url:?}: {e}"))
+            let response = fetch_url(&url).map_err(|message| {
+                rquickjs::Exception::throw_message(ctx, &format!("fetch {url:?}: {message}"))
             })?;
-            let status = i32::from(response.status().as_u16());
-            let body = response.text().unwrap_or_default();
             let result = Object::new(ctx)?;
-            result.set("status", status)?;
-            result.set("body", body)?;
+            result.set("status", i32::from(response.status))?;
+            result.set("body", response.body)?;
             Ok(result)
         }),
     )?;
@@ -565,3 +607,7 @@ pub fn console(ctx: Ctx<'_>) -> rquickjs::Result<Object<'_>> {
     )?;
     Ok(console)
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;
