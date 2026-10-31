@@ -3,8 +3,7 @@ use crate::FeatureFlag;
 pub(super) fn is_online_services_only(feature: FeatureFlag) -> bool {
     matches!(
         feature,
-        FeatureFlag::Changelog
-            | FeatureFlag::Autoupdate
+        FeatureFlag::Autoupdate
             | FeatureFlag::WithSandboxTelemetry
             | FeatureFlag::RecordAppActiveEvents
             | FeatureFlag::CloudObjects
@@ -64,7 +63,6 @@ pub(super) fn is_online_services_only(feature: FeatureFlag) -> bool {
             | FeatureFlag::OzPlatformSkills
             | FeatureFlag::OzIdentityFederation
             | FeatureFlag::OzLaunchModal
-            | FeatureFlag::OzChangelogUpdates
             | FeatureFlag::OpenWarpLaunchModal
             | FeatureFlag::ConversationsAsContext
             | FeatureFlag::OrchestrationLaunchModal

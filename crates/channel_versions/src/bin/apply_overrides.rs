@@ -19,7 +19,7 @@ struct Args {
 
 /// Reads in a JSON-serialized [`ChannelVersions`] from a file, applies any
 /// defined overrides that match a given target OS, and prints out the updated
-/// JSON (omitting changelogs).
+/// JSON.
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -42,7 +42,6 @@ fn main() -> Result<()> {
         dev: ChannelVersion::new(dev_version_info),
         preview: ChannelVersion::new(preview_version_info),
         stable: ChannelVersion::new(stable_version_info),
-        changelogs: None,
     };
 
     // Print out the transformed version info.
