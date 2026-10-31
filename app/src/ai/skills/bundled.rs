@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ai::skills::{parse_bundled_skill, ParsedSkill, SkillPathOrigin, SkillReference};
+use ai::skills::{ParsedSkill, SkillPathOrigin, SkillReference, parse_bundled_skill};
 use futures::TryStreamExt;
 use warp_core::channel::ChannelState;
+use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
+use warp_core::safe_warn;
 use warp_core::ui::icons::Icon;
-use warp_core::{report_error, safe_warn};
+use warp_errors::report_error;
 use warp_util::host_id::HostId;
 use warp_util::local_or_remote_path::LocalOrRemotePath;
 use warp_util::remote_path::RemotePath;
@@ -22,6 +24,8 @@ use crate::settings::user_preferences_toml_file_path;
 pub enum BundledSkillActivation {
     /// Always active.
     Always,
+    /// Active only in the TUI frontend.
+    TuiOnly,
     /// Active only when a specific Warp feature is enabled.
     RequiresFeature(FeatureFlag),
     /// Active only when a specific MCP server is running.
@@ -30,10 +34,21 @@ pub enum BundledSkillActivation {
     RequiresFile(PathBuf),
 }
 
+pub(crate) const FACTORY_DEFERRED_REPOSITORIES_SKILL: &str = "factory-deferred-repositories";
+
+pub(crate) fn factory_deferred_repositories_skill_path() -> Option<PathBuf> {
+    warp_core::paths::bundled_resources_dir().map(|root| {
+        root.join("bundled")
+            .join("skills")
+            .join(FACTORY_DEFERRED_REPOSITORIES_SKILL)
+    })
+}
+
 impl BundledSkillActivation {
     pub fn is_enabled(&self, ctx: &AppContext) -> bool {
         match self {
             Self::Always => true,
+            Self::TuiOnly => AppExecutionMode::as_ref(ctx).is_tui(),
             Self::RequiresFeature(feature) => feature.is_enabled(),
             Self::RequiresMcp(integration) => {
                 TemplatableMCPServerManager::as_ref(ctx).is_mcp_server_running(*integration)
@@ -290,6 +305,7 @@ impl BundledSkill {
                 let icon = match &activation {
                     BundledSkillActivation::RequiresMcp(McpIntegration::Figma) => Icon::Figma,
                     BundledSkillActivation::Always
+                    | BundledSkillActivation::TuiOnly
                     | BundledSkillActivation::RequiresFeature(_)
                     | BundledSkillActivation::RequiresFile(_) => icon_for_bundled_skill(&id),
                 };
@@ -308,7 +324,7 @@ impl BundledSkill {
 
     /// Iterates the catalog's definitions as `(id, skill, activation)`.
     /// Used by the daemon to serialize its catalog for the
-    /// `BundledSkillsSnapshot` push.
+    /// aggregate remote Agent Mode context snapshot.
     pub(crate) fn iter_definitions(
         &self,
     ) -> impl Iterator<Item = (&str, &ParsedSkill, &BundledSkillActivation)> {
@@ -344,6 +360,7 @@ async fn load_bundled_skill_definitions(
     read_bundled_skills(&skills_dir, resources_dir)
         .await
         .into_iter()
+        .filter(|(id, _)| id != FACTORY_DEFERRED_REPOSITORIES_SKILL)
         .map(|(id, skill)| {
             let icon = icon_for_bundled_skill(&id);
             let activation = activation_for_bundled_skill(&id, resources_dir);
@@ -436,16 +453,26 @@ pub(crate) async fn read_bundled_skills(
     skills
 }
 
+fn display_optional_path(path: Option<PathBuf>) -> String {
+    path.unwrap_or_default().display().to_string()
+}
+
 /// Builds the context map for bundled skill variable substitution.
 ///
 /// Supported variables:
 /// - `{{warp_server_url}}` - The server root URL (e.g., `https://api.warp.dev`)
 /// - `{{warp_cli_binary_name}}` - The CLI binary name (e.g., `warp` or `warp-cli`)
+/// - `{{warpctrl_binary_name}}` - The channel-specific Warp Control command name
+/// - `{{warpctrl_wrapper_path}}` - Path to the bundled Warp Control wrapper
 /// - `{{warp_url_scheme}}` - The URL scheme (e.g., `warp`, `warpdev`, `warppreview`)
 /// - `{{settings_schema_path}}` - Path to the bundled JSON settings schema
 /// - `{{skill_dir}}` - Path to the bundled skill's directory
 /// - `{{settings_file_path}}` - Path to the user's settings TOML file
 /// - `{{keybindings_file_path}}` - Path to the user's keybindings YAML file
+/// - `{{gui_settings_file_path}}` - Path to the GUI settings TOML file
+/// - `{{tui_settings_file_path}}` - Path to the TUI settings TOML file
+/// - `{{gui_mcp_config_file_path}}` - Path to the GUI global MCP config
+/// - `{{tui_mcp_config_file_path}}` - Path to the TUI global MCP config
 pub(crate) fn build_bundled_skill_context(
     resources_dir: &Path,
     skill_dir: &Path,
@@ -460,6 +487,18 @@ pub(crate) fn build_bundled_skill_context(
             ChannelState::channel().cli_command_name().to_owned(),
         ),
         (
+            "warpctrl_binary_name".to_owned(),
+            ChannelState::channel().warpctrl_command_name().to_owned(),
+        ),
+        (
+            "warpctrl_wrapper_path".to_owned(),
+            resources_dir
+                .join("bin")
+                .join(ChannelState::channel().warpctrl_command_name())
+                .display()
+                .to_string(),
+        ),
+        (
             "warp_url_scheme".to_owned(),
             ChannelState::url_scheme().to_owned(),
         ),
@@ -470,6 +509,30 @@ pub(crate) fn build_bundled_skill_context(
         (
             "keybindings_file_path".to_owned(),
             keybinding_file_path().display().to_string(),
+        ),
+        (
+            "gui_settings_file_path".to_owned(),
+            display_optional_path(
+                warp_core::paths::gui_config_local_dir()
+                    .map(|config_dir| config_dir.join("settings.toml")),
+            ),
+        ),
+        (
+            "tui_settings_file_path".to_owned(),
+            warp_core::paths::tui_config_local_dir()
+                .join("settings.toml")
+                .display()
+                .to_string(),
+        ),
+        (
+            "gui_mcp_config_file_path".to_owned(),
+            display_optional_path(warp_core::paths::gui_mcp_config_file_path()),
+        ),
+        (
+            "tui_mcp_config_file_path".to_owned(),
+            warp_core::paths::tui_mcp_config_file_path()
+                .display()
+                .to_string(),
         ),
         (
             "settings_schema_path".to_owned(),
@@ -506,7 +569,12 @@ pub(crate) fn activation_for_bundled_skill(
         "modify-settings" => {
             BundledSkillActivation::RequiresFile(resources_dir.join("settings_schema.json"))
         }
+        "tui-migrate-setup" => BundledSkillActivation::TuiOnly,
         "warpctrl" => BundledSkillActivation::RequiresFeature(FeatureFlag::WarpControlCli),
+        // Gate the Factory MCP skill on the same flag that attaches the
+        // Factory MCP server, so the skill and the server it documents roll
+        // out together.
+        "factory-mcp" => BundledSkillActivation::RequiresFeature(FeatureFlag::FactoryMcp),
         _ => BundledSkillActivation::Always,
     }
 }

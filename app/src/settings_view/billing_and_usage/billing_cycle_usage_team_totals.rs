@@ -1,5 +1,6 @@
 use pathfinder_geometry::vector::vec2f;
 use warp_core::ui::appearance::Appearance;
+use warpui::Element;
 use warpui::elements::{
     Border, ChildAnchor, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Empty,
     Expanded, Flex, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle,
@@ -7,12 +8,11 @@ use warpui::elements::{
     Text,
 };
 use warpui::fonts::{Properties, Weight};
-use warpui::Element;
 
 use crate::settings_view::billing_and_usage::billing_cycle_usage_common::{
+    BarSegment, BillingUsageMouseStates, ROW_BORDER_RADIUS, ROW_BORDER_WIDTH, TOOLTIP_GAP,
     aggregate_segments, cost_type_color, format_cost_cents, format_credits,
-    render_breakdown_tooltip, render_section_subheader, BarSegment, BillingUsageMouseStates,
-    ROW_BORDER_RADIUS, ROW_BORDER_WIDTH, TOOLTIP_GAP,
+    render_breakdown_tooltip, render_section_subheader,
 };
 use crate::ui_components::blended_colors;
 use crate::workspaces::workspace::{
@@ -48,8 +48,8 @@ pub struct TeamTotalCardSummary {
     pub title: &'static str,
     pub card_key: &'static str,
     pub segments: Vec<BarSegment>,
-    pub total_credits: i64,
-    pub total_cost_cents: i64,
+    pub total_credits: f64,
+    pub total_cost_cents: f64,
     pub limit_cents: Option<i64>,
 }
 
@@ -118,16 +118,20 @@ pub fn build_team_total_card_summaries(
 
 fn render_card_pill_bar(
     segments: &[BarSegment],
-    total_credits: i64,
-    total_cost_cents: i64,
+    total_credits: f64,
+    total_cost_cents: f64,
     limit_cents: Option<i64>,
     appearance: &Appearance,
 ) -> Box<dyn Element> {
     let theme = appearance.theme();
     let track_bg = theme.surface_overlay_1();
     let corner = Radius::Pixels(CARD_BAR_RADIUS);
+    let segments = segments
+        .iter()
+        .filter(|s| s.credits > 0.0)
+        .collect::<Vec<_>>();
 
-    if total_credits == 0 || segments.is_empty() {
+    if total_credits == 0.0 || segments.is_empty() {
         return ConstrainedBox::new(
             Container::new(Empty::new().finish())
                 .with_background(track_bg)
@@ -237,7 +241,7 @@ fn build_team_total_card(
     let totals_row: Box<dyn Element> = match summary.limit_cents {
         Some(limit) => {
             let limit_text = Text::new_inline(
-                format!("Limit: {}", format_cost_cents(limit)),
+                format!("Limit: {}", format_cost_cents(limit as f64)),
                 appearance.ui_font_family(),
                 12.,
             )

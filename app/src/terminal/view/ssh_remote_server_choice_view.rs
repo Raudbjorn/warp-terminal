@@ -18,6 +18,7 @@
 //! deregistered) is the parent's responsibility.
 use settings::Setting;
 use warp_core::ui::theme::color::internal_colors;
+use warp_errors::report_error;
 use warpui::elements::{
     Border, ChildView, Container, CornerRadius, CrossAxisAlignment, Flex, Hoverable,
     MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius, Text,
@@ -30,7 +31,7 @@ use warpui::{
 };
 
 use crate::ai::blocklist::block::keyboard_navigable_buttons::{
-    rich_navigation_button, KeyboardNavigableButtons,
+    KeyboardNavigableButtons, rich_navigation_button,
 };
 use crate::ai::blocklist::inline_action::inline_action_header::{
     HeaderConfig, INLINE_ACTION_HORIZONTAL_PADDING,
@@ -39,7 +40,7 @@ use crate::server::telemetry::TelemetryEvent;
 use crate::terminal::model::session::SessionId;
 use crate::terminal::warpify::settings::{SshExtensionInstallMode, WarpifySettings};
 use crate::ui_components::blended_colors;
-use crate::{send_telemetry_from_ctx, Appearance};
+use crate::{Appearance, send_telemetry_from_ctx};
 
 const PROMPT_BORDER_RADIUS: f32 = 8.;
 
@@ -58,9 +59,18 @@ pub enum SshRemoteServerChoiceViewEvent {
     OpenWarpifySettings,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SshRemoteServerChoiceViewMode {
+    InitialInstall,
+    UpdateRequired,
+    RetryAfterControlMasterError,
+    RetryAfterSetupFailure,
+}
+
 /// Choice block prompting the user to install the remote-server binary on the remote host or skip.
 pub struct SshRemoteServerChoiceView {
     session_id: SessionId,
+    mode: SshRemoteServerChoiceViewMode,
     buttons: ViewHandle<KeyboardNavigableButtons>,
     do_not_ask_again_mouse_state: MouseStateHandle,
     do_not_ask_again_label_mouse_state: MouseStateHandle,
@@ -71,26 +81,61 @@ pub struct SshRemoteServerChoiceView {
 
 impl SshRemoteServerChoiceView {
     pub fn new(session_id: SessionId, ctx: &mut ViewContext<Self>) -> Self {
+        Self::new_with_mode(
+            session_id,
+            SshRemoteServerChoiceViewMode::InitialInstall,
+            ctx,
+        )
+    }
+
+    pub fn new_with_mode(
+        session_id: SessionId,
+        mode: SshRemoteServerChoiceViewMode,
+        ctx: &mut ViewContext<Self>,
+    ) -> Self {
+        let (install_title, install_description, skip_title, skip_description) = match mode {
+            SshRemoteServerChoiceViewMode::InitialInstall => (
+                "Install Warp's SSH extension",
+                "Install Warp's extension to enable agent features like file browsing, \
+                 code review, and intelligent command completions in this session.",
+                "Continue without installing",
+                "You'll still get a Warpified experience just without the coding features.",
+            ),
+            SshRemoteServerChoiceViewMode::UpdateRequired => (
+                "Update Warp's SSH extension",
+                "Update Warp's extension to restore agent features like file browsing, \
+                 code review, and intelligent command completions.",
+                "Continue without SSH extension",
+                "Keep this SSH shell running with advanced remote features disabled.",
+            ),
+            SshRemoteServerChoiceViewMode::RetryAfterControlMasterError => (
+                "Retry installing SSH extension",
+                "Reinstall and reconnect Warp's extension to restore agent features like file \
+                 browsing, code review, and intelligent command completions.",
+                "Continue without SSH extension",
+                "Keep this SSH shell running with advanced remote features disabled.",
+            ),
+            SshRemoteServerChoiceViewMode::RetryAfterSetupFailure => (
+                "Retry installing SSH extension",
+                "Reinstall and reconnect Warp's extension to restore agent features like file \
+                 browsing, code review, and intelligent command completions.",
+                "Continue without SSH extension",
+                "Keep this SSH shell running with advanced remote features disabled.",
+            ),
+        };
+
         let buttons = ctx.add_typed_action_view(|_| {
             KeyboardNavigableButtons::new(vec![
                 rich_navigation_button(
-                    "Install Warp's SSH extension".to_string(),
-                    Some(
-                        "Install Warp's extension to enable agent features like file browsing, \
-                         code review, and intelligent command completions in this session."
-                            .to_string(),
-                    ),
+                    install_title.to_string(),
+                    Some(install_description.to_string()),
                     /* recommended */ true,
                     MouseStateHandle::default(),
                     SshRemoteServerChoiceViewAction::Install,
                 ),
                 rich_navigation_button(
-                    "Continue without installing".to_string(),
-                    Some(
-                        "You'll still get a Warpified experience just without the coding \
-                         features."
-                            .to_string(),
-                    ),
+                    skip_title.to_string(),
+                    Some(skip_description.to_string()),
                     /* recommended */ false,
                     MouseStateHandle::default(),
                     SshRemoteServerChoiceViewAction::Skip,
@@ -100,6 +145,7 @@ impl SshRemoteServerChoiceView {
 
         Self {
             session_id,
+            mode,
             buttons,
             do_not_ask_again_mouse_state: MouseStateHandle::default(),
             do_not_ask_again_label_mouse_state: MouseStateHandle::default(),
@@ -120,7 +166,21 @@ impl SshRemoteServerChoiceView {
         // Match the Figma design: a plain title row, no icon / chevron /
         // action buttons. `HeaderConfig` without an `interaction_mode` set
         // renders exactly that.
-        HeaderConfig::new("Choose your experience for this remote session:", app)
+        let title = match self.mode {
+            SshRemoteServerChoiceViewMode::InitialInstall => {
+                "Choose your experience for this remote session:"
+            }
+            SshRemoteServerChoiceViewMode::UpdateRequired => {
+                "Warp's SSH extension is out of date on this host. Update it?"
+            }
+            SshRemoteServerChoiceViewMode::RetryAfterControlMasterError => {
+                "Warp's SSH extension hit an SSH channel error. Repair this session?"
+            }
+            SshRemoteServerChoiceViewMode::RetryAfterSetupFailure => {
+                "Warp couldn't connect to the SSH extension. Retry this session?"
+            }
+        };
+        HeaderConfig::new(title, app)
             .with_corner_radius_override(CornerRadius::with_top(Radius::Pixels(
                 PROMPT_BORDER_RADIUS,
             )))
@@ -266,7 +326,9 @@ impl TypedActionView for SshRemoteServerChoiceView {
                     let mode = SshExtensionInstallMode::AlwaysInstall;
                     WarpifySettings::handle(ctx).update(ctx, |settings, ctx| {
                         if let Err(e) = settings.ssh_extension_install_mode.set_value(mode, ctx) {
-                            log::error!("Failed to persist ssh_extension_install_mode: {e}");
+                            report_error!(
+                                e.context("Failed to persist ssh_extension_install_mode")
+                            );
                         }
                     });
                     send_telemetry_from_ctx!(
@@ -283,7 +345,9 @@ impl TypedActionView for SshRemoteServerChoiceView {
                     let mode = SshExtensionInstallMode::NeverInstall;
                     WarpifySettings::handle(ctx).update(ctx, |settings, ctx| {
                         if let Err(e) = settings.ssh_extension_install_mode.set_value(mode, ctx) {
-                            log::error!("Failed to persist ssh_extension_install_mode: {e}");
+                            report_error!(
+                                e.context("Failed to persist ssh_extension_install_mode")
+                            );
                         }
                     });
                     send_telemetry_from_ctx!(

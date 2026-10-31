@@ -22,7 +22,7 @@
 //! `host_response_tests.rs` forces every new request variant to be
 //! classified one way or the other.
 
-use crate::proto::{server_message, ServerMessage};
+use crate::proto::{ServerMessage, server_message};
 
 /// Interprets a per-operation response with the standard
 /// `Success | Error | (unset)` result shape. A missing `result` is an error
@@ -48,6 +48,16 @@ pub fn write_file_result(msg: &ServerMessage) -> Result<(), String> {
         server_message::Message::WriteFileResponse,
         crate::proto::write_file_response::Result,
         "WriteFile"
+    )
+}
+
+/// Interprets a [`ServerMessage`] as the result of a `RenameFile` request.
+pub fn rename_file_result(msg: &ServerMessage) -> Result<(), String> {
+    file_op_result!(
+        msg,
+        server_message::Message::RenameFileResponse,
+        crate::proto::rename_file_response::Result,
+        "RenameFile"
     )
 }
 

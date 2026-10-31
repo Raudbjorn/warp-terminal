@@ -1,0 +1,189 @@
+From 04720759de0b7cfc24b637ab0bf74b8d03af9453 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 20 May 2026 11:51:24 -0400
+Subject: [PATCH 03/48] Show a leader-engaged indicator in the tab bar with
+ auto-cancel
+
+Surface the keymap matcher's in-progress multi-keystroke sequence so the UI
+can tell when a tmux-style leader/prefix is armed:
+- warpui_core: Matcher::pending_keystrokes()/clear_pending(); AppContext
+  tracks the pending sequence, repaints on change, and auto-cancels a
+  stranded prefix after 1.5s so a stray ctrl-b can't get stuck.
+- workspace tab bar: render a 'LEADER <keys>' pill while a chord is pending.
+---
+ app/src/workspace/view.rs                | 38 +++++++++++++++++
+ crates/warpui_core/src/core/app.rs       | 54 ++++++++++++++++++++++++
+ crates/warpui_core/src/keymap/matcher.rs | 18 ++++++++
+ 3 files changed, 110 insertions(+)
+
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index 0b4ce5b2..96e8a71f 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -19719,6 +19719,40 @@ impl Workspace {
+         .finish()
+     }
+ 
++    /// oh-my-warp: renders the "leader engaged" pill shown in the tab bar while a
++    /// leader/prefix chord is pending (e.g. after pressing `ctrl-b`), or `None`
++    /// when no chord is in progress. The pending state comes from the keymap
++    /// matcher via `AppContext::keymap_pending_keystrokes`.
++    fn render_leader_indicator(
++        &self,
++        appearance: &Appearance,
++        ctx: &AppContext,
++    ) -> Option<Box<dyn Element>> {
++        let pending = ctx.keymap_pending_keystrokes()?;
++        if pending.is_empty() {
++            return None;
++        }
++        let label = pending
++            .iter()
++            .map(|keystroke| keystroke.displayed())
++            .collect::<Vec<_>>()
++            .join(" ");
++        let text = Text::new_inline(format!("LEADER {label}"), appearance.ui_font_family(), 11.)
++            .with_color(PhenomenonStyle::body_text())
++            .with_selectable(false)
++            .finish();
++        let pill = Container::new(text)
++            .with_padding_left(8.)
++            .with_padding_right(8.)
++            .with_padding_top(2.)
++            .with_padding_bottom(2.)
++            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(4.)))
++            .with_background_color(blended_colors::neutral_1(appearance.theme()))
++            .with_margin_right(8.)
++            .finish();
++        Some(pill)
++    }
++
+     fn render_tab_bar_contents(
+         &self,
+         hover_fixed_width: Option<f32>,
+@@ -19726,6 +19760,10 @@ impl Workspace {
+         ctx: &AppContext,
+     ) -> Box<dyn Element> {
+         let mut tab_bar = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
++        // oh-my-warp: show the leader/prefix indicator while a chord is pending.
++        if let Some(indicator) = self.render_leader_indicator(appearance, ctx) {
++            tab_bar.add_child(indicator);
++        }
+         let is_web_anonymous_user = self
+             .auth_state
+             .is_user_web_anonymous_user()
+diff --git a/crates/warpui_core/src/core/app.rs b/crates/warpui_core/src/core/app.rs
+index 4e68ba25..08aa81af 100644
+--- a/crates/warpui_core/src/core/app.rs
++++ b/crates/warpui_core/src/core/app.rs
+@@ -603,6 +603,12 @@ pub struct AppContext {
+     rendering_config: rendering::Config,
+     global_actions: HashMap<String, Vec<Box<GlobalActionCallback>>>,
+     keystroke_matcher: Matcher,
++    /// oh-my-warp: snapshot of the matcher's current pending multi-keystroke
++    /// sequence (the "leader engaged" state). Drives the leader indicator and an
++    /// auto-cancel timeout. `None` when no sequence is in progress.
++    keymap_pending: Option<Vec<Keystroke>>,
++    /// oh-my-warp: in-flight auto-cancel timer for `keymap_pending`.
++    keymap_pending_timeout: Option<ForegroundTask>,
+     next_task_id: usize,
+     weak_self: rc::Weak<RefCell<Self>>,
+     pub(super) subscriptions: HashMap<EntityId, Vec<Subscription>>,
+@@ -764,6 +770,8 @@ impl AppContext {
+             presenters: Default::default(),
+             rendering_config: Default::default(),
+             keystroke_matcher: Default::default(),
++            keymap_pending: None,
++            keymap_pending_timeout: None,
+             disabled_key_bindings_windows: Default::default(),
+             next_task_id: 0,
+             weak_self: rc::Weak::default(),
+@@ -982,6 +990,46 @@ impl AppContext {
+         }
+     }
+ 
++    /// oh-my-warp: returns the matcher's current in-progress (pending)
++    /// multi-keystroke sequence, if a "leader"/prefix chord is engaged. Views can
++    /// read this to render a "leader engaged" indicator.
++    pub fn keymap_pending_keystrokes(&self) -> Option<Vec<Keystroke>> {
++        self.keystroke_matcher.pending_keystrokes()
++    }
++
++    /// oh-my-warp: synchronize `keymap_pending` with the matcher after a
++    /// keystroke, request a redraw when it changes, and (re)arm a timeout that
++    /// auto-cancels a stranded pending sequence so the indicator can't get stuck.
++    fn update_keymap_pending_indicator(&mut self, window_id: WindowId) {
++        let pending = self.keystroke_matcher.pending_keystrokes();
++        if pending == self.keymap_pending {
++            return;
++        }
++        self.keymap_pending = pending.clone();
++        self.invalidate_all_views_for_window(window_id);
++
++        // Drop any previous timer; (re)arm only while a sequence is pending.
++        self.keymap_pending_timeout = None;
++        if let Some(active) = pending {
++            let weak_app = self.weak_self.clone();
++            let task = self.foreground.spawn(async move {
++                Timer::after(std::time::Duration::from_millis(1500)).await;
++                if let Some(app) = weak_app.upgrade() {
++                    let mut app = app.borrow_mut();
++                    // Only cancel if the very same sequence is still pending.
++                    if app.keymap_pending.as_deref() == Some(active.as_slice()) {
++                        app.keystroke_matcher.clear_pending();
++                        app.keymap_pending = None;
++                        app.keymap_pending_timeout = None;
++                        app.invalidate_all_views_for_window(window_id);
++                        app.update_windows();
++                    }
++                }
++            });
++            self.keymap_pending_timeout = Some(task);
++        }
++    }
++
+     pub(crate) fn on_global_shortcut_triggered(&mut self, shortcut: Keystroke) {
+         if let Some(global_action) = self.global_shortcuts.remove(&shortcut) {
+             self.dispatch_global_action(global_action.action, global_action.args.as_ref());
+@@ -3266,6 +3314,12 @@ impl AppContext {
+             }
+         }
+ 
++        // oh-my-warp: keep the leader/prefix "engaged" indicator in sync with the
++        // matcher's pending multi-keystroke state (and arm its auto-cancel timeout).
++        if matches!(event, Event::KeyDown { .. }) {
++            self.update_keymap_pending_indicator(window_id);
++        }
++
+         let mut result = crate::windowing::EventDispatchResult::default();
+         if !keystroke_handled {
+             result = self.handle_non_keybound_event(event.clone(), window_id, presenter.clone());
+diff --git a/crates/warpui_core/src/keymap/matcher.rs b/crates/warpui_core/src/keymap/matcher.rs
+index 80b271b3..2c960c3b 100644
+--- a/crates/warpui_core/src/keymap/matcher.rs
++++ b/crates/warpui_core/src/keymap/matcher.rs
+@@ -345,6 +345,24 @@ impl Matcher {
+         }
+     }
+ 
++    /// oh-my-warp: returns the in-progress (pending) multi-keystroke sequence for
++    /// any view, if one is currently engaged (e.g. a tmux-style leader prefix has
++    /// been pressed and we're waiting for the next key). Used to drive a
++    /// "leader engaged" UI indicator.
++    pub fn pending_keystrokes(&self) -> Option<Vec<Keystroke>> {
++        self.pending
++            .values()
++            .map(|p| &p.keystrokes)
++            .find(|keystrokes| !keystrokes.is_empty())
++            .cloned()
++    }
++
++    /// oh-my-warp: clears any in-progress pending keystroke sequences (used by the
++    /// leader auto-cancel timeout).
++    pub fn clear_pending(&mut self) {
++        self.pending.clear();
++    }
++
+     // Attempt to match with a StandardAction.
+     // This returns None or Action, never Pending.
+     pub fn match_standard(&self, action: StandardAction, ctx: &Context) -> MatchResult {

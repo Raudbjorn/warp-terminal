@@ -7,7 +7,7 @@ use warpui::{Entity, ModelContext, ModelHandle, SingletonEntity, WeakModelHandle
 
 #[cfg(feature = "local_fs")]
 use super::git_repo_model::new_local_git_repo_status_model;
-use super::git_repo_model::{new_remote_git_repo_status_model, GitRepoStatusModel};
+use super::git_repo_model::{GitRepoStatusModel, new_remote_git_repo_status_model};
 #[cfg(feature = "local_fs")]
 use super::github_repo_model::LocalGitHubRepoModel;
 use super::github_repo_model::{GitHubRepoModel, RemoteGitHubRepoModel};
@@ -124,7 +124,9 @@ impl GitRepoModels {
                     let inner =
                         ctx.add_model(|ctx| LocalGitHubRepoModel::new(repo_path, git_status, ctx));
                     ctx.add_model(|ctx| {
-                        ctx.subscribe_to_model(&inner, GitHubRepoModel::forward_event);
+                        ctx.subscribe_to_model(&inner, |me, _, event, ctx| {
+                            GitHubRepoModel::forward_event(me, event, ctx)
+                        });
                         GitHubRepoModel::Local(inner)
                     })
                 }
@@ -140,7 +142,9 @@ impl GitRepoModels {
                 let inner =
                     ctx.add_model(|ctx| RemoteGitHubRepoModel::new(remote_path.clone(), ctx));
                 ctx.add_model(|ctx| {
-                    ctx.subscribe_to_model(&inner, GitHubRepoModel::forward_event);
+                    ctx.subscribe_to_model(&inner, |me, _, event, ctx| {
+                        GitHubRepoModel::forward_event(me, event, ctx)
+                    });
                     GitHubRepoModel::Remote(inner)
                 })
             }
@@ -152,6 +156,11 @@ impl GitRepoModels {
     }
 }
 
+impl Default for GitRepoModels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Entity for GitRepoModels {
     type Event = ();
 }

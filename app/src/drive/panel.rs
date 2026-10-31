@@ -1,4 +1,6 @@
+use warp_core::channel::ChannelState;
 use futures::Future;
+use warp_errors::report_error;
 use warpui::elements::{
     Align, Flex, Hoverable, MouseStateHandle, ParentElement, SavePosition, Shrinkable,
 };
@@ -24,10 +26,10 @@ use crate::cloud_object::model::view::CloudViewModel;
 use crate::cloud_object::{
     CloudObjectEventEntrypoint, GenericStringObjectFormat, JsonObjectType, Owner, Space,
 };
-use crate::env_vars::manager::EnvVarCollectionSource;
 use crate::env_vars::CloudEnvVarCollection;
-use crate::notebooks::manager::NotebookSource;
+use crate::env_vars::manager::EnvVarCollectionSource;
 use crate::notebooks::CloudNotebook;
+use crate::notebooks::manager::NotebookSource;
 use crate::server::cloud_objects::update_manager::{InitiatedBy, UpdateManager};
 use crate::server::ids::{ClientId, ServerId, SyncId};
 use crate::server::telemetry::SharingDialogSource;
@@ -94,9 +96,19 @@ impl DrivePanel {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
         let index_view = ctx.add_typed_action_view(move |ctx| {
             let mut index = DriveIndex::new(ctx);
-            index.initialize_section_states(ctx);
+            if !ChannelState::is_local_only() {
+                index.initialize_section_states(ctx);
+            }
             index
         });
+
+        if ChannelState::is_local_only() {
+            return Self {
+                index_view,
+                mouse_state_handles: Default::default(),
+            };
+        }
+
         ctx.subscribe_to_view(&index_view, |me, _, event, ctx| {
             me.handle_index_view_event(event, ctx);
         });
@@ -150,7 +162,10 @@ impl DrivePanel {
                     }));
                 }
                 None => {
-                    log::error!("Cannot identify a notebook owner from {space:?}");
+                    report_error!(
+                        "Cannot identify a notebook owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::OpenImportModal {
@@ -162,7 +177,10 @@ impl DrivePanel {
                     initial_folder_id: *initial_folder_id,
                 }),
                 None => {
-                    log::error!("Cannot identify an import target from {space:?}");
+                    report_error!(
+                        "Cannot identify an import target",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::CreateFolder {
@@ -185,7 +203,10 @@ impl DrivePanel {
                     });
                 }
                 None => {
-                    log::error!("Cannot identify a folder owner from {space:?}");
+                    report_error!(
+                        "Cannot identify a folder owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::CreateEnvVarCollection {
@@ -201,7 +222,10 @@ impl DrivePanel {
                     },
                 )),
                 None => {
-                    log::error!("Cannot identify an env var owner from {space:?}");
+                    report_error!(
+                        "Cannot identify an env var owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::CreateWorkflow {
@@ -222,7 +246,10 @@ impl DrivePanel {
                     WorkflowViewMode::Create,
                 )),
                 None => {
-                    log::error!("Cannot identify a workflow owner from {space:?}");
+                    report_error!(
+                        "Cannot identify a workflow owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::OpenAIFactCollection => {
@@ -343,7 +370,10 @@ impl DrivePanel {
                     });
                 }
                 None => {
-                    log::error!("Cannot identify an AI rule owner from {space:?}");
+                    report_error!(
+                        "Cannot identify an AI rule owner",
+                        extra: { "space" => ?space }
+                    );
                 }
             },
             DriveIndexEvent::AttachPlanAsContext(id) => {
@@ -641,7 +671,7 @@ impl DrivePanel {
     pub fn has_warp_drive_initialized_sections(
         &self,
         app: &AppContext,
-    ) -> impl Future<Output = ()> {
+    ) -> impl Future<Output = ()> + use<> {
         self.index_view.as_ref(app).has_initialized_sections()
     }
 

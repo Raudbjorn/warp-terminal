@@ -163,31 +163,39 @@ fn state_is_ready() {
 
 #[test]
 fn state_is_failed() {
-    assert!(RemoteServerSetupState::Failed {
-        error: "test".into()
-    }
-    .is_failed());
+    assert!(
+        RemoteServerSetupState::Failed {
+            error: "test".into()
+        }
+        .is_failed()
+    );
     assert!(!RemoteServerSetupState::Ready.is_failed());
 }
 
 #[test]
 fn state_is_terminal() {
     assert!(RemoteServerSetupState::Ready.is_terminal());
-    assert!(RemoteServerSetupState::Failed {
-        error: "test".into()
-    }
-    .is_terminal());
-    assert!(RemoteServerSetupState::Unsupported {
-        reason: UnsupportedReason::NonGlibc {
-            name: "musl".into()
+    assert!(
+        RemoteServerSetupState::Failed {
+            error: "test".into()
         }
-    }
-    .is_terminal());
+        .is_terminal()
+    );
+    assert!(
+        RemoteServerSetupState::Unsupported {
+            reason: UnsupportedReason::NonGlibc {
+                name: "musl".into()
+            }
+        }
+        .is_terminal()
+    );
     assert!(!RemoteServerSetupState::Checking.is_terminal());
-    assert!(!RemoteServerSetupState::Installing {
-        progress_percent: None,
-    }
-    .is_terminal());
+    assert!(
+        !RemoteServerSetupState::Installing {
+            progress_percent: None,
+        }
+        .is_terminal()
+    );
     assert!(!RemoteServerSetupState::Updating.is_terminal());
     assert!(!RemoteServerSetupState::Initializing.is_terminal());
 }
@@ -366,9 +374,11 @@ fn install_script_installs_binary_and_global_resources() {
     assert!(fs::metadata(&binary).unwrap().is_file());
     assert!(fs::metadata(&resources).unwrap().is_dir());
     assert_eq!(fs::read_to_string(&skill_md).unwrap(), "test skill");
-    assert!(std::path::Path::new(&resources)
-        .join("bundled/skills/test-skill/oz-decoy.sh")
-        .is_file());
+    assert!(
+        std::path::Path::new(&resources)
+            .join("bundled/skills/test-skill/oz-decoy.sh")
+            .is_file()
+    );
 
     let check_output = Command::new("bash")
         .arg("-c")
@@ -384,9 +394,11 @@ fn install_script_installs_binary_and_global_resources() {
     let second_tarball = make_test_tarball(&test_root, "second", "updated skill", false);
     run_install_script(&second_tarball, &fake_home);
     assert_eq!(fs::read_to_string(&skill_md).unwrap(), "updated skill");
-    assert!(!std::path::Path::new(&resources)
-        .join("bundled/skills/test-skill/oz-decoy.sh")
-        .exists());
+    assert!(
+        !std::path::Path::new(&resources)
+            .join("bundled/skills/test-skill/oz-decoy.sh")
+            .exists()
+    );
 
     // Removal deletes the binary but leaves the global resources for the
     // next install to overwrite.
@@ -688,4 +700,100 @@ fn parse_preinstall_missing_status_falls_open() {
     let result = PreinstallCheckResult::parse(stdout);
     assert_eq!(result.status, PreinstallStatus::Unknown);
     assert!(result.is_supported());
+}
+
+#[test]
+fn install_script_with_options_uses_configured_download_url_and_channel() {
+    let script = install_script_with_options(
+        &InstallScriptOptions::new(
+            "https://downloads.example.com/warp/cli/".to_string(),
+            DOWNLOAD_CHANNEL_PREVIEW.to_string(),
+        ),
+        None,
+    );
+
+    assert!(script.contains(
+        "https://downloads.example.com/warp/cli?package=tar&os=$os_name&arch=$arch_name&channel=preview"
+    ));
+}
+
+#[test]
+fn install_script_with_options_falls_back_for_invalid_channel() {
+    let script = install_script_with_options(
+        &InstallScriptOptions::new(
+            PRODUCTION_DOWNLOAD_BASE_URL.to_string(),
+            "nightly".to_string(),
+        ),
+        None,
+    );
+
+    assert!(script.contains(&format!("channel={}", default_download_channel())));
+}
+
+#[test]
+fn install_script_with_options_uses_slipstream_release_asset_url() {
+    let script = install_script_with_options(
+        &InstallScriptOptions::new(
+            SLIPSTREAM_RELEASES_BASE_URL.to_string(),
+            DOWNLOAD_CHANNEL_DEV.to_string(),
+        ),
+        None,
+    );
+
+    assert!(script.contains(
+        "https://github.com/pixelkaiser/slipstream/releases/download/remote-server-latest/slipstream-remote-server-$os_name-$arch_name.tar.gz"
+    ));
+}
+
+#[test]
+fn download_tarball_url_with_options_uses_slipstream_release_asset_url() {
+    let platform = RemotePlatform {
+        os: RemoteOs::Linux,
+        arch: RemoteArch::X86_64,
+    };
+    let url = download_tarball_url_with_options(
+        &platform,
+        &InstallScriptOptions::new(
+            SLIPSTREAM_RELEASES_BASE_URL.to_string(),
+            DOWNLOAD_CHANNEL_DEV.to_string(),
+        ),
+    );
+
+    assert_eq!(
+        url,
+        "https://github.com/pixelkaiser/slipstream/releases/download/remote-server-latest/slipstream-remote-server-linux-x86_64.tar.gz"
+    );
+}
+
+#[test]
+fn remote_server_artifact_version_uses_latest_release_for_untagged_oss() {
+    assert_eq!(
+        remote_server_artifact_version(),
+        SLIPSTREAM_LATEST_REMOTE_SERVER_RELEASE_TAG
+    );
+    assert!(remote_server_artifact_is_moving_latest());
+}
+
+#[test]
+fn production_download_url_is_stale_default_for_untagged_oss() {
+    assert!(is_stale_default_download_base_url(
+        PRODUCTION_DOWNLOAD_BASE_URL
+    ));
+    assert!(is_stale_default_download_base_url(&format!(
+        "{PRODUCTION_DOWNLOAD_BASE_URL}/"
+    )));
+    assert!(!is_stale_default_download_base_url(
+        SLIPSTREAM_RELEASES_BASE_URL
+    ));
+    assert!(!is_stale_default_download_base_url(
+        "https://downloads.example.com/warp/cli"
+    ));
+}
+
+#[test]
+fn slipstream_remote_server_asset_name_uses_platform() {
+    assert_eq!(
+        slipstream_remote_server_asset_name("linux", "aarch64"),
+        "slipstream-remote-server-linux-aarch64.tar.gz"
+    );
 }

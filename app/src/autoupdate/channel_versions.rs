@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use channel_versions::ChannelVersions;
+use warp_errors::report_error;
 
 use crate::channel::{Channel, ChannelState};
-use crate::report_error;
-use crate::server::server_api::{ServerApi, FETCH_CHANNEL_VERSIONS_TIMEOUT};
+use crate::server::server_api::{FETCH_CHANNEL_VERSIONS_TIMEOUT, ServerApi};
 
 // Fetches channel versions asynchronously from the Warp server. If the Warp server request fails,
 // then fetches from GCP JSON storage as a fallback.
@@ -24,6 +24,12 @@ pub async fn fetch_channel_versions(
         let channel_versions_string = read_to_string::<&str>(&path)?;
         return serde_json::from_str(channel_versions_string.as_str())
             .context("Failed to parse channel versions JSON");
+    }
+
+    if ChannelState::is_local_only() {
+        return Err(anyhow::anyhow!(
+            "Online channel version fetching is disabled in local-only services mode"
+        ));
     }
 
     let channel_versions = server_api

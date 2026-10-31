@@ -1,3 +1,4 @@
+use warp_core::channel::ChannelState;
 use std::borrow::Cow;
 use std::boxed::Box;
 use std::cell::RefCell;
@@ -10,9 +11,9 @@ use settings::Setting as _;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::color::contrast::{
-    foreground_color_with_minimum_contrast, MinimumAllowedContrast,
+    MinimumAllowedContrast, foreground_color_with_minimum_contrast,
 };
-use warp_core::ui::color::{coloru_with_opacity, Opacity, Rgb};
+use warp_core::ui::color::{Opacity, Rgb, coloru_with_opacity};
 use warp_core::ui::theme;
 use warp_core::ui::theme::color::internal_colors;
 use warpui::elements::{
@@ -26,22 +27,24 @@ use warpui::ui_components::segmented_control::{
 };
 use warpui::{
     AppContext, Element, Entity, EntityId, ModelHandle, SingletonEntity as _, TypedActionView,
-    View, ViewAsRef, ViewContext, ViewHandle,
+    View, ViewAsRef, ViewContext, ViewHandle, WeakViewHandle,
 };
 
+use crate::BlocklistAIHistoryModel;
+use crate::ai::AIRequestUsageModel;
 use crate::ai::blocklist::block::cli_controller::CLISubagentController;
-use crate::ai::blocklist::prompt::prompt_alert::{PromptAlertEvent, PromptAlertView};
 use crate::ai::blocklist::prompt::PromptIconButtonTheme;
+use crate::ai::blocklist::prompt::prompt_alert::{PromptAlertEvent, PromptAlertView};
 use crate::ai::blocklist::{
     BlocklistAIHistoryEvent, BlocklistAIInputModel, InputConfig, InputType,
 };
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::llms::LLMPreferences;
-use crate::ai::AIRequestUsageModel;
 use crate::cloud_object::model::generic_string_model::StringModel;
 use crate::network::NetworkStatus;
 #[cfg(not(target_family = "wasm"))]
 use crate::search::ai_context_menu::view::AIContextMenu;
+use crate::server::ids::ServerId;
 #[cfg(not(target_family = "wasm"))]
 use crate::settings::InputSettings;
 use crate::settings::{AISettings, AISettingsChangedEvent};
@@ -53,8 +56,8 @@ use crate::terminal::model::block::BlockMetadata;
 use crate::terminal::model::session::SessionType;
 use crate::terminal::model::session::Sessions;
 use crate::terminal::profile_model_selector::{
-    calculate_max_profile_name_width, calculate_scaled_font_size, ProfileModelSelector,
-    ProfileModelSelectorEvent,
+    ProfileModelSelector, ProfileModelSelectorEvent, calculate_max_profile_name_width,
+    calculate_scaled_font_size,
 };
 use crate::terminal::session_settings::{SessionSettings, SessionSettingsChangedEvent};
 use crate::terminal::shared_session::permissions_manager::SessionPermissionsManager;
@@ -63,8 +66,7 @@ use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, ButtonSize, NakedTheme, TooltipAlignment,
 };
-use crate::workspaces::user_workspaces::UserWorkspaces;
-use crate::BlocklistAIHistoryModel;
+use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
 
 pub enum AtContextMenuDisabledReason {
     #[cfg(target_family = "wasm")]
@@ -194,6 +196,7 @@ const BLURRED_OPACITY: Opacity = 50;
 // This is used for determining whether the selector should be rendered as full or compact
 fn calculate_profile_model_selector_threshold(
     terminal_view_id: EntityId,
+    team_uid: Option<ServerId>,
     appearance: &Appearance,
     ctx: &AppContext,
 ) -> f32 {
@@ -212,11 +215,12 @@ fn calculate_profile_model_selector_threshold(
         .em_width(appearance.monospace_font_family(), scaled_font_size);
 
     let llm_preferences = LLMPreferences::as_ref(ctx);
-    let active_llm = llm_preferences.get_active_base_model(ctx, Some(terminal_view_id));
+    let active_llm =
+        llm_preferences.get_active_base_model_for_team_uid(team_uid, ctx, Some(terminal_view_id));
     let model_name_char_count = active_llm.menu_display_name().chars().count() as f32;
     let model_text_width = model_name_char_count * em_width;
 
-    let result = if has_multiple_profiles {
+    if has_multiple_profiles {
         let profile_name_char_count = AIExecutionProfilesModel::as_ref(ctx)
             .active_profile(Some(terminal_view_id), ctx)
             .data()
@@ -229,8 +233,7 @@ fn calculate_profile_model_selector_threshold(
         font_size * 20.0 + profile_text_width + model_text_width
     } else {
         20.0 * font_size + base_constant + model_text_width
-    };
-    result
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,6 +264,10 @@ impl ActionButtonTheme for UDIDisabledButtonTheme {
 
 impl From<&BlocklistAIInputModel> for InputToggleMode {
     fn from(input_model: &BlocklistAIInputModel) -> Self {
+        if ChannelState::is_local_only() {
+            return InputToggleMode::Terminal;
+        }
+
         if input_model.is_input_type_locked() {
             match input_model.input_type() {
                 InputType::Shell => InputToggleMode::Terminal,
@@ -283,6 +290,10 @@ struct CachedUIState {
     is_in_active_terminal: bool,
 }
 
+fn online_agent_controls_allowed_by_channel() -> bool {
+    !ChannelState::is_local_only()
+}
+
 impl CachedUIState {
     fn is_button_bar_blurred(&self) -> bool {
         !self.is_hovered && !self.is_in_active_terminal
@@ -291,6 +302,7 @@ impl CachedUIState {
 
 pub struct UniversalDeveloperInputButtonBar {
     terminal_view_id: EntityId,
+    view_handle: WeakViewHandle<Self>,
     mic_button: ViewHandle<ActionButton>,
     at_button: ViewHandle<ActionButton>,
     file_button: ViewHandle<ActionButton>,
@@ -437,10 +449,13 @@ impl UniversalDeveloperInputButtonBar {
         let ai_settings = AISettings::as_ref(ctx);
         let is_autodetection_enabled = ai_settings.is_ai_autodetection_enabled(ctx);
 
-        let mut options = vec![InputToggleMode::Terminal, InputToggleMode::AgentMode];
+        let mut options = vec![InputToggleMode::Terminal];
+        if online_agent_controls_allowed_by_channel() {
+            options.push(InputToggleMode::AgentMode);
+        }
 
         let mut default_option = input_model.as_ref(ctx).into();
-        if is_autodetection_enabled {
+        if is_autodetection_enabled && online_agent_controls_allowed_by_channel() {
             options.push(InputToggleMode::AutoDetection);
         } else if default_option == InputToggleMode::AutoDetection {
             // Don't set the default to auto-detection if it's not enabled.
@@ -481,12 +496,16 @@ impl UniversalDeveloperInputButtonBar {
                     ));
                 }
                 InputToggleMode::AgentMode => {
-                    ctx.emit(UniversalDeveloperInputButtonBarEvent::InputTypeSelected(
-                        InputType::AI,
-                    ));
+                    if online_agent_controls_allowed_by_channel() {
+                        ctx.emit(UniversalDeveloperInputButtonBarEvent::InputTypeSelected(
+                            InputType::AI,
+                        ));
+                    }
                 }
                 InputToggleMode::AutoDetection => {
-                    ctx.emit(UniversalDeveloperInputButtonBarEvent::EnableAutoDetection);
+                    if online_agent_controls_allowed_by_channel() {
+                        ctx.emit(UniversalDeveloperInputButtonBarEvent::EnableAutoDetection);
+                    }
                 }
             },
         });
@@ -502,8 +521,8 @@ impl UniversalDeveloperInputButtonBar {
             // Re-render when AI settings change (like voice input enabled/disabled)
             // Also update segmented control options when auto-detection setting changes
             if let AISettingsChangedEvent::AIAutoDetectionEnabled { .. } = event {
-                let is_autodection_enabled =
-                    ai_settings.as_ref(ctx).is_ai_autodetection_enabled(ctx);
+                let is_autodection_enabled = online_agent_controls_allowed_by_channel()
+                    && ai_settings.as_ref(ctx).is_ai_autodetection_enabled(ctx);
                 me.segmented_control.update(ctx, |segmented_control, ctx| {
                     if is_autodection_enabled {
                         segmented_control.update_options(
@@ -515,10 +534,11 @@ impl UniversalDeveloperInputButtonBar {
                             ctx,
                         );
                     } else {
-                        segmented_control.update_options(
-                            vec![InputToggleMode::Terminal, InputToggleMode::AgentMode],
-                            ctx,
-                        );
+                        let mut options = vec![InputToggleMode::Terminal];
+                        if online_agent_controls_allowed_by_channel() {
+                            options.push(InputToggleMode::AgentMode);
+                        }
+                        segmented_control.update_options(options, ctx);
                     }
                 });
             }
@@ -557,7 +577,7 @@ impl UniversalDeveloperInputButtonBar {
             &BlocklistAIHistoryModel::handle(ctx),
             |me, _, event, ctx| {
                 if event
-                    .terminal_view_id()
+                    .terminal_surface_id()
                     .is_some_and(|id| id != me.terminal_view_id)
                 {
                     return;
@@ -597,6 +617,7 @@ impl UniversalDeveloperInputButtonBar {
 
         let mut me = Self {
             terminal_view_id,
+            view_handle: ctx.handle(),
             mic_button: mic_button_view,
             at_button: at_button_view,
             file_button: file_button_view,
@@ -778,6 +799,14 @@ impl UniversalDeveloperInputButtonBar {
         self.profile_model_selector_full.as_ref(ctx).is_open()
             || self.profile_model_selector_compact.as_ref(ctx).is_open()
     }
+
+    fn team_uid(&self, app: &AppContext) -> Option<ServerId> {
+        self.view_handle.window_id(app).and_then(|window_id| {
+            UserWorkspaces::as_ref(app)
+                .team_context_for_window(window_id)
+                .team_uid()
+        })
+    }
 }
 
 // Implement Entity trait for UniversalDeveloperInputButtonBar
@@ -792,6 +821,10 @@ impl View for UniversalDeveloperInputButtonBar {
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn warpui::Element> {
+        // We still render in local-only mode so the user keeps the offline-compatible
+        // controls (segmented mode switcher, slash-command button). Online-only
+        // controls (mic, @, file, model selector) are gated below on
+        // `online_agent_controls_allowed_by_channel()`.
         let appearance = Appearance::as_ref(app);
         let theme = appearance.theme();
         #[cfg(feature = "voice_input")]
@@ -813,6 +846,7 @@ impl View for UniversalDeveloperInputButtonBar {
         };
 
         let build_buttons = |model_selector_element: Box<dyn warpui::Element>| {
+            let online_agent_controls_allowed = online_agent_controls_allowed_by_channel();
             // Create a horizontal layout with buttons arranged in a row
             let mut buttons = Flex::row()
                 .with_main_axis_size(MainAxisSize::Max)
@@ -823,29 +857,33 @@ impl View for UniversalDeveloperInputButtonBar {
                         .with_padding_right(4.0)
                         .finish(),
                 );
-            buttons = buttons.with_child(create_divider());
 
             buttons = buttons.with_child(ChildView::new(&self.slash_command_button).finish());
 
             #[cfg(feature = "voice_input")]
-            if is_voice_input_enabled {
+            if online_agent_controls_allowed && is_voice_input_enabled {
                 buttons = buttons.with_child(ChildView::new(&self.mic_button).finish());
             }
 
-            buttons = buttons.with_child(ChildView::new(&self.at_button).finish());
+            if online_agent_controls_allowed {
+                buttons = buttons.with_child(create_divider());
+                buttons = buttons.with_child(ChildView::new(&self.at_button).finish());
+            }
 
             // Viewers cannot attach files in shared sessions at this point.
-            if !self
-                .terminal_model
-                .lock()
-                .shared_session_status()
-                .is_viewer()
+            if online_agent_controls_allowed
+                && !self
+                    .terminal_model
+                    .lock()
+                    .shared_session_status()
+                    .is_viewer()
             {
                 buttons = buttons.with_child(ChildView::new(&self.file_button).finish());
             }
 
-            let show_model_selector = FeatureFlag::ProfilesDesignRevamp.is_enabled()
-                || *SessionSettings::as_ref(app).show_model_selectors_in_prompt;
+            let show_model_selector = online_agent_controls_allowed
+                && (FeatureFlag::ProfilesDesignRevamp.is_enabled()
+                    || *SessionSettings::as_ref(app).show_model_selectors_in_prompt);
             if show_model_selector {
                 buttons = buttons
                     .with_child(create_divider())
@@ -865,8 +903,12 @@ impl View for UniversalDeveloperInputButtonBar {
             buttons.finish()
         };
 
-        let compact_threshold =
-            calculate_profile_model_selector_threshold(self.terminal_view_id, appearance, app);
+        let compact_threshold = calculate_profile_model_selector_threshold(
+            self.terminal_view_id,
+            self.team_uid(app),
+            appearance,
+            app,
+        );
         let content = SizeConstraintSwitch::new(
             // We only need to add left padding to the full profile model selector because the
             // compact selector icons follow the UDI button styling with ~4px margin horizontally.

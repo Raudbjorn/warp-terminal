@@ -5,11 +5,11 @@ use std::time::Duration;
 use anyhow::Context;
 use chrono::{LocalResult, TimeZone, Utc};
 use warp_core::execution_mode::AppExecutionMode;
-use warp_core::{report_error, report_if_error};
+use warp_errors::{report_error, report_if_error};
 use warpui::r#async::{FutureExt as _, Timer};
 use warpui::{App, Entity, ModelContext, SingletonEntity};
 
-use super::{clear_event_queue, rudder_event_file_path, RUDDER_TELEMETRY_EVENTS_FILE_NAME};
+use super::{RUDDER_TELEMETRY_EVENTS_FILE_NAME, clear_event_queue, rudder_event_file_path};
 use crate::auth::AuthStateProvider;
 use crate::channel::ChannelState;
 use crate::features::FeatureFlag;
@@ -42,6 +42,11 @@ impl TelemetryCollector {
     }
 
     pub fn initialize_telemetry_collection(&self, ctx: &mut ModelContext<TelemetryCollector>) {
+        if ChannelState::is_local_only() {
+            log::info!("Local-only services mode; telemetry collection is disabled.");
+            return;
+        }
+
         // Start a background thread to periodically flush events from the telemetry event queue.
         if ChannelState::is_release_bundle() || FeatureFlag::WithSandboxTelemetry.is_enabled() {
             // Flush the events to Rudderstack that were persisted into a file the last time the app was
@@ -70,7 +75,7 @@ impl TelemetryCollector {
         // previously opted-out of telemetry. In the case where the user turns the telemetry from
         // on to off, we should not send another request with any telemetry, even if the event was
         // initially recorded prior to the user turning telemetry off.`
-        ctx.subscribe_to_model(&PrivacySettings::handle(ctx), |_me, event, _ctx| {
+        ctx.subscribe_to_model(&PrivacySettings::handle(ctx), |_me, _, event, _ctx| {
             if let PrivacySettingsChangedEvent::UpdateIsTelemetryEnabled { .. } = event {
                 clear_event_queue();
             }
@@ -80,6 +85,11 @@ impl TelemetryCollector {
     /// Writes all queued but unsent telemetry telemetry events to disk so that they may be sent
     /// on the next app startup.
     pub fn write_telemetry_events_to_disk(&self, ctx: &mut ModelContext<TelemetryCollector>) {
+        if ChannelState::is_local_only() {
+            log::info!("Local-only services mode; not persisting telemetry events.");
+            return;
+        }
+
         match self.server_api.persist_telemetry_events(
             MAX_TELEMETRY_EVENTS_TO_STORE,
             PrivacySettings::as_ref(ctx).get_snapshot(ctx),
@@ -88,7 +98,7 @@ impl TelemetryCollector {
                 log::info!("Successfully wrote telemetry events to disk")
             }
             Err(e) => {
-                log::error!("Failed to write telemetry events to disk {e:#}");
+                report_error!(e.context("Failed to write telemetry events to disk"));
             }
         }
     }
@@ -99,6 +109,11 @@ impl TelemetryCollector {
     /// * Write events to disk, for sending on the next app startup
     /// * Synchronously send events to rudderstack
     pub fn flush_telemetry_events_for_shutdown(&self, ctx: &mut ModelContext<TelemetryCollector>) {
+        if ChannelState::is_local_only() {
+            log::info!("Local-only services mode; not flushing telemetry events.");
+            return;
+        }
+
         let execution_mode = AppExecutionMode::as_ref(ctx);
 
         if execution_mode.send_telemetry_at_shutdown() {
@@ -145,18 +160,20 @@ impl TelemetryCollector {
 
                 // Try flushing from both new and legacy locations.
                 for path in [new_path, old_path] {
-                    report_if_error!(server_api
-                        .flush_persisted_events_to_rudder(&path, privacy_settings_snapshot)
-                        .await
-                        .context("Failed to flush rudder events from disk"));
+                    report_if_error!(
+                        server_api
+                            .flush_persisted_events_to_rudder(&path, privacy_settings_snapshot)
+                            .await
+                            .context("Failed to flush rudder events from disk")
+                    );
                     // Remove the file regardless of outcome  of flushing the events to avoid the
                     // case where we accidentally try to re-flush the events on the next app startup.
-                    if let Err(e) = remove_file(&path) {
-                        if e.kind() != std::io::ErrorKind::NotFound {
-                            warp_core::report_error!(
-                                anyhow::anyhow!(e).context("Failed to remove persisted event file")
-                            );
-                        }
+                    if let Err(e) = remove_file(&path)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        report_error!(
+                            anyhow::anyhow!(e).context("Failed to remove persisted event file")
+                        );
                     }
                 }
             },
@@ -177,16 +194,14 @@ impl TelemetryCollector {
                 if is_telemetry_enabled
                     && last_active_timestamp + ACTIVE_USAGE_DURATION.as_secs() as i64
                         > Utc::now().timestamp()
-                {
-                    if let LocalResult::Single(timestamp) =
+                    && let LocalResult::Single(timestamp) =
                         Utc.timestamp_opt(last_active_timestamp, 0)
-                    {
-                        warpui::telemetry::record_app_active_event(
-                            auth_state.user_id().map(|uid| uid.as_string()),
-                            auth_state.anonymous_id(),
-                            timestamp,
-                        );
-                    }
+                {
+                    warpui::telemetry::record_app_active_event(
+                        auth_state.user_id().map(|uid| uid.as_string()),
+                        auth_state.anonymous_id(),
+                        timestamp,
+                    );
                 }
                 Timer::after(ACTIVE_USAGE_DURATION).await;
             },

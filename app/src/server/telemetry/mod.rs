@@ -23,14 +23,15 @@ use rudder_message::{
     BatchMessageItem as RudderBatchMessage, Message as RudderMessage,
 };
 use warp_core::channel::RudderStackDestination;
+use warp_errors::report_error;
 use warpui::telemetry::Event;
 
+use crate::ChannelState;
 use crate::auth::UserUid;
 use crate::features::FeatureFlag;
 use crate::server::telemetry::context::AttachContext;
 use crate::server::telemetry_ext::TelemetryExt;
 use crate::settings::PrivacySettingsSnapshot;
-use crate::ChannelState;
 
 /// Filename for file where telemetry events are written on app quit.
 const RUDDER_TELEMETRY_EVENTS_FILE_NAME: &str = "rudder_telemetry_events.json";
@@ -94,6 +95,10 @@ impl TelemetryApi {
     pub async fn flush_events(&self, settings_snapshot: PrivacySettingsSnapshot) -> Result<usize> {
         let events = warpui::telemetry::flush_events();
         let event_count = events.len();
+        if ChannelState::is_local_only() {
+            log::debug!("Dropping queued telemetry events in local-only services mode");
+            return Ok(event_count);
+        }
 
         #[cfg(not(target_family = "wasm"))]
         if FeatureFlag::SendTelemetryToFile.is_enabled() {
@@ -121,6 +126,11 @@ impl TelemetryApi {
         path: &Path,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if ChannelState::is_local_only() {
+            log::debug!("Skipping persisted telemetry flush in local-only services mode");
+            return Ok(());
+        }
+
         if path.exists() {
             let file = File::open(path)?;
             let events: Vec<RudderBatchMessage> = serde_json::from_reader(file)?;
@@ -149,6 +159,12 @@ impl TelemetryApi {
         max_event_count: usize,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if ChannelState::is_local_only() {
+            warpui::telemetry::flush_events();
+            log::debug!("Dropping queued telemetry events in local-only services mode");
+            return Ok(());
+        }
+
         self.flush_and_persist_events_at_path(
             max_event_count,
             settings_snapshot,
@@ -172,7 +188,7 @@ impl TelemetryApi {
 
         let events = warpui::telemetry::flush_events();
         if events.len() > max_event_count {
-            log::error!("More telemetry events in queue than the limit to persist")
+            report_error!("More telemetry events in queue than the limit to persist")
         }
 
         self.persist_events_at_path(&file, max_event_count, events)?;
@@ -227,6 +243,11 @@ impl TelemetryApi {
             warpui::time::get_current_time(),
         );
 
+        if ChannelState::is_local_only() {
+            log::debug!("Skipping telemetry event send in local-only services mode");
+            return Ok(());
+        }
+
         self.send_telemetry_event_internal(event, settings_snapshot)
             .await
     }
@@ -270,11 +291,11 @@ impl TelemetryApi {
             #[cfg(not(target_family = "wasm"))]
             if let Err(error) = &result {
                 for cause in error.chain() {
-                    if let Some(err) = cause.downcast_ref::<reqwest::Error>() {
-                        if err.is_connect() {
-                            log::warn!("Failed to send telemetry event: {error}");
-                            return Ok(());
-                        }
+                    if let Some(err) = cause.downcast_ref::<reqwest::Error>()
+                        && err.is_connect()
+                    {
+                        log::warn!("Failed to send telemetry event: {error}");
+                        return Ok(());
                     }
                 }
             }
@@ -305,6 +326,11 @@ impl TelemetryApi {
         messages: Vec<RudderBatchMessageWithMetadata>,
         settings_snapshot: PrivacySettingsSnapshot,
     ) -> Result<()> {
+        if ChannelState::is_local_only() {
+            log::debug!("Dropping RudderStack telemetry batch in local-only services mode");
+            return Ok(());
+        }
+
         if messages.is_empty() {
             log::debug!("Dropping empty RudderStack telemetry batch");
             return Ok(());
@@ -363,11 +389,11 @@ impl TelemetryApi {
                 // against `is_connect` and not the whole loop.
                 #[cfg(not(target_family = "wasm"))]
                 for cause in e.chain() {
-                    if let Some(err) = cause.downcast_ref::<reqwest::Error>() {
-                        if err.is_connect() {
-                            log::warn!("Failed to send event to RudderStack: {e}");
-                            return Ok(());
-                        }
+                    if let Some(err) = cause.downcast_ref::<reqwest::Error>()
+                        && err.is_connect()
+                    {
+                        log::warn!("Failed to send event to RudderStack: {e}");
+                        return Ok(());
                     }
                 }
                 return Err(e);
@@ -394,13 +420,9 @@ impl TelemetryApi {
             RudderMessage::Batch(_) => "/v1/batch",
         };
 
-        self.client
-            .post(&format!("{}{}", rudder_stack_destination.root_url, path))
-            .basic_auth(rudder_stack_destination.write_key, Some(""))
-            .json(&msg)
-            .send()
-            .await?
-            .error_for_status()?;
+        // oh-my-warp: observability stripped — drop the telemetry request instead
+        // of POSTing it to RudderStack so no data ever leaves the machine.
+        let _ = (&self.client, &msg, path, rudder_stack_destination);
 
         Ok(())
     }

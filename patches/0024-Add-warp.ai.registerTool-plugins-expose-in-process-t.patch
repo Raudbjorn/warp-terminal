@@ -1,0 +1,517 @@
+From f929420f1787d64aba241c87ca68dd20408c31e3 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Thu, 21 May 2026 21:48:35 -0400
+Subject: [PATCH 24/48] Add warp.ai.registerTool: plugins expose in-process
+ tools to the AI agent (oh-my-warp)
+
+---
+ app/src/ai/agent/api.rs                       | 50 +++++++++++-
+ .../action_model/execute/call_mcp_tool.rs     | 51 ++++++++++++
+ app/src/plugin/ai_tools.rs                    | 77 +++++++++++++++++++
+ app/src/plugin/app/mod.rs                     |  3 +-
+ app/src/plugin/app/service_impl/mod.rs        |  2 +
+ app/src/plugin/app/service_impl/tools.rs      | 38 +++++++++
+ app/src/plugin/host/native/js_api/mod.rs      | 40 ++++++++++
+ app/src/plugin/host/native/plugin.rs          | 24 +++++-
+ app/src/plugin/mod.rs                         |  1 +
+ app/src/plugin/service/mod.rs                 |  2 +
+ app/src/plugin/service/tools.rs               | 33 ++++++++
+ 11 files changed, 317 insertions(+), 4 deletions(-)
+ create mode 100644 app/src/plugin/ai_tools.rs
+ create mode 100644 app/src/plugin/app/service_impl/tools.rs
+ create mode 100644 app/src/plugin/service/tools.rs
+
+diff --git a/app/src/ai/agent/api.rs b/app/src/ai/agent/api.rs
+index b40bd77d..8085e779 100644
+--- a/app/src/ai/agent/api.rs
++++ b/app/src/ai/agent/api.rs
+@@ -153,6 +153,31 @@ pub struct ConversationData {
+     pub existing_suggestions: Option<Suggestions>,
+ }
+ 
++/// oh-my-warp: the AI tools registered by JS plugins (`warp.ai.registerTool`), built as `rmcp`
++/// tools to inject into the model's MCP context. They are dispatched in-process by the tool-call
++/// executor (`crate::ai::blocklist::action_model::execute::call_mcp_tool`). See PLUGIN_SPEC.md (M4).
++#[cfg(feature = "plugin_host")]
++fn plugin_ai_tools() -> Vec<rmcp::model::Tool> {
++    crate::plugin::ai_tools::all()
++        .into_iter()
++        .filter_map(|tool| {
++            let schema: serde_json::Value = serde_json::from_str(&tool.schema_json)
++                .unwrap_or_else(|_| serde_json::json!({ "type": "object" }));
++            serde_json::from_value(serde_json::json!({
++                "name": tool.name,
++                "description": tool.description,
++                "inputSchema": schema,
++            }))
++            .ok()
++        })
++        .collect()
++}
++
++/// oh-my-warp: synthetic MCP "server" id grouping plugin-registered tools in the model request.
++/// A fixed UUID so it never collides with a real installed MCP server.
++#[cfg(feature = "plugin_host")]
++const PLUGIN_TOOLS_SERVER_ID: &str = "0a0a0a0a-0b0b-4c0c-8d0d-0e0e0e0e0e0e";
++
+ impl RequestParams {
+     pub fn new(
+         terminal_view_id: Option<EntityId>,
+@@ -194,7 +219,8 @@ impl RequestParams {
+                     .values(),
+             );
+ 
+-            let servers: Vec<MCPServer> = active_servers
++            #[cfg_attr(not(feature = "plugin_host"), allow(unused_mut))]
++            let mut servers: Vec<MCPServer> = active_servers
+                 .into_iter()
+                 .map(|server| MCPServer {
+                     name: server.name().to_string(),
+@@ -205,6 +231,22 @@ impl RequestParams {
+                 })
+                 .collect();
+ 
++            // oh-my-warp: surface plugin-registered AI tools as a synthetic MCP server so the
++            // model can call them; the call is dispatched in-process (see `call_mcp_tool`).
++            #[cfg(feature = "plugin_host")]
++            {
++                let plugin_tools = plugin_ai_tools();
++                if !plugin_tools.is_empty() {
++                    servers.push(MCPServer {
++                        name: "oh-my-warp plugins".to_string(),
++                        description: "Tools registered by oh-my-warp plugins".to_string(),
++                        id: PLUGIN_TOOLS_SERVER_ID.to_string(),
++                        resources: vec![],
++                        tools: plugin_tools,
++                    });
++                }
++            }
++
+             if servers.is_empty() {
+                 None
+             } else {
+@@ -222,7 +264,11 @@ impl RequestParams {
+                 .resources()
+                 .cloned()
+                 .collect::<Vec<_>>();
+-            let tools = templatable_mcp_manager.tools().cloned().collect::<Vec<_>>();
++            #[cfg_attr(not(feature = "plugin_host"), allow(unused_mut))]
++            let mut tools = templatable_mcp_manager.tools().cloned().collect::<Vec<_>>();
++            // oh-my-warp: include plugin-registered AI tools (dispatched in-process).
++            #[cfg(feature = "plugin_host")]
++            tools.extend(plugin_ai_tools());
+ 
+             #[allow(deprecated)]
+             (!resources.is_empty() || !tools.is_empty()).then_some(MCPContext {
+diff --git a/app/src/ai/blocklist/action_model/execute/call_mcp_tool.rs b/app/src/ai/blocklist/action_model/execute/call_mcp_tool.rs
+index 2ac150a8..f71a5f0d 100644
+--- a/app/src/ai/blocklist/action_model/execute/call_mcp_tool.rs
++++ b/app/src/ai/blocklist/action_model/execute/call_mcp_tool.rs
+@@ -102,6 +102,57 @@ impl CallMCPToolExecutor {
+             let name_owned = name.to_owned();
+             let name_clone = name_owned.clone();
+ 
++            // oh-my-warp: a plugin-registered AI tool (warp.ai.registerTool) is dispatched
++            // in-process to the plugin host, not to an MCP server. Tool args cross as a JSON string;
++            // the plugin's `run(argsJson)` returns a string result. See PLUGIN_SPEC.md (M4).
++            #[cfg(feature = "plugin_host")]
++            if let Some(function_id) = crate::plugin::ai_tools::function_id(&name_owned) {
++                use crate::plugin::service::{
++                    CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
++                };
++                let args_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_owned());
++                let Some(caller) = crate::plugin::PluginHost::handle(ctx)
++                    .as_ref(ctx)
++                    .plugin_service_caller::<CallJsFunctionService>()
++                else {
++                    return ActionExecution::Sync(AIAgentActionResultType::CallMCPTool(
++                        CallMCPToolResult::Error("plugin host unavailable".to_owned()),
++                    ));
++                };
++                let Ok(serialized_input) = warp_js::SerializedJsValue::from_value(args_json) else {
++                    return ActionExecution::Sync(AIAgentActionResultType::CallMCPTool(
++                        CallMCPToolResult::Error("failed to serialize tool args".to_owned()),
++                    ));
++                };
++                let name_for_result = name_clone.clone();
++                return ActionExecution::new_async(
++                    async move {
++                        let text = match caller
++                            .call(CallJsFunctionRequest {
++                                id: function_id,
++                                serialized_input,
++                            })
++                            .await
++                        {
++                            Ok(CallJsFunctionResponse::Success(output)) => output
++                                .to_value::<crate::plugin::ai_tools::ToolOutput>()
++                                .map(|o| o.0.unwrap_or_default())
++                                .unwrap_or_default(),
++                            Ok(CallJsFunctionResponse::Error { message }) => {
++                                format!("plugin tool error: {message}")
++                            }
++                            Err(e) => format!("plugin tool dispatch failed: {e:?}"),
++                        };
++                        Ok(rmcp::model::CallToolResult::success(vec![
++                            rmcp::model::Content::text(text),
++                        ]))
++                    },
++                    move |res, ctx| {
++                        handle_call_tool_result(res, server_output_id, name_for_result, ctx)
++                    },
++                );
++            }
++
+             let serde_json::Value::Object(mut arguments) = input.clone() else {
+                 return ActionExecution::Sync(AIAgentActionResultType::CallMCPTool(
+                     CallMCPToolResult::Error("MCP server tool input not an object".to_owned()),
+diff --git a/app/src/plugin/ai_tools.rs b/app/src/plugin/ai_tools.rs
+new file mode 100644
+index 00000000..0c82d0ca
+--- /dev/null
++++ b/app/src/plugin/ai_tools.rs
+@@ -0,0 +1,77 @@
++//! oh-my-warp: runtime registry of AI agent tools registered by JS plugins via `warp.ai.registerTool`.
++//!
++//! A plugin (granted the `ai` permission) calls `warp.ai.registerTool({ name, description, schema,
++//! run })` in the host process. The host registers the `run` callback in its
++//! [`warp_js::JsFunctionRegistry`] and sends a `RegisterToolService` request to the app, which
++//! records the tool here. The agent request builder ([`crate::ai::agent::api`]) injects these tools
++//! into the model's MCP context, and the tool-call executor
++//! ([`crate::ai::blocklist::action_model::execute::call_mcp_tool`]) dispatches a call back to the
++//! plugin's `run` callback via `CallJsFunctionService`.
++//!
++//! Tool I/O is JSON-string based (the proven `warp_js` `String` path): `run(argsJson)` receives the
++//! model's arguments as a JSON string and returns a string result. See PLUGIN_SPEC.md (M4).
++
++use std::collections::HashMap;
++use std::sync::{LazyLock, Mutex};
++
++use serde::{Deserialize, Serialize};
++use warp_js::{FromWarpJs, JsFunctionId, JsFunctionRegistry};
++
++/// A tool registered by a plugin via `warp.ai.registerTool`.
++#[derive(Clone, Debug)]
++pub struct PluginTool {
++    /// Tool name the model calls (should be unique; authors namespace it, e.g. `"greet_lookup"`).
++    pub name: String,
++    /// Human-readable description shown to the model.
++    pub description: String,
++    /// JSON Schema (as a JSON string) describing the tool's argument object.
++    pub schema_json: String,
++    /// Id of the registered JS `run` callback in the plugin host, invoked when the tool is called.
++    pub function_id: JsFunctionId,
++}
++
++/// The lenient return value of a plugin tool's `run` callback: a string result, or nothing.
++///
++/// Mirrors `events::OptionalToast` — using a bare `String` output would error on a `void`/`undefined`
++/// return and drop the IPC response ("oneshot cancelled").
++#[derive(Clone, Debug, Default, Serialize, Deserialize)]
++pub struct ToolOutput(pub Option<String>);
++
++impl<'js> FromWarpJs<'js> for ToolOutput {
++    fn from_warp_js(
++        ctx: rquickjs::Ctx<'js>,
++        value: rquickjs::Value<'js>,
++        registry: &mut JsFunctionRegistry,
++    ) -> rquickjs::Result<Self> {
++        if value.is_undefined() || value.is_null() {
++            return Ok(ToolOutput(None));
++        }
++        Ok(ToolOutput(Some(String::from_warp_js(
++            ctx, value, registry,
++        )?)))
++    }
++}
++
++static REGISTRY: LazyLock<Mutex<HashMap<String, PluginTool>>> =
++    LazyLock::new(|| Mutex::new(HashMap::new()));
++
++/// Registers (or replaces) a plugin tool. Called on the app process when a plugin invokes
++/// `warp.ai.registerTool`.
++pub fn register(tool: PluginTool) {
++    log::info!(
++        "Registered plugin AI tool {:?} ({})",
++        tool.name,
++        tool.description
++    );
++    REGISTRY.lock().unwrap().insert(tool.name.clone(), tool);
++}
++
++/// Returns a snapshot of all registered plugin tools.
++pub fn all() -> Vec<PluginTool> {
++    REGISTRY.lock().unwrap().values().cloned().collect()
++}
++
++/// Returns the JS `run` callback id for the tool with the given name, if registered.
++pub fn function_id(name: &str) -> Option<JsFunctionId> {
++    REGISTRY.lock().unwrap().get(name).map(|t| t.function_id)
++}
+diff --git a/app/src/plugin/app/mod.rs b/app/src/plugin/app/mod.rs
+index 19ca06ad..9b93c90d 100644
+--- a/app/src/plugin/app/mod.rs
++++ b/app/src/plugin/app/mod.rs
+@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
+ use command::blocking::Command;
+ use service_impl::{
+     LogServiceImpl, PluginAppRequestServiceImpl, PluginHostBootstrapServiceImpl,
+-    RegisterCommandServiceImpl, RegisterEventHandlerServiceImpl,
++    RegisterCommandServiceImpl, RegisterEventHandlerServiceImpl, RegisterToolServiceImpl,
+ };
+ use warpui::keymap::EditableBinding;
+ use warpui::{Entity, ModelContext, SingletonEntity};
+@@ -85,6 +85,7 @@ impl PluginHost {
+             .with_service(LogServiceImpl::new())
+             .with_service(RegisterCommandServiceImpl::new())
+             .with_service(RegisterEventHandlerServiceImpl::new())
++            .with_service(RegisterToolServiceImpl::new())
+             .with_service(PluginAppRequestServiceImpl::new());
+ 
+         #[cfg(feature = "completions_v2")]
+diff --git a/app/src/plugin/app/service_impl/mod.rs b/app/src/plugin/app/service_impl/mod.rs
+index d889de8d..8e2ec54e 100644
+--- a/app/src/plugin/app/service_impl/mod.rs
++++ b/app/src/plugin/app/service_impl/mod.rs
+@@ -9,9 +9,11 @@ mod commands;
+ mod events;
+ mod logging;
+ mod plugin_host_bootstrap;
++mod tools;
+ 
+ pub(super) use app_requests::*;
+ pub(super) use commands::*;
+ pub(super) use events::*;
+ pub(super) use logging::*;
+ pub(super) use plugin_host_bootstrap::*;
++pub(super) use tools::*;
+diff --git a/app/src/plugin/app/service_impl/tools.rs b/app/src/plugin/app/service_impl/tools.rs
+new file mode 100644
+index 00000000..3e60f769
+--- /dev/null
++++ b/app/src/plugin/app/service_impl/tools.rs
+@@ -0,0 +1,38 @@
++//! The implementation of `RegisterToolService` served by the app process to the plugin host.
++
++use std::fmt;
++
++use async_trait::async_trait;
++
++use crate::plugin::ai_tools::PluginTool;
++use crate::plugin::service::{RegisterToolRequest, RegisterToolResponse, RegisterToolService};
++
++#[derive(Clone, Default)]
++pub struct RegisterToolServiceImpl {}
++
++impl RegisterToolServiceImpl {
++    pub fn new() -> Self {
++        Self {}
++    }
++}
++
++impl fmt::Debug for RegisterToolServiceImpl {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("RegisterToolService").finish()
++    }
++}
++
++#[async_trait]
++impl ipc::ServiceImpl for RegisterToolServiceImpl {
++    type Service = RegisterToolService;
++
++    async fn handle_request(&self, request: RegisterToolRequest) -> RegisterToolResponse {
++        crate::plugin::ai_tools::register(PluginTool {
++            name: request.name,
++            description: request.description,
++            schema_json: request.schema_json,
++            function_id: request.function_id,
++        });
++        RegisterToolResponse { success: true }
++    }
++}
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index 237fbaf5..570f7623 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -2,6 +2,7 @@ use rquickjs::{function::Opt, prelude::MutFn, Ctx, Function, Object};
+ 
+ use super::manifest::Manifest;
+ use super::plugin::PluginHandle;
++use crate::plugin::ai_tools::ToolOutput;
+ use crate::plugin::app_requests::{PluginAppRequest, ToastKind};
+ use crate::plugin::events::{
+     CommandFinishedEvent, CommandStartedEvent, OptionalToast, EVENT_COMMAND_FINISHED,
+@@ -73,6 +74,9 @@ pub fn warp<'js>(
+     if manifest.permits("ui") {
+         api.set("ui", ui(ctx)?)?;
+     }
++    if manifest.permits("ai") {
++        api.set("ai", ai(plugin.clone(), ctx)?)?;
++    }
+ 
+     #[cfg(feature = "completions_v2")]
+     if manifest.permits("completions") {
+@@ -82,6 +86,42 @@ pub fn warp<'js>(
+     Ok(api)
+ }
+ 
++/// Returns a JS object representing the AI namespace for the Warp Plugin API.
++///
++/// `registerTool({ name, description, schema, run })` — registers a tool the Warp AI agent can
++/// call. `schema` is a JSON Schema **string** for the argument object; `run(argsJson)` receives the
++/// model's arguments as a JSON string and returns a string result. The tool is injected into the
++/// agent's MCP context and dispatched in-process back to this callback. Requires the `ai`
++/// permission. See PLUGIN_SPEC.md (M4).
++fn ai<'js>(plugin: PluginHandle, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
++    let ai = Object::new(ctx)?;
++    ai.set(
++        "registerTool",
++        Function::new(
++            ctx,
++            MutFn::from(move |tool: Object<'js>| {
++                let name: String = tool.get("name").unwrap_or_default();
++                let description: String = tool.get("description").unwrap_or_default();
++                let schema_json: String = tool.get("schema").unwrap_or_default();
++                let Ok(run) = tool.get::<_, Function>("run") else {
++                    log::warn!("warp.ai.registerTool: tool {name:?} is missing a 'run' function");
++                    return;
++                };
++                if name.is_empty() {
++                    log::warn!("warp.ai.registerTool: ignoring tool with empty 'name'");
++                    return;
++                }
++                let mut plugin = plugin.get_mut();
++                let func_ref = plugin
++                    .js_function_registry_mut()
++                    .register_js_function::<String, ToolOutput>(run, ctx);
++                plugin.register_tool(name, description, schema_json, func_ref.id);
++            }),
++        ),
++    )?;
++    Ok(ai)
++}
++
+ /// Returns a JS object representing the UI namespace for the Warp Plugin API.
+ ///
+ /// `toast(message: string, kind?: "info" | "warn" | "error")` — shows a transient toast.
+diff --git a/app/src/plugin/host/native/plugin.rs b/app/src/plugin/host/native/plugin.rs
+index 6fc3474d..00ba943f 100644
+--- a/app/src/plugin/host/native/plugin.rs
++++ b/app/src/plugin/host/native/plugin.rs
+@@ -8,7 +8,7 @@ use warp_js::{JsFunctionId, JsFunctionRegistry, SerializedJsValue};
+ 
+ use crate::plugin::service::{
+     RegisterCommandRequest, RegisterCommandService, RegisterEventHandlerRequest,
+-    RegisterEventHandlerService,
++    RegisterEventHandlerService, RegisterToolRequest, RegisterToolService,
+ };
+ 
+ cfg_if::cfg_if! {
+@@ -50,6 +50,7 @@ impl PluginHandle {
+ pub(super) struct AppServiceCallers {
+     register_command_caller: Box<dyn ipc::ServiceCaller<RegisterCommandService>>,
+     register_event_handler_caller: Box<dyn ipc::ServiceCaller<RegisterEventHandlerService>>,
++    register_tool_caller: Box<dyn ipc::ServiceCaller<RegisterToolService>>,
+     #[cfg(feature = "completions_v2")]
+     register_command_signatures_caller:
+         Box<dyn ipc::ServiceCaller<RegisterCommandSignatureService>>,
+@@ -64,6 +65,7 @@ impl AppServiceCallers {
+             register_event_handler_caller: ipc::service_caller::<RegisterEventHandlerService>(
+                 app_client.clone(),
+             ),
++            register_tool_caller: ipc::service_caller::<RegisterToolService>(app_client.clone()),
+             #[cfg(feature = "completions_v2")]
+             register_command_signatures_caller: ipc::service_caller::<
+                 RegisterCommandSignatureService,
+@@ -145,6 +147,26 @@ impl Plugin {
+         }
+     }
+ 
++    /// Registers a JS `run` callback (by its `function_id`) as an AI agent tool.
++    pub(super) fn register_tool(
++        &mut self,
++        name: String,
++        description: String,
++        schema_json: String,
++        function_id: JsFunctionId,
++    ) {
++        if let Err(e) = warpui::r#async::block_on(self.app_services.register_tool_caller.call(
++            RegisterToolRequest {
++                name,
++                description,
++                schema_json,
++                function_id,
++            },
++        )) {
++            log::warn!("Failed to register plugin AI tool: {e:?}");
++        }
++    }
++
+     pub(super) fn js_function_registry_mut(&mut self) -> &mut JsFunctionRegistry {
+         &mut self.js_function_registry
+     }
+diff --git a/app/src/plugin/mod.rs b/app/src/plugin/mod.rs
+index aad50725..4bd466c9 100644
+--- a/app/src/plugin/mod.rs
++++ b/app/src/plugin/mod.rs
+@@ -1,3 +1,4 @@
++pub(crate) mod ai_tools;
+ pub(crate) mod app;
+ pub(crate) mod app_requests;
+ pub(crate) mod commands;
+diff --git a/app/src/plugin/service/mod.rs b/app/src/plugin/service/mod.rs
+index efc7bfcb..a943ba6a 100644
+--- a/app/src/plugin/service/mod.rs
++++ b/app/src/plugin/service/mod.rs
+@@ -10,6 +10,7 @@ mod commands;
+ mod events;
+ mod logging;
+ mod plugin_host_bootstrap;
++mod tools;
+ 
+ pub use app_requests::*;
+ pub use call_js_function::*;
+@@ -17,3 +18,4 @@ pub use commands::*;
+ pub use events::*;
+ pub use logging::*;
+ pub use plugin_host_bootstrap::*;
++pub use tools::*;
+diff --git a/app/src/plugin/service/tools.rs b/app/src/plugin/service/tools.rs
+new file mode 100644
+index 00000000..a288845d
+--- /dev/null
++++ b/app/src/plugin/service/tools.rs
+@@ -0,0 +1,33 @@
++//! IPC service for registering AI agent tools defined by JS plugins.
++//!
++//! Hosted by the app process and called by the plugin host process when a plugin invokes
++//! `warp.ai.registerTool`. See [`crate::plugin::ai_tools`].
++
++use serde::{Deserialize, Serialize};
++use warp_js::JsFunctionId;
++
++#[derive(Clone, Serialize, Deserialize, Debug)]
++pub struct RegisterToolRequest {
++    /// Tool name the model calls (unique across plugins).
++    pub name: String,
++    /// Human-readable description shown to the model.
++    pub description: String,
++    /// JSON Schema (as a JSON string) describing the tool's argument object.
++    pub schema_json: String,
++    /// Id of the JS `run` callback (registered in the host) to invoke when the tool is called.
++    pub function_id: JsFunctionId,
++}
++
++#[derive(Clone, Serialize, Deserialize, Debug)]
++pub struct RegisterToolResponse {
++    /// `true` if the request succeeded, `false` otherwise.
++    pub success: bool,
++}
++
++/// IPC service to register plugin AI tools in the app-side tool registry.
++pub struct RegisterToolService {}
++
++impl ipc::Service for RegisterToolService {
++    type Request = RegisterToolRequest;
++    type Response = RegisterToolResponse;
++}

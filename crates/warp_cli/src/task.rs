@@ -4,8 +4,10 @@ use clap::{Args, Subcommand, ValueEnum};
 use crate::SortOrderArg;
 use crate::date_time::parse_rfc3339;
 use crate::json_filter::JsonOutput;
+use crate::scope::TeamSelection;
 
 /// Task-related subcommands.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, Subcommand)]
 pub enum TaskCommand {
     /// List ambient agent tasks.
@@ -18,6 +20,17 @@ pub enum TaskCommand {
     /// Messages sent to and from runs.
     #[command(subcommand)]
     Message(MessageCommand),
+}
+
+impl TaskCommand {
+    pub(crate) fn as_str_for_tracing(&self) -> &'static str {
+        match self {
+            TaskCommand::List(_) => "run list",
+            TaskCommand::Get(_) => "run get",
+            TaskCommand::Conversation(_) => "run conversation",
+            TaskCommand::Message(_) => "run message",
+        }
+    }
 }
 
 /// Conversation-related subcommands.
@@ -119,6 +132,8 @@ pub struct MessageDeliveredArgs {
 
 #[derive(Debug, Clone, Args)]
 pub struct ListTasksArgs {
+    #[command(flatten)]
+    pub team_selection: TeamSelection,
     /// Maximum number of tasks to return (default: 10).
     #[arg(short = 'L', long = "limit", default_value = "10")]
     pub limit: i32,

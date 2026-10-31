@@ -31,11 +31,7 @@ while IFS= read -r match; do
     rest=${match#*:}
     line=${rest%%:*}
 
-    if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
-        echo "::error file=${file#./},line=$line::Move this inline test module to a sibling _tests.rs file."
-    else
-        echo "$match"
-    fi
+    echo "$match"
 done <<< "$matches"
 
 exit 1

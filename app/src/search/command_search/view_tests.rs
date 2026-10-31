@@ -1,5 +1,5 @@
-use warpui::platform::WindowStyle;
 use warpui::App;
+use warpui::platform::WindowStyle;
 
 use super::*;
 use crate::cloud_object::model::persistence::CloudModel;
@@ -45,7 +45,10 @@ fn test_render_view() {
         initialize_app(&mut app);
 
         let (_window_id, _view) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
-            CommandSearchView::new(ServerApiProvider::as_ref(ctx).get_ai_client(), ctx)
+            CommandSearchView::new(
+                ServerApiProvider::as_ref(ctx).get_command_generation_client(),
+                ctx,
+            )
         });
 
         app.update(|_| {
