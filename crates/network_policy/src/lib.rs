@@ -1,3 +1,21 @@
+//! The network policy of local-only services mode: only loopback destinations are allowed.
+//!
+//! [`check_url`] decides whether a request may start. Native clients must also be built with
+//! `apply_to_client_builder` (or `apply_to_blocking_client_builder`), which re-checks every
+//! redirect and turns proxies off, because the check only sees the URL a request starts with.
+//!
+//! # WebAssembly
+//!
+//! The wasm build keeps [`check_url`] and drops the rest: the redirect policy and the proxy
+//! settings do not exist on wasm, where `fetch` belongs to the browser. A browser follows
+//! redirects itself, so a loopback URL that passes [`check_url`] can still be redirected to a
+//! public host, and the policy never sees the hop. Native clients are not affected.
+//!
+//! This is a known gap, not an oversight. Closing it needs `fetch` with `redirect: "error"`, which
+//! reqwest's wasm backend does not expose (`redirect: "manual"` does not help: a browser returns an
+//! opaque response without a readable `Location`). Until then, code that runs on wasm must not
+//! treat a passed [`check_url`] as a promise that the request stays on the machine.
+
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU8, Ordering};
 

@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Type-checks the crates that carry wasm-specific code for wasm32. This is what to run after
+# touching a `cfg(target_family = "wasm")` branch in them. Needs the target:
+#
+#   rustup target add wasm32-unknown-unknown
+
+set -eo pipefail
+
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+
+cargo check --keep-going \
+    -p network_policy -p http_client -p asset_cache \
+    --target wasm32-unknown-unknown "$@"

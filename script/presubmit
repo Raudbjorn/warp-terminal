@@ -29,6 +29,15 @@ cargo clippy --workspace --all-targets --tests -- -D warnings
 cargo clippy -p warp --all-targets --tests -- -D warnings
 echo "clippy succeeded..."
 
+# The wasm32 target is optional locally; without it the check is skipped, not failed.
+if rustup target list --installed | grep -qx wasm32-unknown-unknown; then
+    echo "Checking the wasm32 build of the network policy crates..."
+    ./script/wasm/check
+    echo "wasm32 check succeeded..."
+else
+    echo "Skipping the wasm32 check; run 'rustup target add wasm32-unknown-unknown' to enable it."
+fi
+
 echo "Running clang-format..."
 ./script/run-clang-format.py -r --extensions 'c,h,cpp,m' ./crates/warpui/src/ ./app/src/
 echo "clang-format succeeded..."
