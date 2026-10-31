@@ -96,6 +96,14 @@ impl TelemetryApi {
             return Ok(());
         }
 
+        // `telemetry_config: None` means telemetry is disabled for this build, and
+        // `telemetry_file_name()` is then empty — which would make the path below
+        // collapse to the log directory itself.
+        let file_name = ChannelState::telemetry_file_name();
+        if file_name.is_empty() {
+            return Ok(());
+        }
+
         let lines: Vec<String> = events
             .into_iter()
             .filter(|event| !event.contains_ugc)
@@ -106,7 +114,7 @@ impl TelemetryApi {
         }
 
         let log_directory = warp_logging::log_directory()?;
-        let path = log_directory.join(&*ChannelState::telemetry_file_name());
+        let path = log_directory.join(&*file_name);
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         for line in lines {
             writeln!(file, "{line}")?;
