@@ -135,7 +135,10 @@ impl LocalAIProviderWidget {
                 ai_settings.local_openai_prediction_model.value().clone(),
                 ai_settings.local_openai_timeout_ms.value().to_string(),
                 ai_settings.local_openai_opencode_command.value().clone(),
-                ai_settings.local_openai_opencode_args.value().join(" "),
+                // Quote with `shell_words::join` so the text round-trips through
+                // the `shell_words::split` save handler below: arguments with
+                // spaces, quotes, or backslashes survive an unchanged save.
+                shell_words::join(ai_settings.local_openai_opencode_args.value()),
             )
         };
         let base_url_editor = Self::create_editor(ctx, base_url, "http://127.0.0.1:1234/v1", false);
