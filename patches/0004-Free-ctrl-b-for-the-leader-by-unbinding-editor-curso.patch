@@ -1,0 +1,35 @@
+From 65ba3bd641cdca8398861211f1a5c864848309d7 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Wed, 20 May 2026 12:29:16 -0400
+Subject: [PATCH 04/48] Free ctrl-b for the leader by unbinding editor
+ cursor-left
+
+The leader prefix is ctrl-b, but EditorView bound ctrl-b to editor_view:left
+("move cursor left"). The keymap matcher fires an exact single-key match
+before a longer sequence, so that binding shadowed the leader chord in the
+terminal input. Drop the ctrl-b default from editor_view:left so the prefix can
+start; the Left arrow still moves the cursor.
+---
+ app/src/editor/view/mod.rs | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/app/src/editor/view/mod.rs b/app/src/editor/view/mod.rs
+index 4581c9c3..90934a45 100644
+--- a/app/src/editor/view/mod.rs
++++ b/app/src/editor/view/mod.rs
+@@ -621,9 +621,13 @@ pub fn init(ctx: &mut AppContext) {
+         EditableBinding::new("editor_view:down", "Move cursor down", EditorAction::Down)
+             .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
+             .with_key_binding("ctrl-n"),
++        // oh-my-warp: ctrl-b is the tmux-style leader/prefix key (see
++        // crate::util::leader), so it is intentionally NOT bound to cursor-left
++        // here — an exact single-key ctrl-b binding would shadow the leader chord
++        // (the matcher fires an exact match before a longer sequence). Use the
++        // Left arrow for cursor-left.
+         EditableBinding::new("editor_view:left", "Move cursor left", EditorAction::Left)
+-            .with_context_predicate(id!("EditorView") & !id!("IMEOpen"))
+-            .with_key_binding("ctrl-b"),
++            .with_context_predicate(id!("EditorView") & !id!("IMEOpen")),
+         EditableBinding::new(
+             "editor_view:right",
+             "Move cursor right",

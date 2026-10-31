@@ -7,6 +7,7 @@ use super::js_api;
 use super::plugin::{AppServiceCallers, PluginHandle};
 use super::plugin_ref::PluginRef;
 use super::runners::PluginRunnerMessage;
+use crate::plugin::app_requests::PluginAppRequest;
 
 /// The name of the entrypoint JS file for a plugin.
 pub(super) const PLUGIN_ENTRYPOINT_JS_FILE_NAME: &str = "main.js";
@@ -52,6 +53,27 @@ impl PluginRunner {
     /// After `activate()`, listens for incoming [`PluginRequest`]s from the host main thread and
     /// serves corresponding responses.
     pub(super) fn run(&mut self, plugin_ref: &PluginRef) -> Result<()> {
+        let manifest = plugin_ref.manifest();
+        let plugin_id = plugin_ref.effective_id(&manifest);
+
+        // Enforce `engines.warp` before loading any plugin code: an incompatible plugin is skipped
+        // with a logged, user-facing reason rather than loaded half-broken (PLUGIN_SPEC.md §9).
+        if let Err(reason) = manifest.check_engine_compatibility() {
+            log::warn!("Skipping incompatible plugin {plugin_id:?}: {reason}");
+            return Ok(());
+        }
+        let plugin_dir = plugin_ref.display_dir();
+
+        // Apply declarative `contributes.keybindings` (PLUGIN_SPEC.md §6) — no plugin code runs for
+        // these. A binding resolves its command id at key-press time, so it works regardless of
+        // whether/when `activate()` registers the matching command handler.
+        for keybinding in &manifest.contributes.keybindings {
+            super::app_request::send_app_request(PluginAppRequest::BindKey {
+                keys: keybinding.key.clone(),
+                command_id: keybinding.command.clone(),
+            });
+        }
+
         let plugin_source_bytes = plugin_ref.plugin_bytes()?;
         let plugin = self.plugin.clone();
         self.ctx.with(|ctx| -> Result<()> {
@@ -61,7 +83,7 @@ impl PluginRunner {
 
             ctx.globals().set("console", js_api::console(ctx))?;
 
-            let warp_api = js_api::warp(plugin, ctx);
+            let warp_api = js_api::warp(plugin, &manifest, &plugin_id, &plugin_dir, ctx);
 
             let activate_fn: Function = plugin_module
                 .get("activate")

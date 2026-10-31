@@ -1,0 +1,110 @@
+From a11d6a4899197664fb7310baaecd1d7a4a7d5872 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Mon, 25 May 2026 12:16:32 -0400
+Subject: [PATCH 37/48] Right-click menus: add 'Launch Web Pane' to terminal
+ pane and browser page context menus (oh-my-warp)
+
+---
+ app/src/browser/view.rs         | 14 ++++++++++++++
+ app/src/terminal/view.rs        | 11 +++++++++++
+ app/src/terminal/view/action.rs |  5 +++++
+ 3 files changed, 30 insertions(+)
+
+diff --git a/app/src/browser/view.rs b/app/src/browser/view.rs
+index 95697d5c..60568689 100644
+--- a/app/src/browser/view.rs
++++ b/app/src/browser/view.rs
+@@ -127,6 +127,10 @@ pub enum BrowserViewAction {
+     CopyUrl,
+     /// Open the current page URL in the system default browser.
+     OpenInSystemBrowser,
++    /// Launch another embedded browser pane as a right-split (dispatches
++    /// `WorkspaceAction::OpenBrowserPane`). Surfaced as "Launch Web Pane"
++    /// in the page right-click menu.
++    LaunchWebPaneSplit,
+ }
+ 
+ /// A pane view that renders a live, interactive browser viewport over CDP.
+@@ -312,6 +316,10 @@ impl BrowserView {
+             MenuItemFields::new("Open in System Browser")
+                 .with_on_select_action(BrowserViewAction::OpenInSystemBrowser)
+                 .into_item(),
++            MenuItem::Separator,
++            MenuItemFields::new("Launch Web Pane")
++                .with_on_select_action(BrowserViewAction::LaunchWebPaneSplit)
++                .into_item(),
+         ];
+         self.right_click_menu.update(ctx, |menu, view_ctx| {
+             menu.set_items(items, view_ctx);
+@@ -736,6 +744,12 @@ impl TypedActionView for BrowserView {
+             BrowserViewAction::OpenInSystemBrowser => {
+                 open_in_system_browser(&self.url);
+             }
++            BrowserViewAction::LaunchWebPaneSplit => {
++                // Reuse the workspace action the tab right-click menu and leader
++                // chord use, so the new pane lands as a right-split of the
++                // active pane group (with the configured home URL).
++                ctx.dispatch_typed_action(&crate::workspace::WorkspaceAction::OpenBrowserPane);
++            }
+         }
+     }
+ }
+diff --git a/app/src/terminal/view.rs b/app/src/terminal/view.rs
+index 11c21850..8b7d9739 100644
+--- a/app/src/terminal/view.rs
++++ b/app/src/terminal/view.rs
+@@ -17511,6 +17511,10 @@ impl TerminalView {
+                         ctx,
+                     ))
+                     .into_item(),
++                // oh-my-warp: launch an embedded browser pane as a right-split.
++                MenuItemFields::new("Launch Web Pane")
++                    .with_on_select_action(TerminalAction::OpenBrowserPaneSplit)
++                    .into_item(),
+             ]);
+         }
+ 
+@@ -26282,6 +26286,7 @@ impl TypedActionView for TerminalView {
+             | SplitLeft(_)
+             | SplitDown(_)
+             | SplitUp(_)
++            | OpenBrowserPaneSplit
+             | OpenGridLink(_)
+             | OpenRichContentLink(_)
+             | ToggleGridSecret { .. }
+@@ -26675,6 +26680,12 @@ impl TypedActionView for TerminalView {
+             SplitUp(chosen_shell) => {
+                 ctx.emit(Event::Pane(PaneEvent::SplitUp(chosen_shell.to_owned())))
+             }
++            OpenBrowserPaneSplit => {
++                // oh-my-warp: split a browser pane to the right of the active
++                // pane group. Reuses the same workspace action the tab right-click
++                // menu and the leader chord use.
++                ctx.dispatch_typed_action(&WorkspaceAction::OpenBrowserPane);
++            }
+             ToggleMaximizePane => ctx.emit(Event::Pane(PaneEvent::ToggleMaximized)),
+             PromptContextMenu {
+                 position_offset_from_prompt,
+diff --git a/app/src/terminal/view/action.rs b/app/src/terminal/view/action.rs
+index c6bc83c9..b96da7b8 100644
+--- a/app/src/terminal/view/action.rs
++++ b/app/src/terminal/view/action.rs
+@@ -205,6 +205,10 @@ pub enum TerminalAction {
+     SplitLeft(Option<AvailableShell>),
+     SplitDown(Option<AvailableShell>),
+     SplitUp(Option<AvailableShell>),
++    /// oh-my-warp: open an embedded browser pane as a right-split (dispatches
++    /// `WorkspaceAction::OpenBrowserPane`). Surfaced as "Launch Web Pane" in the
++    /// terminal context menu.
++    OpenBrowserPaneSplit,
+     /// The context menu that's used for the prompt directly above input editor
+     PromptContextMenu {
+         position_offset_from_prompt: Vector2F,
+@@ -570,6 +574,7 @@ impl fmt::Debug for TerminalAction {
+             SplitLeft(_) => f.write_str("SplitLeft"),
+             SplitDown(_) => f.write_str("SplitDown"),
+             SplitUp(_) => f.write_str("SplitUp"),
++            OpenBrowserPaneSplit => f.write_str("OpenBrowserPaneSplit"),
+             ToggleMaximizePane => f.write_str("ToggleMaximizeActivePane"),
+             PromptContextMenu {
+                 position_offset_from_prompt,

@@ -16,13 +16,13 @@ use cfg_if::cfg_if;
 // configures the profiling behavior.
 cfg_if! {
     if #[cfg(feature = "jemalloc_auto_heap_profiling")] {
-        #[cfg_attr(target_vendor = "apple", export_name = "_rjem_malloc_conf")]
-        #[cfg_attr(not(target_vendor = "apple"), export_name = "malloc_conf")]
+        #[cfg_attr(target_vendor = "apple", unsafe(export_name = "_rjem_malloc_conf"))]
+        #[cfg_attr(not(target_vendor = "apple"), unsafe(export_name = "malloc_conf"))]
         pub static MALLOC_CONF: &[u8] =
             b"prof:true,prof_active:true,lg_prof_interval:29,lg_prof_sample:21,prof_prefix:/tmp/jeprof\0";
     } else if #[cfg(feature = "jemalloc_pprof")] {
-        #[cfg_attr(target_vendor = "apple", export_name = "_rjem_malloc_conf")]
-        #[cfg_attr(not(target_vendor = "apple"), export_name = "malloc_conf")]
+        #[cfg_attr(target_vendor = "apple", unsafe(export_name = "_rjem_malloc_conf"))]
+        #[cfg_attr(not(target_vendor = "apple"), unsafe(export_name = "malloc_conf"))]
         pub static MALLOC_CONF: &[u8] =
             b"prof:true,prof_active:true,lg_prof_sample:21\0";
     }
@@ -61,53 +61,43 @@ pub fn dump_dhat_heap_profile() {
     let _ = HEAP_PROFILER.lock().take();
 }
 
-/// Dumps a jemalloc heap profile and sends it to Sentry.
+/// Writes a heap profile to disk and returns the generated path.
+pub async fn dump_heap_profile_to_disk() -> anyhow::Result<std::path::PathBuf> {
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "dhat_heap_profiling")] {
+            let path = heap_profile_path();
+            dump_dhat_heap_profile();
+            Ok(path)
+        } else if #[cfg(feature = "heap_usage_tracking")] {
+            use anyhow::Context as _;
+
+            let path = heap_profile_path();
+            let profile_data = dump_jemalloc_heap_profile_inner().await?;
+            async_fs::write(&path, profile_data).await
+                .with_context(|| format!("Failed to write heap profile to {}", path.display()))?;
+            Ok(path)
+        } else {
+            anyhow::bail!("heap profiling is not enabled in this build");
+        }
+    }
+}
+
+/// Dumps a jemalloc heap profile to disk and logs the accompanying memory
+/// breakdown.
 ///
 /// On Linux the profile is produced in-process via the `jemalloc_pprof` crate
 /// as a raw (unsymbolized) pprof -- sample addresses + mappings + GNU build-id
-/// -- and is symbolized offline against the debug-info file uploaded to Sentry
-/// by the release process (matched by build-id).  On other platforms it spawns
-/// the bundled `pprof` binary to fetch and symbolicate the heap profile from
-/// the local HTTP server.  Either way, the resulting profile is attached to a
-/// Sentry event.
+/// -- and is symbolized offline against the matching debug-info file (matched
+/// by build-id). On other platforms it spawns the bundled `pprof` binary to
+/// fetch and symbolicate the heap profile from the local HTTP server.
 #[cfg(feature = "heap_usage_tracking")]
 pub async fn dump_jemalloc_heap_profile(memory_breakdown: serde_json::Value) {
-    use sentry::protocol::{Attachment, AttachmentType};
-
-    let result = dump_jemalloc_heap_profile_inner().await;
-    match result {
-        Ok(profile_data) => {
-            let attachment = Attachment {
-                buffer: profile_data,
-                filename: "heap-profile.pb".to_string(),
-                ty: Some(AttachmentType::Attachment),
-                ..Default::default()
-            };
-            sentry::with_scope(
-                |scope| {
-                    scope.add_attachment(attachment);
-
-                    // Attach the memory breakdown as structured context so it
-                    // is visible directly in the Sentry event.
-                    if let serde_json::Value::Object(map) = memory_breakdown {
-                        let context_map: std::collections::BTreeMap<
-                            String,
-                            sentry::protocol::Value,
-                        > = map.into_iter().collect();
-                        scope.set_context(
-                            "memory_breakdown",
-                            sentry::protocol::Context::Other(context_map),
-                        );
-                    }
-                },
-                || {
-                    sentry::capture_message(
-                        "Excessive memory usage detected",
-                        sentry::Level::Warning,
-                    )
-                },
+    match dump_heap_profile_to_disk().await {
+        Ok(path) => {
+            log::info!(
+                "Wrote heap profile to {} (memory breakdown: {memory_breakdown})",
+                path.display()
             );
-            log::info!("Sent heap profile to Sentry");
         }
         Err(err) => {
             log::warn!("Failed to dump heap profile: {err:#}");
@@ -195,9 +185,15 @@ fn pprof_binary_path() -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// Returns the path at which heap profiles will be written.
-#[cfg(feature = "dhat_heap_profiling")]
+#[cfg(any(feature = "dhat_heap_profiling", feature = "heap_usage_tracking"))]
 pub fn heap_profile_path() -> std::path::PathBuf {
-    profile_output_dir().join("dhat-heap.json")
+    cfg_if::cfg_if! {
+        if #[cfg(feature = "dhat_heap_profiling")] {
+            profile_output_dir().join("dhat-heap.json")
+        } else {
+            profile_output_dir().join("heap-profile.pb")
+        }
+    }
 }
 
 /// Uninitializes the profiling subsystem, writing reports to disk as-needed.
@@ -215,7 +211,7 @@ pub fn teardown() {
         .map_err(Into::into)
         .and_then(write_pprof_report)
     {
-        log::error!("Failed to write pprof data: {err:#}");
+        warp_errors::report_error!(err.context("Failed to write pprof data"));
     }
 }
 
@@ -229,7 +225,11 @@ fn write_pprof_report(report: pprof::Report) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(any(feature = "dhat_heap_profiling", feature = "pprof_cpu_profiling"))]
+#[cfg(any(
+    feature = "dhat_heap_profiling",
+    feature = "heap_usage_tracking",
+    feature = "pprof_cpu_profiling"
+))]
 fn profile_output_dir() -> std::path::PathBuf {
     cfg_if::cfg_if! {
         if #[cfg(feature = "release_bundle")] {
@@ -253,8 +253,8 @@ pub fn make_router() -> axum::Router {
 }
 
 #[cfg(feature = "jemalloc_pprof")]
-pub async fn handle_get_heap(
-) -> Result<impl axum::response::IntoResponse, (axum::http::StatusCode, String)> {
+pub async fn handle_get_heap()
+-> Result<impl axum::response::IntoResponse, (axum::http::StatusCode, String)> {
     let Some(prof_ctl) = jemalloc_pprof::PROF_CTL.as_ref() else {
         return Err((
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,

@@ -30,10 +30,4 @@ retries = 2
 # Docs: https://nexte.st/docs/machine-readable/junit/
 path = "junit.xml"
 
-[[profile.ci.overrides]]
-# On Windows CI, update_manager tests are flaky and often time out but succeed after a retry
-# Evidence suggest that the test itself passes but the process running it hangs
-# We haven't figured out why the process hangs, so this is a workaround to unblock devs
-filter = 'test(update_manager)'
-platform = { host = 'cfg(target_os = "windows")' }
-retries = 2
+

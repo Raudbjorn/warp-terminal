@@ -11,10 +11,6 @@ red="\033[0;31m"
 reset="\033[0m"
 
 CI_FLAGS=""
-if [ "${GITHUB_ACTIONS}" == "true" ]; then
-  CI_FLAGS="-s -- -y"
-fi
-
 # Install Rust.
 if ! command -v cargo; then
   echo "⬇️  Installing rust..."

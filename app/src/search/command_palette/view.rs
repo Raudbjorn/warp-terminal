@@ -27,18 +27,18 @@ use crate::drive::CloudObjectTypeAndId;
 use crate::features::FeatureFlag;
 use crate::palette::PaletteMode;
 use crate::root_view::OpenLaunchConfigArg;
+use crate::search::QueryFilter;
 use crate::search::action::search_item::MatchedBinding;
 use crate::search::binding_source::{BindingFilterFn, BindingSource};
+use crate::search::command_palette::SelectedItems;
 use crate::search::command_palette::data_sources::DataSourceStore;
 use crate::search::command_palette::mixer::CommandPaletteItemAction;
 use crate::search::command_palette::zero_state::{self, Event as ZeroStateEvent, ZeroState};
-use crate::search::command_palette::SelectedItems;
 use crate::search::data_source::QueryResult;
 use crate::search::result_renderer::QueryResultRenderer;
 use crate::search::search_bar::{
     SearchBar, SearchBarEvent, SearchBarState, SearchResultOrdering, SelectionUpdate,
 };
-use crate::search::QueryFilter;
 use crate::server::ids::SyncId;
 use crate::server::telemetry::{LaunchConfigUiLocation, TelemetryEvent};
 use crate::session_management::SessionSource;
@@ -46,8 +46,8 @@ use crate::settings::CtrlTabBehavior;
 use crate::terminal::keys_settings::KeysSettings;
 use crate::themes::theme::WarpTheme;
 use crate::view_components::DismissibleToast;
-use crate::workspace::{active_terminal_in_window, ForkedConversationDestination, WorkspaceAction};
-use crate::{send_telemetry_from_ctx, ToastStack};
+use crate::workspace::{ForkedConversationDestination, WorkspaceAction, active_terminal_in_window};
+use crate::{ToastStack, send_telemetry_from_ctx};
 
 lazy_static! {
     /// Set of hardcoded action names that we want to show in the command palette zero state.
@@ -238,8 +238,14 @@ impl View {
         let binding_source = ctx.add_model(|_| BindingSource::None);
         let session_source = ctx.add_model(|_| SessionSource::None);
 
+        let window_id = ctx.window_id();
         let data_source_store = ctx.add_model(|ctx| {
-            DataSourceStore::new(binding_source.clone(), session_source.clone(), ctx)
+            DataSourceStore::new(
+                binding_source.clone(),
+                session_source.clone(),
+                window_id,
+                ctx,
+            )
         });
 
         ctx.observe(&binding_source, |me, _, ctx| {
@@ -328,6 +334,14 @@ impl View {
             .into_iter()
             .flat_map(|results| results.iter())
             .map(|item| &item.search_result)
+    }
+
+    #[cfg(feature = "integration_tests")]
+    pub fn selected_search_result<'a>(
+        &'a self,
+        app: &'a AppContext,
+    ) -> Option<&'a QueryResult<CommandPaletteItemAction>> {
+        self.search_bar_state.as_ref(app).selected_result()
     }
 
     /// Set the active query filter in the search bar to be `filter`.
@@ -713,6 +727,71 @@ impl View {
     }
 
     /// Handles the `CommandPaletteItemAction` action and closes the search panel.
+    /// oh-my-warp: runs a plugin-registered command by invoking its JS callback in the plugin host
+    /// and showing the returned string (if any) as a toast. See PLUGIN_SPEC.md (Milestone 1).
+    #[cfg(feature = "plugin_host")]
+    fn run_plugin_command(&mut self, command_id: String, ctx: &mut ViewContext<Self>) {
+        use crate::plugin::service::{
+            CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
+        };
+        use crate::plugin::PluginHost;
+        use crate::view_components::{DismissibleToast, ToastFlavor};
+        use crate::workspace::ToastStack;
+        use warp_js::SerializedJsValue;
+
+        let window_id = ctx.window_id();
+        let Some(function_id) = crate::plugin::commands::function_id(&command_id) else {
+            return;
+        };
+        let Some(caller) = PluginHost::handle(ctx)
+            .as_ref(ctx)
+            .plugin_service_caller::<CallJsFunctionService>()
+        else {
+            log::warn!("Plugin host unavailable; cannot run plugin command {command_id:?}");
+            return;
+        };
+        let Ok(input) = SerializedJsValue::from_value(String::new()) else {
+            return;
+        };
+
+        ctx.spawn(
+            async move {
+                caller
+                    .call(CallJsFunctionRequest {
+                        id: function_id,
+                        serialized_input: input,
+                    })
+                    .await
+            },
+            move |_view, response, ctx| {
+                let toast = match response {
+                    Ok(CallJsFunctionResponse::Success(output)) => {
+                        match output.to_value::<crate::plugin::events::OptionalToast>() {
+                            Ok(crate::plugin::events::OptionalToast(Some(message)))
+                                if !message.trim().is_empty() =>
+                            {
+                                Some(DismissibleToast::new(message, ToastFlavor::Default))
+                            }
+                            _ => None,
+                        }
+                    }
+                    Ok(CallJsFunctionResponse::Error { message }) => {
+                        Some(DismissibleToast::new(message, ToastFlavor::Error))
+                    }
+                    Err(e) => Some(DismissibleToast::new(
+                        format!("Plugin command failed: {e:?}"),
+                        ToastFlavor::Error,
+                    )),
+                };
+                if let Some(toast) = toast {
+                    ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                        toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+                    });
+                }
+            },
+        );
+    }
+
     fn handle_result_accepted(
         &mut self,
         result_action: CommandPaletteItemAction,
@@ -730,55 +809,64 @@ impl View {
             });
         }
 
-        if let CommandPaletteItemAction::AcceptBinding { binding } = &result_action {
-            if let Some(action) = &binding.action {
-                match action.as_any().downcast_ref::<WorkspaceAction>() {
-                    Some(WorkspaceAction::TogglePalette {
-                        mode: PaletteMode::LaunchConfig,
-                        source: _,
-                    }) => {
-                        self.reset(ctx);
-                        self.set_active_query_filter(QueryFilter::LaunchConfigurations, ctx);
-                        return;
-                    }
-                    Some(WorkspaceAction::TogglePalette {
-                        mode: PaletteMode::Navigation,
-                        source: _,
-                    }) => {
-                        self.reset(ctx);
-                        self.set_active_query_filter(QueryFilter::Sessions, ctx);
-                        return;
-                    }
-                    Some(WorkspaceAction::TogglePalette {
-                        mode: PaletteMode::Files,
-                        source: _,
-                    }) => {
-                        self.reset(ctx);
-                        self.set_active_query_filter(QueryFilter::Files, ctx);
-                        return;
-                    }
-                    Some(WorkspaceAction::TogglePalette {
-                        mode: PaletteMode::Conversations,
-                        source: _,
-                    }) => {
-                        self.reset(ctx);
-                        self.set_active_query_filter(QueryFilter::Conversations, ctx);
-                        return;
-                    }
-                    Some(WorkspaceAction::TogglePalette {
-                        mode: PaletteMode::Command,
-                        source: _,
-                    }) => {
-                        self.close(ctx, Some(result_action.result_type()));
-                        return;
-                    }
-                    _ => {}
+        if let CommandPaletteItemAction::AcceptBinding { binding } = &result_action
+            && let Some(action) = &binding.action
+        {
+            match action.as_any().downcast_ref::<WorkspaceAction>() {
+                Some(WorkspaceAction::TogglePalette {
+                    mode: PaletteMode::LaunchConfig,
+                    source: _,
+                }) => {
+                    self.reset(ctx);
+                    self.set_active_query_filter(QueryFilter::LaunchConfigurations, ctx);
+                    return;
                 }
+                Some(WorkspaceAction::TogglePalette {
+                    mode: PaletteMode::Navigation,
+                    source: _,
+                }) => {
+                    self.reset(ctx);
+                    self.set_active_query_filter(QueryFilter::Sessions, ctx);
+                    return;
+                }
+                Some(WorkspaceAction::TogglePalette {
+                    mode: PaletteMode::Files,
+                    source: _,
+                }) => {
+                    self.reset(ctx);
+                    self.set_active_query_filter(QueryFilter::Files, ctx);
+                    return;
+                }
+                Some(WorkspaceAction::TogglePalette {
+                    mode: PaletteMode::Conversations,
+                    source: _,
+                }) => {
+                    self.reset(ctx);
+                    self.set_active_query_filter(QueryFilter::Conversations, ctx);
+                    return;
+                }
+                Some(WorkspaceAction::TogglePalette {
+                    mode: PaletteMode::Command,
+                    source: _,
+                }) => {
+                    self.close(ctx, Some(result_action.result_type()));
+                    return;
+                }
+                _ => {}
             }
         }
 
         match result_action.clone() {
             CommandPaletteItemAction::AcceptBinding { binding } => {
+                #[cfg(feature = "plugin_host")]
+                if let Some(command_id) = binding.name.strip_prefix(
+                    crate::search::command_palette::plugin_command_data_source::PLUGIN_COMMAND_BINDING_PREFIX,
+                ) {
+                    let command_id = command_id.to_owned();
+                    self.run_plugin_command(command_id, ctx);
+                    self.close(ctx, Some(result_action.result_type()));
+                    return;
+                }
                 if let Some(action) = binding.action.as_deref() {
                     self.dispatch_typed_action_on_view(action, ctx);
                 };
@@ -927,11 +1015,11 @@ impl View {
             } => {
                 let file_path = std::path::Path::new(&current_directory).join(&file_name);
 
-                if let Err(e) = std::fs::File::create_new(&file_path) {
-                    if e.kind() != std::io::ErrorKind::AlreadyExists {
-                        log::warn!("Failed to create file {}: {e}", file_path.display());
-                        return;
-                    }
+                if let Err(e) = std::fs::File::create_new(&file_path)
+                    && e.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    log::warn!("Failed to create file {}: {e}", file_path.display());
+                    return;
                 }
 
                 ctx.emit(Event::OpenFile {

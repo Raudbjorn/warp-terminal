@@ -573,3 +573,230 @@ fn test_multiple_global_rules_all_contribute() {
     assert!(contents.contains(&"agents_global"));
     assert!(contents.contains(&"warp_global"));
 }
+
+#[test]
+fn test_remote_global_rules_only_layer_for_matching_remote_host() {
+    let mut model = ProjectContextModel::default();
+    insert_global_rule(
+        &mut model,
+        Path::new("/home/local/.agents/AGENTS.md"),
+        "local_global",
+    );
+    insert_remote_project_rule(
+        &mut model,
+        "host-a",
+        "/repo",
+        "/repo/WARP.md",
+        "remote_project",
+    );
+    let host_a = HostId::new("host-a".to_string());
+    model.set_remote_global_rules(
+        host_a.clone(),
+        vec![ProjectRule {
+            path: remote_path("host-a", "/home/remote/.agents/AGENTS.md"),
+            content: "remote_global".to_string(),
+        }],
+    );
+    model.set_remote_global_rules(
+        HostId::new("host-b".to_string()),
+        vec![ProjectRule {
+            path: remote_path("host-b", "/home/remote/.agents/AGENTS.md"),
+            content: "other_remote_global".to_string(),
+        }],
+    );
+
+    let matching = model
+        .find_applicable_rules(&remote_path("host-a", "/repo/src/main.rs"))
+        .unwrap();
+    assert_eq!(
+        matching
+            .active_rules
+            .iter()
+            .map(|rule| rule.content.as_str())
+            .collect::<Vec<_>>(),
+        ["local_global", "remote_global", "remote_project"]
+    );
+
+    let other_host = model
+        .find_applicable_rules(&remote_path("host-b", "/repo/src/main.rs"))
+        .unwrap();
+    assert_eq!(
+        other_host
+            .active_rules
+            .iter()
+            .map(|rule| rule.content.as_str())
+            .collect::<Vec<_>>(),
+        ["local_global", "other_remote_global"]
+    );
+
+    let local = model
+        .find_applicable_rules(&local_path("/repo/src/main.rs"))
+        .unwrap();
+    assert_eq!(local.active_rules.len(), 1);
+    assert_eq!(local.active_rules[0].content, "local_global");
+
+    assert_eq!(
+        model.global_rule_paths().collect::<Vec<_>>(),
+        [local_path("/home/local/.agents/AGENTS.md")]
+    );
+
+    model.set_remote_global_rules(host_a, Vec::new());
+    let replaced = model
+        .find_applicable_rules(&remote_path("host-a", "/repo/src/main.rs"))
+        .unwrap();
+    assert_eq!(
+        replaced
+            .active_rules
+            .iter()
+            .map(|rule| rule.content.as_str())
+            .collect::<Vec<_>>(),
+        ["local_global", "remote_project"]
+    );
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_superseding_refresh_coalesces_without_overlapping_reads() {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use repo_metadata::repositories::DetectedRepositories;
+    use warpui_core::App;
+    use warpui_core::r#async::Timer;
+
+    /// Coordinates a background reader that blocks until released, so the test can observe a
+    /// read that is genuinely in flight (rather than one that resolves before the next
+    /// refresh request is even issued).
+    struct ReadCoordinator {
+        active_readers: AtomicUsize,
+        max_active_readers: AtomicUsize,
+        completed_rounds: AtomicUsize,
+        release: AtomicBool,
+    }
+
+    fn coordinator() -> &'static ReadCoordinator {
+        static INSTANCE: OnceLock<ReadCoordinator> = OnceLock::new();
+        INSTANCE.get_or_init(|| ReadCoordinator {
+            active_readers: AtomicUsize::new(0),
+            max_active_readers: AtomicUsize::new(0),
+            completed_rounds: AtomicUsize::new(0),
+            release: AtomicBool::new(false),
+        })
+    }
+
+    fn repo_root() -> StandardizedPath {
+        let root = if cfg!(windows) { "C:/repo" } else { "/repo" };
+        StandardizedPath::try_new(root).unwrap()
+    }
+
+    fn path_in_repo(name: &str) -> LocalOrRemotePath {
+        local_path(repo_root().join(name).as_str())
+    }
+
+    // The first round reports a rule; the coalesced second round reports none, so the test can
+    // confirm the latest (empty) result wins instead of leaving stale content behind.
+    fn controlled_content_reader(
+        _paths: Vec<LocalOrRemotePath>,
+        _ctx: &AppContext,
+    ) -> BoxFuture<'static, anyhow::Result<ProjectRuleContents>> {
+        Box::pin(async move {
+            let coordinator = coordinator();
+            let active = coordinator.active_readers.fetch_add(1, Ordering::SeqCst) + 1;
+            coordinator
+                .max_active_readers
+                .fetch_max(active, Ordering::SeqCst);
+
+            while !coordinator.release.load(Ordering::SeqCst) {
+                Timer::after(Duration::from_millis(1)).await;
+            }
+
+            coordinator.active_readers.fetch_sub(1, Ordering::SeqCst);
+            let round = coordinator.completed_rounds.fetch_add(1, Ordering::SeqCst);
+            let contents = if round == 0 {
+                vec![(path_in_repo("WARP.md"), "stale-round".to_string())]
+            } else {
+                Vec::new()
+            };
+            Ok(contents)
+        })
+    }
+
+    App::test((), |mut app| async move {
+        app.add_singleton_model(|_| DetectedRepositories::default());
+        app.add_singleton_model(RepoMetadataModel::new);
+        let model = app.add_model(|_| ProjectContextModel::default());
+        let repo_id = RepositoryIdentifier::Local(repo_root());
+        let coordinator = coordinator();
+
+        // First refresh: its read blocks on `coordinator.release` until we let it proceed
+        // below, simulating a slow, uncancellable file read that is genuinely in flight.
+        model.update(&mut app, |model, ctx| {
+            model.refresh_project_rules_for_repo(repo_id.clone(), controlled_content_reader, ctx);
+        });
+
+        // Wait until the first read has actually started before superseding it, so the test
+        // exercises real overlap rather than two sequential no-ops.
+        for _ in 0..2000 {
+            if coordinator.active_readers.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            Timer::after(Duration::from_millis(1)).await;
+        }
+        assert_eq!(
+            coordinator.active_readers.load(Ordering::SeqCst),
+            1,
+            "first refresh should be blocked mid-read"
+        );
+
+        // Second refresh supersedes the first while it is still reading files. Coalescing must
+        // record this request rather than spawn a second, overlapping read.
+        model.update(&mut app, |model, ctx| {
+            model.refresh_project_rules_for_repo(repo_id.clone(), controlled_content_reader, ctx);
+        });
+        // Give the executor a chance to (incorrectly) start a second overlapping read before
+        // checking the invariant.
+        Timer::after(Duration::from_millis(5)).await;
+        assert_eq!(
+            coordinator.active_readers.load(Ordering::SeqCst),
+            1,
+            "a superseding refresh must not start a second concurrent read"
+        );
+
+        // Let the in-flight (stale) read and its coalesced follow-up run to completion, then
+        // wait for the model to finish applying both rounds' completion callbacks. The coalesced
+        // (second, latest) refresh finds no rules, so the stale first-round rule must not
+        // survive: coalescing must not silently leave `path_to_rules` stuck on stale content
+        // applied by the superseded read.
+        coordinator.release.store(true, Ordering::SeqCst);
+        let mut observed_two_rounds = false;
+        let mut has_stale_rule = true;
+        for _ in 0..5000 {
+            if coordinator.completed_rounds.load(Ordering::SeqCst) >= 2 {
+                observed_two_rounds = true;
+            }
+            has_stale_rule = model.read(&app, |model, _ctx| {
+                model
+                    .find_applicable_project_rules(&path_in_repo("main.rs"))
+                    .is_some()
+            });
+            if observed_two_rounds && !has_stale_rule {
+                break;
+            }
+            Timer::after(Duration::from_millis(1)).await;
+        }
+        assert!(
+            observed_two_rounds,
+            "the coalesced refresh should run once the in-flight one completes"
+        );
+        assert_eq!(
+            coordinator.max_active_readers.load(Ordering::SeqCst),
+            1,
+            "no two reads should ever have been active at the same time"
+        );
+        assert!(
+            !has_stale_rule,
+            "the latest (empty) refresh result must win over the stale in-flight one"
+        );
+    });
+}

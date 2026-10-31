@@ -1,11 +1,20 @@
 use futures::channel::oneshot;
 use warp_core::SessionId;
+use warp_util::standardized_path::StandardizedPath;
 use warpui_core::App;
 
-use super::{HostRequestError, PendingHostRequest, RemoteServerManager};
-use crate::proto::{host_scoped_request, ClientMessage, RipgrepSearchRequest, WriteFile};
-use crate::protocol::RequestId;
+#[cfg(not(target_family = "wasm"))]
+use warp_core::channel::Channel;
+
+#[cfg(not(target_family = "wasm"))]
+use super::version_is_compatible_for_channel;
+use super::{
+    HostRequestError, PendingHostRequest, RemoteServerManager, RemoteServerManagerEvent,
+    RipgrepSearchParams,
+};
 use crate::HostId;
+use crate::proto::{ClientMessage, RemoteAgentContextSnapshot, WriteFile, host_scoped_request};
+use crate::protocol::RequestId;
 
 #[test]
 fn abort_host_request_removes_pending_request_and_resolves_caller() {
@@ -45,6 +54,41 @@ fn abort_host_request_removes_pending_request_and_resolves_caller() {
 }
 
 #[test]
+fn remote_agent_context_snapshot_is_a_host_scoped_manager_event() {
+    let host_id = HostId::new("test-host".to_string());
+    let event = RemoteServerManagerEvent::RemoteAgentContextSnapshot {
+        host_id,
+        snapshot: RemoteAgentContextSnapshot {
+            revision: 1,
+            home_dir: "/home/user".to_string(),
+            skills: Vec::new(),
+            global_rules: Vec::new(),
+        },
+    };
+    assert!(event.session_id().is_none());
+}
+
+#[test]
+fn remote_agent_context_snapshot_revisions_are_deduplicated_per_host() {
+    App::test((), |mut app| async move {
+        let manager = app.add_model(RemoteServerManager::new);
+        let host_id = HostId::new("test-host".to_string());
+        let other_host_id = HostId::new("other-host".to_string());
+
+        manager.update(&mut app, |manager, ctx| {
+            assert!(manager.accept_remote_agent_context_snapshot_revision(&host_id, 2));
+            assert!(!manager.accept_remote_agent_context_snapshot_revision(&host_id, 2));
+            assert!(!manager.accept_remote_agent_context_snapshot_revision(&host_id, 1));
+            assert!(manager.accept_remote_agent_context_snapshot_revision(&host_id, 3));
+            assert!(manager.accept_remote_agent_context_snapshot_revision(&other_host_id, 1));
+
+            manager.handle_host_disconnected(&host_id, ctx);
+            assert!(manager.accept_remote_agent_context_snapshot_revision(&host_id, 3));
+        });
+    });
+}
+
+#[test]
 fn start_ripgrep_search_without_connected_host_resolves_immediately() {
     App::test((), |mut app| async move {
         let manager = app.add_model(RemoteServerManager::new);
@@ -52,9 +96,9 @@ fn start_ripgrep_search_without_connected_host_resolves_immediately() {
         let pending = manager.update(&mut app, |manager, _ctx| {
             manager.start_ripgrep_search(
                 &host_id,
-                RipgrepSearchRequest {
+                RipgrepSearchParams {
                     pattern: "needle".to_string(),
-                    roots: vec!["/repo".to_string()],
+                    roots: vec![StandardizedPath::try_new("/repo").unwrap()],
                     ignore_case: false,
                     multiline: false,
                     max_matches: 100,
@@ -67,4 +111,50 @@ fn start_ripgrep_search_without_connected_host_resolves_immediately() {
             Err(HostRequestError::AllSessionsDisconnected)
         ));
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn oss_without_client_version_rejects_production_remote_server_version() {
+    assert!(!version_is_compatible_for_channel(
+        Channel::Oss,
+        None,
+        "v0.2026.04.29.08.57.stable_01"
+    ));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn local_without_client_version_rejects_production_remote_server_version() {
+    assert!(!version_is_compatible_for_channel(
+        Channel::Local,
+        None,
+        "v0.2026.04.29.08.57.stable_01"
+    ));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn matching_release_versions_are_compatible() {
+    assert!(version_is_compatible_for_channel(
+        Channel::Stable,
+        Some("v0.2026.04.29.08.57.stable_01"),
+        "v0.2026.04.29.08.57.stable_01"
+    ));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn mismatched_release_versions_are_incompatible() {
+    assert!(!version_is_compatible_for_channel(
+        Channel::Stable,
+        Some("v0.2026.04.29.08.57.stable_01"),
+        "v0.2026.04.30.08.57.stable_01"
+    ));
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn empty_client_and_server_versions_are_compatible() {
+    assert!(version_is_compatible_for_channel(Channel::Local, None, ""));
 }

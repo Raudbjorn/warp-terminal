@@ -21,8 +21,9 @@ use reqwest_eventsource::RequestBuilderExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use warp_core::channel::{Channel, ChannelState};
+use warp_core::execution_mode;
 use warp_core::operating_system_info::OperatingSystemInfo;
-use warp_core::{execution_mode, report_error};
+use warp_errors::{ErrorExt, register_error, report_error};
 
 use crate::iap::{IapTokenProvider, proxy_auth_header};
 
@@ -46,6 +47,12 @@ pub mod headers {
     /// Custom Warp header indicating the client role. We don't use the User-Agent header
     /// because it can't be set from WASM.
     pub(crate) const WARP_CLIENT_ID: &str = "X-Warp-Client-ID";
+
+    /// Custom Warp header carrying the client's current OTEL span context in W3C
+    /// `traceparent` wire format. It is deliberately distinct from the standard
+    /// `traceparent` header so the server links its request span to the client
+    /// span rather than reparenting the server span under the client trace.
+    pub(crate) const TRACE_LINK_HEADER: &str = "X-Warp-Traceparent";
 }
 
 /// The environment variable containing extra HTTP headers to attach to requests.
@@ -58,6 +65,9 @@ const EXTRA_HTTP_HEADERS_ENV_VAR: &str = "WARP_EXTRA_HTTP_HEADERS";
 /// run outside of a Tokio context.
 pub struct Client {
     wrapped: reqwest::Client,
+    include_warp_headers: bool,
+    #[cfg(target_family = "wasm")]
+    omit_credentials: bool,
 
     /// A callback that is executed before every request is sent with a cloned
     /// version of the outbound request.  If for some reason the request cannot be
@@ -128,6 +138,27 @@ pub enum Error {
     Reqwest(#[from] reqwest::Error),
 }
 
+impl Error {
+    pub fn without_url(self) -> Self {
+        match self {
+            Self::Reqwest(error) => Self::Reqwest(error.without_url()),
+            Self::NetworkPolicyDenied(error) => {
+                Self::NetworkPolicyDenied(NetworkPolicyDenied::new(error.purpose(), "<redacted>"))
+            }
+        }
+    }
+}
+
+impl ErrorExt for Error {
+    fn is_actionable(&self) -> bool {
+        match self {
+            Self::NetworkPolicyDenied(_) => false,
+            Self::Reqwest(error) => error.is_actionable(),
+        }
+    }
+}
+register_error!(Error);
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// A wrapper around a `reqwest::Response` that ensures any async calls to the underlying `Response`
@@ -160,6 +191,17 @@ impl Client {
         Self::from_client_builder(builder).expect("should not fail to create client")
     }
 
+    /// Creates a pooled client without automatic Warp headers, IAP tokens, or browser credentials.
+    pub fn new_external() -> Self {
+        let mut client = Self::new();
+        client.include_warp_headers = false;
+        #[cfg(target_family = "wasm")]
+        {
+            client.omit_credentials = true;
+        }
+        client
+    }
+
     #[cfg(feature = "test-util")]
     pub fn new_for_test() -> Self {
         let client_builder = reqwest::ClientBuilder::new()
@@ -179,9 +221,21 @@ impl Client {
         // re-checking the URL, which would let a loopback URL that passes
         // the initial check redirect to a public host and bypass LocalOnly
         // restrictions. The closure is consulted on every hop.
+        //
+        // Note: calling `.redirect(...)` on the passed builder *replaces* any
+        // redirect policy the caller previously configured (reqwest does not
+        // expose composition). Callers that need a custom redirect policy
+        // must extend the local-only enforcement by chaining a Policy::custom
+        // in front of this one, or by configuring the builder before
+        // `from_client_builder` and accepting that their policy will be
+        // overridden. In practice no caller currently sets a redirect policy
+        // of its own; this note documents the gotcha for future use.
         let client_builder = client_builder.redirect(network_policy_redirect_policy());
         client_builder.build().map(|client| Self {
             wrapped: client,
+            include_warp_headers: true,
+            #[cfg(target_family = "wasm")]
+            omit_credentials: false,
             before_request_sent: None,
             after_response_received: None,
             iap_token_provider: None,
@@ -207,6 +261,12 @@ impl Client {
         iap_token: Option<String>,
         policy_url: Option<reqwest::Url>,
     ) -> RequestBuilder<'_> {
+        #[cfg(target_family = "wasm")]
+        let wrapped = if self.omit_credentials {
+            wrapped.fetch_credentials_omit()
+        } else {
+            wrapped
+        };
         let mut builder = RequestBuilder {
             wrapped,
             client: self,
@@ -215,7 +275,7 @@ impl Client {
             prevent_sleep_reason: None,
         };
 
-        if include_warp_headers {
+        if include_warp_headers && self.include_warp_headers {
             builder = Self::add_warp_http_headers(builder);
         }
 
@@ -231,35 +291,60 @@ impl Client {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.get(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.get(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     pub fn post<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.post(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.post(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     pub fn put<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.put(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.put(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     pub fn patch<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.patch(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.patch(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     pub fn delete<U: IntoUrl + Clone>(&self, url: U) -> RequestBuilder<'_> {
         let include_warp_headers = Self::include_warp_http_headers(url.clone());
         let iap_token = self.iap_token_for(url.clone());
         let policy_url = url.clone().into_url().ok();
-        self.builder(self.wrapped.delete(url), include_warp_headers, iap_token, policy_url)
+        self.builder(
+            self.wrapped.delete(url),
+            include_warp_headers,
+            iap_token,
+            policy_url,
+        )
     }
 
     /// Returns the IAP bearer token to attach to a request targeting
@@ -371,6 +456,13 @@ impl Client {
             }
         }
 
+        // Forward the current trace context so the server can attach a span link
+        // back to this client (cloud-agent) span. Only present when a valid OTEL
+        // span context exists; omitted otherwise (e.g. non-cloud-agent or wasm).
+        if let Some(trace_link) = current_trace_link_header() {
+            builder = builder.header(headers::TRACE_LINK_HEADER, trace_link);
+        }
+
         builder
     }
 
@@ -394,17 +486,22 @@ impl Client {
 
         let _guard = prevent_sleep_reason.map(prevent_sleep::prevent_sleep);
 
-        cfg_if::cfg_if! {
-            if #[cfg(target_family = "wasm")] {
-                let result = self.wrapped.execute(request).await?;
-            } else {
-                // Explicitly await the future before converting from tokio -> futures. This is because
-                // certain calls to tokio (such as tokio::time::sleep) will panic upon creation if they
-                // are not in a tokio runtime. Wrapping the call in an async block first makes sure that it
-                // is lazily evaluated, ensuring that it is created within a tokio runtime.
-                let result = Compat::new(async { self.wrapped.execute(request).await }).await?;
+        let result = match self.wrapped_execute(request).await {
+            Ok(result) => result,
+            Err(err) => {
+                // Redirect-policy denials originate from
+                // [`network_policy_redirect_policy`], which wraps the
+                // structured `NetworkPolicyDenied` in a `reqwest::Error`.
+                // Remap those here so callers see the same error variant
+                // they would have seen if the URL had been denied by the
+                // initial `check_url` (so `is_recoverable()` returns
+                // `false` instead of triggering spurious retries).
+                if let Some(denied) = redirect_denial_from(&err) {
+                    return Err(Error::NetworkPolicyDenied(denied));
+                }
+                return Err(err.into());
             }
-        }
+        };
 
         if let Some(after_response_received_fn) = &self.after_response_received {
             after_response_received_fn(&result);
@@ -412,6 +509,46 @@ impl Client {
 
         Ok(Response(result))
     }
+
+    /// Await the underlying reqwest client, bridging from `tokio` -> `futures`
+    /// on native targets so the future is created inside a tokio runtime.
+    /// Returns the raw `reqwest::Error` so callers can inspect the source
+    /// chain before the `?` conversion in [`Self::execute`].
+    async fn wrapped_execute(
+        &self,
+        request: reqwest::Request,
+    ) -> std::result::Result<reqwest::Response, reqwest::Error> {
+        cfg_if::cfg_if! {
+            if #[cfg(target_family = "wasm")] {
+                self.wrapped.execute(request).await
+            } else {
+                // Explicitly await the future before converting from tokio -> futures. This is because
+                // certain calls to tokio (such as tokio::time::sleep) will panic upon creation if they
+                // are not in a tokio runtime. Wrapping the call in an async block first makes sure that it
+                // is lazily evaluated, ensuring that it is created within a tokio runtime.
+                Compat::new(async { self.wrapped.execute(request).await }).await
+            }
+        }
+    }
+}
+
+/// If `err` is a `reqwest::redirect` error whose source is a
+/// `NetworkPolicyDenied`, return a clone of that denial. Used by
+/// [`Client::execute_inner`] to remap deterministic LocalOnly denials
+/// surfaced by the redirect policy into the structured error variant
+/// callers expect.
+fn redirect_denial_from(err: &reqwest::Error) -> Option<NetworkPolicyDenied> {
+    if !err.is_redirect() {
+        return None;
+    }
+    let mut source = std::error::Error::source(err);
+    while let Some(current) = source {
+        if let Some(denied) = current.downcast_ref::<NetworkPolicyDenied>() {
+            return Some(denied.clone());
+        }
+        source = current.source();
+    }
+    None
 }
 
 fn is_warp_server_origin(url: &reqwest::Url) -> bool {
@@ -422,6 +559,38 @@ fn is_warp_server_origin(url: &reqwest::Url) -> bool {
     .iter()
     .filter_map(|candidate| reqwest::Url::parse(candidate.as_ref()).ok())
     .any(|candidate| candidate.origin() == url.origin())
+}
+
+/// Returns the current OTEL span context formatted as a W3C `traceparent` value
+/// (`00-<trace-id>-<span-id>-<flags>`) for the [`headers::TRACE_LINK_HEADER`]
+/// header, or `None` when there is no valid active span context.
+///
+/// A valid span context only exists in processes where the OpenTelemetry
+/// subscriber is installed — i.e. cloud-agent processes (see
+/// `app/src/tracing/native.rs`). Everywhere else, and on wasm, this returns
+/// `None` so the header is omitted rather than sent empty or malformed.
+#[cfg(not(target_family = "wasm"))]
+fn current_trace_link_header() -> Option<String> {
+    use opentelemetry::trace::TraceContextExt as _;
+    use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+    let context = tracing::Span::current().context();
+    let span = context.span();
+    let span_context = span.span_context();
+    if !span_context.is_valid() {
+        return None;
+    }
+    Some(format!(
+        "00-{}-{}-{:02x}",
+        span_context.trace_id(),
+        span_context.span_id(),
+        span_context.trace_flags().to_u8(),
+    ))
+}
+
+#[cfg(target_family = "wasm")]
+fn current_trace_link_header() -> Option<String> {
+    None
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -675,11 +844,27 @@ fn denied_eventsource_stream()
 /// error rather than silently returning the 3xx response.
 fn network_policy_redirect_policy() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
-        match network_policy::check_url(attempt.url(), "redirect target") {
-            Ok(()) => attempt.follow(),
-            Err(err) => attempt.error(err),
+        if check_redirect_target(attempt.url()) {
+            attempt.follow()
+        } else {
+            // Build a structured `NetworkPolicyDenied` so the error path in
+            // [`Client::execute_inner`] can remap the resulting
+            // `reqwest::Error` to `Error::NetworkPolicyDenied` instead of
+            // the generic `Error::Reqwest(_)` (which would otherwise make
+            // `is_recoverable()` return `true` and trigger spurious retries
+            // for a deterministic LocalOnly denial).
+            let url = attempt.url().clone();
+            let denied = NetworkPolicyDenied::new("redirect target", url.as_str());
+            attempt.error(denied)
         }
     })
+}
+
+/// Returns `true` if a redirect target passes the active network policy.
+/// Extracted from [`network_policy_redirect_policy`] so the decision logic
+/// can be unit-tested without a live `reqwest` redirect attempt.
+fn check_redirect_target(url: &reqwest::Url) -> bool {
+    network_policy::check_url(url, "redirect target").is_ok()
 }
 
 /// An error returned from `Response::error_for_status` that includes response metadata.
@@ -826,7 +1011,6 @@ impl<'c> oauth2::AsyncHttpClient<'c> for Client {
                 .builder(builder, include_warp_headers, iap_token, None)
                 .send()
                 .await
-                .map_err(Error::from)
                 .map_err(Box::new)?;
 
             let mut builder = ::http::Response::builder().status(response.status());
@@ -877,14 +1061,18 @@ mod origin_tests {
     }
 }
 
+#[cfg(all(test, not(target_family = "wasm")))]
+#[path = "lib_tests.rs"]
+mod tests;
+
 #[cfg(test)]
-mod tests {
-    use futures::StreamExt as _;
+mod network_policy_tests {
     use oauth2::AsyncHttpClient as _;
 
     use super::*;
 
-    static POLICY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static POLICY_TEST_LOCK: std::sync::LazyLock<futures::lock::Mutex<()>> =
+        std::sync::LazyLock::new(|| futures::lock::Mutex::new(()));
 
     fn new_test_client() -> Client {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -896,9 +1084,7 @@ mod tests {
         mode: network_policy::ServicesMode,
         test: impl FnOnce() -> T,
     ) -> T {
-        let _guard = POLICY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = futures::executor::block_on(POLICY_TEST_LOCK.lock());
         let previous = network_policy::services_mode();
         network_policy::set_services_mode(mode);
         let result = test();
@@ -910,9 +1096,7 @@ mod tests {
         mode: network_policy::ServicesMode,
         test: impl Future<Output = T>,
     ) -> T {
-        let _guard = POLICY_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = POLICY_TEST_LOCK.lock().await;
         let previous = network_policy::services_mode();
         network_policy::set_services_mode(mode);
         let result = test.await;
@@ -990,5 +1174,45 @@ mod tests {
             assert!(err.to_string().contains("NetworkPolicyDenied"));
         })
         .await
+    }
+
+    #[test]
+    fn local_only_allows_loopback_redirect_targets() {
+        run_with_services_mode(network_policy::ServicesMode::LocalOnly, || {
+            for url in [
+                "http://127.0.0.1:8080/redirect",
+                "http://localhost:11434/v1/chat/completions",
+            ] {
+                let url = reqwest::Url::parse(url).unwrap();
+                assert!(
+                    check_redirect_target(&url),
+                    "expected {url} to be allowed as redirect target"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn local_only_denies_public_redirect_targets() {
+        run_with_services_mode(network_policy::ServicesMode::LocalOnly, || {
+            for url in [
+                "https://app.warp.dev/redirect",
+                "https://evil.example.com/steal",
+            ] {
+                let url = reqwest::Url::parse(url).unwrap();
+                assert!(
+                    !check_redirect_target(&url),
+                    "expected {url} to be denied as redirect target"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn online_mode_allows_public_redirect_targets() {
+        run_with_services_mode(network_policy::ServicesMode::Online, || {
+            let url = reqwest::Url::parse("https://app.warp.dev/redirect").unwrap();
+            assert!(check_redirect_target(&url));
+        });
     }
 }

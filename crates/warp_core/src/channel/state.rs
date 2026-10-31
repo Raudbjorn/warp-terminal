@@ -7,12 +7,12 @@ use parking_lot::Mutex;
 use url::{Origin, ParseError, Url};
 
 use super::Channel;
+use crate::AppId;
 use crate::channel::config::{
     ChannelConfig, IapConfig, McpOAuthProviderConfig, OzConfig, RudderStackDestination,
     ServicesMode, WarpServerConfig,
 };
 use crate::features::FeatureFlag;
-use crate::AppId;
 
 lazy_static! {
     static ref CHANNEL_STATE: Mutex<ChannelState> = Mutex::new(ChannelState::init());
@@ -20,8 +20,8 @@ lazy_static! {
 
 #[cfg(feature = "test-util")]
 lazy_static! {
-    static ref MOCK_SERVER: mockito::ServerGuard = mockito::Server::new();
-    static ref MOCK_SERVER_URL: String = MOCK_SERVER.url();
+    static ref MOCK_SERVER: Mutex<mockito::ServerGuard> = Mutex::new(mockito::Server::new());
+    static ref MOCK_SERVER_URL: String = MOCK_SERVER.lock().url();
     static ref APP_VERSION: Mutex<Option<&'static str>> = Mutex::new(None);
 }
 
@@ -50,10 +50,16 @@ impl ChannelState {
                 services_mode: ServicesMode::Online,
                 telemetry_config: None,
                 autoupdate_config: None,
-                crash_reporting_config: None,
                 mcp_static_config: None,
             },
         }
+    }
+
+    /// Returns the server used by test-only URL routing so downstream tests can install mocks.
+    #[cfg(feature = "test-util")]
+    pub fn mock_server() -> parking_lot::MutexGuard<'static, mockito::ServerGuard> {
+        lazy_static::initialize(&MOCK_SERVER_URL);
+        MOCK_SERVER.lock()
     }
 
     pub fn new(channel: Channel, mut config: ChannelConfig) -> Self {
@@ -88,7 +94,9 @@ impl ChannelState {
     pub fn override_server_root_url(url: impl Into<Cow<'static, str>>) -> Result<(), ParseError> {
         let url = url.into();
         Url::parse(&url)?;
-        CHANNEL_STATE.lock().config.server_config.server_root_url = url;
+        let mut channel_state = CHANNEL_STATE.lock();
+        channel_state.config.server_config.server_root_url = url;
+        channel_state.config.server_config.iap_config = None;
         Ok(())
     }
 
@@ -207,12 +215,11 @@ impl ChannelState {
         !Self::is_local_only() && CHANNEL_STATE.lock().config.telemetry_config.is_some()
     }
 
-    /// Returns whether this build has a crash reporting config and can therefore
-    /// ship crash reports. Builds like OpenWarp intentionally ship with
-    /// `crash_reporting_config: None`, in which case UI that controls crash
-    /// reporting should be hidden since the toggle has no effect.
+    /// Always `false` in this fork: the Sentry crash-reporting subsystem has been
+    /// removed, so there is nowhere to ship crash reports. Callers use this to hide
+    /// UI that controls crash reporting, since the toggle has no effect.
     pub fn is_crash_reporting_available() -> bool {
-        !Self::is_local_only() && CHANNEL_STATE.lock().config.crash_reporting_config.is_some()
+        false
     }
 
     pub fn releases_base_url() -> Cow<'static, str> {
@@ -292,6 +299,30 @@ impl ChannelState {
         }
     }
 
+    pub fn override_prewarmed_sandbox_control_url(
+        url: impl Into<Cow<'static, str>>,
+    ) -> Result<(), ParseError> {
+        let url = url.into();
+        Url::parse(&url)?;
+        CHANNEL_STATE
+            .lock()
+            .config
+            .server_config
+            .prewarmed_sandbox_control_url = Some(url);
+        Ok(())
+    }
+
+    pub fn prewarmed_sandbox_control_url() -> Cow<'static, str> {
+        let state = CHANNEL_STATE.lock();
+        match &state.config.server_config.prewarmed_sandbox_control_url {
+            Some(url) => url.clone(),
+            None => {
+                drop(state);
+                Self::server_root_url()
+            }
+        }
+    }
+
     pub fn workload_audience_url() -> Cow<'static, str> {
         let state = CHANNEL_STATE.lock();
         match &state.config.oz_config.workload_audience_url {
@@ -355,16 +386,6 @@ impl ChannelState {
     #[cfg(not(feature = "test-util"))]
     pub fn app_version() -> Option<&'static str> {
         option_env!("GIT_RELEASE_TAG")
-    }
-
-    pub fn sentry_url() -> Cow<'static, str> {
-        CHANNEL_STATE
-            .lock()
-            .config
-            .crash_reporting_config
-            .as_ref()
-            .map(|crc| crc.sentry_url.clone())
-            .unwrap_or_default()
     }
 
     pub fn show_autoupdate_menu_items() -> bool {

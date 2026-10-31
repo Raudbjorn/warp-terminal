@@ -1,52 +1,77 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use ai::api_keys::{ApiKeyManager, ApiKeyManagerEvent};
+use ai::api_keys::{
+    ApiKeyManager, ApiKeyManagerEvent, CustomEndpointParams, DEFAULT_PROFILE_INFERENCE_KEY,
+};
 use itertools::Itertools;
 use regex::Regex;
 use thousands::Separable;
+use warp_core::channel::ChannelState;
 use warp_core::ui::theme::color::internal_colors;
 use warpui::elements::{
     Align, Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
     Container, CrossAxisAlignment, Expanded, Flex, Highlight, MouseStateHandle, ParentElement,
-    PartialClickableElement, ScrollbarWidth, Text,
+    PartialClickableElement, ScrollbarWidth, Stack, Text,
 };
-use warpui::fonts::Properties;
+use warpui::fonts::{Properties, Weight};
+use warpui::keymap::Keystroke;
 use warpui::platform::Cursor;
+use warpui::ui_components::components::{Coords, UiComponentStyles};
 use warpui::ui_components::slider::SliderStateHandle;
 use warpui::ui_components::switch::SwitchStateHandle;
 use warpui::{
     AppContext, Element, Entity, ModelHandle, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle,
+    ViewHandle, WeakViewHandle,
 };
 
 use crate::ai::blocklist::BlocklistAIPermissions;
-use crate::ai::execution_profiles::model_menu_items::available_model_menu_items;
+use crate::ai::execution_profiles::model_menu_items::{
+    CollapsedModelVariants, available_model_menu_items,
+};
 use crate::ai::execution_profiles::profiles::{
-    AIExecutionProfilesModel, AIExecutionProfilesModelEvent, ClientProfileId,
+    AIExecutionProfilesModel, AIExecutionProfilesModelEvent,
 };
 use crate::ai::execution_profiles::{
-    AIExecutionProfile, AIExecutionProfileAppExt as _, ActionPermission, RunAgentsPermission,
-    WriteToPtyPermission,
+    AIExecutionProfile, AIExecutionProfileAppExt as _, ActionPermission, ExecutionProfileId,
+    RunAgentsPermission, WriteToPtyPermission,
 };
 use crate::ai::llms::{
     DisableReason, LLMContextWindow, LLMId, LLMInfo, LLMPreferences, LLMPreferencesEvent,
 };
 use crate::ai::paths::host_native_absolute_path;
 use crate::editor::{
-    EditorView, Event as EditorEvent, InteractionState, SingleLineEditorOptions, TextOptions,
+    EditorView, Event as EditorEvent, InteractionState, SingleLineEditorOptions, TextColors,
+    TextOptions,
 };
+#[cfg(not(target_family = "wasm"))]
+use crate::local_multi_agent::{
+    LOCAL_MODEL_ALIAS_IDS, LocalMultiAgentManager, LocalMultiAgentManagerEvent,
+    LocalMultiAgentTestStatus,
+};
+use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::pane_group::focus_state::PaneFocusHandle;
 use crate::pane_group::pane::view;
 use crate::pane_group::{BackingView, PaneConfiguration, PaneEvent};
 use crate::settings::{AISettings, AISettingsChangedEvent, AgentModeCommandExecutionPredicate};
+use crate::settings_view::custom_inference_modal::{
+    CustomEndpointModal, CustomEndpointModalEvent, CustomEndpointModalViewState,
+};
+use crate::settings_view::remove_custom_endpoint_confirmation_dialog::{
+    RemoveCustomEndpointConfirmationDialog, RemoveCustomEndpointConfirmationDialogEvent,
+};
 use crate::ui_components::icons::Icon;
-use crate::view_components::action_button::{ActionButton, DangerSecondaryTheme};
+use crate::view_components::action_button::{
+    ActionButton, ButtonSize, DangerSecondaryTheme, SecondaryTheme,
+};
 use crate::view_components::dropdown::DropdownAction;
 use crate::view_components::{
     Dropdown, DropdownItem, FilterableDropdown, SubmittableTextInput, SubmittableTextInputEvent,
 };
 use crate::workspace::WorkspaceAction;
-use crate::workspaces::user_workspaces::UserWorkspacesEvent;
+use crate::workspaces::user_workspaces::{
+    ResolvedTeamScope, TeamContext, TeamScope, UserWorkspacesEvent,
+};
 use crate::{Appearance, TemplatableMCPServerManager, UserWorkspaces};
 
 const MODEL_MENU_WIDTH: f32 = 250.;
@@ -196,6 +221,17 @@ pub enum ExecutionProfileEditorViewAction {
     SetRunAgents {
         permission: RunAgentsPermission,
     },
+    #[cfg(not(target_family = "wasm"))]
+    ToggleLocalAIAutocomplete,
+    #[cfg(not(target_family = "wasm"))]
+    SetLocalModelAlias {
+        alias: String,
+        model: String,
+    },
+    #[cfg(not(target_family = "wasm"))]
+    RestartLocalMultiAgent,
+    #[cfg(not(target_family = "wasm"))]
+    TestLocalMultiAgent,
     AddToCommandAllowlist {
         predicate: AgentModeCommandExecutionPredicate,
     },
@@ -233,10 +269,13 @@ pub enum ExecutionProfileEditorViewAction {
     SetWebSearchEnabled {
         enabled: bool,
     },
+    OpenAddCustomEndpointModal,
+    OpenEditCustomEndpointModal(usize),
 }
 
 pub struct ExecutionProfileEditorView {
-    profile_id: ClientProfileId,
+    profile_id: ExecutionProfileId,
+    self_handle: WeakViewHandle<Self>,
     pane_configuration: ModelHandle<PaneConfiguration>,
     focus_handle: Option<PaneFocusHandle>,
     clipped_scroll_state: ClippedScrollStateHandle,
@@ -274,10 +313,30 @@ pub struct ExecutionProfileEditorView {
     plan_auto_sync_switch: SwitchStateHandle,
     web_search_switch: SwitchStateHandle,
     upgrade_footer_mouse_state: MouseStateHandle,
+    openai_api_key_editor: ViewHandle<EditorView>,
+    anthropic_api_key_editor: ViewHandle<EditorView>,
+    google_api_key_editor: ViewHandle<EditorView>,
+    #[cfg(not(target_family = "wasm"))]
+    openai_base_url_editor: ViewHandle<EditorView>,
+    #[cfg(not(target_family = "wasm"))]
+    local_agent_alias_dropdowns:
+        HashMap<&'static str, ViewHandle<FilterableDropdown<ExecutionProfileEditorViewAction>>>,
+    #[cfg(not(target_family = "wasm"))]
+    local_agent_autocomplete_switch: SwitchStateHandle,
+    #[cfg(not(target_family = "wasm"))]
+    local_agent_restart_button: ViewHandle<ActionButton>,
+    #[cfg(not(target_family = "wasm"))]
+    local_agent_health_button: ViewHandle<ActionButton>,
+    custom_endpoint_modal_state: CustomEndpointModalViewState,
+    remove_custom_endpoint_confirmation_dialog: ViewHandle<RemoveCustomEndpointConfirmationDialog>,
+    pending_remove_custom_endpoint_index: Option<usize>,
+    custom_inference_add_button: ViewHandle<ActionButton>,
+    custom_endpoint_edit_buttons: Vec<ViewHandle<ActionButton>>,
 }
 
 impl ExecutionProfileEditorView {
-    pub fn new(profile_id: ClientProfileId, ctx: &mut ViewContext<Self>) -> Self {
+    pub fn new(profile_id: ExecutionProfileId, ctx: &mut ViewContext<Self>) -> Self {
+        let self_handle = ctx.handle();
         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new(HEADER_TEXT));
 
         let apply_code_diffs_dropdown = ctx.add_typed_action_view(|ctx| {
@@ -517,7 +576,8 @@ impl ExecutionProfileEditorView {
         });
 
         let permissions = BlocklistAIPermissions::as_ref(ctx);
-        let profile_data = permissions.permissions_profile_for_id(ctx, profile_id);
+        let team_context = UserWorkspaces::as_ref(ctx).team_context(&self_handle, ctx);
+        let profile_data = permissions.permissions_profile_for_id(&profile_id, &team_context, ctx);
 
         let mcp_allowlist_mouse_state_handles = profile_data
             .mcp_allowlist
@@ -541,7 +601,8 @@ impl ExecutionProfileEditorView {
         // persisted limit (or the active model's max as a sensible default).
         // The slider's current position is derived from the profile on each
         // render, so no local Cell is needed.
-        let initial_context_window_value = initial_context_window_display_value(&profile_data, ctx);
+        let initial_context_window_value =
+            initial_context_window_display_value(&profile_data, &profile_id, ctx);
         let context_window_slider_state = SliderStateHandle::default();
         let context_window_editor = ctx.add_typed_action_view(|ctx| {
             let options = SingleLineEditorOptions {
@@ -634,6 +695,219 @@ impl ExecutionProfileEditorView {
 
         Self::update_profile_name_editor(&profile_name_editor, &profile_data, ctx);
 
+        let inference_profile_key =
+            Self::inference_profile_key_for_profile_id(&profile_id, ctx).unwrap_or_default();
+        let inference_settings = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&inference_profile_key);
+
+        macro_rules! create_profile_inference_key_editor {
+            ($editor:ident, $initial:expr, $placeholder:literal, $is_password:literal, |$manager:ident, $profile_key:ident, $key:ident, $ctx:ident| $apply:block) => {
+                let initial_value = $initial;
+                let $editor = ctx.add_typed_action_view(move |ctx| {
+                    let appearance = Appearance::handle(ctx).as_ref(ctx);
+                    let options = SingleLineEditorOptions {
+                        is_password: $is_password,
+                        text: TextOptions {
+                            font_size_override: Some(appearance.ui_font_size()),
+                            font_family_override: Some(appearance.monospace_font_family()),
+                            text_colors_override: Some(TextColors {
+                                default_color: appearance.theme().active_ui_text_color(),
+                                disabled_color: appearance.theme().disabled_ui_text_color(),
+                                hint_color: appearance.theme().disabled_ui_text_color(),
+                            }),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let mut editor = EditorView::single_line(options, ctx);
+                    editor.set_placeholder_text($placeholder, ctx);
+                    if let Some(value) = &initial_value {
+                        editor.set_buffer_text(value, ctx);
+                    }
+                    editor
+                });
+                let editor_clone = $editor.clone();
+                ctx.subscribe_to_view(&editor_clone, |view, editor, event, ctx| {
+                    if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                        let Some($profile_key) = view.inference_profile_key(ctx) else {
+                            return;
+                        };
+                        let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
+                        let $key = (!buffer_text.is_empty()).then_some(buffer_text);
+                        ApiKeyManager::handle(ctx).update(ctx, |$manager, $ctx| $apply);
+                    }
+                });
+            };
+        }
+
+        create_profile_inference_key_editor!(
+            openai_api_key_editor,
+            inference_settings.openai.clone(),
+            "sk-...",
+            true,
+            |manager, profile_key, key, ctx| {
+                manager.set_openai_key_for_profile(&profile_key, key, ctx);
+            }
+        );
+        create_profile_inference_key_editor!(
+            anthropic_api_key_editor,
+            inference_settings.anthropic.clone(),
+            "sk-ant-...",
+            true,
+            |manager, profile_key, key, ctx| {
+                manager.set_anthropic_key_for_profile(&profile_key, key, ctx);
+            }
+        );
+        create_profile_inference_key_editor!(
+            google_api_key_editor,
+            inference_settings.google.clone(),
+            "AIzaSy...",
+            true,
+            |manager, profile_key, key, ctx| {
+                manager.set_google_key_for_profile(&profile_key, key, ctx);
+            }
+        );
+
+        #[cfg(not(target_family = "wasm"))]
+        create_profile_inference_key_editor!(
+            openai_base_url_editor,
+            inference_settings.openai_base_url.clone(),
+            "https://api.openai.com/v1",
+            false,
+            |manager, profile_key, key, ctx| {
+                manager.set_openai_base_url_for_profile(&profile_key, key.clone(), ctx);
+                if key.is_some() {
+                    let openai_api_key = manager.openai_key_for_profile(&profile_key);
+                    LocalMultiAgentManager::handle(ctx).update(ctx, |local_manager, ctx| {
+                        local_manager.test_profile_backend(
+                            profile_key.clone(),
+                            key.clone(),
+                            openai_api_key.clone(),
+                            ctx,
+                        );
+                    });
+                }
+            }
+        );
+
+        #[cfg(not(target_family = "wasm"))]
+        let local_agent_alias_dropdowns: HashMap<
+            &'static str,
+            ViewHandle<FilterableDropdown<ExecutionProfileEditorViewAction>>,
+        > = LOCAL_MODEL_ALIAS_IDS
+            .into_iter()
+            .map(|alias| {
+                let dropdown = ctx.add_typed_action_view(|ctx| {
+                    let mut dropdown = FilterableDropdown::new(ctx);
+                    dropdown.set_menu_width(MODEL_MENU_WIDTH, ctx);
+                    dropdown
+                });
+                (alias, dropdown)
+            })
+            .collect();
+
+        #[cfg(not(target_family = "wasm"))]
+        let local_agent_restart_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("Restart", SecondaryTheme)
+                .with_icon(Icon::RefreshCw04)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(
+                        ExecutionProfileEditorViewAction::RestartLocalMultiAgent,
+                    );
+                })
+        });
+        #[cfg(not(target_family = "wasm"))]
+        let local_agent_health_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("Test", SecondaryTheme)
+                .with_icon(Icon::Check)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(
+                        ExecutionProfileEditorViewAction::TestLocalMultiAgent,
+                    );
+                })
+        });
+
+        let custom_inference_controls_enabled = Self::can_use_custom_inference_controls(ctx);
+        let custom_inference_add_button = ctx.add_typed_action_view(|_| {
+            ActionButton::new("+ Add custom model", SecondaryTheme)
+                .with_size(ButtonSize::Small)
+                .on_click(|ctx| {
+                    ctx.dispatch_typed_action(
+                        ExecutionProfileEditorViewAction::OpenAddCustomEndpointModal,
+                    );
+                })
+        });
+        custom_inference_add_button.update(ctx, |button, ctx| {
+            button.set_disabled(!custom_inference_controls_enabled, ctx);
+        });
+
+        let custom_endpoint_modal_body =
+            ctx.add_typed_action_view(|ctx| CustomEndpointModal::new(None, None, ctx));
+        ctx.subscribe_to_view(&custom_endpoint_modal_body, |me, _, event, ctx| {
+            me.handle_custom_endpoint_modal_event(event, ctx);
+        });
+
+        let custom_endpoint_modal_body_for_modal = custom_endpoint_modal_body.clone();
+        let custom_endpoint_modal_view = ctx.add_typed_action_view(move |ctx| {
+            Modal::new(
+                Some("Add custom endpoint".to_string()),
+                custom_endpoint_modal_body_for_modal.clone(),
+                ctx,
+            )
+            .with_modal_style(UiComponentStyles {
+                width: Some(560.),
+                height: Some(600.),
+                ..Default::default()
+            })
+            .with_header_style(UiComponentStyles {
+                padding: Some(Coords {
+                    top: 24.,
+                    bottom: 0.,
+                    left: 24.,
+                    right: 24.,
+                }),
+                font_size: Some(16.),
+                font_weight: Some(Weight::Bold),
+                ..Default::default()
+            })
+            .with_body_style(UiComponentStyles {
+                padding: Some(Coords {
+                    top: 0.,
+                    bottom: 24.,
+                    left: 24.,
+                    right: 24.,
+                }),
+                ..Default::default()
+            })
+            .with_background_opacity(100)
+            .with_dismiss_on_click()
+            .with_dismiss_keystroke(Keystroke::parse("escape").unwrap())
+        });
+        ctx.subscribe_to_view(&custom_endpoint_modal_view, |me, _, event, ctx| {
+            me.handle_custom_endpoint_modal_close_event(event, ctx);
+        });
+
+        let custom_endpoint_modal_state =
+            CustomEndpointModalViewState::new(ModalViewState::new(custom_endpoint_modal_view));
+
+        let remove_custom_endpoint_confirmation_dialog =
+            ctx.add_typed_action_view(RemoveCustomEndpointConfirmationDialog::new);
+        ctx.subscribe_to_view(
+            &remove_custom_endpoint_confirmation_dialog,
+            |me, _, event, ctx| {
+                me.handle_remove_custom_endpoint_confirmation_dialog_event(event, ctx);
+            },
+        );
+
+        let custom_endpoint_edit_buttons = Self::create_custom_endpoint_edit_buttons(
+            Self::profile_custom_endpoints_len(&profile_id, ctx),
+            custom_inference_controls_enabled,
+            ctx,
+        );
+
         let delete_button = ctx.add_typed_action_view(|_| {
             ActionButton::new("Delete profile", DangerSecondaryTheme)
                 .with_icon(Icon::Trash)
@@ -644,6 +918,7 @@ impl ExecutionProfileEditorView {
 
         let mut view = Self {
             profile_id,
+            self_handle,
             pane_configuration,
             focus_handle: None,
             clipped_scroll_state: Default::default(),
@@ -684,6 +959,24 @@ impl ExecutionProfileEditorView {
             plan_auto_sync_switch: Default::default(),
             web_search_switch: Default::default(),
             upgrade_footer_mouse_state: Default::default(),
+            openai_api_key_editor,
+            anthropic_api_key_editor,
+            google_api_key_editor,
+            #[cfg(not(target_family = "wasm"))]
+            openai_base_url_editor,
+            #[cfg(not(target_family = "wasm"))]
+            local_agent_alias_dropdowns,
+            #[cfg(not(target_family = "wasm"))]
+            local_agent_autocomplete_switch: Default::default(),
+            #[cfg(not(target_family = "wasm"))]
+            local_agent_restart_button,
+            #[cfg(not(target_family = "wasm"))]
+            local_agent_health_button,
+            custom_endpoint_modal_state,
+            remove_custom_endpoint_confirmation_dialog,
+            pending_remove_custom_endpoint_index: None,
+            custom_inference_add_button,
+            custom_endpoint_edit_buttons,
         };
 
         ctx.subscribe_to_view(&view.profile_name_editor, |view, _, event, ctx| {
@@ -708,7 +1001,7 @@ impl ExecutionProfileEditorView {
                     }
                 };
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.add_to_command_allowlist(view.profile_id, &predicate, ctx);
+                    profiles_model.add_to_command_allowlist(&view.profile_id, &predicate, ctx);
                 });
                 ctx.notify();
             }
@@ -726,7 +1019,7 @@ impl ExecutionProfileEditorView {
                     }
                 };
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.add_to_command_denylist(view.profile_id, &predicate, ctx);
+                    profiles_model.add_to_command_denylist(&view.profile_id, &predicate, ctx);
                 });
                 ctx.notify();
             }
@@ -737,7 +1030,7 @@ impl ExecutionProfileEditorView {
                 let expanded = host_native_absolute_path(s, &None, &None);
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
                     profiles_model.add_to_directory_allowlist(
-                        view.profile_id,
+                        &view.profile_id,
                         &PathBuf::from(expanded),
                         ctx,
                     );
@@ -748,62 +1041,34 @@ impl ExecutionProfileEditorView {
 
         ctx.subscribe_to_model(&LLMPreferences::handle(ctx), |me, _, event, ctx| {
             let permissions = BlocklistAIPermissions::as_ref(ctx);
-            let current_permissions = permissions.permissions_profile_for_id(ctx, me.profile_id);
+            let scope = me.team_context(ctx);
+            let current_permissions =
+                permissions.permissions_profile_for_id(&me.profile_id, &scope, ctx);
 
             match event {
                 LLMPreferencesEvent::UpdatedAvailableLLMs => {
-                    Self::refresh_filterable_model_dropdown(
-                        &me.base_model_dropdown,
-                        current_permissions.base_model.clone(),
-                        |prefs, app| prefs.get_base_llm_choices_for_agent_mode(app).collect_vec(),
-                        |id| ExecutionProfileEditorViewAction::SetBaseModel { id },
-                        |prefs| prefs.get_default_base_model().id.clone(),
-                        &me.upgrade_footer_mouse_state,
-                        ctx,
-                    );
-                    Self::refresh_coding_model_dropdown(
-                        &me.coding_model_dropdown,
-                        current_permissions.coding_model.clone(),
-                        ctx,
-                    );
-                    Self::refresh_filterable_model_dropdown(
-                        &me.full_terminal_use_model_dropdown,
-                        current_permissions.cli_agent_model.clone(),
-                        |prefs, app| prefs.get_cli_agent_llm_choices(app).collect_vec(),
-                        |id| ExecutionProfileEditorViewAction::SetFullTerminalUseModel { id },
-                        |prefs| prefs.get_default_cli_agent_model().id.clone(),
-                        &me.upgrade_footer_mouse_state,
-                        ctx,
-                    );
+                    me.refresh_model_dropdowns(&current_permissions, ctx);
                     Self::refresh_filterable_model_dropdown(
                         &me.computer_use_model_dropdown,
                         current_permissions.computer_use_model.clone(),
-                        |prefs, _| prefs.get_computer_use_llm_choices().collect_vec(),
+                        |prefs, scope, app| {
+                            prefs.get_computer_use_llm_choices(scope, app).collect_vec()
+                        },
                         |id| ExecutionProfileEditorViewAction::SetComputerUseModel { id },
-                        |prefs| prefs.get_default_computer_use_model().id.clone(),
+                        |prefs, scope, app| {
+                            prefs.get_default_computer_use_model(scope, app).id.clone()
+                        },
                         &me.upgrade_footer_mouse_state,
                         ctx,
                     );
                     me.sync_context_window_editor(ctx, false);
                 }
                 LLMPreferencesEvent::UpdatedActiveAgentModeLLM => {
-                    Self::refresh_filterable_model_dropdown(
-                        &me.base_model_dropdown,
-                        current_permissions.base_model.clone(),
-                        |prefs, app| prefs.get_base_llm_choices_for_agent_mode(app).collect_vec(),
-                        |id| ExecutionProfileEditorViewAction::SetBaseModel { id },
-                        |prefs| prefs.get_default_base_model().id.clone(),
-                        &me.upgrade_footer_mouse_state,
-                        ctx,
-                    );
+                    me.refresh_base_model_dropdown(current_permissions.base_model.clone(), ctx);
                     me.sync_context_window_editor(ctx, false);
                 }
                 LLMPreferencesEvent::UpdatedActiveCodingLLM => {
-                    Self::refresh_coding_model_dropdown(
-                        &me.coding_model_dropdown,
-                        current_permissions.coding_model.clone(),
-                        ctx,
-                    );
+                    me.refresh_coding_model_dropdown(current_permissions.coding_model.clone(), ctx);
                 }
             }
         });
@@ -813,71 +1078,313 @@ impl ExecutionProfileEditorView {
             &ApiKeyManager::handle(ctx),
             |me, _model, _event: &ApiKeyManagerEvent, ctx| {
                 let permissions = BlocklistAIPermissions::as_ref(ctx);
+                let scope = me.team_context(ctx);
                 let current_permissions =
-                    permissions.permissions_profile_for_id(ctx, me.profile_id);
-                Self::refresh_filterable_model_dropdown(
-                    &me.base_model_dropdown,
-                    current_permissions.base_model.clone(),
-                    |prefs, app| prefs.get_base_llm_choices_for_agent_mode(app).collect_vec(),
-                    |id| ExecutionProfileEditorViewAction::SetBaseModel { id },
-                    |prefs| prefs.get_default_base_model().id.clone(),
-                    &me.upgrade_footer_mouse_state,
-                    ctx,
-                );
-                Self::refresh_coding_model_dropdown(
-                    &me.coding_model_dropdown,
-                    current_permissions.coding_model.clone(),
-                    ctx,
-                );
+                    permissions.permissions_profile_for_id(&me.profile_id, &scope, ctx);
+                me.refresh_model_dropdowns(&current_permissions, ctx);
+                me.sync_profile_inference_editors(ctx);
+                me.sync_custom_endpoint_buttons(ctx);
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    me.refresh_local_agent_alias_dropdowns(ctx);
+                    me.update_local_agent_buttons(ctx);
+                }
                 me.sync_context_window_editor(ctx, false);
                 ctx.notify();
+            },
+        );
+
+        #[cfg(not(target_family = "wasm"))]
+        ctx.subscribe_to_model(
+            &LocalMultiAgentManager::handle(ctx),
+            |me, _, event: &LocalMultiAgentManagerEvent, ctx| {
+                if matches!(
+                    event,
+                    LocalMultiAgentManagerEvent::ConfigChanged
+                        | LocalMultiAgentManagerEvent::StatusChanged
+                        | LocalMultiAgentManagerEvent::TestStatusChanged
+                ) {
+                    let permissions = BlocklistAIPermissions::as_ref(ctx);
+                    let current_permissions = permissions.permissions_profile_for_id(
+                        &me.profile_id,
+                        &me.team_context(ctx),
+                        ctx,
+                    );
+                    me.refresh_model_dropdowns(&current_permissions, ctx);
+                    me.refresh_local_agent_alias_dropdowns(ctx);
+                    me.update_local_agent_buttons(ctx);
+                    ctx.notify();
+                }
             },
         );
 
         ctx.subscribe_to_model(
             &AIExecutionProfilesModel::handle(ctx),
             |me, _, event, ctx| {
-                if matches!(event, AIExecutionProfilesModelEvent::ProfileUpdated(profile_id) if *profile_id == me.profile_id) {
+                if matches!(event, AIExecutionProfilesModelEvent::ProfileUpdated(profile_id) if profile_id == &me.profile_id) {
                     me.refresh_profile_state(ctx);
                     me.update_mouse_state_handles(ctx);
+                    me.sync_custom_endpoint_buttons(ctx);
                 }
             },
         );
 
         let workspace = UserWorkspaces::handle(ctx);
-        ctx.subscribe_to_model(&workspace, |me, workspace, event, ctx| {
+        ctx.subscribe_to_model(&workspace, |me, _, event, ctx| {
             if let UserWorkspacesEvent::TeamsChanged = event {
-                Self::update_all_editor_interaction_states(me, workspace, ctx);
+                Self::update_all_editor_interaction_states(me, ctx);
                 me.update_mouse_state_handles(ctx);
+                me.sync_custom_endpoint_buttons(ctx);
+                #[cfg(not(target_family = "wasm"))]
+                me.update_local_agent_buttons(ctx);
                 ctx.notify();
             }
         });
         ctx.subscribe_to_model(&AISettings::handle(ctx), |me, _, event, ctx| {
             if let AISettingsChangedEvent::IsAnyAIEnabled { .. } = event {
-                let workspace = UserWorkspaces::handle(ctx);
-                Self::update_all_editor_interaction_states(me, workspace, ctx);
+                Self::update_all_editor_interaction_states(me, ctx);
+                me.sync_custom_endpoint_buttons(ctx);
+                #[cfg(not(target_family = "wasm"))]
+                me.update_local_agent_buttons(ctx);
                 me.sync_context_window_editor(ctx, true);
                 ctx.notify();
             }
         });
 
-        Self::update_all_editor_interaction_states(&view, workspace, ctx);
+        Self::update_all_editor_interaction_states(&view, ctx);
 
         view.refresh_profile_state(ctx);
+        view.sync_profile_inference_editors(ctx);
+        view.sync_custom_endpoint_buttons(ctx);
+        #[cfg(not(target_family = "wasm"))]
+        view.update_local_agent_buttons(ctx);
 
         view.update_mouse_state_handles(ctx);
 
         view
     }
 
-    pub fn profile_id(&self) -> ClientProfileId {
-        self.profile_id
+    pub fn profile_id(&self) -> &ExecutionProfileId {
+        &self.profile_id
+    }
+
+    pub(super) fn team_context<'a>(&self, app: &'a AppContext) -> TeamContext<'a> {
+        UserWorkspaces::as_ref(app).team_context(&self.self_handle, app)
+    }
+
+    fn profile_custom_endpoints_len(profile_id: &ExecutionProfileId, app: &AppContext) -> usize {
+        Self::inference_profile_key_for_profile_id(profile_id, app)
+            .map(|profile_key| {
+                ApiKeyManager::as_ref(app)
+                    .keys()
+                    .profile_settings(&profile_key)
+                    .custom_endpoints
+                    .len()
+            })
+            .unwrap_or_default()
+    }
+
+    fn inference_profile_key_for_profile_id(
+        profile_id: &ExecutionProfileId,
+        app: &AppContext,
+    ) -> Option<String> {
+        AIExecutionProfilesModel::as_ref(app)
+            .get_profile_by_id(profile_id, app)
+            .map(|profile| profile.inference_profile_key())
+    }
+
+    fn inference_profile_key(&self, app: &AppContext) -> Option<String> {
+        Self::inference_profile_key_for_profile_id(&self.profile_id, app)
+    }
+
+    fn inference_profile_key_or_default(&self, app: &AppContext) -> String {
+        self.inference_profile_key(app)
+            .unwrap_or_else(|| DEFAULT_PROFILE_INFERENCE_KEY.to_string())
+    }
+
+    fn sync_editor_text(
+        editor: &ViewHandle<EditorView>,
+        value: Option<String>,
+        ctx: &mut AppContext,
+    ) {
+        let value = value.unwrap_or_default();
+        editor.update(ctx, |editor, ctx| {
+            if editor.buffer_text(ctx) != value {
+                editor.set_buffer_text(&value, ctx);
+            }
+        });
+    }
+
+    fn sync_profile_inference_editors(&self, ctx: &mut AppContext) {
+        let Some(profile_key) = self.inference_profile_key(ctx) else {
+            return;
+        };
+        let settings = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&profile_key);
+        Self::sync_editor_text(&self.openai_api_key_editor, settings.openai, ctx);
+        Self::sync_editor_text(&self.anthropic_api_key_editor, settings.anthropic, ctx);
+        Self::sync_editor_text(&self.google_api_key_editor, settings.google, ctx);
+        #[cfg(not(target_family = "wasm"))]
+        Self::sync_editor_text(&self.openai_base_url_editor, settings.openai_base_url, ctx);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn local_inference_settings_enabled(app: &AppContext) -> bool {
+        AISettings::as_ref(app).is_any_ai_enabled(app)
+            && UserWorkspaces::as_ref(app).is_byo_api_key_enabled(app)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn update_local_agent_buttons(&self, app: &mut AppContext) {
+        let is_enabled = Self::local_inference_settings_enabled(app);
+        let test_status = LocalMultiAgentManager::as_ref(app).test_status().clone();
+        self.local_agent_restart_button.update(app, |button, ctx| {
+            button.set_disabled(!is_enabled, ctx);
+        });
+        self.local_agent_health_button
+            .update(app, |button, ctx| match test_status {
+                LocalMultiAgentTestStatus::NotRun => {
+                    button.set_label("Test", ctx);
+                    button.set_icon(Some(Icon::Check), ctx);
+                    button.set_disabled(!is_enabled, ctx);
+                }
+                LocalMultiAgentTestStatus::Testing => {
+                    button.set_label("Testing...", ctx);
+                    button.set_icon(Some(Icon::RefreshCw04), ctx);
+                    button.set_disabled(true, ctx);
+                }
+                LocalMultiAgentTestStatus::Passed { .. } => {
+                    button.set_label("Passed", ctx);
+                    button.set_icon(Some(Icon::Check), ctx);
+                    button.set_disabled(!is_enabled, ctx);
+                }
+                LocalMultiAgentTestStatus::Failed { .. } => {
+                    button.set_label("Failed", ctx);
+                    button.set_icon(Some(Icon::AlertTriangle), ctx);
+                    button.set_disabled(!is_enabled, ctx);
+                }
+            });
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn refresh_local_agent_alias_dropdowns(&self, ctx: &mut AppContext) {
+        let Some(profile_key) = self.inference_profile_key(ctx) else {
+            return;
+        };
+        let is_enabled = Self::local_inference_settings_enabled(ctx);
+        let manager = LocalMultiAgentManager::as_ref(ctx);
+        let config = manager.config().clone();
+        let profile_settings = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&profile_key);
+        let autocomplete_enabled = profile_settings.local_ai_autocomplete_enabled;
+        let mut profile_alias_config = config.clone();
+        profile_alias_config.local_model_aliases = profile_settings.local_model_aliases.clone();
+        profile_alias_config.local_model_list = profile_settings.local_model_list.clone();
+        let choices = profile_alias_config.model_choices(&[]);
+        let aliases = profile_alias_config.model_aliases().unwrap_or_default();
+
+        for alias in LOCAL_MODEL_ALIAS_IDS {
+            let Some(dropdown_handle) = self.local_agent_alias_dropdowns.get(alias) else {
+                continue;
+            };
+            let selected = aliases
+                .get(alias)
+                .filter(|model| choices.iter().any(|choice| choice == *model))
+                .or_else(|| choices.first())
+                .cloned();
+            dropdown_handle.update(ctx, |dropdown, ctx| {
+                let alias_enabled = is_enabled
+                    && !choices.is_empty()
+                    && (alias != "auto-autocomplete" || autocomplete_enabled);
+                if alias_enabled {
+                    dropdown.set_enabled(ctx);
+                } else {
+                    dropdown.set_disabled(ctx);
+                }
+                let items = choices
+                    .iter()
+                    .map(|model| {
+                        DropdownItem::new(
+                            model.clone(),
+                            ExecutionProfileEditorViewAction::SetLocalModelAlias {
+                                alias: alias.to_string(),
+                                model: model.clone(),
+                            },
+                        )
+                    })
+                    .collect();
+                dropdown.set_items(items, ctx);
+                if let Some(selected) = selected.clone() {
+                    dropdown.set_selected_by_action(
+                        ExecutionProfileEditorViewAction::SetLocalModelAlias {
+                            alias: alias.to_string(),
+                            model: selected,
+                        },
+                        ctx,
+                    );
+                }
+            });
+        }
+    }
+
+    fn can_use_custom_inference_controls(app: &AppContext) -> bool {
+        AISettings::as_ref(app).is_any_ai_enabled(app)
+            && UserWorkspaces::as_ref(app).is_byo_endpoint_enabled_for_any_team(app)
+    }
+
+    fn sync_custom_endpoint_buttons(&mut self, ctx: &mut ViewContext<Self>) {
+        let enabled = Self::can_use_custom_inference_controls(ctx);
+        self.custom_inference_add_button.update(ctx, |button, ctx| {
+            button.set_disabled(!enabled, ctx);
+        });
+
+        let endpoint_count = Self::profile_custom_endpoints_len(&self.profile_id, ctx);
+        if self.custom_endpoint_edit_buttons.len() != endpoint_count {
+            self.custom_endpoint_edit_buttons =
+                Self::create_custom_endpoint_edit_buttons(endpoint_count, enabled, ctx);
+        } else {
+            for button in &self.custom_endpoint_edit_buttons {
+                button.update(ctx, |button, ctx| {
+                    button.set_disabled(!enabled, ctx);
+                });
+            }
+        }
+    }
+
+    fn create_custom_endpoint_edit_buttons(
+        count: usize,
+        enabled: bool,
+        ctx: &mut ViewContext<Self>,
+    ) -> Vec<ViewHandle<ActionButton>> {
+        (0..count)
+            .map(|index| {
+                let button = ctx.add_typed_action_view(move |_| {
+                    ActionButton::new("Edit", SecondaryTheme)
+                        .with_icon(Icon::Pencil)
+                        .with_size(ButtonSize::Small)
+                        .on_click(move |ctx| {
+                            ctx.dispatch_typed_action(
+                                ExecutionProfileEditorViewAction::OpenEditCustomEndpointModal(
+                                    index,
+                                ),
+                            );
+                        })
+                });
+                button.update(ctx, |button, ctx| {
+                    button.set_disabled(!enabled, ctx);
+                });
+                button
+            })
+            .collect()
     }
 
     fn update_mouse_state_handles(&mut self, ctx: &mut ViewContext<Self>) {
-        let app = ctx;
-        let permissions = BlocklistAIPermissions::as_ref(app);
-        let current_permissions = permissions.permissions_profile_for_id(app, self.profile_id);
+        let permissions = BlocklistAIPermissions::as_ref(ctx);
+        let scope = self.team_context(ctx);
+        let current_permissions =
+            permissions.permissions_profile_for_id(&self.profile_id, &scope, ctx);
 
         self.command_allowlist_mouse_state_handles = current_permissions
             .command_allowlist
@@ -918,48 +1425,30 @@ impl ExecutionProfileEditorView {
 
     fn refresh_profile_state(&mut self, ctx: &mut ViewContext<Self>) {
         let permissions = BlocklistAIPermissions::as_ref(ctx);
-        let current_permissions = permissions.permissions_profile_for_id(ctx, self.profile_id);
+        let scope = self.team_context(ctx);
+        let current_permissions =
+            permissions.permissions_profile_for_id(&self.profile_id, &scope, ctx);
         let ai_settings = AISettings::as_ref(ctx);
 
-        let apply_code_diffs_disabled = !ai_settings.is_code_diffs_permissions_editable(ctx);
-        let read_files_disabled = !ai_settings.is_read_files_permissions_editable(ctx);
-        let execute_commands_disabled = !ai_settings.is_execute_commands_permissions_editable(ctx);
-        let write_to_pty_disabled = !ai_settings.is_write_to_pty_permissions_editable(ctx);
-        let computer_use_disabled = !ai_settings.is_computer_use_permissions_editable(ctx);
+        let apply_code_diffs_disabled =
+            !ai_settings.is_code_diffs_permissions_editable(&scope, ctx);
+        let read_files_disabled = !ai_settings.is_read_files_permissions_editable(&scope, ctx);
+        let execute_commands_disabled =
+            !ai_settings.is_execute_commands_permissions_editable(&scope, ctx);
+        let write_to_pty_disabled = !ai_settings.is_write_to_pty_permissions_editable(&scope, ctx);
+        let computer_use_disabled = !ai_settings.is_computer_use_permissions_editable(&scope, ctx);
         let ask_user_question_disabled =
             !ai_settings.is_ask_user_question_permissions_editable(ctx);
         let run_agents_disabled = !ai_settings.is_run_agents_permissions_editable(ctx);
         let mcp_disabled = !ai_settings.is_mcp_permission_editable(ctx);
 
-        Self::refresh_filterable_model_dropdown(
-            &self.base_model_dropdown,
-            current_permissions.base_model.clone(),
-            |prefs, app| prefs.get_base_llm_choices_for_agent_mode(app).collect_vec(),
-            |id| ExecutionProfileEditorViewAction::SetBaseModel { id },
-            |prefs| prefs.get_default_base_model().id.clone(),
-            &self.upgrade_footer_mouse_state,
-            ctx,
-        );
-        Self::refresh_coding_model_dropdown(
-            &self.coding_model_dropdown,
-            current_permissions.coding_model.clone(),
-            ctx,
-        );
-        Self::refresh_filterable_model_dropdown(
-            &self.full_terminal_use_model_dropdown,
-            current_permissions.cli_agent_model.clone(),
-            |prefs, app| prefs.get_cli_agent_llm_choices(app).collect_vec(),
-            |id| ExecutionProfileEditorViewAction::SetFullTerminalUseModel { id },
-            |prefs| prefs.get_default_cli_agent_model().id.clone(),
-            &self.upgrade_footer_mouse_state,
-            ctx,
-        );
+        self.refresh_model_dropdowns(&current_permissions, ctx);
         Self::refresh_filterable_model_dropdown(
             &self.computer_use_model_dropdown,
             current_permissions.computer_use_model.clone(),
-            |prefs, _| prefs.get_computer_use_llm_choices().collect_vec(),
+            |prefs, scope, app| prefs.get_computer_use_llm_choices(scope, app).collect_vec(),
             |id| ExecutionProfileEditorViewAction::SetComputerUseModel { id },
-            |prefs| prefs.get_default_computer_use_model().id.clone(),
+            |prefs, scope, app| prefs.get_default_computer_use_model(scope, app).id.clone(),
             &self.upgrade_footer_mouse_state,
             ctx,
         );
@@ -1026,6 +1515,8 @@ impl ExecutionProfileEditorView {
             &current_permissions.mcp_denylist,
             ctx,
         );
+        #[cfg(not(target_family = "wasm"))]
+        self.refresh_local_agent_alias_dropdowns(ctx);
 
         Self::update_profile_name_editor(&self.profile_name_editor, &current_permissions, ctx);
         self.sync_context_window_editor(ctx, false);
@@ -1157,6 +1648,83 @@ impl ExecutionProfileEditorView {
         ctx.notify();
     }
 
+    fn refresh_model_dropdowns(
+        &self,
+        current_permissions: &AIExecutionProfile,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.refresh_base_model_dropdown(current_permissions.base_model.clone(), ctx);
+        self.refresh_coding_model_dropdown(current_permissions.coding_model.clone(), ctx);
+        self.refresh_full_terminal_use_model_dropdown(
+            current_permissions.cli_agent_model.clone(),
+            ctx,
+        );
+    }
+
+    fn refresh_base_model_dropdown(
+        &self,
+        profile_base_model: Option<LLMId>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let choices_profile_key = self.inference_profile_key_or_default(ctx);
+        let default_profile_key = choices_profile_key.clone();
+        Self::refresh_filterable_model_dropdown(
+            &self.base_model_dropdown,
+            profile_base_model,
+            move |prefs, scope, app| {
+                if ChannelState::is_local_only() {
+                    prefs.get_base_llm_choices_for_profile_key(app, &choices_profile_key)
+                } else {
+                    prefs
+                        .get_base_llm_choices_for_agent_mode(scope, app)
+                        .collect_vec()
+                }
+            },
+            |id| ExecutionProfileEditorViewAction::SetBaseModel { id },
+            move |prefs, scope, app| {
+                let model = if ChannelState::is_local_only() {
+                    prefs.get_default_base_model_for_profile_key(&default_profile_key)
+                } else {
+                    prefs.get_default_base_model(scope, app)
+                };
+                model.id.clone()
+            },
+            &self.upgrade_footer_mouse_state,
+            ctx,
+        );
+    }
+
+    fn refresh_full_terminal_use_model_dropdown(
+        &self,
+        profile_cli_agent_model: Option<LLMId>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let choices_profile_key = self.inference_profile_key_or_default(ctx);
+        let default_profile_key = choices_profile_key.clone();
+        Self::refresh_filterable_model_dropdown(
+            &self.full_terminal_use_model_dropdown,
+            profile_cli_agent_model,
+            move |prefs, scope, app| {
+                if ChannelState::is_local_only() {
+                    prefs.get_cli_agent_llm_choices_for_profile_key(app, &choices_profile_key)
+                } else {
+                    prefs.get_cli_agent_llm_choices(scope, app).collect_vec()
+                }
+            },
+            |id| ExecutionProfileEditorViewAction::SetFullTerminalUseModel { id },
+            move |prefs, scope, app| {
+                let model = if ChannelState::is_local_only() {
+                    prefs.get_default_cli_agent_model_for_profile_key(&default_profile_key)
+                } else {
+                    prefs.get_default_cli_agent_model(scope, app)
+                };
+                model.id.clone()
+            },
+            &self.upgrade_footer_mouse_state,
+            ctx,
+        );
+    }
+
     fn refresh_filterable_model_dropdown<G, A, D>(
         menu: &ViewHandle<FilterableDropdown<ExecutionProfileEditorViewAction>>,
         profile_model: Option<LLMId>,
@@ -1166,9 +1734,9 @@ impl ExecutionProfileEditorView {
         upgrade_mouse_state: &MouseStateHandle,
         ctx: &mut ViewContext<Self>,
     ) where
-        G: for<'a> FnOnce(&'a LLMPreferences, &AppContext) -> Vec<&'a LLMInfo>,
+        G: for<'a> FnOnce(&'a LLMPreferences, &dyn TeamScope, &'a AppContext) -> Vec<&'a LLMInfo>,
         A: Fn(LLMId) -> ExecutionProfileEditorViewAction,
-        D: FnOnce(&LLMPreferences) -> LLMId,
+        D: FnOnce(&LLMPreferences, &dyn TeamScope, &AppContext) -> LLMId,
     {
         menu.update(ctx, |dropdown, ctx| {
             let disabled_by_ai_toggle = !AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
@@ -1179,9 +1747,12 @@ impl ExecutionProfileEditorView {
                 dropdown.set_enabled(ctx);
             }
 
+            let scope = ResolvedTeamScope::from_scope(
+                &UserWorkspaces::as_ref(ctx).team_context_for_view(ctx),
+            );
             let llm_prefs = LLMPreferences::handle(ctx);
             let llm_prefs = llm_prefs.as_ref(ctx);
-            let choices = get_choices(llm_prefs, ctx);
+            let choices = get_choices(llm_prefs, &scope, ctx);
 
             let has_upgrade_gated_models = choices
                 .iter()
@@ -1192,8 +1763,9 @@ impl ExecutionProfileEditorView {
                 |llm| DropdownAction::select_action_and_close(create_action(llm.id.clone())),
                 None,
                 None,
-                false,
-                false,
+                CollapsedModelVariants::default(),
+                None,
+                &scope,
                 ctx,
             );
             dropdown.set_rich_items(items, ctx);
@@ -1210,7 +1782,8 @@ impl ExecutionProfileEditorView {
 
             let llm_prefs = LLMPreferences::handle(ctx);
             let llm_prefs = llm_prefs.as_ref(ctx);
-            let model_to_select = profile_model.unwrap_or_else(|| get_default_id(llm_prefs));
+            let model_to_select =
+                profile_model.unwrap_or_else(|| get_default_id(llm_prefs, &scope, ctx));
             dropdown.set_selected_by_action(create_action(model_to_select), ctx);
             ctx.notify();
         });
@@ -1218,52 +1791,64 @@ impl ExecutionProfileEditorView {
     }
 
     fn refresh_coding_model_dropdown(
-        menu: &ViewHandle<Dropdown<ExecutionProfileEditorViewAction>>,
+        &self,
         profile_coding_model: Option<LLMId>,
         ctx: &mut ViewContext<Self>,
     ) {
-        menu.update(ctx, |dropdown, ctx| {
-            let disabled_by_ai_toggle = !AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
+        let profile_key = self.inference_profile_key_or_default(ctx);
+        self.coding_model_dropdown
+            .update(ctx, move |dropdown, ctx| {
+                let disabled_by_ai_toggle = !AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
 
-            if disabled_by_ai_toggle {
-                dropdown.set_disabled(ctx);
-            } else {
-                dropdown.set_enabled(ctx);
-            }
+                if disabled_by_ai_toggle {
+                    dropdown.set_disabled(ctx);
+                } else {
+                    dropdown.set_enabled(ctx);
+                }
 
-            let choices = LLMPreferences::as_ref(ctx)
-                .get_coding_llm_choices(ctx)
-                .collect_vec();
+                let scope = ResolvedTeamScope::from_scope(
+                    &UserWorkspaces::as_ref(ctx).team_context_for_view(ctx),
+                );
+                let prefs = LLMPreferences::as_ref(ctx);
+                let choices = if ChannelState::is_local_only() {
+                    prefs.get_coding_llm_choices_for_profile_key(ctx, &profile_key)
+                } else {
+                    prefs.get_coding_llm_choices(&scope, ctx).collect_vec()
+                };
 
-            let items = available_model_menu_items(
-                choices,
-                |llm| {
-                    DropdownAction::select_action_and_close(
-                        ExecutionProfileEditorViewAction::SetCodingModel { id: llm.id.clone() },
-                    )
-                },
-                None,
-                None,
-                false,
-                false,
-                ctx,
-            );
-            dropdown.set_rich_items(items, ctx);
+                let items = available_model_menu_items(
+                    choices,
+                    |llm| {
+                        DropdownAction::select_action_and_close(
+                            ExecutionProfileEditorViewAction::SetCodingModel { id: llm.id.clone() },
+                        )
+                    },
+                    None,
+                    None,
+                    CollapsedModelVariants::default(),
+                    None,
+                    &scope,
+                    ctx,
+                );
+                dropdown.set_rich_items(items, ctx);
 
-            let model_to_select = profile_coding_model.unwrap_or_else(|| {
-                LLMPreferences::as_ref(ctx)
-                    .get_default_coding_model()
-                    .id
-                    .clone()
+                let model_to_select = profile_coding_model.unwrap_or_else(|| {
+                    let prefs = LLMPreferences::as_ref(ctx);
+                    let model = if ChannelState::is_local_only() {
+                        prefs.get_default_coding_model_for_profile_key(&profile_key)
+                    } else {
+                        prefs.get_default_coding_model(&scope, ctx)
+                    };
+                    model.id.clone()
+                });
+                dropdown.set_selected_by_action(
+                    ExecutionProfileEditorViewAction::SetCodingModel {
+                        id: model_to_select,
+                    },
+                    ctx,
+                );
+                ctx.notify();
             });
-            dropdown.set_selected_by_action(
-                ExecutionProfileEditorViewAction::SetCodingModel {
-                    id: model_to_select,
-                },
-                ctx,
-            );
-            ctx.notify();
-        });
         ctx.notify();
     }
 
@@ -1316,13 +1901,14 @@ impl ExecutionProfileEditorView {
             return;
         }
 
+        let scope = self.team_context(ctx);
         let current_name = BlocklistAIPermissions::as_ref(ctx)
-            .permissions_profile_for_id(ctx, self.profile_id)
+            .permissions_profile_for_id(&self.profile_id, &scope, ctx)
             .name;
 
         if current_name != new_name {
             AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                profiles_model.set_profile_name(self.profile_id, &new_name, ctx);
+                profiles_model.set_profile_name(&self.profile_id, &new_name, ctx);
             });
         }
     }
@@ -1352,13 +1938,12 @@ impl ExecutionProfileEditorView {
         });
     }
 
-    fn update_all_editor_interaction_states(
-        view: &Self,
-        workspace: ModelHandle<UserWorkspaces>,
-        ctx: &mut ViewContext<Self>,
-    ) {
+    fn update_all_editor_interaction_states(view: &Self, ctx: &mut ViewContext<Self>) {
         let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
-        let ai_autonomy_settings = workspace.as_ref(ctx).ai_autonomy_settings();
+        let scope = view.team_context(ctx);
+        let ai_autonomy_settings = UserWorkspaces::as_ref(ctx).ai_autonomy_settings(&scope);
+        let inference_settings_editable =
+            is_any_ai_enabled && UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
 
         Self::update_editor_interaction_state(
             view.command_denylist_editor.as_ref(ctx).editor().clone(),
@@ -1378,6 +1963,28 @@ impl ExecutionProfileEditorView {
             is_any_ai_enabled && !ai_autonomy_settings.has_override_for_read_files_allowlist(),
             ctx,
         );
+
+        Self::update_editor_interaction_state(
+            view.openai_api_key_editor.clone(),
+            inference_settings_editable,
+            ctx,
+        );
+        Self::update_editor_interaction_state(
+            view.anthropic_api_key_editor.clone(),
+            inference_settings_editable,
+            ctx,
+        );
+        Self::update_editor_interaction_state(
+            view.google_api_key_editor.clone(),
+            inference_settings_editable,
+            ctx,
+        );
+        #[cfg(not(target_family = "wasm"))]
+        Self::update_editor_interaction_state(
+            view.openai_base_url_editor.clone(),
+            inference_settings_editable,
+            ctx,
+        );
     }
 
     fn update_editor_interaction_state(
@@ -1395,15 +2002,301 @@ impl ExecutionProfileEditorView {
     }
 
     fn configurable_context_window(&self, app: &AppContext) -> Option<LLMContextWindow> {
-        let profile =
-            BlocklistAIPermissions::as_ref(app).permissions_profile_for_id(app, self.profile_id);
+        let scope = self.team_context(app);
+        let profile = BlocklistAIPermissions::as_ref(app).permissions_profile_for_id(
+            &self.profile_id,
+            &scope,
+            app,
+        );
         profile.configurable_context_window(app)
     }
 
     fn current_context_window_display_value(&self, app: &AppContext) -> Option<u32> {
-        let profile =
-            BlocklistAIPermissions::as_ref(app).permissions_profile_for_id(app, self.profile_id);
+        let scope = self.team_context(app);
+        let profile = BlocklistAIPermissions::as_ref(app).permissions_profile_for_id(
+            &self.profile_id,
+            &scope,
+            app,
+        );
         profile.context_window_display_value(app)
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    fn test_local_agent_backend_for_profile(&self, ctx: &mut ViewContext<Self>) {
+        let Some(profile_key) = self.inference_profile_key(ctx) else {
+            return;
+        };
+        let settings = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&profile_key);
+        LocalMultiAgentManager::handle(ctx).update(ctx, |manager, ctx| {
+            manager.test_profile_backend(
+                profile_key,
+                settings.openai_base_url,
+                settings.openai,
+                ctx,
+            );
+        });
+        self.update_local_agent_buttons(ctx);
+        ctx.notify();
+    }
+
+    fn show_add_custom_endpoint_modal(&mut self, ctx: &mut ViewContext<Self>) {
+        if !Self::can_use_custom_inference_controls(ctx) {
+            return;
+        }
+        self.remove_custom_endpoint_confirmation_dialog
+            .update(ctx, |dialog, ctx| {
+                dialog.hide(ctx);
+            });
+        self.pending_remove_custom_endpoint_index = None;
+
+        self.custom_endpoint_modal_state
+            .set_title(Some("Add custom endpoint".to_string()), ctx);
+        self.custom_endpoint_modal_state.prefill(None, None, ctx);
+        self.custom_endpoint_modal_state.open(ctx);
+        ctx.notify();
+    }
+
+    fn show_edit_custom_endpoint_modal(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
+        if !Self::can_use_custom_inference_controls(ctx) {
+            return;
+        }
+        let Some(profile_key) = self.inference_profile_key(ctx) else {
+            return;
+        };
+        let endpoint = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&profile_key)
+            .custom_endpoints
+            .get(index)
+            .cloned();
+        if endpoint.is_none() {
+            return;
+        }
+
+        self.remove_custom_endpoint_confirmation_dialog
+            .update(ctx, |dialog, ctx| {
+                dialog.hide(ctx);
+            });
+        self.pending_remove_custom_endpoint_index = None;
+
+        self.custom_endpoint_modal_state
+            .set_title(Some("Edit custom endpoint".to_string()), ctx);
+        self.custom_endpoint_modal_state
+            .prefill(endpoint.as_ref(), Some(index), ctx);
+        self.custom_endpoint_modal_state.open(ctx);
+        ctx.notify();
+    }
+
+    fn hide_custom_endpoint_modal(&mut self, ctx: &mut ViewContext<Self>) {
+        self.custom_endpoint_modal_state.close(ctx);
+        ctx.notify();
+    }
+
+    fn handle_custom_endpoint_modal_close_event(
+        &mut self,
+        event: &ModalEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            ModalEvent::Close => {
+                self.hide_custom_endpoint_modal(ctx);
+            }
+        }
+    }
+
+    fn handle_custom_endpoint_modal_event(
+        &mut self,
+        event: &CustomEndpointModalEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            CustomEndpointModalEvent::Close => {
+                self.hide_custom_endpoint_modal(ctx);
+            }
+            CustomEndpointModalEvent::AddEndpoint {
+                name,
+                url,
+                api_key,
+                schema,
+                models,
+            } => {
+                if !Self::can_use_custom_inference_controls(ctx) {
+                    self.hide_custom_endpoint_modal(ctx);
+                    return;
+                }
+                let Some(profile_key) = self.inference_profile_key(ctx) else {
+                    self.hide_custom_endpoint_modal(ctx);
+                    return;
+                };
+                ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                    manager.add_custom_endpoint_for_profile(
+                        &profile_key,
+                        CustomEndpointParams {
+                            name: name.clone(),
+                            url: url.clone(),
+                            api_key: api_key.clone(),
+                            models: models.clone(),
+                            schema: *schema,
+                        },
+                        ctx,
+                    );
+                });
+                self.hide_custom_endpoint_modal(ctx);
+                self.sync_custom_endpoint_buttons(ctx);
+
+                let window_id = ctx.window_id();
+                crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    let toast = crate::view_components::DismissibleToast::success(
+                        "Endpoint added".to_string(),
+                    );
+                    toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+                });
+                ctx.notify();
+            }
+            CustomEndpointModalEvent::SaveEndpoint {
+                index,
+                name,
+                url,
+                api_key,
+                schema,
+                models,
+            } => {
+                if !Self::can_use_custom_inference_controls(ctx) {
+                    self.hide_custom_endpoint_modal(ctx);
+                    return;
+                }
+                let Some(profile_key) = self.inference_profile_key(ctx) else {
+                    self.hide_custom_endpoint_modal(ctx);
+                    return;
+                };
+                ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                    manager.save_custom_endpoint_for_profile(
+                        &profile_key,
+                        *index,
+                        CustomEndpointParams {
+                            name: name.clone(),
+                            url: url.clone(),
+                            api_key: api_key.clone(),
+                            models: models.clone(),
+                            schema: *schema,
+                        },
+                        ctx,
+                    );
+                });
+                self.hide_custom_endpoint_modal(ctx);
+                self.sync_custom_endpoint_buttons(ctx);
+
+                let window_id = ctx.window_id();
+                crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    let toast = crate::view_components::DismissibleToast::success(
+                        "Endpoint saved".to_string(),
+                    );
+                    toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+                });
+                ctx.notify();
+            }
+            CustomEndpointModalEvent::RemoveEndpoint { index } => {
+                if !Self::can_use_custom_inference_controls(ctx) {
+                    self.hide_custom_endpoint_modal(ctx);
+                    return;
+                }
+                self.hide_custom_endpoint_modal(ctx);
+                self.show_remove_custom_endpoint_confirmation_dialog(*index, ctx);
+            }
+        }
+    }
+
+    fn show_remove_custom_endpoint_confirmation_dialog(
+        &mut self,
+        index: usize,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !Self::can_use_custom_inference_controls(ctx) {
+            return;
+        }
+        let Some(profile_key) = self.inference_profile_key(ctx) else {
+            return;
+        };
+        let endpoint = ApiKeyManager::as_ref(ctx)
+            .keys()
+            .profile_settings(&profile_key)
+            .custom_endpoints
+            .get(index)
+            .cloned();
+        let Some(endpoint) = endpoint else {
+            return;
+        };
+
+        let model_labels = endpoint
+            .models
+            .iter()
+            .map(|model| model.alias.clone().unwrap_or_else(|| model.name.clone()))
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+
+        self.pending_remove_custom_endpoint_index = Some(index);
+        self.remove_custom_endpoint_confirmation_dialog
+            .update(ctx, |dialog, ctx| {
+                dialog.show(index, endpoint.name.clone(), model_labels, ctx);
+            });
+        ctx.notify();
+    }
+
+    fn handle_remove_custom_endpoint_confirmation_dialog_event(
+        &mut self,
+        event: &RemoveCustomEndpointConfirmationDialogEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            RemoveCustomEndpointConfirmationDialogEvent::Cancel => {
+                self.pending_remove_custom_endpoint_index = None;
+                self.remove_custom_endpoint_confirmation_dialog
+                    .update(ctx, |dialog, ctx| {
+                        dialog.hide(ctx);
+                    });
+                ctx.notify();
+            }
+            RemoveCustomEndpointConfirmationDialogEvent::Confirm(index) => {
+                if !Self::can_use_custom_inference_controls(ctx) {
+                    self.pending_remove_custom_endpoint_index = None;
+                    self.remove_custom_endpoint_confirmation_dialog
+                        .update(ctx, |dialog, ctx| {
+                            dialog.hide(ctx);
+                        });
+                    ctx.notify();
+                    return;
+                }
+                let Some(profile_key) = self.inference_profile_key(ctx) else {
+                    self.pending_remove_custom_endpoint_index = None;
+                    self.remove_custom_endpoint_confirmation_dialog
+                        .update(ctx, |dialog, ctx| {
+                            dialog.hide(ctx);
+                        });
+                    ctx.notify();
+                    return;
+                };
+                ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                    manager.remove_custom_endpoint_for_profile(&profile_key, *index, ctx);
+                });
+                self.pending_remove_custom_endpoint_index = None;
+                self.remove_custom_endpoint_confirmation_dialog
+                    .update(ctx, |dialog, ctx| {
+                        dialog.hide(ctx);
+                    });
+                self.sync_custom_endpoint_buttons(ctx);
+
+                let window_id = ctx.window_id();
+                crate::ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+                    let toast = crate::view_components::DismissibleToast::success(
+                        "Endpoint removed".to_string(),
+                    );
+                    toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+                });
+                ctx.notify();
+            }
+        }
     }
 
     fn handle_context_window_editor_event(
@@ -1430,7 +2323,7 @@ impl ExecutionProfileEditorView {
                     if Some(clamped) != self.current_context_window_display_value(ctx) {
                         AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
                             profiles_model.set_context_window_limit(
-                                self.profile_id,
+                                &self.profile_id,
                                 Some(clamped),
                                 ctx,
                             );
@@ -1481,13 +2374,24 @@ impl ExecutionProfileEditorView {
 
 fn initial_context_window_display_value(
     profile_data: &AIExecutionProfile,
+    profile_id: &ExecutionProfileId,
     app: &AppContext,
 ) -> u32 {
     profile_data
         .context_window_display_value(app)
         .unwrap_or_else(|| {
+            if !ChannelState::is_local_only() {
+                let team_uid = UserWorkspaces::as_ref(app).inherited_or_default_team_uid(None);
+                return LLMPreferences::as_ref(app)
+                    .get_default_base_model_for_team_uid(team_uid, app)
+                    .context_window
+                    .default_max;
+            }
+            let profile_key =
+                ExecutionProfileEditorView::inference_profile_key_for_profile_id(profile_id, app)
+                    .unwrap_or_else(|| DEFAULT_PROFILE_INFERENCE_KEY.to_string());
             LLMPreferences::as_ref(app)
-                .get_default_base_model()
+                .get_default_base_model_for_profile_key(&profile_key)
                 .context_window
                 .default_max
         })
@@ -1509,7 +2413,8 @@ impl View for ExecutionProfileEditorView {
         use ui_helpers::*;
 
         let permissions = BlocklistAIPermissions::as_ref(app);
-        let profile_data = permissions.permissions_profile_for_id(app, self.profile_id);
+        let scope = self.team_context(app);
+        let profile_data = permissions.permissions_profile_for_id(&self.profile_id, &scope, app);
 
         let mut column = Flex::column()
             .with_child(render_header_section(
@@ -1518,6 +2423,7 @@ impl View for ExecutionProfileEditorView {
                 profile_data.is_default_profile,
             ))
             .with_child(render_models_section(appearance, self, app))
+            .with_child(render_local_inference_section(appearance, self, app))
             .with_child(render_permissions_section(
                 appearance,
                 self,
@@ -1533,7 +2439,7 @@ impl View for ExecutionProfileEditorView {
             .with_uniform_padding(16.)
             .finish();
 
-        ClippedScrollable::vertical(
+        let editor = ClippedScrollable::vertical(
             self.clipped_scroll_state.clone(),
             Align::new(content).top_center().finish(),
             ScrollbarWidth::Auto,
@@ -1541,7 +2447,21 @@ impl View for ExecutionProfileEditorView {
             appearance.theme().active_ui_detail().into(),
             warpui::elements::Fill::None,
         )
-        .finish()
+        .finish();
+
+        let mut stack = Stack::new().with_child(editor);
+        if self.custom_endpoint_modal_state.is_open() {
+            stack.add_overlay_child(self.custom_endpoint_modal_state.render());
+        } else if self
+            .remove_custom_endpoint_confirmation_dialog
+            .as_ref(app)
+            .is_visible()
+        {
+            stack.add_overlay_child(
+                ChildView::new(&self.remove_custom_endpoint_confirmation_dialog).finish(),
+            );
+        }
+        stack.finish()
     }
 }
 
@@ -1567,8 +2487,8 @@ impl TypedActionView for ExecutionProfileEditorView {
                 // be configurable at all). The user can pick a new value for
                 // the new model if they want one.
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_base_model(self.profile_id, Some(id.clone()), ctx);
-                    profiles_model.set_context_window_limit(self.profile_id, None, ctx);
+                    profiles_model.set_base_model(&self.profile_id, Some(id.clone()), ctx);
+                    profiles_model.set_context_window_limit(&self.profile_id, None, ctx);
                 });
                 self.sync_context_window_editor(ctx, true);
                 ctx.notify();
@@ -1601,154 +2521,220 @@ impl TypedActionView for ExecutionProfileEditorView {
                 };
                 let clamped = (*value).clamp(cw.min, cw.max);
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_context_window_limit(self.profile_id, Some(clamped), ctx);
+                    profiles_model.set_context_window_limit(&self.profile_id, Some(clamped), ctx);
                 });
                 self.sync_context_window_editor(ctx, true);
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetCodingModel { id } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_coding_model(self.profile_id, Some(id.clone()), ctx);
+                    profiles_model.set_coding_model(&self.profile_id, Some(id.clone()), ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetFullTerminalUseModel { id } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_cli_agent_model(self.profile_id, Some(id.clone()), ctx);
+                    profiles_model.set_cli_agent_model(&self.profile_id, Some(id.clone()), ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetComputerUseModel { id } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_computer_use_model(self.profile_id, Some(id.clone()), ctx);
+                    profiles_model.set_computer_use_model(&self.profile_id, Some(id.clone()), ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetApplyCodeDiffs { permission } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_apply_code_diffs(self.profile_id, permission, ctx);
+                    profiles_model.set_apply_code_diffs(&self.profile_id, permission, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetReadFiles { permission } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_read_files(self.profile_id, permission, ctx);
+                    profiles_model.set_read_files(&self.profile_id, permission, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetExecuteCommands { permission } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_execute_commands(self.profile_id, permission, ctx);
+                    profiles_model.set_execute_commands(&self.profile_id, permission, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetWriteToPty { permission } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_write_to_pty(self.profile_id, permission, ctx);
+                    profiles_model.set_write_to_pty(&self.profile_id, permission, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetCallMcpServers { permission } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_mcp_permissions(self.profile_id, permission, ctx);
+                    profiles_model.set_mcp_permissions(&self.profile_id, permission, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetComputerUse { permission } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_computer_use(self.profile_id, permission, ctx);
+                    profiles_model.set_computer_use(&self.profile_id, permission, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetAskUserQuestion { permission } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_ask_user_question(self.profile_id, *permission, ctx);
+                    profiles_model.set_ask_user_question(&self.profile_id, *permission, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetRunAgents { permission } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_run_agents(self.profile_id, *permission, ctx);
+                    profiles_model.set_run_agents(&self.profile_id, *permission, ctx);
                 });
                 ctx.notify();
             }
+            #[cfg(not(target_family = "wasm"))]
+            ExecutionProfileEditorViewAction::ToggleLocalAIAutocomplete => {
+                let Some(profile_key) = self.inference_profile_key(ctx) else {
+                    return;
+                };
+                ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                    let enabled = !manager.local_ai_autocomplete_enabled_for_profile(&profile_key);
+                    manager.set_local_ai_autocomplete_enabled_for_profile(
+                        &profile_key,
+                        enabled,
+                        ctx,
+                    );
+                });
+                self.refresh_local_agent_alias_dropdowns(ctx);
+                ctx.notify();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            ExecutionProfileEditorViewAction::SetLocalModelAlias { alias, model } => {
+                let Some(profile_key) = self.inference_profile_key(ctx) else {
+                    return;
+                };
+                let settings = ApiKeyManager::as_ref(ctx)
+                    .keys()
+                    .profile_settings(&profile_key);
+                let mut config = LocalMultiAgentManager::as_ref(ctx).config().clone();
+                config.local_model_aliases = settings.local_model_aliases;
+                config.local_model_list = settings.local_model_list;
+                match config.set_model_alias(alias, model) {
+                    Ok(()) => {
+                        ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
+                            manager.set_local_model_aliases_for_profile(
+                                &profile_key,
+                                config.local_model_aliases.clone(),
+                                ctx,
+                            );
+                        });
+                    }
+                    Err(error) => log::warn!("Failed to update local model alias: {error}"),
+                }
+                // ApiKeyManagerEvent refreshes these dropdowns after the current action effect
+                // completes. Refreshing here re-enters the selected FilterableDropdown while it
+                // is closing and can panic with a circular view update.
+                ctx.notify();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            ExecutionProfileEditorViewAction::RestartLocalMultiAgent => {
+                LocalMultiAgentManager::handle(ctx).update(ctx, |manager, ctx| {
+                    manager.restart_with_config(ctx);
+                });
+                self.update_local_agent_buttons(ctx);
+                ctx.notify();
+            }
+            #[cfg(not(target_family = "wasm"))]
+            ExecutionProfileEditorViewAction::TestLocalMultiAgent => {
+                self.test_local_agent_backend_for_profile(ctx);
+            }
             ExecutionProfileEditorViewAction::AddToCommandAllowlist { predicate } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.add_to_command_allowlist(self.profile_id, predicate, ctx);
+                    profiles_model.add_to_command_allowlist(&self.profile_id, predicate, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::RemoveFromCommandAllowlist { predicate } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.remove_from_command_allowlist(self.profile_id, predicate, ctx);
+                    profiles_model.remove_from_command_allowlist(&self.profile_id, predicate, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::AddToCommandDenylist { predicate } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.add_to_command_denylist(self.profile_id, predicate, ctx);
+                    profiles_model.add_to_command_denylist(&self.profile_id, predicate, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::RemoveFromCommandDenylist { predicate } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.remove_from_command_denylist(self.profile_id, predicate, ctx);
+                    profiles_model.remove_from_command_denylist(&self.profile_id, predicate, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::AddToDirectoryAllowlist { path } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.add_to_directory_allowlist(self.profile_id, path, ctx);
+                    profiles_model.add_to_directory_allowlist(&self.profile_id, path, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::RemoveFromDirectoryAllowlist { path } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.remove_from_directory_allowlist(self.profile_id, path, ctx);
+                    profiles_model.remove_from_directory_allowlist(&self.profile_id, path, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::AddToMCPAllowlist { id } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.add_to_mcp_allowlist(self.profile_id, id, ctx);
+                    profiles_model.add_to_mcp_allowlist(&self.profile_id, id, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::RemoveFromMCPAllowlist { id } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.remove_from_mcp_allowlist(self.profile_id, id, ctx);
+                    profiles_model.remove_from_mcp_allowlist(&self.profile_id, id, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::AddToMCPDenylist { id } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.add_to_mcp_denylist(self.profile_id, id, ctx);
+                    profiles_model.add_to_mcp_denylist(&self.profile_id, id, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::RemoveFromMCPDenylist { id } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.remove_from_mcp_denylist(self.profile_id, id, ctx);
+                    profiles_model.remove_from_mcp_denylist(&self.profile_id, id, ctx);
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::DeleteProfile => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.delete_profile(self.profile_id, ctx);
+                    profiles_model.delete_profile(&self.profile_id, ctx);
                 });
                 ctx.emit(ExecutionProfileEditorViewEvent::Pane(PaneEvent::Close));
             }
             ExecutionProfileEditorViewAction::SetPlanAutoSync { enabled } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_autosync_plans_to_warp_drive(self.profile_id, *enabled, ctx);
+                    profiles_model.set_autosync_plans_to_warp_drive(
+                        &self.profile_id,
+                        *enabled,
+                        ctx,
+                    );
                 });
                 ctx.notify();
             }
             ExecutionProfileEditorViewAction::SetWebSearchEnabled { enabled } => {
                 AIExecutionProfilesModel::handle(ctx).update(ctx, |profiles_model, ctx| {
-                    profiles_model.set_web_search_enabled(self.profile_id, *enabled, ctx);
+                    profiles_model.set_web_search_enabled(&self.profile_id, *enabled, ctx);
                 });
                 ctx.notify();
+            }
+            ExecutionProfileEditorViewAction::OpenAddCustomEndpointModal => {
+                self.show_add_custom_endpoint_modal(ctx);
+            }
+            ExecutionProfileEditorViewAction::OpenEditCustomEndpointModal(index) => {
+                self.show_edit_custom_endpoint_modal(*index, ctx);
             }
         }
     }

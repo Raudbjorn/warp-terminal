@@ -23,14 +23,15 @@ use rudder_message::{
     BatchMessageItem as RudderBatchMessage, Message as RudderMessage,
 };
 use warp_core::channel::RudderStackDestination;
+use warp_errors::report_error;
 use warpui::telemetry::Event;
 
+use crate::ChannelState;
 use crate::auth::UserUid;
 use crate::features::FeatureFlag;
 use crate::server::telemetry::context::AttachContext;
 use crate::server::telemetry_ext::TelemetryExt;
 use crate::settings::PrivacySettingsSnapshot;
-use crate::ChannelState;
 
 /// Filename for file where telemetry events are written on app quit.
 const RUDDER_TELEMETRY_EVENTS_FILE_NAME: &str = "rudder_telemetry_events.json";
@@ -187,7 +188,7 @@ impl TelemetryApi {
 
         let events = warpui::telemetry::flush_events();
         if events.len() > max_event_count {
-            log::error!("More telemetry events in queue than the limit to persist")
+            report_error!("More telemetry events in queue than the limit to persist")
         }
 
         self.persist_events_at_path(&file, max_event_count, events)?;
@@ -290,11 +291,11 @@ impl TelemetryApi {
             #[cfg(not(target_family = "wasm"))]
             if let Err(error) = &result {
                 for cause in error.chain() {
-                    if let Some(err) = cause.downcast_ref::<reqwest::Error>() {
-                        if err.is_connect() {
-                            log::warn!("Failed to send telemetry event: {error}");
-                            return Ok(());
-                        }
+                    if let Some(err) = cause.downcast_ref::<reqwest::Error>()
+                        && err.is_connect()
+                    {
+                        log::warn!("Failed to send telemetry event: {error}");
+                        return Ok(());
                     }
                 }
             }
@@ -388,11 +389,11 @@ impl TelemetryApi {
                 // against `is_connect` and not the whole loop.
                 #[cfg(not(target_family = "wasm"))]
                 for cause in e.chain() {
-                    if let Some(err) = cause.downcast_ref::<reqwest::Error>() {
-                        if err.is_connect() {
-                            log::warn!("Failed to send event to RudderStack: {e}");
-                            return Ok(());
-                        }
+                    if let Some(err) = cause.downcast_ref::<reqwest::Error>()
+                        && err.is_connect()
+                    {
+                        log::warn!("Failed to send event to RudderStack: {e}");
+                        return Ok(());
                     }
                 }
                 return Err(e);
@@ -419,13 +420,9 @@ impl TelemetryApi {
             RudderMessage::Batch(_) => "/v1/batch",
         };
 
-        self.client
-            .post(&format!("{}{}", rudder_stack_destination.root_url, path))
-            .basic_auth(rudder_stack_destination.write_key, Some(""))
-            .json(&msg)
-            .send()
-            .await?
-            .error_for_status()?;
+        // oh-my-warp: observability stripped — drop the telemetry request instead
+        // of POSTing it to RudderStack so no data ever leaves the machine.
+        let _ = (&self.client, &msg, path, rudder_stack_destination);
 
         Ok(())
     }

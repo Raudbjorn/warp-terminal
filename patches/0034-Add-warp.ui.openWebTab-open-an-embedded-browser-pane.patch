@@ -1,0 +1,138 @@
+From 7c9a8b47b92ebd15bf68b82fa36715c165365744 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Fri, 22 May 2026 22:44:35 -0400
+Subject: [PATCH 34/48] Add warp.ui.openWebTab: open an embedded browser pane
+ from plugins (oh-my-warp)
+
+---
+ app/src/browser/view.rs                  | 21 ++++++++++++++++++++-
+ app/src/plugin/app/mod.rs                |  5 +++++
+ app/src/plugin/app_requests.rs           |  2 ++
+ app/src/plugin/host/native/js_api/mod.rs | 13 +++++++++++--
+ app/src/workspace/view.rs                |  6 ++++++
+ 5 files changed, 44 insertions(+), 3 deletions(-)
+
+diff --git a/app/src/browser/view.rs b/app/src/browser/view.rs
+index 2afe2458..66d82925 100644
+--- a/app/src/browser/view.rs
++++ b/app/src/browser/view.rs
+@@ -62,6 +62,22 @@ const SCROLL_SCALE: f64 = 1.0;
+ /// where the pane sits in the window (e.g. a right-hand split).
+ const BROWSER_VIEWPORT_POSITION_ID: &str = "oh_my_warp_browser_viewport";
+ 
++thread_local! {
++    /// One-shot initial-URL override for the next [`BrowserView::new`], set by
++    /// `warp.ui.openWebTab(url)` immediately before the pane is constructed (same
++    /// UI-thread call stack, so it is consumed before any other pane is built).
++    /// `None` falls back to the configured home page.
++    static NEXT_BROWSER_URL: Cell<Option<String>> = const { Cell::new(None) };
++}
++
++/// Sets the initial URL for the *next* browser pane created (consumed once by
++/// [`BrowserView::new`]). Backs the `warp.ui.openWebTab` plugin bridge; the input
++/// is normalized like an address-bar entry (bare hosts gain `https://`, non-URLs
++/// become a web search) via [`normalize_url`].
++pub fn set_next_browser_url(url: String) {
++    NEXT_BROWSER_URL.with(|cell| cell.set(Some(normalize_url(&url))));
++}
++
+ /// The CSS viewport size the current frame represents (shared with input
+ /// closures so they can map pointer positions without borrowing the view).
+ type CssSize = Rc<Cell<Option<(f32, f32)>>>;
+@@ -150,7 +166,10 @@ impl BrowserView {
+     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
+         let pane_configuration = ctx.add_model(|_ctx| PaneConfiguration::new(BROWSER_HEADER_TEXT));
+         let config = load_config();
+-        let url = config.home.clone();
++        // A pending `warp.ui.openWebTab(url)` override wins over the configured home.
++        let url = NEXT_BROWSER_URL
++            .with(|cell| cell.take())
++            .unwrap_or_else(|| config.home.clone());
+         let scroll_sign = if config.reverse_scroll { -1.0 } else { 1.0 };
+ 
+         // session updates out (frames + URL), commands in (clicks / nav).
+diff --git a/app/src/plugin/app/mod.rs b/app/src/plugin/app/mod.rs
+index 880d2e24..f6e22d7e 100644
+--- a/app/src/plugin/app/mod.rs
++++ b/app/src/plugin/app/mod.rs
+@@ -176,6 +176,9 @@ impl PluginHost {
+             PluginAppRequest::ShowPalette { title, items } => {
+                 ctx.emit(PluginHostEvent::ShowPalette { title, items });
+             }
++            PluginAppRequest::OpenWebTab { url } => {
++                ctx.emit(PluginHostEvent::OpenWebTab { url });
++            }
+         }
+     }
+ }
+@@ -191,6 +194,8 @@ pub enum PluginHostEvent {
+         title: String,
+         items: Vec<PalettePluginItem>,
+     },
++    /// Open an embedded browser pane navigated to `url` (`warp.ui.openWebTab`).
++    OpenWebTab { url: String },
+ }
+ 
+ impl Drop for PluginHost {
+diff --git a/app/src/plugin/app_requests.rs b/app/src/plugin/app_requests.rs
+index c175a265..01a6446d 100644
+--- a/app/src/plugin/app_requests.rs
++++ b/app/src/plugin/app_requests.rs
+@@ -48,6 +48,8 @@ pub enum PluginAppRequest {
+         title: String,
+         items: Vec<PalettePluginItem>,
+     },
++    /// Open an embedded browser pane navigated to `url` (`warp.ui.openWebTab`).
++    OpenWebTab { url: String },
+ }
+ 
+ static SENDER: OnceLock<Sender<PluginAppRequest>> = OnceLock::new();
+diff --git a/app/src/plugin/host/native/js_api/mod.rs b/app/src/plugin/host/native/js_api/mod.rs
+index b7cbf546..2401a85a 100644
+--- a/app/src/plugin/host/native/js_api/mod.rs
++++ b/app/src/plugin/host/native/js_api/mod.rs
+@@ -253,9 +253,10 @@ fn network_api<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+ 
+ /// Returns a JS object representing the UI namespace for the Warp Plugin API.
+ ///
+-/// `toast(message: string, kind?: "info" | "warn" | "error")` — shows a transient toast.
++/// `toast(message, kind?)` — transient toast; `showMarkdown(title, markdown)` — markdown panel;
++/// `showPalette(title, items)` — command picker; `openWebTab(url)` — open an embedded browser pane.
+ ///
+-/// The request is enqueued (non-blocking) and relayed to the app on a background task; we must not
++/// Each request is enqueued (non-blocking) and relayed to the app on a background task; we must not
+ /// do the blocking IPC inline on the plugin runner thread (see `super::app_request`).
+ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+     let ui = Object::new(ctx)?;
+@@ -300,6 +301,14 @@ fn ui<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
+             });
+         }),
+     )?;
++    // `openWebTab(url)` — opens an embedded browser pane navigated to `url` (a bare host like
++    // `example.com` is upgraded to `https://`). Fire-and-forget, like the other `ui.*` relays.
++    ui.set(
++        "openWebTab",
++        Function::new(ctx, |url: String| {
++            super::app_request::send_app_request(PluginAppRequest::OpenWebTab { url });
++        }),
++    )?;
+     Ok(ui)
+ }
+ 
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index 5e82d8df..b42f7e46 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -2181,6 +2181,12 @@ impl Workspace {
+             crate::plugin::PluginHostEvent::ShowPalette { title, items } => {
+                 me.show_plugin_palette(title.clone(), items.clone(), ctx);
+             }
++            crate::plugin::PluginHostEvent::OpenWebTab { url } => {
++                // Set the one-shot initial-URL override, then open a browser tab;
++                // `BrowserView::new` consumes it synchronously during construction.
++                crate::browser::view::set_next_browser_url(url.clone());
++                me.open_web_tab(ctx);
++            }
+         });
+     }
+ 

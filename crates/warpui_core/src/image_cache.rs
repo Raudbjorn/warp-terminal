@@ -5,7 +5,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use image::codecs::gif::GifDecoder;
 use image::codecs::webp::WebPDecoder;
 use image::imageops::FilterType;
@@ -411,6 +411,19 @@ impl StaticImage {
     pub fn rgba_bytes(&self) -> &[u8] {
         self.img.as_raw().as_slice()
     }
+
+    /// Constructs a [`StaticImage`] directly from a decoded RGBA buffer, bypassing
+    /// the asset cache.
+    ///
+    /// This is the entry point for *live* frame streams (e.g. the embedded browser
+    /// pane's viewport): the caller wraps each decoded frame in a fresh
+    /// `Arc<StaticImage>` and swaps it into its view. Because the renderer's
+    /// texture cache is keyed by `Arc` pointer identity (see
+    /// [`crate::rendering::texture_cache`]), each new frame uploads to the GPU
+    /// exactly once and is reclaimed when its `Arc` is dropped.
+    pub fn from_rgba(img: image::RgbaImage) -> Self {
+        Self { img }
+    }
 }
 
 /// A representation of a single frame in an animated image.
@@ -796,12 +809,13 @@ struct RenderedImageCacheKey {
     fit_type: FitType,
     animated_image_behavior: AnimatedImageBehavior,
 }
+type RenderedImageCache = HashMap<u64, HashMap<RenderedImageCacheKey, Rc<Image>>>;
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ImageCache {
     /// Map of rendered images of any ImageType already materialized for a certain size and fit.
     /// Uses the hashed AssetSource and rendered-image properties as a key.
-    images: RwLock<HashMap<u64, HashMap<RenderedImageCacheKey, Rc<Image>>>>,
+    images: Rc<RwLock<RenderedImageCache>>,
 }
 
 impl ImageCache {
@@ -932,12 +946,12 @@ impl ImageCache {
                 // If it is already in the image cache at the target size and fit, return it.
                 let cache = if should_cache_rendered_image {
                     let cache = self.images.upgradable_read();
-                    if let Some(inner_map) = cache.get(&cache_key) {
-                        if let Some(image) = inner_map.get(&rendered_image_cache_key) {
-                            return AssetState::Loaded {
-                                data: image.clone(),
-                            };
-                        }
+                    if let Some(inner_map) = cache.get(&cache_key)
+                        && let Some(image) = inner_map.get(&rendered_image_cache_key)
+                    {
+                        return AssetState::Loaded {
+                            data: image.clone(),
+                        };
                     }
                     Some(cache)
                 } else {
