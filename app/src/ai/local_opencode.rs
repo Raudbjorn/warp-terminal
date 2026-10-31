@@ -58,11 +58,12 @@ pub enum OpenCodeError {
 /// We accept the minimum subset; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
 struct OpenCodeAnnouncement {
-    /// Listening port. Newer OpenCode versions print a bare JSON number
-    /// (`{"port": 43123}`); the `#[serde(alias)]`s also accept a *numeric*
-    /// `address`/`url` field. String forms (`{"url":"http://127.0.0.1:43123"}`
-    /// or the plain-text `ready:43123`) cannot deserialize into `u16`, so they
-    /// fall through to the URL/heuristic parsing in `from_line`.
+    /// Listening port. JSON parsing accepts a bare `{"port": N}` shape
+    /// (and the `address`/`url` aliases on the field are a no-op for
+    /// `u16` — kept for forward-compat in case a future schema ever
+    /// aliases a numeric field). URL-style and trailing-port forms
+    /// (e.g. `ready:43123`) are handled by the fallback in
+    /// `OpenCodeAnnouncement::from_line`.
     #[serde(alias = "address", alias = "url")]
     port: u16,
 }
@@ -244,15 +245,30 @@ pub async fn spawn(
 async fn read_announcement(
     mut stdout: async_process::ChildStdout,
 ) -> Result<(OpenCodeAnnouncement, async_process::ChildStdout), OpenCodeError> {
+    // Byte-at-a-time read so we can detect the announcement whether
+    // the sidecar emits it on its own line, appended to the first
+    // line of output, or right before EOF without a trailing
+    // newline. We clear `buffer` at every newline so the parser
+    // only ever sees one line of input — without that, a leading
+    // unparseable line (e.g. a `#` comment) would otherwise be
+    // concatenated with the real announcement and confuse the
+    // `rfind(':')` fallback in `OpenCodeAnnouncement::from_line`.
     let mut buffer = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
     loop {
         match stdout.read(&mut byte).await {
-            Ok(0) => break, // EOF before announcement
+            Ok(0) => {
+                // EOF before announcement. Give the buffered tail
+                // one last parse attempt so a sidecar that prints
+                // the port line and exits without a trailing
+                // newline is still recognized.
+                if let Ok(ann) = try_parse_buffer(&buffer) {
+                    return Ok((ann, stdout));
+                }
+                break;
+            }
             Ok(_) => {
                 buffer.push(byte[0]);
-                // Try to parse on every newline; this keeps the
-                // recognizer from buffering arbitrarily long log lines.
                 if byte[0] == b'\n' {
                     if let Ok(ann) = try_parse_buffer(&buffer) {
                         // Hand stdout back so the caller can keep draining it;
@@ -260,9 +276,7 @@ async fn read_announcement(
                         // EPIPE/blocking if the sidecar logs more to stdout.
                         return Ok((ann, stdout));
                     }
-                    // Drop the non-matching line so we only ever parse the
-                    // current line (avoids O(N^2) re-parsing and prevents a
-                    // preceding log line from poisoning the JSON parse).
+                    // Reset so the next line is parsed in isolation.
                     buffer.clear();
                 }
             }
