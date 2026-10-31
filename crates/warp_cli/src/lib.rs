@@ -561,11 +561,12 @@ fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) ->
         }
 
         if arg.starts_with('-') && arg != "-" {
-            // Skip both long (`--foo`, `--foo=bar`) and short (`-v`, `-o value`,
-            // `-obar`, `-abc`) options. The previous implementation only
-            // skipped long options, which let invocations like
-            // `warp -v agent` misidentify `-v` as the subcommand and bypass
-            // local-only gating entirely.
+            // Skip options so they aren't mistaken for the subcommand. Only
+            // options listed in `GLOBAL_OPTIONS_WITH_VALUES` consume the next
+            // argument; the rest (`--debug`, `-h`, `-obar`, `--foo=bar`) skip
+            // one. A test keeps that list in sync with the clap definition, so
+            // a new value-taking top-level option (long or short) can't slip
+            // past the gate.
             let option_name = arg.split_once('=').map_or(arg, |(name, _)| name);
             index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name) && !arg.contains('=') {
                 2

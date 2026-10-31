@@ -156,12 +156,6 @@ impl From<ViewHandle<LocalAISettingsPageView>> for SettingsPageViewHandle {
     }
 }
 
-/// Render args the way `shlex::split` will read them back, so quoted
-/// arguments survive an edit round-trip.
-fn format_opencode_args(args: &[String]) -> String {
-    shlex::try_join(args.iter().map(String::as_str)).unwrap_or_else(|_| args.join(" "))
-}
-
 struct LocalAIProviderWidget {
     enabled_toggle: SwitchStateHandle,
     base_url_editor: ViewHandle<EditorView>,
@@ -192,7 +186,10 @@ impl LocalAIProviderWidget {
                 ai_settings.local_openai_prediction_model.value().clone(),
                 ai_settings.local_openai_timeout_ms.value().to_string(),
                 ai_settings.local_openai_opencode_command.value().clone(),
-                format_opencode_args(ai_settings.local_openai_opencode_args.value()),
+                // Quote with `shell_words::join` so the text round-trips through
+                // the `shell_words::split` save handler below: arguments with
+                // spaces, quotes, or backslashes survive an unchanged save.
+                shell_words::join(ai_settings.local_openai_opencode_args.value()),
             )
         };
         let base_url_editor = Self::create_editor(ctx, base_url, "http://127.0.0.1:1234/v1", false);
@@ -297,13 +294,13 @@ impl LocalAIProviderWidget {
                 // Shell-style split so quoted arguments containing spaces
                 // (`--model "my model"`) stay one token. Unbalanced quotes
                 // are rejected and the saved value restored, matching the
-                // timeout editor above.
-                let Some(value) = shlex::split(&buffer_text) else {
+                // timeout editor above, rather than saving a mangled argv.
+                let Ok(value) = shell_words::split(&buffer_text) else {
                     log::warn!(
                         "Invalid OpenCode args (unbalanced quote): {:?}",
                         buffer_text.trim()
                     );
-                    let current = format_opencode_args(
+                    let current = shell_words::join(
                         AISettings::as_ref(ctx).local_openai_opencode_args.value(),
                     );
                     editor.update(ctx, |editor, ctx| {
