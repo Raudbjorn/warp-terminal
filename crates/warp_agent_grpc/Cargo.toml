@@ -1,0 +1,16 @@
+# oh-my-warp: isolated gRPC client + generated types for the in-process agent
+# bridge (app/src/server/server_api/ai/bridge.rs). Deliberately NOT on the
+# workspace's prost 0.14 — it carries tonic 0.12 + its own prost 0.13 so the
+# generated proto code can't clash with the warp app crate's prost version.
+[package]
+name = "warp_agent_grpc"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tonic = "0.12"
+prost = "0.13"
+
+[build-dependencies]
+tonic-build = "0.12"

@@ -4,20 +4,22 @@ use std::path::PathBuf;
 use warp_core::context_flag::ContextFlag;
 use warp_core::features::FeatureFlag;
 use warpui::keymap::BindingId;
-use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
+use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, WindowId};
 
 use super::{conversations, warp_drive};
 use crate::drive::settings::WarpDriveSettings;
+use crate::search::QueryFilter;
 use crate::search::action::CommandBindingDataSource;
 use crate::search::binding_source::BindingSource;
 use crate::search::command_palette::mixer::{CommandPaletteItemAction, ItemSummary};
 use crate::search::command_palette::new_session::NewSessionDataSource;
+#[cfg(feature = "plugin_host")]
+use crate::search::command_palette::plugin_command_data_source::PluginCommandDataSource;
 use crate::search::command_palette::repos::RepoDataSource;
-use crate::search::command_palette::{files, launch_config, navigation, tabs, CommandPaletteMixer};
+use crate::search::command_palette::{CommandPaletteMixer, files, launch_config, navigation, tabs};
 use crate::search::data_source::QueryResult;
 use crate::search::files::model::FileSearchModel;
 use crate::search::mixer::AddAsyncSourceOptions;
-use crate::search::QueryFilter;
 use crate::session_management::SessionSource;
 use crate::settings::AISettings;
 
@@ -31,12 +33,15 @@ pub struct DataSourceStore {
     all_conversation_data_source: ModelHandle<conversations::DataSource>,
     repo_data_source: ModelHandle<RepoDataSource>,
     tabs_data_source: Option<ModelHandle<tabs::DataSource>>,
+    #[cfg(feature = "plugin_host")]
+    plugin_command_data_source: ModelHandle<PluginCommandDataSource>,
 }
 
 impl DataSourceStore {
     pub fn new(
         binding_source: ModelHandle<BindingSource>,
         active_session_handle: ModelHandle<SessionSource>,
+        window_id: WindowId,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         let actions_data_source =
@@ -45,7 +50,8 @@ impl DataSourceStore {
         let sessions_data_source =
             ctx.add_model(|_| navigation::DataSource::new(active_session_handle));
 
-        let warp_drive_data_source = ctx.add_model(warp_drive::DataSource::new);
+        let warp_drive_data_source =
+            ctx.add_model(|ctx| warp_drive::DataSource::new(window_id, ctx));
 
         let launch_config_data_source = ctx.add_model(launch_config::DataSource::new);
 
@@ -58,6 +64,9 @@ impl DataSourceStore {
 
         let repo_data_source = ctx.add_model(|_| RepoDataSource::new());
 
+        #[cfg(feature = "plugin_host")]
+        let plugin_command_data_source = ctx.add_model(|_| PluginCommandDataSource);
+
         Self {
             actions_data_source,
             sessions_data_source,
@@ -67,6 +76,8 @@ impl DataSourceStore {
             all_conversation_data_source,
             repo_data_source,
             tabs_data_source: None,
+            #[cfg(feature = "plugin_host")]
+            plugin_command_data_source,
         }
     }
 
@@ -110,6 +121,12 @@ impl DataSourceStore {
 
             mixer.add_sync_source(
                 self.actions_data_source.clone(),
+                HashSet::from([QueryFilter::Actions]),
+            );
+
+            #[cfg(feature = "plugin_host")]
+            mixer.add_sync_source(
+                self.plugin_command_data_source.clone(),
                 HashSet::from([QueryFilter::Actions]),
             );
 

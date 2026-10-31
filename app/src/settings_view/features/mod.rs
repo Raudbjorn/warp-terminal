@@ -1,10 +1,15 @@
+pub mod agent_backend;
+pub use agent_backend::BackendSelectorView;
+
+pub mod grpc_harness;
+pub use grpc_harness::GrpcHarnessSelectorView;
+
 pub mod undo_close;
 pub use undo_close::UndoCloseView;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "local_fs")] {
         pub mod external_editor;
-        pub use external_editor::ExternalEditorView;
     }
 }
 

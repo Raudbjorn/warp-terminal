@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{fs, io};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use channel_versions::VersionInfo;
 use command::blocking::Command;
 use lazy_static::lazy_static;
@@ -14,7 +14,7 @@ use tempfile::TempPath;
 use warp_core::channel::{Channel, ChannelState};
 use warpui::AppContext;
 
-use super::{release_assets_directory_url, DownloadReady};
+use super::{DownloadReady, release_assets_directory_url};
 use crate::server::telemetry::TelemetryEvent;
 use crate::util::windows::install_dir;
 
@@ -45,7 +45,9 @@ pub(super) async fn download_update_and_cleanup(
         .rand_bytes(0)
         .suffix(&format!("{}-{}", version_info.version, installer_file_name))
         .make(|path| {
-            already_exists = path.is_file();
+            // Treat a 0-byte file as missing.
+            let non_empty = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+            already_exists = non_empty;
             if already_exists {
                 File::open(path)
             } else {
@@ -120,7 +122,7 @@ fn parse_minidump_cleanup_exit_code(contents_lowercase: &[u8]) -> Option<i32> {
 }
 
 /// Checks the autoupdate log file from a previous update attempt.
-/// Sends telemetry for specific known issues, and sends a Sentry event if errors are found.
+/// Sends telemetry for specific known issues.
 /// The log file is renamed after processing to avoid duplicate reports on subsequent launches.
 pub(super) fn check_and_report_update_errors(ctx: &mut AppContext) {
     if ChannelState::is_local_only() {
@@ -183,13 +185,13 @@ pub(super) fn check_and_report_update_errors(ctx: &mut AppContext) {
     // Fired when taskkill returned non-zero after the mutex timeout.
     // Exit code 128 means "no matching process found" — the process was already
     // gone when taskkill ran — so suppress that harmless race condition.
-    if let Some(exit_code) = parse_forcekill_exit_code(&contents_lowercase) {
-        if exit_code != 128 {
-            crate::send_telemetry_sync_from_app_ctx!(
-                TelemetryEvent::AutoupdateForcekillFailed { exit_code },
-                ctx
-            );
-        }
+    if let Some(exit_code) = parse_forcekill_exit_code(&contents_lowercase)
+        && exit_code != 128
+    {
+        crate::send_telemetry_sync_from_app_ctx!(
+            TelemetryEvent::AutoupdateForcekillFailed { exit_code },
+            ctx
+        );
     }
 
     // Fired when the PowerShell cleanup of the orphaned minidump server process
@@ -199,49 +201,6 @@ pub(super) fn check_and_report_update_errors(ctx: &mut AppContext) {
             TelemetryEvent::AutoupdateMinidumpCleanupFailed { exit_code },
             ctx
         );
-    }
-
-    #[cfg(feature = "crash_reporting")]
-    {
-        use sentry::protocol::{Attachment, AttachmentType};
-
-        // Patterns for known benign errors that should not trigger Sentry reporting.
-        const IGNOREABLE_ERRORS: &[&[u8]] = &[
-            // User running out of disk space is not an error we need concern ourselves with.
-            // This message occurs after "An error occurred while trying to copy a file:"
-            b"there is not enough space on the disk",
-            // Recent Inno Setup versions try to enable a security feature which is unavailable on
-            // Windows 10 versions prior to 22H2 and this call fails. The failure is benign.
-            b"setprocessmitigationpolicy failed with error code 87",
-            // Bundled skill files whose names contain "error" appear in "Dest filename:" log lines
-            // and produce false positives.
-            b"error-codes.md",
-            b"error-recovery.md",
-        ];
-
-        let mut error_count = memchr::memmem::find_iter(&contents_lowercase, b"error").count();
-
-        for pattern in IGNOREABLE_ERRORS {
-            let ignoreable_count = memchr::memmem::find_iter(&contents_lowercase, pattern).count();
-            error_count = error_count.saturating_sub(ignoreable_count);
-        }
-
-        if error_count > 0 {
-            log::warn!("Autoupdate log file contains errors; reporting to Sentry");
-
-            let attachment = Attachment {
-                buffer: contents,
-                filename: UPDATE_LOG_FILENAME.to_string(),
-                ty: Some(AttachmentType::Attachment),
-                ..Default::default()
-            };
-            sentry::with_scope(
-                |scope| {
-                    scope.add_attachment(attachment);
-                },
-                || sentry::capture_message("Windows auto-update error", sentry::Level::Error),
-            );
-        }
     }
 
     // Rename the log file to avoid duplicate reports on subsequent launches.

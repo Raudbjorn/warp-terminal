@@ -14,15 +14,15 @@ use crate::ai::blocklist::{InputConfig, SerializedBlockListItem};
 use crate::code::editor_management::CodeSource;
 use crate::drive::OpenWarpDriveObjectSettings;
 use crate::root_view::quake_mode_window_id;
-use crate::server::ids::SyncId;
-use crate::settings_view::environments_page::EnvironmentsPage;
+use crate::server::ids::{ServerId, SyncId};
 use crate::settings_view::SettingsSection;
+use crate::settings_view::environments_page::EnvironmentsPage;
 use crate::tab::SelectedTabColor;
 use crate::terminal::ShellLaunchData;
 use crate::themes::theme::AnsiColorIdentifier;
+use crate::workspace::WorkspaceRegistry;
 use crate::workspace::tab_group::TabGroupId;
 use crate::workspace::view::left_panel::ToolPanelView;
-use crate::workspace::WorkspaceRegistry;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppState {
@@ -45,6 +45,7 @@ pub struct PersistedAgentManagementFilters {
 pub struct WindowSnapshot {
     pub tabs: Vec<TabSnapshot>,
     pub active_tab_index: usize,
+    pub team_uid: Option<ServerId>,
     pub bounds: Option<RectF>,
     pub fullscreen_state: FullscreenState,
     pub quake_mode: bool,
@@ -143,12 +144,24 @@ pub enum LeafContents {
     Workflow(WorkflowPaneSnapshot),
     Settings(SettingsPaneSnapshot),
     AIFact(AIFactPaneSnapshot),
+    CustomRouterEditor,
     ExecutionProfileEditor,
     CodeReview(CodeReviewPaneSnapshot),
     AmbientAgent(AmbientAgentPaneSnapshot),
     /// The in-app network log pane. Not persisted across restarts because the
     /// backing log is an in-memory ring buffer that starts empty on launch.
     NetworkLog,
+    /// The embedded browser pane (oh-my-warp). We persist only the current URL —
+    /// the Chrome + CDP screencast session itself is ephemeral and recreated on
+    /// restore (navigating to the stored URL).
+    Browser {
+        url: String,
+    },
+    /// An entrypoint pane type to launch other pane types from a search palette. The default view
+    /// when creating a tab.
+    Welcome {
+        startup_directory: Option<PathBuf>,
+    },
     /// A new first-time user experience which prioritizes choosing a coding repository.
     GetStarted,
 }
@@ -173,6 +186,9 @@ impl LeafContents {
             // Environment management panes are opened on-demand via workspace
             // actions and have no persistable state.
             | LeafContents::EnvironmentManagement(_) => false,
+            // Browser panes (oh-my-warp): persist the URL; the live CDP session
+            // is rebuilt on restore.
+            LeafContents::Browser { .. } => true,
             LeafContents::Terminal(_)
             | LeafContents::Notebook(_)
             | LeafContents::AIDocument(_)
@@ -181,10 +197,12 @@ impl LeafContents {
             | LeafContents::Workflow(_)
             | LeafContents::Settings(_)
             | LeafContents::AIFact(_)
+            | LeafContents::CustomRouterEditor
             | LeafContents::ExecutionProfileEditor
             | LeafContents::CodeReview(_)
-            | LeafContents::AmbientAgent(_)
-            | LeafContents::GetStarted => true,
+            | LeafContents::GetStarted
+            | LeafContents::Welcome { .. }
+            | LeafContents::AmbientAgent(_) => true,
         }
     }
 }
@@ -311,6 +329,12 @@ pub enum LeftPanelDisplayedTab {
     GlobalSearch,
     WarpDrive,
     ConversationListView,
+    #[cfg(not(target_family = "wasm"))]
+    CodexConversations,
+    #[cfg(not(target_family = "wasm"))]
+    OpenCodeConversations,
+    #[cfg(not(target_family = "wasm"))]
+    DockerContainers,
 }
 
 impl From<ToolPanelView> for LeftPanelDisplayedTab {
@@ -320,6 +344,8 @@ impl From<ToolPanelView> for LeftPanelDisplayedTab {
             ToolPanelView::GlobalSearch { .. } => LeftPanelDisplayedTab::GlobalSearch,
             ToolPanelView::WarpDrive => LeftPanelDisplayedTab::WarpDrive,
             ToolPanelView::ConversationListView => LeftPanelDisplayedTab::ConversationListView,
+            #[cfg(not(target_family = "wasm"))]
+            ToolPanelView::DockerContainers => LeftPanelDisplayedTab::DockerContainers,
         }
     }
 }
@@ -358,10 +384,10 @@ pub fn get_app_state(app: &AppContext) -> AppState {
 
     for (index, window_id) in app.window_ids().enumerate() {
         // Determine index of active window
-        if let Some(active_window_id) = active_window_id {
-            if active_window_id == window_id {
-                active_window_index = Some(index);
-            }
+        if let Some(active_window_id) = active_window_id
+            && active_window_id == window_id
+        {
+            active_window_index = Some(index);
         }
 
         if let Some(workspace) = WorkspaceRegistry::as_ref(app).get(window_id, app) {

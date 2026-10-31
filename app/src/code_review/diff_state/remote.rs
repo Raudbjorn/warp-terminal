@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use instant::Instant;
 use remote_server::manager::{RemoteServerManager, RemoteServerManagerEvent};
-use warp_core::{send_telemetry_from_ctx, HostId, SessionId};
+use warp_core::{HostId, SessionId, send_telemetry_from_ctx};
 use warp_util::remote_path::RemotePath;
 use warp_util::standardized_path::StandardizedPath;
 use warpui::{ModelContext, SingletonEntity};
@@ -81,7 +81,9 @@ impl RemoteDiffStateModel {
     ) -> Self {
         // Subscribe to RemoteServerManager push events and filter by remote_path and diff_mode
         let mgr_handle = RemoteServerManager::handle(ctx);
-        ctx.subscribe_to_model(&mgr_handle, Self::handle_manager_event);
+        ctx.subscribe_to_model(&mgr_handle, |me, _, event, ctx| {
+            me.handle_manager_event(event, ctx)
+        });
 
         let host_id = remote_path.host_id.clone();
         let repo_path = remote_path.path.clone();

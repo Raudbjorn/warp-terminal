@@ -1,34 +1,29 @@
-use crate::{
-    appearance::Appearance,
-    editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextColors, TextOptions},
-    report_if_error,
-    settings::{AISettings, LocalOpenAIEnabled, LocalOpenAIProviderKind, LocalProviderKind},
-    view_components::{Dropdown, DropdownItem},
-};
-use settings::{Setting, ToggleableSetting};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use warpui::{
-    elements::{
-        ChildView, Container, CrossAxisAlignment, Element, Flex, MouseStateHandle, ParentElement,
-        Text,
-    },
-    fonts::{Properties, Weight},
-    ui_components::{
-        components::{Coords, UiComponent, UiComponentStyles},
-        switch::SwitchStateHandle,
-    },
-    AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
-};
 
-use super::{
-    settings_page::{
-        build_toggle_element, render_body_item, render_body_item_label, LocalOnlyIconState,
-        MatchData, PageType, SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, ToggleState,
-        CONTENT_FONT_SIZE, HEADER_PADDING,
-    },
-    SettingsSection,
+use settings::{Setting, ToggleableSetting};
+use warp_core::channel::ChannelState;
+use warpui::elements::{
+    ChildView, Container, CrossAxisAlignment, Element, Flex, MouseStateHandle, ParentElement, Text,
 };
+use warpui::fonts::{Properties, Weight};
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
+use warpui::ui_components::switch::SwitchStateHandle;
+use warpui::{AppContext, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle};
+
+use super::SettingsSection;
+use super::settings_page::{
+    CONTENT_FONT_SIZE, HEADER_PADDING, LocalOnlyIconState, MatchData, PageTitle, PageType,
+    SettingsPageMeta, SettingsPageViewHandle, SettingsWidget, ToggleState, build_toggle_element,
+    render_body_item, render_body_item_label,
+};
+use crate::appearance::Appearance;
+use crate::editor::{
+    EditorView, Event as EditorEvent, SingleLineEditorOptions, TextColors, TextOptions,
+};
+use crate::report_if_error;
+use crate::settings::{AISettings, LocalOpenAIEnabled, LocalOpenAIProviderKind, LocalProviderKind};
+use crate::view_components::{Dropdown, DropdownItem};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalAISettingsPageAction {
@@ -61,7 +56,7 @@ impl LocalAISettingsPageView {
         Self {
             page: PageType::new_uncategorized(
                 vec![Box::new(LocalAIProviderWidget::new(ctx))],
-                Some("Local AI"),
+                Some(PageTitle::new("Local AI")),
             ),
             local_only_icon_tooltip_states: Default::default(),
             provider_kind_dropdown,
@@ -119,9 +114,11 @@ impl TypedActionView for LocalAISettingsPageView {
             }
             LocalAISettingsPageAction::SetProviderKind(kind) => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                    report_if_error!(settings
-                        .local_openai_provider_kind
-                        .set_value(kind.setting_value().to_string(), ctx));
+                    report_if_error!(
+                        settings
+                            .local_openai_provider_kind
+                            .set_value(kind.setting_value().to_string(), ctx)
+                    );
                 });
                 ctx.notify();
             }
@@ -133,9 +130,11 @@ impl SettingsPageMeta for LocalAISettingsPageView {
     fn section() -> SettingsSection {
         SettingsSection::LocalAI
     }
-
     fn should_render(&self, _ctx: &AppContext) -> bool {
-        true
+        // Local AI (openai-compatible endpoint, model selection) only works in
+        // the local-only channel — in Dev/Preview/Stable the local provider
+        // is not configured, so showing this page would just confuse users.
+        ChannelState::is_local_only()
     }
 
     fn update_filter(&mut self, query: &str, ctx: &mut ViewContext<Self>) -> MatchData {
@@ -243,9 +242,27 @@ impl LocalAIProviderWidget {
             if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
                 let buffer_text = editor.as_ref(ctx).buffer_text(ctx);
                 // Reject non-positive timeouts (`0ms` would make every request fail
-                // immediately) as well as unparseable input, resetting to the saved value.
+                // immediately) and clamp the upper bound to 1 hour to prevent
+                // integer-overflow panics inside `tokio`/`reqwest` timer wheels when
+                // the duration is added to `Instant::now()`. On any other invalid
+                // input, reset the editor text to the saved value.
                 let value = match buffer_text.trim().parse::<u64>() {
-                    Ok(value) if value > 0 => value,
+                    // Clamp overly-large (but otherwise valid) inputs to the 1-hour
+                    // cap rather than reverting them; reject non-positive/invalid input.
+                    Ok(value) if value > 0 => {
+                        let clamped =
+                            value.min(crate::ai::local_openai::MAX_LOCAL_OPENAI_TIMEOUT_MS);
+                        // When we clamped the input, the persisted value no longer matches
+                        // what the user typed. Sync the editor buffer to the clamped value
+                        // so the UI does not mislead users into thinking the larger value
+                        // was applied.
+                        if clamped != value {
+                            editor.update(ctx, |editor, ctx| {
+                                editor.set_buffer_text(&clamped.to_string(), ctx);
+                            });
+                        }
+                        clamped
+                    }
                     _ => {
                         log::warn!("Invalid local OpenAI timeout: {:?}", buffer_text.trim());
                         let current = AISettings::as_ref(ctx)
@@ -523,6 +540,20 @@ impl SettingsWidget for LocalAIProviderWidget {
                     appearance,
                     "Timeout (ms)",
                     self.timeout_ms_editor.clone(),
+                ))
+                .with_child(Self::render_description(
+                    appearance,
+                    "OpenCode sidecar: route requests through a locally-spawned OpenCode process bound to the working directory. The sidecar exposes an OpenAI-compatible endpoint on a random loopback port; we read the port from its startup announcement. Set `OpenCode Command` to the binary name or absolute path; the default `opencode` resolves from `$PATH`.",
+                ))
+                .with_child(Self::render_input(
+                    appearance,
+                    "OpenCode Command",
+                    self.opencode_command_editor.clone(),
+                ))
+                .with_child(Self::render_input(
+                    appearance,
+                    "OpenCode Args",
+                    self.opencode_args_editor.clone(),
                 ))
                 .finish(),
         )

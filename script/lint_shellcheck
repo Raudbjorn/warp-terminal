@@ -1,0 +1,19 @@
+#!/bin/bash
+
+set -e
+cd "$(dirname "$0")/.."
+
+if [[ "$#" -gt 0 ]]; then
+  echo "Unknown argument: $1" >&2
+  exit 2
+fi
+
+if ! command -v shellcheck >/dev/null 2>&1; then
+  echo "No ShellCheck installation detected; skipping ShellCheck."
+  exit 0
+fi
+
+shellcheck \
+  --shell=bash \
+  --severity=warning \
+  app/assets/bundled/bootstrap/bash_body.sh

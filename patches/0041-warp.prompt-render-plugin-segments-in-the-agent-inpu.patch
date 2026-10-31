@@ -1,0 +1,204 @@
+From 2e935da9fbefd2def2f7b711a2027aa929c99374 Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Tue, 2 Jun 2026 22:25:34 -0400
+Subject: [PATCH 41/48] warp.prompt: render plugin segments in the agent input
+ footer too (oh-my-warp)
+
+Pull the chip-rendering for plugin prompt segments out of PromptDisplay into a
+small helper in context_chips/plugin_prompt.rs (render_plugin_chips_for_side)
+and call it from BOTH:
+
+  - PromptDisplay::render (the terminal prompt row), and
+  - AgentInputFooter::render (the agent input footer chip rows).
+
+So a plugin's warp.prompt.set([...]) is now visible in both surfaces (left and
+right groups), matching where the native context chips live. No JS API change.
+---
+ .../agent_view/agent_input_footer/mod.rs      | 20 ++++++++
+ app/src/context_chips/display.rs              | 24 ++++-----
+ app/src/context_chips/plugin_prompt.rs        | 50 +++++++++++++------
+ 3 files changed, 64 insertions(+), 30 deletions(-)
+
+diff --git a/app/src/ai/blocklist/agent_view/agent_input_footer/mod.rs b/app/src/ai/blocklist/agent_view/agent_input_footer/mod.rs
+index a674c35f..69c9b289 100644
+--- a/app/src/ai/blocklist/agent_view/agent_input_footer/mod.rs
++++ b/app/src/ai/blocklist/agent_view/agent_input_footer/mod.rs
+@@ -62,6 +62,7 @@ use crate::appearance::Appearance;
+ use crate::auth::{AuthManager, AuthStateProvider};
+ use crate::completer::SessionContext;
+ use crate::context_chips::display_chip::{DisplayChip, DisplayChipConfig, PromptChipShellCommand};
++use crate::context_chips::plugin_prompt::{render_plugin_chips_for_side, PromptSide};
+ use crate::context_chips::prompt_type::PromptType;
+ use crate::context_chips::{self, ContextChipKind};
+ use crate::features::FeatureFlag;
+@@ -1584,6 +1585,10 @@ impl AgentInputFooter {
+                 left_buttons.add_child(element);
+             }
+         }
++        // oh-my-warp: plugin-contributed prompt segments (`warp.prompt.set`).
++        for elem in render_plugin_chips_for_side(PromptSide::Left, app, appearance) {
++            left_buttons.add_child(elem);
++        }
+ 
+         let mut right_buttons = Flex::row()
+             .with_cross_axis_alignment(CrossAxisAlignment::Center)
+@@ -1600,6 +1605,10 @@ impl AgentInputFooter {
+                 right_buttons.add_child(element);
+             }
+         }
++        // oh-my-warp: plugin-contributed prompt segments (`warp.prompt.set`).
++        for elem in render_plugin_chips_for_side(PromptSide::Right, app, appearance) {
++            right_buttons.add_child(elem);
++        }
+ 
+         let content = Wrap::row()
+             .with_main_axis_size(MainAxisSize::Max)
+@@ -2174,6 +2183,8 @@ impl View for AgentInputFooter {
+         }
+ 
+         let session_settings = SessionSettings::as_ref(app);
++        // oh-my-warp: used by `render_plugin_chips_for_side` below to render plugin chips.
++        let appearance = Appearance::as_ref(app);
+         let left_items = session_settings.agent_footer_chip_selection.left_items();
+         let right_items = session_settings.agent_footer_chip_selection.right_items();
+ 
+@@ -2221,6 +2232,10 @@ impl View for AgentInputFooter {
+                 left_buttons.add_child(element);
+             }
+         }
++        // oh-my-warp: plugin-contributed prompt segments (`warp.prompt.set`).
++        for elem in render_plugin_chips_for_side(PromptSide::Left, app, appearance) {
++            left_buttons.add_child(elem);
++        }
+ 
+         let mut right_buttons = Flex::row()
+             .with_cross_axis_alignment(CrossAxisAlignment::Center)
+@@ -2249,6 +2264,11 @@ impl View for AgentInputFooter {
+                 }
+             }
+         }
++        // oh-my-warp: plugin-contributed prompt segments (`warp.prompt.set`). Appended outside
++        // the alert branch so plugin chips persist even when a prompt-alert is shown on the right.
++        for elem in render_plugin_chips_for_side(PromptSide::Right, app, appearance) {
++            right_buttons.add_child(elem);
++        }
+ 
+         let content = Wrap::row()
+             .with_main_axis_size(MainAxisSize::Max)
+diff --git a/app/src/context_chips/display.rs b/app/src/context_chips/display.rs
+index 3c1c8fdb..b87f9e1c 100644
+--- a/app/src/context_chips/display.rs
++++ b/app/src/context_chips/display.rs
+@@ -11,10 +11,8 @@ use warpui::{
+     View, ViewContext, ViewHandle,
+ };
+ 
+-use super::display_chip::{
+-    render_udi_chip, DisplayChip, DisplayChipConfig, PromptDisplayChipEvent, UdiChipConfig,
+-};
+-use super::plugin_prompt::PluginPromptModel;
++use super::display_chip::{DisplayChip, DisplayChipConfig, PromptDisplayChipEvent};
++use super::plugin_prompt::{render_plugin_chips_for_side, PluginPromptModel, PromptSide};
+ use super::prompt_type::PromptType;
+ use super::{git_line_changes_from_chips, ChipResult, ContextChipKind};
+ use crate::ai::blocklist::agent_view::AgentViewController;
+@@ -443,16 +441,14 @@ impl View for PromptDisplay {
+         });
+ 
+         // oh-my-warp: append plugin-contributed segments (`warp.prompt.set`) as native chips —
+-        // left-grouped segments first, then right-grouped. (True right-edge alignment is a follow-up;
+-        // the modern UDI prompt has no rprompt region.)
+-        let plugin_prompt = PluginPromptModel::as_ref(app);
+-        if !plugin_prompt.is_empty() {
+-            let appearance = Appearance::as_ref(app);
+-            let color = appearance.theme().ansi_fg_blue();
+-            for segment in plugin_prompt.ordered_segments() {
+-                let config = UdiChipConfig::new(color, segment.text.clone());
+-                row.add_child(render_udi_chip(config, appearance));
+-            }
++        // left-grouped first, then right-grouped. (True right-edge alignment is a follow-up;
++        // the modern UDI prompt has no rprompt region.) Same helper feeds the agent input footer.
++        let appearance = Appearance::as_ref(app);
++        for elem in render_plugin_chips_for_side(PromptSide::Left, app, appearance) {
++            row.add_child(elem);
++        }
++        for elem in render_plugin_chips_for_side(PromptSide::Right, app, appearance) {
++            row.add_child(elem);
+         }
+ 
+         // This is a hack to apply horizontal clipping without vertical clipping (for padding).
+diff --git a/app/src/context_chips/plugin_prompt.rs b/app/src/context_chips/plugin_prompt.rs
+index f4b1a2ee..e8e0517a 100644
+--- a/app/src/context_chips/plugin_prompt.rs
++++ b/app/src/context_chips/plugin_prompt.rs
+@@ -13,7 +13,11 @@
+ use std::collections::BTreeMap;
+ 
+ use serde::{Deserialize, Serialize};
+-use warpui::{Entity, ModelContext, SingletonEntity};
++use warpui::elements::Element;
++use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
++
++use super::display_chip::{render_udi_chip, UdiChipConfig};
++use crate::appearance::Appearance;
+ 
+ /// Which side of the prompt a segment is grouped on. Left segments render first (after the built-in
+ /// chips), then right segments. (True right-edge alignment is classic-mode only; see PLUGIN_SPEC.md.)
+@@ -65,21 +69,12 @@ impl PluginPromptModel {
+         ctx.notify();
+     }
+ 
+-    /// All segments in render order: every left segment (across plugins, by plugin id) then every
+-    /// right segment.
+-    pub fn ordered_segments(&self) -> Vec<&PromptSegment> {
+-        let mut out: Vec<&PromptSegment> = Vec::new();
+-        for seg in self.segments_by_plugin.values().flatten() {
+-            if matches!(seg.side, PromptSide::Left) {
+-                out.push(seg);
+-            }
+-        }
+-        for seg in self.segments_by_plugin.values().flatten() {
+-            if matches!(seg.side, PromptSide::Right) {
+-                out.push(seg);
+-            }
+-        }
+-        out
++    /// All segments for one side, across all plugins (plugin-id order, deterministic).
++    pub fn segments_for_side(&self, side: PromptSide) -> impl Iterator<Item = &PromptSegment> {
++        self.segments_by_plugin
++            .values()
++            .flatten()
++            .filter(move |s| s.side == side)
+     }
+ 
+     pub fn is_empty(&self) -> bool {
+@@ -87,6 +82,29 @@ impl PluginPromptModel {
+     }
+ }
+ 
++/// Renders the plugin-pushed segments for one side as native chip elements. Returns an empty `Vec`
++/// when no plugin has pushed segments for that side; callers can `for elem in … { row.add_child(elem) }`
++/// without any guarding. Used by `PromptDisplay::render` (terminal prompt) and the agent input
++/// footer (`agent_view::agent_input_footer`) so plugin chips appear consistently in both surfaces.
++pub fn render_plugin_chips_for_side(
++    side: PromptSide,
++    app: &AppContext,
++    appearance: &Appearance,
++) -> Vec<Box<dyn Element>> {
++    let model = PluginPromptModel::as_ref(app);
++    if model.is_empty() {
++        return Vec::new();
++    }
++    let color = appearance.theme().ansi_fg_blue();
++    model
++        .segments_for_side(side)
++        .map(|seg| {
++            let config = UdiChipConfig::new(color, seg.text.clone());
++            render_udi_chip(config, appearance)
++        })
++        .collect()
++}
++
+ pub enum PluginPromptEvent {
+     Changed,
+ }

@@ -2,6 +2,7 @@ use warp_core::channel::ChannelState;
 use std::collections::HashMap;
 
 use uuid::Uuid;
+use warp_errors::report_error;
 use warpui::elements::{ChildView, Container};
 use warpui::ui_components::components::{Coords, UiComponentStyles};
 use warpui::{
@@ -18,6 +19,7 @@ use crate::appearance::Appearance;
 use crate::cloud_object::Space;
 use crate::modal::{Modal, ModalViewState};
 use crate::server::cloud_objects::update_manager::InitiatedBy;
+use crate::settings_view::SettingsSection;
 use crate::settings_view::mcp_servers::edit_page::{
     MCPServersEditPageView, MCPServersEditPageViewEvent,
 };
@@ -27,9 +29,8 @@ use crate::settings_view::mcp_servers::installation_modal::{
 use crate::settings_view::mcp_servers::list_page::{
     MCPServersListPageView, MCPServersListPageViewEvent,
 };
-use crate::settings_view::mcp_servers::{style, ServerCardItemId};
+use crate::settings_view::mcp_servers::{ServerCardItemId, style};
 use crate::settings_view::settings_page::{MatchData, PageType, SettingsPageMeta, SettingsWidget};
-use crate::settings_view::SettingsSection;
 use crate::view_components::DismissibleToast;
 use crate::workspace::ToastStack;
 
@@ -154,7 +155,7 @@ impl MCPServersSettingsPageView {
         };
         match item_id {
             ServerCardItemId::TemplatableMCP(_) => {
-                log::error!("Logging out is not supported for template MCP servers.");
+                report_error!("Logging out is not supported for template MCP servers.");
             }
             ServerCardItemId::TemplatableMCPInstallation(uuid) => {
                 TemplatableMCPServerManager::handle(ctx).update(ctx, |manager, ctx| {
@@ -164,18 +165,17 @@ impl MCPServersSettingsPageView {
                 self.add_toast(&message, ctx);
             }
             ServerCardItemId::GalleryMCP(_) => {
-                log::error!("Logging out is not supported for gallery MCP servers.");
+                report_error!("Logging out is not supported for gallery MCP servers.");
             }
             ServerCardItemId::FileBasedMCP(uuid) => {
                 if let Some(installation) =
                     FileBasedMCPManager::as_ref(ctx).get_installation_by_uuid(uuid)
+                    && let Some(hash) = installation.hash()
                 {
-                    if let Some(hash) = installation.hash() {
-                        TemplatableMCPServerManager::handle(ctx).update(ctx, |manager, ctx| {
-                            manager.shutdown_server(uuid, ctx);
-                            manager.purge_file_based_server_credentials(&vec![hash], ctx);
-                        });
-                    }
+                    TemplatableMCPServerManager::handle(ctx).update(ctx, |manager, ctx| {
+                        manager.shutdown_server(uuid, ctx);
+                        manager.purge_file_based_server_credentials(&vec![hash], ctx);
+                    });
                 }
                 self.add_toast(&message, ctx);
             }
@@ -540,7 +540,7 @@ impl TypedActionView for MCPServersSettingsPageView {
 
 impl SettingsPageMeta for MCPServersSettingsPageView {
     fn section() -> SettingsSection {
-        SettingsSection::MCPServers
+        SettingsSection::AgentMCPServers
     }
 
     fn should_render(&self, _ctx: &AppContext) -> bool {

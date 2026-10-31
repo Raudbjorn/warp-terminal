@@ -1,0 +1,229 @@
+From 33ee1728aa0c1df967eb2ca751c0ee80237a1a1f Mon Sep 17 00:00:00 2001
+From: Zach Taylor <zctaylor.work@gmail.com>
+Date: Fri, 22 May 2026 18:48:46 -0400
+Subject: [PATCH 32/48] Add browser open paths: leader ctrl-b w, right-click
+ Launch Web Pane, +/File menu New Web Tab (oh-my-warp)
+
+---
+ app/src/app_menus.rs        |  1 +
+ app/src/tab.rs              |  6 +++++
+ app/src/util/bindings.rs    |  3 +++
+ app/src/util/leader.rs      |  6 +++++
+ app/src/workspace/action.rs | 10 +++++++-
+ app/src/workspace/mod.rs    | 11 +++++++-
+ app/src/workspace/view.rs   | 50 +++++++++++++++++++++++++++++++++++--
+ 7 files changed, 83 insertions(+), 4 deletions(-)
+
+diff --git a/app/src/app_menus.rs b/app/src/app_menus.rs
+index d96ccbe8..9ffd7c08 100644
+--- a/app/src/app_menus.rs
++++ b/app/src/app_menus.rs
+@@ -1037,6 +1037,7 @@ fn make_new_elements_menu_items(ctx: &AppContext) -> Vec<MenuItem> {
+             },
+             None,
+         )),
++        non_updateable_custom_item(CustomAction::NewWebTab, ctx),
+         non_updateable_custom_item(CustomAction::NewFile, ctx),
+     ];
+ 
+diff --git a/app/src/tab.rs b/app/src/tab.rs
+index 82780ddb..f0d65918 100644
+--- a/app/src/tab.rs
++++ b/app/src/tab.rs
+@@ -428,6 +428,12 @@ impl TabData {
+         menu_items.append(&mut vec![MenuItemFields::new("Rename tab")
+             .with_on_select_action(WorkspaceAction::RenameTab(index))
+             .into_item()]);
++        // oh-my-warp: open an embedded browser pane as a right-split.
++        menu_items.push(
++            MenuItemFields::new("Launch Web Pane")
++                .with_on_select_action(WorkspaceAction::OpenBrowserPane)
++                .into_item(),
++        );
+         // Group together with rename option (note, resetting doesn't make
+         // sense unless you're able to rename a tab).
+         let title = self.pane_group.as_ref(ctx).custom_title(ctx);
+diff --git a/app/src/util/bindings.rs b/app/src/util/bindings.rs
+index 4065ba6d..989ef92b 100644
+--- a/app/src/util/bindings.rs
++++ b/app/src/util/bindings.rs
+@@ -26,6 +26,8 @@ pub const MAC_MENUS_CONTEXT: DescriptionContext = DescriptionContext::Custom("ma
+ #[repr(isize)]
+ pub enum CustomAction {
+     NewTab,
++    /// Open an embedded browser pane as a new tab (oh-my-warp).
++    NewWebTab,
+     NewFile,
+     ShowAboutWarp,
+     ShowSettings,
+@@ -266,6 +268,7 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
+     match custom.into() {
+         CustomAction::FocusInput => Keystroke::parse(cmd_or_ctrl_shift("l")).ok(),
+         CustomAction::NewTab => Keystroke::parse(cmd_or_ctrl_shift("t")).ok(),
++        CustomAction::NewWebTab => None,
+         CustomAction::Cut => Keystroke::parse("cmdorctrl-x").ok(),
+         CustomAction::Copy => Keystroke::parse(cmd_or_ctrl_shift("c")).ok(),
+         CustomAction::Paste => Keystroke::parse(cmd_or_ctrl_shift("v")).ok(),
+diff --git a/app/src/util/leader.rs b/app/src/util/leader.rs
+index d326be02..907495c7 100644
+--- a/app/src/util/leader.rs
++++ b/app/src/util/leader.rs
+@@ -87,6 +87,12 @@ fn leader_bindings() -> Vec<(&'static str, &'static str, &'static str, Workspace
+             "p",
+             WorkspaceAction::ActivatePrevTab,
+         ), // tmux: previous window
++        (
++            "leader:open_browser",
++            "Leader: Open Browser",
++            "w",
++            WorkspaceAction::OpenBrowserPane,
++        ), // oh-my-warp: embedded browser pane (w = web)
+     ]
+ }
+ 
+diff --git a/app/src/workspace/action.rs b/app/src/workspace/action.rs
+index 75972e6b..679b995b 100644
+--- a/app/src/workspace/action.rs
++++ b/app/src/workspace/action.rs
+@@ -792,6 +792,12 @@ pub enum WorkspaceAction {
+     /// Opens (or focuses) the in-app network log pane as a right-split of the
+     /// active pane group. Gated on `ContextFlag::NetworkLogConsole`.
+     OpenNetworkLogPane,
++    /// Opens an embedded browser pane (oh-my-warp) as a right-split of the active
++    /// pane group, streaming Chrome's viewport over CDP. Bound to the leader
++    /// chord `ctrl-b w`.
++    OpenBrowserPane,
++    /// Opens an embedded browser pane (oh-my-warp) as its own new tab.
++    NewWebTab,
+ }
+ 
+ impl From<&WorkspaceAction> for LoginGatedFeature {
+@@ -1094,7 +1100,9 @@ impl WorkspaceAction {
+             | ShowHandoffEnvironmentCreationModal
+             | ShowCloudModeV2EnvironmentCreationModal
+             | OpenCreateAuthSecretModal { .. }
+-            | OpenNetworkLogPane => false,
++            | OpenNetworkLogPane
++            | OpenBrowserPane
++            | NewWebTab => false,
+             #[cfg(debug_assertions)]
+             ShowHoaOnboardingFlow => false,
+             #[cfg(target_family = "wasm")]
+diff --git a/app/src/workspace/mod.rs b/app/src/workspace/mod.rs
+index 7b3aab20..b3f2d4d6 100644
+--- a/app/src/workspace/mod.rs
++++ b/app/src/workspace/mod.rs
+@@ -68,7 +68,7 @@ use crate::workspace::view::{
+     LEFT_PANEL_AGENT_CONVERSATIONS_BINDING_NAME, LEFT_PANEL_GLOBAL_SEARCH_BINDING_NAME,
+     LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME, LEFT_PANEL_WARP_DRIVE_BINDING_NAME,
+     NEW_AGENT_TAB_BINDING_NAME, NEW_AMBIENT_AGENT_TAB_BINDING_NAME, NEW_TAB_BINDING_NAME,
+-    NEW_TERMINAL_TAB_BINDING_NAME, OPEN_GLOBAL_SEARCH_BINDING_NAME,
++    NEW_TERMINAL_TAB_BINDING_NAME, NEW_WEB_TAB_BINDING_NAME, OPEN_GLOBAL_SEARCH_BINDING_NAME,
+     TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME, TOGGLE_NOTIFICATION_MAILBOX_BINDING_NAME,
+     TOGGLE_PROJECT_EXPLORER_BINDING_NAME, TOGGLE_RIGHT_PANEL_BINDING_NAME,
+     TOGGLE_TAB_CONFIGS_MENU_BINDING_NAME, TOGGLE_VERTICAL_TABS_PANEL_BINDING_NAME,
+@@ -664,6 +664,15 @@ pub fn init(app: &mut AppContext) {
+         .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
+         .with_custom_action(CustomAction::NewTab)
+         .with_enabled(|| ContextFlag::CreateNewSession.is_enabled()),
++        // oh-my-warp: open an embedded browser pane as a new tab (File menu item).
++        EditableBinding::new(
++            NEW_WEB_TAB_BINDING_NAME,
++            BindingDescription::new("New Web Tab"),
++            WorkspaceAction::NewWebTab,
++        )
++        .with_context_predicate(id!("Workspace") & !id!("Workspace_PaneDragging"))
++        .with_custom_action(CustomAction::NewWebTab)
++        .with_enabled(|| ContextFlag::CreateNewSession.is_enabled()),
+         EditableBinding::new(
+             NEW_TERMINAL_TAB_BINDING_NAME,
+             BindingDescription::new("New Terminal Tab"),
+diff --git a/app/src/workspace/view.rs b/app/src/workspace/view.rs
+index c88ba834..5e82d8df 100644
+--- a/app/src/workspace/view.rs
++++ b/app/src/workspace/view.rs
+@@ -279,8 +279,8 @@ use crate::pane_group::pane::ActionOrigin;
+ #[cfg(feature = "local_fs")]
+ use crate::pane_group::FilePane;
+ use crate::pane_group::{
+-    self, AIFactPane, AnyPaneContent, ChildAgentOrigin, CodeDiffPane, CodePane, CodeReviewPanelArg,
+-    Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
++    self, AIFactPane, AnyPaneContent, BrowserPane, ChildAgentOrigin, CodeDiffPane, CodePane,
++    CodeReviewPanelArg, Direction as PaneGroupDirection, Direction, EnvironmentManagementPane,
+     ExecutionProfileEditorPane, NetworkLogPane, NewTerminalOptions, PaneGroup, PaneId, PanesLayout,
+     TabBarHoverIndex, TerminalPaneId,
+ };
+@@ -614,6 +614,7 @@ pub(crate) const OPEN_GLOBAL_SEARCH_BINDING_NAME: &str = "workspace:open_global_
+ pub(crate) const TOGGLE_CONVERSATION_LIST_VIEW_BINDING_NAME: &str =
+     "workspace:toggle_conversation_list_view";
+ pub(crate) const NEW_TAB_BINDING_NAME: &str = "workspace:new_tab";
++pub(crate) const NEW_WEB_TAB_BINDING_NAME: &str = "workspace:new_web_tab";
+ pub(crate) const NEW_TERMINAL_TAB_BINDING_NAME: &str = "workspace:new_terminal_tab";
+ pub(crate) const NEW_AGENT_TAB_BINDING_NAME: &str = "workspace:new_agent_tab";
+ pub(crate) const NEW_AMBIENT_AGENT_TAB_BINDING_NAME: &str = "workspace:new_ambient_agent_tab";
+@@ -6560,6 +6561,14 @@ impl Workspace {
+             }
+         }
+ 
++        // oh-my-warp: open an embedded browser pane as a new tab.
++        menu_items.push(
++            MenuItemFields::new("New Web Tab")
++                .with_on_select_action(WorkspaceAction::NewWebTab)
++                .with_icon(icons::Icon::Globe)
++                .into_item(),
++        );
++
+         // 3. Cloud Agent (if flags enabled)
+         if is_any_ai_enabled
+             && FeatureFlag::AgentView.is_enabled()
+@@ -14575,6 +14584,37 @@ impl Workspace {
+         });
+     }
+ 
++    /// Opens an embedded browser pane (oh-my-warp) as a right-split of the
++    /// active pane group. Each pane spawns its own Chrome + CDP screencast
++    /// session, so (unlike the network log) we always open a new one rather
++    /// than focusing an existing one.
++    pub(crate) fn open_browser_pane(&mut self, ctx: &mut ViewContext<Self>) {
++        let pane = BrowserPane::new(ctx);
++        self.active_tab_pane_group().update(ctx, |pane_group, ctx| {
++            pane_group.add_pane_with_direction(
++                Direction::Right,
++                pane,
++                true, /* focus_new_pane */
++                ctx,
++            );
++        });
++    }
++
++    /// Opens an embedded browser pane (oh-my-warp) as its own new tab.
++    pub(crate) fn open_web_tab(&mut self, ctx: &mut ViewContext<Self>) {
++        let panes_layout = PanesLayout::Snapshot(Box::new(PaneNodeSnapshot::Leaf(LeafSnapshot {
++            is_focused: true,
++            custom_vertical_tabs_title: None,
++            contents: LeafContents::Browser,
++        })));
++        self.add_tab_with_pane_layout(
++            panes_layout,
++            Arc::new(HashMap::new()),
++            Some("Browser".to_owned()),
++            ctx,
++        );
++    }
++
+     fn show_handoff_environment_creation_modal(&mut self, ctx: &mut ViewContext<Self>) {
+         // Capture the initiating source view now, before async creation begins.
+         // If we waited until the Created callback, the user may have switched panes.
+@@ -23294,6 +23334,12 @@ impl TypedActionView for Workspace {
+             OpenNetworkLogPane => {
+                 self.open_network_log_pane(ctx);
+             }
++            OpenBrowserPane => {
++                self.open_browser_pane(ctx);
++            }
++            NewWebTab => {
++                self.open_web_tab(ctx);
++            }
+             FixSettingsWithOz { error_description } => {
+                 use crate::ai::skills::SkillManager;
+                 let modify_settings_skill = SkillManager::as_ref(ctx)

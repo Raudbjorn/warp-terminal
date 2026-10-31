@@ -30,10 +30,10 @@ impl Display for ServerExperiment {
             Self::PromptSuggestionsViaMaaOutOfBandExperiment => {
                 "PROMPT_SUGGESTIONS_VIA_MAA_OOB_EXPERIMENT"
             }
-            Self::FreeUserNoAiControl => "FREE_USER_NO_AI_CONTROL",
-            Self::FreeUserNoAiExperiment => "FREE_USER_NO_AI_EXPERIMENT",
             Self::OzMultiHarnessControl => "OZ_MULTI_HARNESS_CONTROL",
             Self::OzMultiHarnessExperiment => "OZ_MULTI_HARNESS_EXPERIMENT",
+            Self::MacosRunnersControl => "MACOS_RUNNERS_CONTROL",
+            Self::MacosRunnersExperiment => "MACOS_RUNNERS_EXPERIMENT",
             #[cfg(test)]
             Self::TestExperiment => "TEST_EXPERIMENT",
         };
@@ -61,10 +61,10 @@ impl ServerExperiment {
             }
             "PROMPT_SUGGESTIONS_VIA_MAA_CONTROL" => Ok(Self::PromptSuggestionsViaMaaControl),
             "PROMPT_SUGGESTIONS_VIA_MAA_EXPERIMENT" => Ok(Self::PromptSuggestionsViaMaaExperiment),
-            "FREE_USER_NO_AI_CONTROL" => Ok(Self::FreeUserNoAiControl),
-            "FREE_USER_NO_AI_EXPERIMENT" => Ok(Self::FreeUserNoAiExperiment),
             "OZ_MULTI_HARNESS_CONTROL" => Ok(Self::OzMultiHarnessControl),
             "OZ_MULTI_HARNESS_EXPERIMENT" => Ok(Self::OzMultiHarnessExperiment),
+            "MACOS_RUNNERS_CONTROL" => Ok(Self::MacosRunnersControl),
+            "MACOS_RUNNERS_EXPERIMENT" => Ok(Self::MacosRunnersExperiment),
             s => Err(anyhow::anyhow!(
                 "String doesn't match any server experiment variant {s}"
             )),
@@ -98,10 +98,10 @@ impl TryFrom<Experiment> for ServerExperiment {
             Experiment::PromptSuggestionsViaMaaOob => {
                 Ok(Self::PromptSuggestionsViaMaaOutOfBandExperiment)
             }
-            Experiment::FreeUserNoAiControl => Ok(Self::FreeUserNoAiControl),
-            Experiment::FreeUserNoAiExperiment => Ok(Self::FreeUserNoAiExperiment),
             Experiment::OzMultiHarnessControl => Ok(Self::OzMultiHarnessControl),
             Experiment::OzMultiHarnessExperiment => Ok(Self::OzMultiHarnessExperiment),
+            Experiment::MacosRunnersControl => Ok(Self::MacosRunnersControl),
+            Experiment::MacosRunnersExperiment => Ok(Self::MacosRunnersExperiment),
             // Experiments that we no longer support on the client.
             e => Err(anyhow::anyhow!(
                 "Server-side enabled experiment '{e:?}' is no longer supported by the client."
@@ -112,7 +112,7 @@ impl TryFrom<Experiment> for ServerExperiment {
 
 #[macro_export]
 macro_rules! convert_to_server_experiment {
-    ($gql_type:expr) => {{
+    ($gql_type:expr_2021) => {{
         let mut acc = Vec::new();
         for a in $gql_type {
             // Note for server experiments we don't currently track on the client.

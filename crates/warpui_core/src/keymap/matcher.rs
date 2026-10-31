@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use itertools::Either;
@@ -8,11 +7,11 @@ use super::{
     Keystroke, Trigger,
 };
 use crate::actions::StandardAction;
-use crate::{Action, EntityId};
+use crate::{Action, EntityId, EntityIdMap};
 
 #[derive(Default)]
 pub struct Matcher {
-    pending: HashMap<EntityId, Pending>,
+    pending: EntityIdMap<Pending>,
     keymap: Keymap,
     /// Default binding validator that should run on every binding (irrespective of the [`Context`]
     /// the binding was registered against).
@@ -55,7 +54,7 @@ pub enum MatchResult {
 impl Matcher {
     pub fn new(keymap: Keymap) -> Self {
         Self {
-            pending: HashMap::new(),
+            pending: EntityIdMap::default(),
             keymap,
             default_binding_validator: None,
             binding_validators: vec![],
@@ -312,27 +311,26 @@ impl Matcher {
     ) -> MatchResult {
         let pending = self.pending.entry(view_id).or_default();
 
-        if let Some(pending_ctx) = pending.context.as_ref() {
-            if pending_ctx != ctx {
-                pending.keystrokes.clear();
-            }
+        if let Some(pending_ctx) = pending.context.as_ref()
+            && pending_ctx != ctx
+        {
+            pending.keystrokes.clear();
         }
 
         pending.keystrokes.push(keystroke);
 
         let mut retain_pending = false;
         for binding in self.keymap.bindings() {
-            if let Trigger::Keystrokes(keystrokes) = &binding.trigger {
-                if keystrokes.starts_with(&pending.keystrokes)
-                    && binding.context_predicate.eval(ctx)
-                {
-                    if keystrokes.len() == pending.keystrokes.len() {
-                        self.pending.remove(&view_id);
-                        return MatchResult::Action(binding.action.clone());
-                    } else {
-                        retain_pending = true;
-                        pending.context = Some(ctx.clone());
-                    }
+            if let Trigger::Keystrokes(keystrokes) = &binding.trigger
+                && keystrokes.starts_with(&pending.keystrokes)
+                && binding.context_predicate.eval(ctx)
+            {
+                if keystrokes.len() == pending.keystrokes.len() {
+                    self.pending.remove(&view_id);
+                    return MatchResult::Action(binding.action.clone());
+                } else {
+                    retain_pending = true;
+                    pending.context = Some(ctx.clone());
                 }
             }
         }
@@ -345,14 +343,33 @@ impl Matcher {
         }
     }
 
+    /// oh-my-warp: returns the in-progress (pending) multi-keystroke sequence for
+    /// any view, if one is currently engaged (e.g. a tmux-style leader prefix has
+    /// been pressed and we're waiting for the next key). Used to drive a
+    /// "leader engaged" UI indicator.
+    pub fn pending_keystrokes(&self) -> Option<Vec<Keystroke>> {
+        self.pending
+            .values()
+            .map(|p| &p.keystrokes)
+            .find(|keystrokes| !keystrokes.is_empty())
+            .cloned()
+    }
+
+    /// oh-my-warp: clears any in-progress pending keystroke sequences (used by the
+    /// leader auto-cancel timeout).
+    pub fn clear_pending(&mut self) {
+        self.pending.clear();
+    }
+
     // Attempt to match with a StandardAction.
     // This returns None or Action, never Pending.
     pub fn match_standard(&self, action: StandardAction, ctx: &Context) -> MatchResult {
         for binding in self.keymap.bindings() {
-            if let Trigger::Standard(triggeract) = binding.trigger {
-                if *triggeract == action && binding.context_predicate.eval(ctx) {
-                    return MatchResult::Action(binding.action.clone());
-                }
+            if let Trigger::Standard(triggeract) = binding.trigger
+                && *triggeract == action
+                && binding.context_predicate.eval(ctx)
+            {
+                return MatchResult::Action(binding.action.clone());
             }
         }
         MatchResult::None
@@ -362,15 +379,17 @@ impl Matcher {
     // This returns None or Action, never Pending.
     pub fn match_custom(&self, action: CustomTag, ctx: &Context) -> MatchResult {
         for binding in self.keymap.bindings() {
-            if let Trigger::Custom(tag) = binding.trigger {
-                if *tag == action && binding.context_predicate.eval(ctx) {
-                    return MatchResult::Action(binding.action.clone());
-                }
+            if let Trigger::Custom(tag) = binding.trigger
+                && *tag == action
+                && binding.context_predicate.eval(ctx)
+            {
+                return MatchResult::Action(binding.action.clone());
             }
-            if let Some(Trigger::Custom(tag)) = binding.original_trigger {
-                if *tag == action && binding.context_predicate.eval(ctx) {
-                    return MatchResult::Action(binding.action.clone());
-                }
+            if let Some(Trigger::Custom(tag)) = binding.original_trigger
+                && *tag == action
+                && binding.context_predicate.eval(ctx)
+            {
+                return MatchResult::Action(binding.action.clone());
             }
         }
         MatchResult::None

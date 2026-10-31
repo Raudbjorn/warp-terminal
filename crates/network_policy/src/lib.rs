@@ -1,7 +1,6 @@
-use std::net::IpAddr;
+use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU8, Ordering};
 
-use serde::{Deserialize, Serialize};
 use url::Url;
 
 static SERVICES_MODE: AtomicU8 = AtomicU8::new(ServicesMode::Online as u8);
@@ -31,6 +30,17 @@ pub struct NetworkPolicyDenied {
 }
 
 impl NetworkPolicyDenied {
+    /// Construct a `NetworkPolicyDenied` from a human-readable purpose and
+    /// the URL that was denied. Exposed so non-`network_policy` crates can
+    /// build denial errors for code paths (such as the HTTP redirect policy)
+    /// that consult the network policy indirectly.
+    pub fn new(purpose: impl Into<String>, url: impl Into<String>) -> Self {
+        Self {
+            purpose: purpose.into(),
+            url: url.into(),
+        }
+    }
+
     pub fn purpose(&self) -> &str {
         &self.purpose
     }
@@ -53,9 +63,21 @@ pub fn is_local_only() -> bool {
 }
 
 pub fn check_url_str(url: &str, purpose: &str) -> Result<(), NetworkPolicyDenied> {
+    check_url_str_for_mode(services_mode(), url, purpose)
+}
+
+/// Like [`check_url_for_mode`], but for unparsed URLs. In local-only mode a URL that fails to
+/// parse is denied: it can't be classified as loopback, and some are not actually local. For
+/// example, the protocol-relative `//example.com/ws` fails to parse without a base, but a browser
+/// resolves it against the page's scheme and connects to `example.com`.
+pub fn check_url_str_for_mode(
+    mode: ServicesMode,
+    url: &str,
+    purpose: &str,
+) -> Result<(), NetworkPolicyDenied> {
     match Url::parse(url) {
-        Ok(url) => check_url(&url, purpose),
-        Err(_) if is_local_only() => Err(NetworkPolicyDenied {
+        Ok(url) => check_url_for_mode(mode, &url, purpose),
+        Err(_) if mode == ServicesMode::LocalOnly => Err(NetworkPolicyDenied {
             purpose: purpose.to_owned(),
             url: url.to_owned(),
         }),
@@ -82,22 +104,74 @@ pub fn check_url_for_mode(
     })
 }
 
+/// Maximum number of redirects followed by [`redirect_policy`]. Matches reqwest's default limit.
+#[cfg(not(target_family = "wasm"))]
+const MAX_REDIRECTS: usize = 10;
+
+/// A reqwest redirect policy that re-validates every redirect target against the network policy.
+///
+/// [`check_url`] only sees the URL a request starts with. reqwest's default policy then follows up
+/// to 10 redirects without consulting it, so in local-only mode a loopback URL could redirect to a
+/// public host and leave the machine. Any client that may reach a non-allowlisted host must use
+/// this policy. A denied target fails the request with [`NetworkPolicyDenied`] as the error
+/// source, rather than handing the 3xx response back to the caller as if it were the result.
+///
+/// Unlike [`reqwest::redirect::Policy::custom`] on its own, this keeps reqwest's default hop limit.
+#[cfg(not(target_family = "wasm"))]
+pub fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        // `previous` includes the initial URL, which is not a redirect. This mirrors the check in
+        // `Policy::limited`.
+        if attempt.previous().len() > MAX_REDIRECTS {
+            return attempt.error("too many redirects");
+        }
+        match check_url(attempt.url(), "redirect target") {
+            Ok(()) => attempt.follow(),
+            Err(err) => attempt.error(err),
+        }
+    })
+}
+
+/// Applies the network policy to a reqwest client builder: re-validates redirects (see
+/// [`redirect_policy`]) and, in local-only mode, disables proxies.
+///
+/// The loopback check only looks at the request URL, not the route. With `HTTP_PROXY` set, reqwest
+/// would send an allowed `http://localhost:11434` request to the proxy, which leaks the
+/// destination off-machine and can't reach this machine's loopback anyway. Local-only mode only
+/// permits loopback, so there is never a reason to proxy. The mode is fixed at startup by
+/// `ChannelState::set`, so reading it when the client is built is enough.
+///
+/// This replaces any redirect or proxy setting already on `builder`.
+#[cfg(not(target_family = "wasm"))]
+pub fn apply_to_client_builder(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let builder = builder.redirect(redirect_policy());
+    if is_local_only() {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
 fn is_guarded_scheme(scheme: &str) -> bool {
     matches!(scheme, "http" | "https" | "ws" | "wss")
 }
 
 fn is_loopback_url(url: &Url) -> bool {
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-
-    if host.eq_ignore_ascii_case("localhost") {
-        return true;
+    // Use the url crate's Host enum rather than manual string parsing
+    // of the host. The url crate already parses IPv4 and IPv6 into
+    // standard library types with proper is_loopback() semantics,
+    // including the bracketed IPv6 form (e.g. [::1]) which the
+    // previous string-strip code happened to handle but only by
+    // accident.
+    match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => {
+            ip.is_loopback()
+                || ip.to_ipv4().is_some_and(|v4| v4.is_loopback())
+        }
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
     }
-
-    host.trim_matches(['[', ']'])
-        .parse::<IpAddr>()
-        .is_ok_and(|addr| addr.is_loopback())
 }
 
 #[cfg(test)]
@@ -117,6 +191,21 @@ mod tests {
             assert_eq!(
                 check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
                 Ok(())
+            );
+        }
+    }
+
+    #[test]
+    fn local_only_allows_ipv4_mapped_loopback() {
+        for url in [
+            "http://[::ffff:127.0.0.1]:8080",
+            "http://[::ffff:7f00:1]:8080",
+        ] {
+            let url = Url::parse(url).unwrap();
+            assert_eq!(
+                check_url_for_mode(ServicesMode::LocalOnly, &url, "test"),
+                Ok(()),
+                "expected {url} to be treated as loopback"
             );
         }
     }
@@ -145,6 +234,22 @@ mod tests {
     }
 
     #[test]
+    fn local_only_denies_unparseable_urls() {
+        // Relative and protocol-relative URLs must not be waved through: a browser resolves
+        // `//example.com/ws` to a public host.
+        for url in ["/ws", "//example.com/ws", "example.com/ws", ""] {
+            assert!(
+                check_url_str_for_mode(ServicesMode::LocalOnly, url, "test").is_err(),
+                "{url:?} should be denied"
+            );
+            assert_eq!(
+                check_url_str_for_mode(ServicesMode::Online, url, "test"),
+                Ok(())
+            );
+        }
+    }
+
+    #[test]
     fn online_mode_allows_public_urls() {
         let url = Url::parse("https://app.warp.dev").unwrap();
         assert_eq!(
@@ -152,4 +257,29 @@ mod tests {
             Ok(())
         );
     }
+
+    #[test]
+    fn ipv4_mapped_ipv6_loopback_is_recognized() {
+        // IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1 should be treated as loopback
+        let url = Url::parse("http://[::ffff:127.0.0.1]:8080").unwrap();
+        assert!(is_loopback_url(&url));
+    }
+
+    #[test]
+    fn legacy_ipv4_compatible_ipv6_loopback_is_recognized() {
+        // Legacy IPv4-compatible IPv6 addresses (::a.b.c.d) are deprecated but
+        // still possible in the wild; `to_ipv4()` recognizes both this form
+        // and the IPv4-mapped form (::ffff:a.b.c.d), whereas `to_ipv4_mapped`
+        // only sees the latter.
+        let url = Url::parse("http://[::127.0.0.1]:8080").unwrap();
+        assert!(is_loopback_url(&url));
+    }
+
+    #[test]
+    fn ipv6_link_local_is_not_loopback() {
+        // Link-local addresses (fe80::/10) are NOT loopback
+        let url = Url::parse("http://[fe80::1]:8080").unwrap();
+        assert!(!is_loopback_url(&url));
+    }
+
 }

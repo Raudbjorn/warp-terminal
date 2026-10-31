@@ -1,13 +1,19 @@
 //! The "sender" of a shared session represents the sharer's end.
 //!
 //! Currently there is no way to share a session from wasm.
-#![cfg_attr(target_family = "wasm", allow(dead_code))]
+#![cfg_attr(
+    any(test, feature = "integration_tests", target_family = "wasm"),
+    allow(dead_code)
+)]
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::pin::pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use anyhow::Context as _;
 use async_channel::Receiver;
 use byte_unit::{Byte, UnitType};
 use futures_util::stream::AbortHandle;
@@ -36,33 +42,50 @@ use session_sharing_protocol::sharer::{
     UpstreamMessage,
 };
 use warp_core::features::FeatureFlag;
-use warpui::r#async::Timer;
-use warpui::{Entity, ModelContext, ModelHandle, RequestState, RetryOption, SingletonEntity};
+use warp_errors::report_error;
+use warp_server_client::iap::IapManager;
+use warpui::r#async::{FutureExt as _, Spawnable, SpawnableOutput, Timer};
+use warpui::{Entity, ModelContext, RetryOption, SingletonEntity};
 use websocket::{Message, Sink, Stream, WebSocket, WebsocketMessage as _};
 
 use crate::auth::{AuthStateProvider, UserUid};
 use crate::editor::{CrdtOperation, ReplicaId};
-use crate::server::iap::IapManager;
 use crate::server::server_api::ServerApiProvider;
-use crate::terminal::model::block::BlockId;
-use crate::terminal::shared_session::network::heartbeat::{Event as HeartbeatEvent, Heartbeat};
-use crate::terminal::shared_session::{
-    connect_endpoint, max_session_size, EventNumber, SharedSessionScrollbackType,
-    SharedSessionSource, SELECTION_THROTTLE_PERIOD,
-};
-use crate::terminal::TerminalModel;
-use crate::throttle::throttle;
 #[cfg(not(any(test, feature = "integration_tests")))]
-use crate::{report_error, server::telemetry::telemetry_context};
+use crate::server::telemetry::telemetry_context;
+use crate::terminal::TerminalModel;
+use crate::terminal::model::block::BlockId;
+#[cfg(not(any(test, feature = "integration_tests")))]
+use crate::terminal::shared_session::SharedSessionScrollbackType;
+use crate::terminal::shared_session::{
+    EventNumber, SELECTION_THROTTLE_PERIOD, SharedSessionSource, connect_endpoint,
+};
+use crate::throttle::throttle;
 
-/// The amount of time we will wait to batch consecutive PTY read events before sending an event to the server
+/// The amount of time we will wait to batch consecutive PTY read events before sending an event to the server.
+#[cfg(not(any(test, feature = "integration_tests")))]
 const PTY_READS_BATCH_THRESHOLD: Duration = Duration::from_millis(50);
+/// Under `test`/`integration_tests` the threshold is larger so the transient
+/// `Batching` state is reliably observable instead of racing the real ~50ms timer
+/// under coarse scheduler granularity (which flaked on Windows CI); see
+/// `test_handle_pty_read_event_while_not_batching`.
+#[cfg(any(test, feature = "integration_tests"))]
+const PTY_READS_BATCH_THRESHOLD: Duration = Duration::from_millis(250);
 #[cfg_attr(any(test, feature = "integration_tests"), allow(dead_code))]
 const CREATE_SESSION_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg_attr(any(test, feature = "integration_tests"), allow(dead_code))]
 const AMBIENT_CREATE_SESSION_MAX_ATTEMPTS: usize = 3;
-/// Exponential backoff when retrying reconnection. This configuration has us retry for ~128 seconds before giving up,
-/// where the last interval between retries is 26s.
+const RECONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+const RECONNECT_CYCLE_TIMEOUT: Duration = Duration::from_secs(128);
+const MAX_NO_PROGRESS_RECONNECTS: usize = 5;
+const RECONNECT_LIMIT_REACHED_MESSAGE: &str = "Reached maximum number of session sharing reconnection attempts without making ordered event progress";
+const MAX_PRE_RECONNECT_MESSAGES: usize = 256;
+const MAX_PRE_RECONNECT_BYTES: usize = 1024 * 1024;
+#[cfg(not(test))]
+const SERVER_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 200 * 1024 * 1024;
+#[cfg(test)]
+const SERVER_MAX_WEBSOCKET_MESSAGE_BYTES: usize = 128;
+/// Exponential backoff, bounded by the reconnect cycle timeout including connection and handshake time.
 /// We should be somewhat generous with the amount of retries allowed when a sharer wants to recover their session,
 /// since they have the choice of giving up early by closing the window/stopping sharing.
 const RECONNECT_RETRY_STRATEGY: RetryOption = RetryOption::exponential(
@@ -71,9 +94,88 @@ const RECONNECT_RETRY_STRATEGY: RetryOption = RetryOption::exponential(
     18,                          /* max retry count */
 )
 .with_jitter(0.2);
+struct ConfirmedReconnection<S, T> {
+    sink: S,
+    stream: T,
+    confirmation: Message,
+    buffered_messages: Vec<Message>,
+}
+
+async fn confirm_reconnection<S: Sink, T: Stream>(
+    mut sink: S,
+    mut stream: T,
+    payload: ReconnectPayload,
+) -> anyhow::Result<ConfirmedReconnection<S, T>> {
+    sink.send(Message::new(UpstreamMessage::Reconnect(payload).to_json()?))
+        .await?;
+    let mut buffered_messages = Vec::new();
+    let mut buffered_bytes = 0;
+    while let Some(message) = stream.next().await {
+        let message = message?;
+        let Some(text) = message.text() else {
+            continue;
+        };
+        if matches!(
+            DownstreamMessage::from_json(text),
+            Ok(DownstreamMessage::SessionReconnected { .. }
+                | DownstreamMessage::FailedToReconnect { .. }
+                | DownstreamMessage::SessionTerminated { .. })
+        ) {
+            return Ok(ConfirmedReconnection {
+                sink,
+                stream,
+                confirmation: message,
+                buffered_messages,
+            });
+        }
+        // The server can send session updates before its reconnect acknowledgement.
+        if buffered_messages.len() >= MAX_PRE_RECONNECT_MESSAGES
+            || text.len() > MAX_PRE_RECONNECT_BYTES - buffered_bytes
+        {
+            anyhow::bail!("Too many messages before shared session reconnect confirmation");
+        }
+        buffered_bytes += text.len();
+        buffered_messages.push(message);
+    }
+    anyhow::bail!("Websocket closed before shared session reconnect confirmation")
+}
+
+async fn retry_reconnection<F, Fut, T>(
+    mut attempt: F,
+    mut retry_strategy: RetryOption,
+    attempt_timeout: Duration,
+    cycle_timeout: Duration,
+) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = anyhow::Result<T>>,
+{
+    // Keep attempts and backoff in one future so cancellation also stops subsequent retries.
+    async move {
+        loop {
+            let result = attempt()
+                .with_timeout(attempt_timeout)
+                .await
+                .context("Timed out waiting for shared session reconnect confirmation")
+                .and_then(|result| result);
+            match result {
+                Ok(connection) => return Ok(connection),
+                Err(error) if retry_strategy.remaining_retries() == 0 => return Err(error),
+                Err(error) => {
+                    log::warn!("Failed to reconnect shared session, will retry: {error:#}");
+                    Timer::after(retry_strategy.duration()).await;
+                    retry_strategy.advance();
+                }
+            }
+        }
+    }
+    .with_timeout(cycle_timeout)
+    .await
+    .context("Shared session reconnect deadline exceeded")?
+}
 
 macro_rules! sharer_info {
-    ($network:expr, $($arg:tt)+) => {{
+    ($network:expr_2021, $($arg:tt)+) => {{
         let (session_id, source_task_id) = $network.log_context();
         log::info!(
             "{message}; session_id={session_id:?} source_task_id={source_task_id:?}",
@@ -85,7 +187,7 @@ macro_rules! sharer_info {
 }
 
 macro_rules! sharer_warn {
-    ($network:expr, $($arg:tt)+) => {{
+    ($network:expr_2021, $($arg:tt)+) => {{
         let (session_id, source_task_id) = $network.log_context();
         log::warn!(
             "{message}; session_id={session_id:?} source_task_id={source_task_id:?}",
@@ -97,13 +199,14 @@ macro_rules! sharer_warn {
 }
 
 macro_rules! sharer_error {
-    ($network:expr, $($arg:tt)+) => {{
+    ($network:expr_2021, $($arg:tt)+) => {{
         let (session_id, source_task_id) = $network.log_context();
-        log::error!(
-            "{message}; session_id={session_id:?} source_task_id={source_task_id:?}",
-            message = format_args!($($arg)+),
-            session_id = session_id,
-            source_task_id = source_task_id,
+        warp_errors::report_error!(
+            anyhow::anyhow!("{}", format_args!($($arg)+)),
+            extra: {
+                "session_id" => ?session_id,
+                "source_task_id" => ?source_task_id
+            }
         );
     }};
 }
@@ -155,6 +258,7 @@ struct StartupConfig {
     universal_developer_input_context: UniversalDeveloperInputContext,
     lifetime: Lifetime,
     selected_model_id: String,
+    share_with_team_uid: Option<crate::server::ids::ServerId>,
 }
 
 #[derive(Debug)]
@@ -182,6 +286,7 @@ impl StartupRetryState {
 enum StartupFailure {
     Transport,
     InitializeSend,
+    InitializeTooLarge,
     WebsocketClosedBeforeStarted,
     WebsocketError,
     Timeout,
@@ -196,6 +301,7 @@ impl StartupFailure {
             | Self::WebsocketClosedBeforeStarted
             | Self::WebsocketError
             | Self::Timeout => true,
+            Self::InitializeTooLarge => false,
             Self::ServerRejected(reason) => matches!(
                 reason,
                 FailedToInitializeSessionReason::InternalServerError { .. }
@@ -214,7 +320,10 @@ impl StartupFailure {
             Self::Timeout => FailedToInitializeSessionReason::InternalServerError {
                 details: "Timed out creating shared session".to_string(),
             },
-            Self::Transport | Self::InitializeSend | Self::WebsocketError => {
+            Self::Transport
+            | Self::InitializeSend
+            | Self::InitializeTooLarge
+            | Self::WebsocketError => {
                 FailedToInitializeSessionReason::internal_server_error_without_details()
             }
         }
@@ -224,6 +333,7 @@ impl StartupFailure {
         match self {
             Self::Transport => "transport_error",
             Self::InitializeSend => "initialize_send_error",
+            Self::InitializeTooLarge => "initialize_too_large",
             Self::WebsocketClosedBeforeStarted => "websocket_closed_before_started",
             Self::WebsocketError => "websocket_error",
             Self::Timeout => "timeout",
@@ -241,6 +351,17 @@ impl StartupFailure {
     }
 }
 
+#[cfg(test)]
+fn share_with_team_uid_for_init_payload(
+    scope: &(impl crate::workspaces::user_workspaces::TeamScope + ?Sized),
+) -> Option<String> {
+    use crate::workspaces::user_workspaces::TeamScope;
+
+    crate::workspaces::user_workspaces::ResolvedTeamScope::from_scope(scope)
+        .team_uid()
+        .map(String::from)
+}
+
 #[cfg_attr(any(test, feature = "integration_tests"), allow(dead_code))]
 fn startup_max_attempts(source: &SharedSessionSource) -> usize {
     if matches!(source.source_type, SessionSourceType::AmbientAgent { .. }) {
@@ -253,7 +374,7 @@ fn startup_max_attempts(source: &SharedSessionSource) -> usize {
 pub struct Network {
     model: Arc<FairMutex<TerminalModel>>,
     stage: Stage,
-    heartbeat: ModelHandle<Heartbeat>,
+    connection_generation: usize,
 
     /// The next event number to use when sending an event to the server.
     event_no: EventNumber,
@@ -287,9 +408,14 @@ pub struct Network {
     /// HashMap from event_no to the event. We keep these in memory to support reconnections
     /// until the server acks that they have been processed and are safe to remove.
     unacked_terminal_events: HashMap<usize, OrderedTerminalEvent>,
+    last_confirmed_event_no: Option<usize>,
+    no_progress_reconnects: usize,
 
     /// The parameters for the next input operation to send.
     next_buffer_seq_no: (BlockId, InputOperationSeqNo),
+
+    /// Input updates buffered while disconnected, to be flushed on reconnect.
+    pending_input_updates: Vec<InputUpdate>,
 }
 
 impl Network {
@@ -298,10 +424,9 @@ impl Network {
     pub fn new_for_test(
         model: Arc<FairMutex<TerminalModel>>,
         ordered_events_rx: Receiver<OrderedTerminalEventType>,
-        _scrollback_type: SharedSessionScrollbackType,
         active_prompt: ActivePrompt,
         selection: Selection,
-        _input_replica_id: ReplicaId,
+        max_session_size: Byte,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         let (ws_proxy_tx, ws_proxy_rx) = async_channel::unbounded();
@@ -309,17 +434,13 @@ impl Network {
         let (selection_throttled_tx, selection_rx) = async_channel::unbounded();
         let selection_throttled_rx = throttle(SELECTION_THROTTLE_PERIOD, selection_rx);
         let init_block_id = model.lock().block_list().active_block_id().clone();
-        let heartbeat = ctx.add_model(|_| Heartbeat::default());
-        ctx.subscribe_to_model(&heartbeat, Self::handle_heartbeat_event);
-
         let network = Network {
-            heartbeat,
             event_no: EventNumber::new(),
             selection_event_no: EventNumber::new(),
             model: model.clone(),
             ws_proxy_tx,
             num_bytes_shared: Byte::from_u64(0),
-            max_session_size: max_session_size(ctx),
+            max_session_size,
             pty_bytes_batch_status: PtyBytesBatchStatus::NotBatching {
                 last_sent_at: Instant::now(),
             },
@@ -333,13 +454,17 @@ impl Network {
             stage: Stage::BeforeStarted {
                 startup_retry: StartupRetryState::new(1),
             },
+            connection_generation: 0,
             session_id: None,
             reconnect_token: None,
             sharer_id: None,
             startup_config: None,
             source: SharedSessionSource::default(),
             unacked_terminal_events: HashMap::new(),
+            last_confirmed_event_no: None,
+            no_progress_reconnects: 0,
             next_buffer_seq_no: (init_block_id, InputOperationSeqNo::zero()),
+            pending_input_updates: Vec::new(),
         };
         let sharer_firebase_uid = UserUid::new("mock_firebase_uid");
         ctx.emit(NetworkEvent::SharedSessionCreatedSuccessfully {
@@ -374,20 +499,19 @@ impl Network {
         selection: Selection,
         input_replica_id: ReplicaId,
         terminal_view_id: warpui::EntityId,
+        team_uid: Option<crate::server::ids::ServerId>,
         universal_developer_input_context: UniversalDeveloperInputContext,
         lifetime: Lifetime,
         source: SharedSessionSource,
+        max_session_size: Byte,
         ctx: &mut ModelContext<Self>,
     ) -> Self {
         let (ws_proxy_tx, ws_proxy_rx) = async_channel::unbounded();
         let scrollback = scrollback_type.to_scrollback(&model.lock());
         let num_bytes_scrollback = scrollback.num_bytes();
-        let max_session_size = max_session_size(ctx);
         let (selection_throttled_tx, selection_rx) = async_channel::unbounded();
         let selection_throttled_rx = throttle(SELECTION_THROTTLE_PERIOD, selection_rx);
         let init_block_id = model.lock().block_list().active_block_id().clone();
-        let heartbeat = ctx.add_model(|_| Heartbeat::default());
-        ctx.subscribe_to_model(&heartbeat, Self::handle_heartbeat_event);
         let window_size = {
             let size_info = *model.lock().block_list().size();
             WindowSize {
@@ -396,7 +520,7 @@ impl Network {
             }
         };
         let selected_model_id: String = crate::ai::llms::LLMPreferences::as_ref(ctx)
-            .get_active_base_model(ctx, Some(terminal_view_id))
+            .get_active_base_model_for_team_uid(team_uid, ctx, Some(terminal_view_id))
             .id
             .clone()
             .into();
@@ -409,10 +533,10 @@ impl Network {
             universal_developer_input_context: universal_developer_input_context.clone(),
             lifetime,
             selected_model_id,
+            share_with_team_uid: team_uid,
         };
 
         let mut network = Network {
-            heartbeat,
             event_no: EventNumber::new(),
             selection_event_no: EventNumber::new(),
             model: model.clone(),
@@ -430,13 +554,17 @@ impl Network {
                 universal_developer_input_context: Some(universal_developer_input_context.clone()),
             },
             stage: Stage::BeforeStarted { startup_retry },
+            connection_generation: 0,
             session_id: None,
             reconnect_token: None,
             sharer_id: None,
             startup_config: Some(startup_config),
             source,
             unacked_terminal_events: HashMap::new(),
+            last_confirmed_event_no: None,
+            no_progress_reconnects: 0,
             next_buffer_seq_no: (init_block_id.clone(), InputOperationSeqNo::zero()),
+            pending_input_updates: Vec::new(),
         };
 
         // We should validate the scrollback is under the limit before creating the Network, but check here just to be safe.
@@ -469,6 +597,7 @@ impl Network {
 
     /// Close the websocket to the session-sharing-server.
     fn close(&mut self) {
+        self.connection_generation += 1;
         if let Stage::Reconnecting { abort_handle, .. } = &self.stage {
             abort_handle.abort();
         }
@@ -508,21 +637,6 @@ impl Network {
         let message = UpstreamMessage::EndSession { reason };
         self.send_message_to_server(message);
         self.close_without_reconnection();
-    }
-
-    /// We need to ensure we're maintaining a heartbeat with the server.
-    /// This helps us detect if the server has gone away silently and helps
-    /// the server detect if we (the client) have disconnected quietly.
-    fn handle_heartbeat_event(&mut self, event: &HeartbeatEvent, ctx: &mut ModelContext<Self>) {
-        match event {
-            HeartbeatEvent::Ping => {
-                self.send_message_to_server(UpstreamMessage::Ping { data: vec![] });
-            }
-            HeartbeatEvent::Idle => {
-                sharer_info!(self, "Sharer reconnecting: heartbeat idle timeout");
-                self.reconnect_websocket(ctx);
-            }
-        }
     }
 
     pub fn send_active_prompt_update_if_changed(&mut self, active_prompt: ActivePrompt) {
@@ -632,6 +746,8 @@ impl Network {
         // with are monotonically increasing.
         if block_id != &self.next_buffer_seq_no.0 {
             self.next_buffer_seq_no = (block_id.clone(), InputOperationSeqNo::zero());
+            // Clear buffered ops for the old block since they're now stale.
+            self.pending_input_updates.clear();
         }
 
         let operations = operations
@@ -656,7 +772,21 @@ impl Network {
         };
         self.next_buffer_seq_no.1.advance();
 
-        self.send_message_to_server(UpstreamMessage::UpdateInput(InputUpdate { id, ops }));
+        let update = InputUpdate { id, ops };
+        if matches!(self.stage, Stage::StartedSuccessfully { .. }) {
+            if let Err(e) = self
+                .ws_proxy_tx
+                .try_send(UpstreamMessage::UpdateInput(update))
+            {
+                sharer_warn!(
+                    self,
+                    "Failed to send input update over ws_proxy channel: {e}"
+                );
+            }
+        } else {
+            // Not connected; buffer the update to be flushed on reconnect.
+            self.pending_input_updates.push(update);
+        }
     }
 
     pub fn send_command_execution_rejection(
@@ -725,10 +855,10 @@ impl Network {
         update: UniversalDeveloperInputContextUpdate,
     ) {
         // Skip update if nothing would change
-        if let Some(ref cached) = self.cached_latest_state.universal_developer_input_context {
-            if !update.changes_cached_context(cached) {
-                return;
-            }
+        if let Some(ref cached) = self.cached_latest_state.universal_developer_input_context
+            && !update.changes_cached_context(cached)
+        {
+            return;
         }
 
         sharer_info!(
@@ -764,7 +894,7 @@ impl Network {
         };
 
         self.abort_startup_handles();
-        self.close_startup_transport(ctx);
+        self.close_startup_transport();
 
         let (ws_proxy_tx, ws_proxy_rx) = async_channel::unbounded();
         self.ws_proxy_tx = ws_proxy_tx;
@@ -853,6 +983,7 @@ impl Network {
                             supports_full_role: true,
                             supports_full_role_for_real: true,
                         },
+                        share_with_team_uid: config.share_with_team_uid.map(String::from),
                     });
                     if let Err(e) = network.ws_proxy_tx.try_send(message) {
                         sharer_error!(network, "Sharer failed to send initialization message: {e}");
@@ -923,16 +1054,23 @@ impl Network {
     /// Do not use this for one-shot startup callbacks that should only run before the
     /// session starts; use `is_active_startup_attempt_callback` for those.
     fn should_ignore_startup_attempt_websocket_callback(&self, attempt: usize) -> bool {
-        matches!(
-            &self.stage,
-            Stage::BeforeStarted { startup_retry }
-                if startup_retry.current_attempt != attempt
-        ) || matches!(
-            &self.stage,
-            Stage::StartedSuccessfully {
-                startup_attempt: Some(startup_attempt),
-            } if *startup_attempt != attempt
-        )
+        match &self.stage {
+            Stage::BeforeStarted { startup_retry } => startup_retry.current_attempt != attempt,
+            Stage::StartedSuccessfully { startup_attempt } => *startup_attempt != Some(attempt),
+            Stage::Reconnecting { .. } | Stage::Finished => true,
+        }
+    }
+
+    fn should_ignore_websocket_callback(
+        &self,
+        generation: usize,
+        startup_attempt: Option<usize>,
+    ) -> bool {
+        self.connection_generation != generation
+            || matches!(self.stage, Stage::Finished)
+            || startup_attempt.is_some_and(|attempt| {
+                self.should_ignore_startup_attempt_websocket_callback(attempt)
+            })
     }
 
     fn should_retry_startup_failure(&self, failure: &StartupFailure) -> bool {
@@ -965,11 +1103,9 @@ impl Network {
         }
     }
 
-    fn close_startup_transport(&mut self, ctx: &mut ModelContext<Self>) {
+    fn close_startup_transport(&mut self) {
+        self.connection_generation += 1;
         self.ws_proxy_tx.close();
-        self.heartbeat.update(ctx, |heartbeat, _| {
-            heartbeat.stop();
-        });
     }
 
     fn handle_startup_failure(&mut self, failure: StartupFailure, ctx: &mut ModelContext<Self>) {
@@ -1002,7 +1138,7 @@ impl Network {
                 );
             }
             self.abort_startup_handles();
-            self.close_startup_transport(ctx);
+            self.close_startup_transport();
 
             #[cfg(not(any(test, feature = "integration_tests")))]
             self.start_create_session_attempt(ctx);
@@ -1022,7 +1158,7 @@ impl Network {
         }
         self.abort_startup_handles();
         self.stage = Stage::Finished;
-        self.close_startup_transport(ctx);
+        self.close_startup_transport();
         self.startup_config = None;
 
         #[cfg(not(any(test, feature = "integration_tests")))]
@@ -1044,6 +1180,18 @@ impl Network {
         if matches!(self.stage, Stage::Finished | Stage::Reconnecting { .. }) {
             return;
         }
+        if self.no_progress_reconnects >= MAX_NO_PROGRESS_RECONNECTS {
+            sharer_warn!(
+                self,
+                "Ending shared session before reconnecting again without ordered event progress; reconnects={}",
+                self.no_progress_reconnects
+            );
+            self.close_without_reconnection();
+            ctx.emit(NetworkEvent::ReconnectLimitReached {
+                reason: RECONNECT_LIMIT_REACHED_MESSAGE,
+            });
+            return;
+        }
 
         let (Some(session_id), Some(reconnect_token)) =
             (self.session_id, self.reconnect_token.clone())
@@ -1063,92 +1211,143 @@ impl Network {
         let auth_client = ServerApiProvider::as_ref(ctx).get_auth_client();
         let auth_state = AuthStateProvider::as_ref(ctx).get().clone();
         let iap_state = IapManager::as_ref(ctx).iap_state();
-
-        let abort_handle = ctx
-            .spawn_with_retry_on_error(
-                move || {
-                    log::info!(
-                        "Attempting to reconnect shared session as sharer; session_id={session_id:?}"
-                    );
-                    let reconnect_endpoint = reconnect_endpoint.clone();
-                    let auth_state = auth_state.clone();
-                    let auth_client = auth_client.clone();
-                    let iap_state = iap_state.clone();
-                    async move {
-                        // Re-read the IAP header each attempt so a refresh that
-                        // landed since the last try is picked up (staging only).
-                        let iap_headers: Vec<(&str, String)> = iap_state
-                            .as_ref()
-                            .and_then(|state| state.proxy_auth_header())
-                            .into_iter()
-                            .collect();
-                        let socket = WebSocket::connect_with_headers(
-                            &reconnect_endpoint,
-                            None::<&str>,
-                            iap_headers,
-                        )
-                        .await?;
-                        let user_id = UserID {
-                            anonymous_id: auth_state.anonymous_id(),
-                            access_token: auth_client
-                                .get_or_refresh_access_token()
-                                .await
-                                .ok()
-                                .and_then(|token| token.bearer_token()),
-                        };
-                        anyhow::Ok((socket.split().await, user_id))
-                    }
-                },
-                RECONNECT_RETRY_STRATEGY,
-                move |network, res, ctx| match res {
-                    RequestState::RequestSucceeded(((sink, stream), user_id)) => {
-                        sharer_info!(
-                            network,
-                            "Connected to session sharing server for reconnect; waiting for server confirmation"
-                        );
-                        let (ws_proxy_tx, ws_proxy_rx) = async_channel::unbounded();
-                        let latest_block_id =
-                            network.model.lock().block_list().active_block_id().clone();
-
-                        // Because we're going to start listening on a new receiver, we need to update the sender.
-                        network.ws_proxy_tx = ws_proxy_tx;
-                        // We don't use the `send_message_to_server` API here
-                        // because we don't want to buffer this message.
-                        let message = UpstreamMessage::Reconnect(ReconnectPayload {
-                            session_secret: Default::default(),
-                            reconnect_token: reconnect_token.clone(),
-                            user_id,
-                            latest_block_id: latest_block_id.into(),
-                            selection: network.cached_latest_state.selection.clone(),
-                            feature_support: FeatureSupport {
-                                supports_agent_view: FeatureFlag::AgentView.is_enabled(),
-                                supports_full_role: true,
-                                supports_full_role_for_real: true,
-                            },
-                        });
-                        if let Err(e) = network.ws_proxy_tx.try_send(message) {
-                            sharer_error!(network, "Sharer failed to send reconnect message: {e}");
-                            return;
+        let spawner = ctx.spawner();
+        self.start_reconnect_task(
+            move || {
+                log::info!(
+                    "Attempting to reconnect shared session as sharer; session_id={session_id:?}"
+                );
+                let reconnect_endpoint = reconnect_endpoint.clone();
+                let auth_state = auth_state.clone();
+                let auth_client = auth_client.clone();
+                let iap_state = iap_state.clone();
+                let reconnect_token = reconnect_token.clone();
+                let spawner = spawner.clone();
+                async move {
+                    // Re-read the IAP header each attempt so a refresh that
+                    // landed since the last try is picked up (staging only).
+                    let iap_headers: Vec<(&str, String)> = iap_state
+                        .as_ref()
+                        .and_then(|state| state.proxy_auth_header())
+                        .into_iter()
+                        .collect();
+                    let socket = match WebSocket::connect_with_headers(
+                        &reconnect_endpoint,
+                        None::<&str>,
+                        iap_headers,
+                    )
+                    .await
+                    {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            return Err(spawner
+                                .spawn(move |_, ctx| {
+                                    IapManager::handle(ctx).update(ctx, |manager, ctx| {
+                                        manager.check_ws_connect_error(&error, ctx);
+                                    });
+                                    error
+                                })
+                                .await?);
                         }
+                    };
+                    let user_id = UserID {
+                        anonymous_id: auth_state.anonymous_id(),
+                        access_token: auth_client
+                            .get_or_refresh_access_token()
+                            .await
+                            .ok()
+                            .and_then(|token| token.bearer_token()),
+                    };
+                    let payload = spawner
+                        .spawn(move |network, _| {
+                            let latest_block_id =
+                                network.model.lock().block_list().active_block_id().clone();
+                            ReconnectPayload {
+                                session_secret: Default::default(),
+                                reconnect_token,
+                                user_id,
+                                latest_block_id: latest_block_id.into(),
+                                selection: network.cached_latest_state.selection.clone(),
+                                feature_support: FeatureSupport {
+                                    supports_agent_view: FeatureFlag::AgentView.is_enabled(),
+                                    supports_full_role: true,
+                                    supports_full_role_for_real: true,
+                                },
+                            }
+                        })
+                        .await?;
+                    let (sink, stream) = socket.split().await;
+                    confirm_reconnection(sink, stream, payload).await
+                }
+            },
+            RECONNECT_RETRY_STRATEGY,
+            RECONNECT_ATTEMPT_TIMEOUT,
+            RECONNECT_CYCLE_TIMEOUT,
+            ctx,
+        );
+    }
 
-                        network.on_websocket_connected(None, ws_proxy_rx, sink, stream, ctx);
+    fn start_reconnect_task<F, Fut, S, T>(
+        &mut self,
+        attempt: F,
+        retry_strategy: RetryOption,
+        attempt_timeout: Duration,
+        cycle_timeout: Duration,
+        ctx: &mut ModelContext<Self>,
+    ) where
+        F: FnMut() -> Fut + SpawnableOutput + 'static,
+        Fut: Future<Output = anyhow::Result<ConfirmedReconnection<S, T>>> + Spawnable,
+        S: Sink,
+        T: Stream,
+    {
+        self.close();
+        let generation = self.connection_generation;
+        let abort_handle = ctx
+            .spawn(
+                retry_reconnection(attempt, retry_strategy, attempt_timeout, cycle_timeout),
+                move |network, result, ctx| {
+                    if network.connection_generation != generation
+                        || !matches!(network.stage, Stage::Reconnecting { .. })
+                    {
+                        return;
                     }
-                    RequestState::RequestFailedRetryPending(e) => {
-                        IapManager::handle(ctx).update(ctx, |manager, ctx| {
-                            manager.check_ws_connect_error(&e, ctx);
-                        });
-                        sharer_warn!(
-                            network,
-                            "Failed to reconnect to shared session, will retry: {e}"
-                        );
-                    }
-                    RequestState::RequestFailed(e) => {
-                        sharer_warn!(
-                            network,
-                            "Failed to reconnect to shared session, and retries exhausted: {e}"
-                        );
-                        network.close_without_reconnection();
-                        ctx.emit(NetworkEvent::FailedToReconnect);
+                    match result {
+                        Ok(connection) => {
+                            let (ws_proxy_tx, ws_proxy_rx) = async_channel::unbounded();
+                            network.ws_proxy_tx = ws_proxy_tx;
+                            network.ws_proxy_rx = ws_proxy_rx.clone();
+                            let buffered_progress = connection
+                                .buffered_messages
+                                .iter()
+                                .filter_map(Self::processed_event_ack)
+                                .max();
+                            network.process_websocket_message_with_confirmed_progress(
+                                connection.confirmation,
+                                buffered_progress,
+                                ctx,
+                            );
+                            if !matches!(network.stage, Stage::StartedSuccessfully { .. }) {
+                                return;
+                            }
+                            for message in connection.buffered_messages {
+                                network.process_websocket_message(message, ctx);
+                            }
+                            network.on_websocket_connected(
+                                None,
+                                ws_proxy_rx,
+                                connection.sink,
+                                connection.stream,
+                                ctx,
+                            );
+                        }
+                        Err(e) => {
+                            sharer_warn!(
+                                network,
+                                "Failed to reconnect to shared session, and retries exhausted: {e}"
+                            );
+                            network.close_without_reconnection();
+                            ctx.emit(NetworkEvent::FailedToReconnect);
+                        }
                     }
                 },
             )
@@ -1168,29 +1367,29 @@ impl Network {
         stream: impl Stream,
         ctx: &mut ModelContext<Self>,
     ) {
-        self.heartbeat.update(ctx, |heartbeat, ctx| {
-            heartbeat.start(ctx);
-        });
-
+        self.connection_generation += 1;
+        let generation = self.connection_generation;
+        let startup_send_failure_pending = Arc::new(AtomicBool::new(false));
+        let receive_startup_send_failure_pending = startup_send_failure_pending.clone();
+        let close_startup_send_failure_pending = startup_send_failure_pending.clone();
         // Handle any messages we receive over the websocket.
         ctx.spawn_stream_local(
             stream,
             move |network, message, ctx| match message {
                 Ok(message) => {
-                    if startup_attempt.is_some_and(|attempt| {
-                        network.should_ignore_startup_attempt_websocket_callback(attempt)
-                    }) {
+                    if receive_startup_send_failure_pending.load(Ordering::Acquire) {
                         return;
                     }
-                    network.heartbeat.update(ctx, |heartbeat, ctx| {
-                        heartbeat.reset_idle_timeout(ctx);
-                    });
+                    if network.should_ignore_websocket_callback(generation, startup_attempt) {
+                        return;
+                    }
                     network.process_websocket_message(message, ctx);
                 }
                 Err(e) => {
-                    if startup_attempt.is_some_and(|attempt| {
-                        network.should_ignore_startup_attempt_websocket_callback(attempt)
-                    }) {
+                    if receive_startup_send_failure_pending.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if network.should_ignore_websocket_callback(generation, startup_attempt) {
                         return;
                     }
                     sharer_error!(
@@ -1201,15 +1400,18 @@ impl Network {
                         && matches!(network.stage, Stage::BeforeStarted { .. })
                     {
                         network.handle_startup_failure(StartupFailure::WebsocketError, ctx);
+                    } else if matches!(network.stage, Stage::StartedSuccessfully { .. }) {
+                        network.reconnect_websocket(ctx);
                     }
                 }
             },
             move |network, ctx| {
-                if startup_attempt.is_some_and(|attempt| {
-                    network.should_ignore_startup_attempt_websocket_callback(attempt)
-                }) {
+                if close_startup_send_failure_pending.load(Ordering::Acquire) {
                     return;
                 }
+                if network.should_ignore_websocket_callback(generation, startup_attempt) {
+                    return;
+                };
                 let stage = network.stage_label();
                 sharer_info!(
                     network,
@@ -1236,26 +1438,49 @@ impl Network {
         // Spawn a task to send messages back up the websocket to the server.
         ctx.spawn(
             async move {
-                let mut startup_send_failed = false;
+                let mut startup_failure = None;
                 let mut ws_proxy_rx = pin!(ws_proxy_rx);
                 while let Some(message) = ws_proxy_rx.next().await {
                     let is_startup_initialize = matches!(message, UpstreamMessage::Initialize(_));
                     let serialized = message.to_json();
                     match serialized {
                         Ok(serialized) => {
+                            if serialized.len() > SERVER_MAX_WEBSOCKET_MESSAGE_BYTES {
+                                if is_startup_initialize {
+                                    log::warn!(
+                                        "Shared session initialization exceeds websocket message limit; bytes={} limit={}",
+                                        serialized.len(),
+                                        SERVER_MAX_WEBSOCKET_MESSAGE_BYTES,
+                                    );
+                                    startup_send_failure_pending.store(true, Ordering::Release);
+                                    startup_failure = Some(StartupFailure::InitializeTooLarge);
+                                    break;
+                                }
+                                log::warn!(
+                                    "Skipping oversized message to shared session server; bytes={} limit={}",
+                                    serialized.len(),
+                                    SERVER_MAX_WEBSOCKET_MESSAGE_BYTES,
+                                );
+                                continue;
+                            }
                             if let Err(e) = sink.send(Message::new(serialized)).await {
                                 // Errors are not typically retryable after startup. For a case like no
                                 // network connection, sink.send will succeed and the message will
                                 // actually be sent when connection is restored.
                                 log::warn!("Failed to send message over shared session websocket as sharer: {e}. Terminating connection.");
-                                startup_send_failed = is_startup_initialize;
+                                startup_failure = is_startup_initialize
+                                    .then_some(StartupFailure::InitializeSend);
+                                if startup_failure.is_some() {
+                                    startup_send_failure_pending.store(true, Ordering::Release);
+                                }
                                 break;
                             }
                         }
                         Err(e) => {
                             log::warn!("Failed to serialize message to send over shared session websocket as sharer: {e}");
                             if is_startup_initialize {
-                                startup_send_failed = true;
+                                startup_send_failure_pending.store(true, Ordering::Release);
+                                startup_failure = Some(StartupFailure::InitializeSend);
                                 break;
                             }
                         }
@@ -1263,32 +1488,41 @@ impl Network {
                 }
                 log::info!("Closing websocket to session sharing server as sharer");
                 if let Err(e) = sink.close().await {
-                    log::error!("Failed to close session sharing websocket as sharer due to {e}");
+                    report_error!(anyhow::Error::new(e)
+                        .context("Failed to close session sharing websocket as sharer"));
                 }
-                startup_send_failed
+                startup_failure
             },
-            move |network, startup_send_failed, ctx| {
-                if !startup_send_failed {
+            move |network, startup_failure, ctx| {
+                let Some(startup_failure) = startup_failure else {
                     return;
-                }
-                if startup_attempt.is_some_and(|attempt| {
-                    network.should_ignore_startup_attempt_websocket_callback(attempt)
-                }) {
+                };
+                if network.should_ignore_websocket_callback(generation, startup_attempt) {
                     return;
                 }
                 if startup_attempt.is_some() && matches!(network.stage, Stage::BeforeStarted { .. })
                 {
-                    network.handle_startup_failure(StartupFailure::InitializeSend, ctx);
+                    network.handle_startup_failure(startup_failure, ctx);
                 }
             },
         );
     }
 
     fn process_websocket_message(&mut self, message: Message, ctx: &mut ModelContext<Self>) {
-        let Some(downstream_message) = message
-            .text()
-            .and_then(|t| DownstreamMessage::from_json(t).ok())
-        else {
+        self.process_websocket_message_with_confirmed_progress(message, None, ctx);
+    }
+
+    fn process_websocket_message_with_confirmed_progress(
+        &mut self,
+        message: Message,
+        additional_confirmed_event_no: Option<usize>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        // Ignore non-text frames (e.g. ping frames sent by the server).
+        let Some(text) = message.text() else {
+            return;
+        };
+        let Some(downstream_message) = DownstreamMessage::from_json(text).ok() else {
             sharer_warn!(
                 self,
                 "Received unexpected message from shared session websocket as sharer"
@@ -1352,17 +1586,27 @@ impl Network {
                     );
                     return;
                 }
+                let confirmed_event_no = last_received_event_no.max(additional_confirmed_event_no);
+                if self.record_confirmed_event_progress(confirmed_event_no) {
+                    self.no_progress_reconnects = 0;
+                } else {
+                    self.no_progress_reconnects += 1;
+                }
                 sharer_info!(
                     self,
                     "Successfully reconnected to shared session server as sharer."
                 );
+                if let Stage::Reconnecting { abort_handle } = &self.stage {
+                    abort_handle.abort();
+                }
                 self.stage = Stage::StartedSuccessfully {
                     startup_attempt: None,
                 };
 
-                let start_event_no = last_received_event_no
+                let start_event_no = confirmed_event_no
                     .map_or(0, |last_received_event_no| last_received_event_no + 1);
                 self.flush_terminal_events_to_server(start_event_no);
+                self.flush_pending_input_updates_to_server();
                 // Non terminal events where we only care about the latest value were dropped while disconnected.
                 self.send_latest_state_to_server();
                 ctx.emit(NetworkEvent::ReconnectedSuccessfully);
@@ -1390,6 +1634,9 @@ impl Network {
             DownstreamMessage::EventsProcessedAck {
                 latest_processed_event_no,
             } => {
+                if self.record_confirmed_event_progress(Some(latest_processed_event_no)) {
+                    self.no_progress_reconnects = 0;
+                }
                 let mut event_no = latest_processed_event_no;
                 // Remove all stored events before latest_processed_event_no to free up memory.
                 while self.unacked_terminal_events.remove(&event_no).is_some() && event_no > 0 {
@@ -1526,6 +1773,24 @@ impl Network {
         }
     }
 
+    fn record_confirmed_event_progress(&mut self, event_no: Option<usize>) -> bool {
+        if event_no <= self.last_confirmed_event_no {
+            return false;
+        }
+        self.last_confirmed_event_no = event_no;
+        true
+    }
+
+    fn processed_event_ack(message: &Message) -> Option<usize> {
+        let text = message.text()?;
+        match DownstreamMessage::from_json(text).ok()? {
+            DownstreamMessage::EventsProcessedAck {
+                latest_processed_event_no,
+            } => Some(latest_processed_event_no),
+            _ => None,
+        }
+    }
+
     fn start_ordered_terminal_events_listener(
         &self,
         events_rx: Receiver<OrderedTerminalEventType>,
@@ -1658,13 +1923,13 @@ impl Network {
                 .insert(event.event_no, event.clone());
         }
 
-        if let Stage::StartedSuccessfully { .. } = self.stage {
-            if let Err(e) = self.ws_proxy_tx.try_send(message) {
-                sharer_warn!(
-                    self,
-                    "Failed to send message over ws_proxy channel in session sharer: {e}"
-                );
-            }
+        if let Stage::StartedSuccessfully { .. } = self.stage
+            && let Err(e) = self.ws_proxy_tx.try_send(message)
+        {
+            sharer_warn!(
+                self,
+                "Failed to send message over ws_proxy channel in session sharer: {e}"
+            );
         }
     }
 
@@ -1675,6 +1940,28 @@ impl Network {
         );
         self.send_message_to_server(UpstreamMessage::ExtendSessionRetention { reason });
     }
+
+    /// Sends all input updates buffered during disconnection to the server, then clears the buffer.
+    /// This is more a best-effort attempt because these events are not critical - that's why they are not ordered terminal events.
+    /// With ordered terminal events we require an ack from the server before the client can remove them from the buffer, but we don't do that for these events.
+    fn flush_pending_input_updates_to_server(&mut self) {
+        // Take the updates out of self to avoid a borrow conflict with sharer_warn!, which
+        // borrows all of self while drain() holds a mutable borrow on pending_input_updates.
+        let updates = std::mem::take(&mut self.pending_input_updates);
+        for update in updates {
+            if let Err(e) = self
+                .ws_proxy_tx
+                .try_send(UpstreamMessage::UpdateInput(update))
+            {
+                sharer_warn!(
+                    self,
+                    "Failed to send pending input update over ws_proxy channel: {e}"
+                );
+                return;
+            }
+        }
+    }
+
     /// Send all stored terminal events from [start_event_no, ...) to the server
     /// The events are not removed from memory.
     fn flush_terminal_events_to_server(&self, start_event_no: usize) {
@@ -1806,6 +2093,9 @@ pub enum NetworkEvent {
     ParticipantPresenceUpdated(ParticipantPresenceUpdate),
     ReconnectedSuccessfully,
     FailedToReconnect,
+    ReconnectLimitReached {
+        reason: &'static str,
+    },
     RoleRequested {
         participant_id: ParticipantId,
         role_request_id: RoleRequestId,

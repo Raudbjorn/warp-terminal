@@ -5,6 +5,14 @@ use prost::Message;
 
 use crate::proto::{ClientMessage, ServerMessage};
 
+/// Compatibility key for the client/server protobuf envelope.
+///
+/// Bump this whenever an older remote-server binary can successfully decode
+/// the current `ClientMessage` envelope as a different request shape. Version
+/// tags alone are not enough for untagged local clients.
+pub const REMOTE_SERVER_PROTOCOL_VERSION: &str =
+    "remote-server-protocol-2026-06-session-scoped-envelope";
+
 /// Maximum allowed message payload size (64 MB).
 ///
 /// `read_message` rejects payloads exceeding this limit after decoding the
