@@ -176,16 +176,6 @@ define_settings_group!(TuiZeroStateSettings, settings: [
         toml_path: "appearance.zero_state.show_signed_in_user",
         description: "Whether the Warp Agent CLI zero state shows the signed-in account line.",
     },
-    show_changelog: TuiZeroStateShowChangelogSetting {
-        type: bool,
-        default: true,
-        supported_platforms: SupportedPlatforms::DESKTOP,
-        sync_to_cloud: SyncToCloud::Never,
-        surface: settings::SettingSurfaces::TUI,
-        private: false,
-        toml_path: "appearance.zero_state.show_changelog",
-        description: "Whether the Warp Agent CLI zero state shows the \"What's new\" changelog section.",
-    },
     show_project_info: TuiZeroStateShowProjectInfoSetting {
         type: bool,
         default: true,

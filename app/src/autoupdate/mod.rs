@@ -1,4 +1,3 @@
-mod changelog;
 mod channel_versions;
 #[cfg(target_os = "linux")]
 pub mod linux;
@@ -24,7 +23,6 @@ use warpui::windowing::state::ApplicationStage;
 use warpui::windowing::{self, WindowManager};
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity, ViewContext};
 
-pub use self::changelog::get_current_changelog;
 use self::channel_versions::fetch_channel_versions;
 use crate::channel::Channel;
 use crate::features::FeatureFlag;
@@ -781,7 +779,7 @@ async fn fetch_version(
     update_id: &str,
     server_api: Arc<ServerApi>,
 ) -> Result<VersionInfo> {
-    let versions = fetch_channel_versions(update_id, server_api.clone(), false, is_daily).await?;
+    let versions = fetch_channel_versions(update_id, server_api.clone(), is_daily).await?;
 
     let channel_version = match channel {
         Channel::Stable => versions.stable,

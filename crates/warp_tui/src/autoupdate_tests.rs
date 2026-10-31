@@ -299,7 +299,6 @@ fn uses_channel_specific_tui_versions() {
         dev: channel_version("dev_app", Some("dev_tui")),
         preview: channel_version("preview_app", Some("preview_tui")),
         stable: channel_version("stable_app", Some("stable_tui")),
-        changelogs: None,
     };
 
     assert_eq!(
@@ -322,7 +321,6 @@ fn falls_back_to_app_version_when_tui_version_is_omitted() {
         dev: ChannelVersion::new(VersionInfo::new("dev_app".to_owned())),
         preview: ChannelVersion::new(VersionInfo::new("preview_app".to_owned())),
         stable: ChannelVersion::new(VersionInfo::new("stable_app".to_owned())),
-        changelogs: None,
     };
 
     assert_eq!(

@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use ai::skills::{ParsedSkill, SkillPathOrigin, SkillReference, parse_bundled_skill};
 use futures::TryStreamExt;
 use warp_core::channel::ChannelState;
-use warp_core::execution_mode::AppExecutionMode;
 use warp_core::features::FeatureFlag;
 use warp_core::safe_warn;
 use warp_core::ui::icons::Icon;
@@ -24,8 +23,6 @@ use crate::settings::user_preferences_toml_file_path;
 pub enum BundledSkillActivation {
     /// Always active.
     Always,
-    /// Active only in the TUI frontend.
-    TuiOnly,
     /// Active only when a specific Warp feature is enabled.
     RequiresFeature(FeatureFlag),
     /// Active only when a specific MCP server is running.
@@ -48,7 +45,6 @@ impl BundledSkillActivation {
     pub fn is_enabled(&self, ctx: &AppContext) -> bool {
         match self {
             Self::Always => true,
-            Self::TuiOnly => AppExecutionMode::as_ref(ctx).is_tui(),
             Self::RequiresFeature(feature) => feature.is_enabled(),
             Self::RequiresMcp(integration) => {
                 TemplatableMCPServerManager::as_ref(ctx).is_mcp_server_running(*integration)
@@ -305,7 +301,6 @@ impl BundledSkill {
                 let icon = match &activation {
                     BundledSkillActivation::RequiresMcp(McpIntegration::Figma) => Icon::Figma,
                     BundledSkillActivation::Always
-                    | BundledSkillActivation::TuiOnly
                     | BundledSkillActivation::RequiresFeature(_)
                     | BundledSkillActivation::RequiresFile(_) => icon_for_bundled_skill(&id),
                 };
@@ -569,12 +564,7 @@ pub(crate) fn activation_for_bundled_skill(
         "modify-settings" => {
             BundledSkillActivation::RequiresFile(resources_dir.join("settings_schema.json"))
         }
-        "tui-migrate-setup" => BundledSkillActivation::TuiOnly,
         "warpctrl" => BundledSkillActivation::RequiresFeature(FeatureFlag::WarpControlCli),
-        // Gate the Factory MCP skill on the same flag that attaches the
-        // Factory MCP server, so the skill and the server it documents roll
-        // out together.
-        "factory-mcp" => BundledSkillActivation::RequiresFeature(FeatureFlag::FactoryMcp),
         _ => BundledSkillActivation::Always,
     }
 }

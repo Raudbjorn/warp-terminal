@@ -1,6 +1,6 @@
 //! The pre-first-interaction "zero state" filling the transcript area: the
 //! Warp title and version, either first-run guidance or a "What's new"
-//! changelog section, and the session's project context.
+//! and the session's project context.
 //!
 //! The session view owns visibility: the zero state fills the transcript
 //! slot while the transcript has no visible content, so it dismisses once
@@ -17,9 +17,8 @@ use ai::project_context::model::{
 };
 use warp::settings::{TuiZeroStateSettings, TuiZeroStateSettingsChangedEvent};
 use warp::tui_export::{
-    ActiveSession, ActiveSessionEvent, ChangelogModel, ChangelogModelEvent, ChangelogState,
-    SkillManager, SkillManagerEvent, TuiMcpManager, TuiMcpServerStatus, TuiUserInfoManager,
-    TuiUserInfoManagerEvent, TuiUserInfoSnapshot,
+    ActiveSession, ActiveSessionEvent, SkillManager, SkillManagerEvent, TuiMcpManager,
+    TuiMcpServerStatus, TuiUserInfoManager, TuiUserInfoManagerEvent, TuiUserInfoSnapshot,
 };
 use warp_core::channel::ChannelState;
 use warp_core::settings::Setting;
@@ -45,10 +44,9 @@ use crate::zero_state_animation::{
 };
 
 /// Cap on "What's new" bullets, mirroring the compact zero-state mock.
-const MAX_CHANGELOG_BULLETS: usize = 3;
 
 /// Fixed width for the two constrained sub-sections of the overlay column (top: title +
-/// version + changelog bullets; bottom: project context body + MCP). Pinning both axes
+/// version; bottom: project context body + MCP). Pinning both axes
 /// to the same value keeps wrapping stable while those sections load asynchronously.
 ///
 /// The project path *header* is rendered outside these constrained boxes so it can expand
@@ -68,7 +66,6 @@ enum ZeroStateVariant {
 #[derive(Clone, Copy)]
 struct ZeroStateSectionVisibility {
     signed_in_user: bool,
-    changelog: bool,
     project_info: bool,
     mcp: bool,
     animation: bool,
@@ -78,7 +75,6 @@ impl Default for ZeroStateSectionVisibility {
     fn default() -> Self {
         Self {
             signed_in_user: true,
-            changelog: true,
             project_info: true,
             mcp: true,
             animation: true,
@@ -94,7 +90,6 @@ impl ZeroStateSectionVisibility {
         let settings = TuiZeroStateSettings::as_ref(ctx);
         Self {
             signed_in_user: *settings.show_signed_in_user.value(),
-            changelog: *settings.show_changelog.value(),
             project_info: *settings.show_project_info.value(),
             mcp: *settings.show_mcp.value(),
             animation: *settings.show_animation.value(),
@@ -125,14 +120,6 @@ impl TuiZeroStateView {
     ) -> Self {
         // Subscribe to events that change what the zero state displays so
         // this view re-renders independently of its parent.
-        ctx.subscribe_to_model(
-            &ChangelogModel::handle(ctx),
-            |_, _, event: &ChangelogModelEvent, ctx| {
-                if let ChangelogModelEvent::ChangelogRequestComplete { .. } = event {
-                    ctx.notify();
-                }
-            },
-        );
         ctx.subscribe_to_model(
             &TuiAutoupdater::handle(ctx),
             |_, _, event: &TuiAutoupdaterEvent, ctx| {
@@ -183,9 +170,6 @@ impl TuiZeroStateView {
             ctx.subscribe_to_model(&TuiZeroStateSettings::handle(ctx), |view, _, event, ctx| {
                 match event {
                     TuiZeroStateSettingsChangedEvent::TuiZeroStateShowSignedInUserSetting {
-                        ..
-                    }
-                    | TuiZeroStateSettingsChangedEvent::TuiZeroStateShowChangelogSetting {
                         ..
                     }
                     | TuiZeroStateSettingsChangedEvent::TuiZeroStateShowProjectInfoSetting {
@@ -575,7 +559,7 @@ fn build_zero_state_overlay_with_variant(
     // Compute project context once — find_applicable_project_rules walks the
     // directory tree and clones rule file contents, so resolving it once
     // avoids a redundant allocation on every zero-state re-render (pwd change,
-    // changelog load, MCP update, PathIndexed).
+    // MCP update, PathIndexed).
     let project_cwd = visibility.project_info.then_some(cwd).flatten();
     let (path_header_text, project_rules) = match project_cwd {
         Some(cwd) => {
@@ -621,10 +605,10 @@ fn build_zero_state_overlay_with_variant(
     column.finish()
 }
 
-/// Top section of the overlay column: title, version, and changelog bullets.
+/// Top section of the overlay column: title and version.
 ///
 /// This is wrapped in a [`TuiConstrainedBox`] with `min = max = LEFT_COLUMN_COLS` by the
-/// caller so that changelog bullets (which lack `.truncate()`) do not word-wrap against
+/// caller so that wrapped text (which lacks `.truncate()`) does not word-wrap against
 /// the full terminal width while still rendering stably during async content loads.
 fn render_top_section(
     builder: &TuiUiBuilder,
@@ -644,8 +628,6 @@ fn render_standard_top_section(
     app: &AppContext,
 ) -> TuiFlex {
     let title_style = builder.accent_text_style().add_modifier(Modifier::BOLD);
-    let header_style = builder.primary_text_style().add_modifier(Modifier::BOLD);
-    let muted = builder.muted_text_style();
 
     let mut column = TuiFlex::column()
         .child(
@@ -659,29 +641,6 @@ fn render_standard_top_section(
         column = column.child(render_login_line(builder, app));
     }
 
-    let bullets = if visibility.changelog {
-        changelog_bullets(app)
-    } else {
-        Vec::new()
-    };
-    if !bullets.is_empty() {
-        column = column.child(blank_row()).child(
-            TuiText::new("What's new")
-                .with_style(header_style)
-                .truncate()
-                .finish(),
-        );
-        for bullet in bullets {
-            // A fixed (non-flex) text child still wraps against the remaining
-            // width while only reporting its natural width.
-            column = column.child(
-                TuiFlex::row()
-                    .child(TuiText::new("• ").with_style(muted).truncate().finish())
-                    .child(TuiText::new(bullet).with_style(muted).finish())
-                    .finish(),
-            );
-        }
-    }
     column
 }
 
@@ -1049,25 +1008,6 @@ fn render_project_context_body(
         );
     }
     column
-}
-
-/// Up to [`MAX_CHANGELOG_BULLETS`] plain-text bullets for the current
-/// version's changelog, or empty when no changelog is available (request
-/// failed, still pending, or a channel without release changelogs).
-fn changelog_bullets(app: &AppContext) -> Vec<String> {
-    let ChangelogState::Some(changelog) = &ChangelogModel::as_ref(app).changelog else {
-        return Vec::new();
-    };
-    changelog_bullets_from_changelog(changelog)
-}
-
-fn changelog_bullets_from_changelog(changelog: &channel_versions::Changelog) -> Vec<String> {
-    changelog
-        .tui_updates
-        .iter()
-        .take(MAX_CHANGELOG_BULLETS)
-        .cloned()
-        .collect()
 }
 
 /// A one-row spacer between sections.

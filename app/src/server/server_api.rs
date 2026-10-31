@@ -1515,13 +1515,8 @@ impl ServerApi {
     /// Fetches updated Warp Channel Versions from Warp Server. If it is the first such request of
     /// the current calendar day, first attempts to call the '/client_version/daily'. If that call
     /// fails or if it not the first request of the calendar day, returns the result of a call to
-    /// `/client_version'. The caller can specify whether or not changelog information should be
-    /// included in the response based on whether or not it will be used.
-    pub async fn fetch_channel_versions(
-        &self,
-        include_changelogs: bool,
-        is_daily: bool,
-    ) -> Result<ChannelVersions> {
+    /// `/client_version'.
+    pub async fn fetch_channel_versions(&self, is_daily: bool) -> Result<ChannelVersions> {
         if warp_api_disabled() {
             return Err(warp_api_disabled_error());
         }
@@ -1532,14 +1527,11 @@ impl ServerApi {
         } else {
             url.set_path("/client_version");
         }
+        // This fork has no changelog surface, so never ask the server for one.
         url.query_pairs_mut()
-            .append_pair("include_changelogs", &include_changelogs.to_string());
+            .append_pair("include_changelogs", "false");
 
-        if include_changelogs {
-            log::info!("Fetching channel versions and changelogs from Warp server");
-        } else {
-            log::info!("Fetching channel versions (without changelogs) from Warp server");
-        }
+        log::info!("Fetching channel versions from Warp server");
 
         let mut request_builder = self
             .base_client
@@ -1797,7 +1789,7 @@ mod fully_local_tests {
 
         // fetch_channel_versions early-returns the disabled error rather than
         // building a request to the Warp server.
-        let result = block_on(api.fetch_channel_versions(false, false));
+        let result = block_on(api.fetch_channel_versions(false));
 
         let err = result.expect_err("fully-local mode must block the channel-version fetch");
         assert!(
