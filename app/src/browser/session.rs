@@ -319,6 +319,8 @@ fn discover_target(port: u16, stop: &AtomicBool) -> Result<String> {
         if stop.load(Ordering::SeqCst) {
             return Err(anyhow!("stopped before CDP target was ready"));
         }
+        // Exempt from the network policy: `url` is built above from a fixed `127.0.0.1` host and
+        // the debugging port of the Chrome process this module spawned.
         if let Ok(resp) = reqwest::blocking::get(&url) {
             if let Ok(targets) = resp.json::<Vec<CdpTarget>>() {
                 if let Some(ws) = targets
