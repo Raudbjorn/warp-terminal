@@ -43,8 +43,6 @@ use crate::zero_state_animation::{
     ZeroStateAnimationElement, ZeroStateInteractionHandle, ZeroStateStarfieldElement,
 };
 
-/// Cap on "What's new" bullets, mirroring the compact zero-state mock.
-
 /// Fixed width for the two constrained sub-sections of the overlay column (top: title +
 /// version; bottom: project context body + MCP). Pinning both axes
 /// to the same value keeps wrapping stable while those sections load asynchronously.
