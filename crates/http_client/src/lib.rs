@@ -1037,6 +1037,10 @@ mod network_policy_tests {
     static POLICY_TEST_LOCK: std::sync::LazyLock<futures::lock::Mutex<()>> =
         std::sync::LazyLock::new(|| futures::lock::Mutex::new(()));
 
+    /// A loopback port nothing can listen on, so connecting to it always fails. Unlike binding and
+    /// dropping an ephemeral listener, there is no window for another process to take the port.
+    const UNCONNECTABLE_PORT: u16 = 0;
+
     fn new_test_client() -> Client {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         Client::from_client_builder(reqwest::ClientBuilder::new().no_proxy())
@@ -1177,11 +1181,7 @@ mod network_policy_tests {
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_owned()
             });
             // A proxy that refuses connections: if it were used, the request would fail.
-            let dead_proxy = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
+            let dead_proxy = UNCONNECTABLE_PORT;
             let client = Client::from_client_builder(
                 reqwest::ClientBuilder::new()
                     .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{dead_proxy}")).unwrap()),
@@ -1222,11 +1222,7 @@ mod network_policy_tests {
             assert_eq!(denied.purpose(), "redirect target");
 
             // An ordinary connection failure is not a policy denial.
-            let closed_port = std::net::TcpListener::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port();
+            let closed_port = UNCONNECTABLE_PORT;
             let err = reqwest_client
                 .get(format!("http://127.0.0.1:{closed_port}/"))
                 .send()
@@ -1262,12 +1258,7 @@ mod network_policy_tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn reqwest_error_stays_in_the_source_chain() {
-        // Bind then drop a listener to get a loopback port that refuses connections.
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = UNCONNECTABLE_PORT;
         let client = new_test_client();
         let request = client
             .get(format!("http://127.0.0.1:{port}/"))
