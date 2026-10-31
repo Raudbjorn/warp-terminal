@@ -174,6 +174,16 @@ fn challenge_parameter_names(www_authenticate: &str) -> Vec<&str> {
     names
 }
 
+/// A client builder that follows the network policy: redirects are re-checked against it and, in
+/// local-only mode, system proxies are not used. MCP requests carry user-supplied headers (often
+/// credentials), so they must not be redirected to a host the policy would have refused.
+pub(crate) fn policy_client_builder() -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    #[cfg(not(target_family = "wasm"))]
+    let builder = network_policy::apply_to_client_builder(builder);
+    builder
+}
+
 /// Builds a reqwest client with custom headers for MCP HTTP/SSE connections.
 #[allow(clippy::result_large_err)]
 pub fn build_client_with_headers(
@@ -181,7 +191,7 @@ pub fn build_client_with_headers(
 ) -> Result<reqwest::Client, rmcp::RmcpError> {
     let header_map = build_header_map(headers);
 
-    reqwest::Client::builder()
+    policy_client_builder()
         .default_headers(header_map)
         .build()
         .map_err(|e| {
@@ -322,6 +332,14 @@ pub async fn spawn_server(
             )
         }
         TransportType::ServerSentEvents(sse_server) => {
+            if let Err(denied) =
+                network_policy::check_url_str(&sse_server.url, "MCP server connection")
+            {
+                logger.log(format!("[error] MCP: {denied}"));
+                return Err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(
+                    denied.to_string(),
+                ));
+            }
             let headers: HashMap<String, String> = sse_server
                 .headers
                 .iter()

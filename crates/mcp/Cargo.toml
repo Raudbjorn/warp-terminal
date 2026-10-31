@@ -16,6 +16,7 @@ handlebars.workspace = true
 http = "1"
 instant.workspace = true
 log.workspace = true
+network_policy.workspace = true
 oauth2.workspace = true
 pin-project-lite = "0.2"
 reqwest = { workspace = true, features = ["json", "stream"] }

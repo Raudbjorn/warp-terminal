@@ -88,9 +88,14 @@ pub(crate) async fn generate_local_input_suggestions(
 }
 
 fn map_local_error(err: local_agent::LocalAgentError) -> AIApiError {
-    AIApiError::Stream {
-        stream_type: "local next command",
-        source: anyhow::anyhow!(err),
+    match err {
+        local_agent::LocalAgentError::NetworkPolicyDenied(denied) => {
+            AIApiError::NetworkPolicyDenied(denied)
+        }
+        other => AIApiError::Stream {
+            stream_type: "local next command",
+            source: anyhow::anyhow!(other),
+        },
     }
 }
 

@@ -352,7 +352,10 @@ pub(crate) async fn map_event_source_error(
                 "endpoint did not return an event stream (content-type {content_type:?}): {body}"
             ))
         }
-        Error::Transport(err) => LocalAgentError::Transport(err.to_string()),
+        Error::Transport(err) => match network_policy::denial_in_chain(&err) {
+            Some(denied) => LocalAgentError::NetworkPolicyDenied(denied),
+            None => LocalAgentError::Transport(err.to_string()),
+        },
         Error::Utf8(err) => LocalAgentError::Parse(err.to_string()),
         Error::Parser(err) => LocalAgentError::Parse(err.to_string()),
         Error::InvalidLastEventId(id) => {

@@ -51,6 +51,10 @@ pub fn send_request(
             "local control endpoint is disabled for this instance",
         )
     })?;
+    // Exempt from the network policy: `validate_local_control_authority` above has already
+    // required `endpoint` to be an exact `127.0.0.1` URL of the selected instance, this runs in
+    // the standalone `warpctrl` process (which has no policy state), and the credential is only
+    // meant for that endpoint.
     let client = reqwest::blocking::Client::new();
     let response = client
         .post(endpoint.url())

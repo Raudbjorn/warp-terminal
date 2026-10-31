@@ -130,7 +130,11 @@ impl AuthContext {
     /// Creates a transport sharing the latest credential while leaving the exporter itself stable.
     pub(super) fn http_client(&self) -> AuthenticatedHttpClient {
         AuthenticatedHttpClient {
-            inner: reqwest::Client::new(),
+            // Follows the network policy: this client sends the cloud-agent bearer token, so a
+            // redirect must not carry it to a host the policy would have refused.
+            inner: network_policy::apply_to_client_builder(reqwest::Client::builder())
+                .build()
+                .expect("HTTP client should build"),
             token_store: self.token_store.clone(),
             refresh_hint_sender: self.refresh_hint_sender.clone(),
         }

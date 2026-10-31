@@ -128,7 +128,11 @@ impl ProviderRuntime {
     pub fn new() -> Self {
         crate::install_tls_provider();
         Self {
-            client: reqwest::Client::new(),
+            // Follows the network policy: redirects are re-checked (this client sends the
+            // transcript and the API key) and, in local-only mode, system proxies are not used.
+            client: network_policy::apply_to_client_builder(reqwest::Client::builder())
+                .build()
+                .expect("HTTP client should build"),
             context_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -195,9 +199,18 @@ impl ProviderRuntime {
             request_body
         };
 
+        let completions_url = format!("{base_url}/chat/completions");
+        network_policy::check_url_str(&completions_url, "provider chat completion request")
+            .map_err(|error| {
+                LocalAgentError::new(
+                    error.to_string(),
+                    FinishReason::LlmUnavailable,
+                    Some(model.clone()),
+                )
+            })?;
         let response = self
             .client
-            .post(format!("{base_url}/chat/completions"))
+            .post(completions_url)
             .bearer_auth(&api_key)
             .json(&request_body)
             .send()
@@ -366,9 +379,15 @@ impl ProviderRuntime {
             return fallback_local_models(config);
         };
         let base_url = trim_trailing_slash(base_url);
+        let models_url = format!("{base_url}/models");
+        if let Err(error) = network_policy::check_url_str(&models_url, "provider model list request")
+        {
+            log::warn!("{error}");
+            return fallback_local_models(config);
+        }
         let mut request = self
             .client
-            .get(format!("{base_url}/models"))
+            .get(models_url)
             .header(reqwest::header::ACCEPT, "application/json");
         if let Some(api_key) = config.openai_api_key.as_deref().and_then(non_empty_str) {
             request = request.bearer_auth(api_key);
@@ -443,9 +462,15 @@ impl ProviderRuntime {
         }
 
         let mut context_windows_by_model = HashMap::new();
+        let models_url = format!("{base_url}/models");
+        if let Err(error) = network_policy::check_url_str(&models_url, "provider model list request")
+        {
+            log::warn!("{error}");
+            return context_windows_by_model;
+        }
         let result = self
             .client
-            .get(format!("{base_url}/models"))
+            .get(models_url)
             .bearer_auth(api_key)
             .header(reqwest::header::ACCEPT, "application/json")
             .send()

@@ -384,3 +384,102 @@ fn test_params(enable_tools: bool) -> ChatCompletionParams {
         enable_tools,
     }
 }
+
+/// Tests that run with the process-wide services mode set to local-only take this lock. Every
+/// other test here talks to a loopback server, which local-only mode allows.
+static LOCAL_ONLY_LOCK: Mutex<()> = Mutex::new(());
+
+struct LocalOnlyGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl LocalOnlyGuard {
+    fn enter() -> Self {
+        let guard = LOCAL_ONLY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        network_policy::set_services_mode(network_policy::ServicesMode::LocalOnly);
+        Self(guard)
+    }
+}
+
+impl Drop for LocalOnlyGuard {
+    fn drop(&mut self) {
+        network_policy::set_services_mode(network_policy::ServicesMode::Online);
+    }
+}
+
+#[tokio::test]
+async fn local_only_mode_refuses_a_public_provider_without_connecting() {
+    let _local_only = LocalOnlyGuard::enter();
+
+    let error = ProviderRuntime::new()
+        .stream_chat_completion(
+            &test_config("https://api.example.com/v1".to_owned()),
+            test_params(false),
+            |_| {},
+        )
+        .await
+        .expect_err("a public provider must be refused in local-only mode");
+
+    assert_eq!(error.finish_reason, FinishReason::LlmUnavailable);
+    assert!(
+        error.message.contains("NetworkPolicyDenied"),
+        "unexpected error: {}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn local_only_mode_does_not_follow_a_redirect_to_a_public_host() {
+    let _local_only = LocalOnlyGuard::enter();
+    let app = Router::new().route(
+        "/v1/chat/completions",
+        post(|| async {
+            (
+                axum::http::StatusCode::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, "https://api.example.com/v1/chat/completions")],
+            )
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // A 307 keeps the method and the body (the transcript), so following it would send both to the
+    // public host. Bound the wait so a regression fails instead of dialing out.
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ProviderRuntime::new().stream_chat_completion(
+            &test_config(base_url),
+            test_params(false),
+            |_| {},
+        ),
+    )
+    .await
+    .expect("the redirect should be refused without waiting on the public host");
+
+    let error = result.expect_err("a redirect to a public host must fail the request");
+    assert_eq!(error.finish_reason, FinishReason::LlmUnavailable);
+    assert!(
+        error.message.contains("redirect"),
+        "unexpected error: {}",
+        error.message
+    );
+}
+
+#[tokio::test]
+async fn local_only_mode_skips_the_model_list_of_a_public_provider() {
+    let _local_only = LocalOnlyGuard::enter();
+    let config = test_config("https://api.example.com/v1".to_owned());
+
+    let models = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        ProviderRuntime::new().fetch_provider_models(&config),
+    )
+    .await
+    .expect("a refused provider must not be waited on");
+
+    // Falls back to the configured list instead of asking the provider.
+    assert_eq!(models, fallback_local_models(&config));
+}

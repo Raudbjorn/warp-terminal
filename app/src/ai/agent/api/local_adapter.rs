@@ -1713,6 +1713,10 @@ fn map_engine_error(err: local_agent::LocalAgentError) -> AIApiError {
             http::StatusCode::from_u16(status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
             body,
         ),
+        // Deterministic, so it must not go through the retry machinery.
+        local_agent::LocalAgentError::NetworkPolicyDenied(denied) => {
+            AIApiError::NetworkPolicyDenied(denied)
+        }
         other => AIApiError::Stream {
             stream_type: "local agent loop",
             source: anyhow!(other),

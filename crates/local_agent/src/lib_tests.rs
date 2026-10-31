@@ -624,3 +624,89 @@ async fn build_system_prompt_includes_environment_details() {
         );
     }
 }
+
+/// Tests that run with the process-wide services mode set to local-only take this lock. Every
+/// other test here talks to a loopback mockito server, which local-only mode allows.
+static LOCAL_ONLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct LocalOnlyGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl LocalOnlyGuard {
+    fn enter() -> Self {
+        let guard = LOCAL_ONLY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        network_policy::set_services_mode(network_policy::ServicesMode::LocalOnly);
+        Self(guard)
+    }
+}
+
+impl Drop for LocalOnlyGuard {
+    fn drop(&mut self) {
+        network_policy::set_services_mode(network_policy::ServicesMode::Online);
+    }
+}
+
+#[tokio::test]
+async fn local_only_mode_refuses_a_public_endpoint_before_any_request() {
+    let _local_only = LocalOnlyGuard::enter();
+    let config = LocalEndpointConfig {
+        base_url: "https://api.example.com/v1".to_string(),
+        api_key: "secret".to_string(),
+        model_slug: "test-model".to_string(),
+    };
+
+    let result = complete_text(user_only_transcript(), config).await;
+
+    assert!(
+        matches!(result, Err(LocalAgentError::NetworkPolicyDenied(_))),
+        "unexpected result: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn local_only_mode_refuses_a_redirect_to_a_public_host() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut server = Server::new_async().await;
+    // A 307 keeps the method and the body (the transcript and the API key's request), so following
+    // it would hand both to the public host.
+    let redirect = server
+        .mock("POST", "/chat/completions")
+        .with_status(307)
+        .with_header("location", "https://api.example.com/v1/chat/completions")
+        .create_async()
+        .await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        complete_text(user_only_transcript(), config_for(&server)),
+    )
+    .await
+    .expect("the redirect should be refused without waiting on the public host");
+
+    redirect.assert_async().await;
+    assert!(
+        matches!(result, Err(LocalAgentError::NetworkPolicyDenied(_))),
+        "unexpected result: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn loopback_endpoints_still_work_in_local_only_mode() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut server = Server::new_async().await;
+    let body = sse_body(
+        &[
+            delta_chunk(json!({ "role": "assistant", "content": "ok" }), None),
+            delta_chunk(json!({}), Some("stop")),
+        ],
+        true,
+    );
+    let _mock = mock_completion(&mut server, body).await;
+
+    let text = complete_text(user_only_transcript(), config_for(&server))
+        .await
+        .expect("a loopback endpoint is allowed in local-only mode");
+
+    assert_eq!(text, "ok");
+}

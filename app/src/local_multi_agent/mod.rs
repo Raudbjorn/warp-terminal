@@ -19,6 +19,7 @@ use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
 use crate::ChannelState;
 use crate::ai::llms::LLMPreferences;
+use crate::settings::AISettings;
 
 const PREF_KEY: &str = "LocalMultiAgentConfig";
 const BUNDLED_SERVICE_DIR: &str = "bundled/local-multi-agent";
@@ -417,6 +418,9 @@ pub struct LocalMultiAgentManager {
     child: Option<Child>,
     restart_debounce: Option<AbortHandle>,
     openai_api_key: Option<String>,
+    /// The private hosts the running service was told it may reach (see `start_now`). The
+    /// service reads them once at startup, so a change to the setting restarts it.
+    applied_private_hosts: Vec<network_policy::PrivateNetwork>,
 }
 
 impl LocalMultiAgentManager {
@@ -442,10 +446,20 @@ impl LocalMultiAgentManager {
             child: None,
             restart_debounce: None,
             openai_api_key: None,
+            applied_private_hosts: network_policy::allowed_private_hosts(),
         };
         if ChannelState::is_local_only() {
             manager.schedule_restart(ctx);
         }
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |manager, _, _, ctx| {
+            // Another subscriber may not have applied the new setting yet; applying is idempotent.
+            AISettings::as_ref(ctx).apply_network_policy();
+            if ChannelState::is_local_only()
+                && network_policy::allowed_private_hosts() != manager.applied_private_hosts
+            {
+                manager.schedule_restart(ctx);
+            }
+        });
         manager
     }
 
@@ -817,6 +831,8 @@ impl LocalMultiAgentManager {
         if child.is_some() {
             self.stop_child();
             self.child = child;
+            // `start_service` passed the policy as it was when the child was spawned.
+            self.applied_private_hosts = network_policy::allowed_private_hosts();
         }
         set_global_root_url(Some(root_url.clone()));
         let _ = ChannelState::override_server_root_url(root_url.to_string());
@@ -914,6 +930,10 @@ async fn start_service(
     for (key, value) in service_env {
         command.env(key, value);
     }
+    // The service enforces the same network policy as the app, so hand it the current one.
+    for (key, value) in network_policy::env_for_child() {
+        command.env(key, value);
+    }
     command.env("LOCAL_CONFIG_HASH", &config_hash);
 
     let child = command
@@ -944,12 +964,21 @@ async fn wait_until_healthy(root_url: Url) -> Result<()> {
     Err(last_error.unwrap_or_else(|| anyhow!("Timed out waiting for local service health check")))
 }
 
+/// A client for the local service and the configured provider that follows the network policy:
+/// redirects are re-checked and, in local-only mode, system proxies are not used. Callers also
+/// check the request URL with [`network_policy::check_url`] first.
+fn policy_client() -> Result<reqwest::Client> {
+    network_policy::apply_to_client_builder(reqwest::Client::builder())
+        .build()
+        .context("Failed to build HTTP client")
+}
+
 async fn health_check(root_url: Url) -> Result<()> {
     let url = root_url
         .join("/health")
         .context("Failed to build local health URL")?;
-    let client = reqwest::Client::new();
-    let response = client
+    network_policy::check_url(&url, "local service health check")?;
+    let response = policy_client()?
         .get(url)
         .timeout(HEALTH_TIMEOUT)
         .send()
@@ -977,8 +1006,8 @@ async fn health_check(root_url: Url) -> Result<()> {
 async fn fetch_provider_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
     validate_absolute_http_url(base_url)?;
     let models_url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let mut request = client
+    network_policy::check_url_str(&models_url, "provider model list request")?;
+    let mut request = policy_client()?
         .get(models_url)
         .timeout(HEALTH_TIMEOUT)
         .header(reqwest::header::ACCEPT, "application/json");
@@ -1274,6 +1303,10 @@ pub fn local_no_cloud_root_url() -> Option<Url> {
     LocalMultiAgentManager::global_root_url()
         .or_else(|| LocalMultiAgentConfig::default().root_url().ok())
 }
+
+#[cfg(test)]
+#[path = "network_policy_tests.rs"]
+mod network_policy_tests;
 
 #[cfg(test)]
 mod tests {

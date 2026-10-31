@@ -22,12 +22,16 @@ use crate::editor::{
     EditorView, Event as EditorEvent, SingleLineEditorOptions, TextColors, TextOptions,
 };
 use crate::report_if_error;
-use crate::settings::{AISettings, LocalOpenAIEnabled, LocalOpenAIProviderKind, LocalProviderKind};
+use crate::settings::{
+    AISettings, LocalOpenAIEnabled, LocalOpenAIProviderKind, LocalOpenAIUseResponsesApi,
+    LocalProviderKind,
+};
 use crate::view_components::{Dropdown, DropdownItem};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum LocalAISettingsPageAction {
     ToggleLocalOpenAIProvider,
+    ToggleUseResponsesApi,
     SetProviderKind(LocalProviderKind),
 }
 
@@ -35,6 +39,8 @@ pub struct LocalAISettingsPageView {
     page: PageType<Self>,
     local_only_icon_tooltip_states: RefCell<HashMap<String, MouseStateHandle>>,
     provider_kind_dropdown: ViewHandle<Dropdown<LocalAISettingsPageAction>>,
+    /// Why the text in the allowed-private-hosts field was not saved, if it was not.
+    allowed_private_hosts_error: Option<String>,
 }
 
 impl LocalAISettingsPageView {
@@ -60,6 +66,7 @@ impl LocalAISettingsPageView {
             ),
             local_only_icon_tooltip_states: Default::default(),
             provider_kind_dropdown,
+            allowed_private_hosts_error: None,
         }
     }
 
@@ -112,6 +119,12 @@ impl TypedActionView for LocalAISettingsPageView {
                 });
                 ctx.notify();
             }
+            LocalAISettingsPageAction::ToggleUseResponsesApi => {
+                AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.local_openai_use_responses_api.toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
             LocalAISettingsPageAction::SetProviderKind(kind) => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(
@@ -158,6 +171,8 @@ impl From<ViewHandle<LocalAISettingsPageView>> for SettingsPageViewHandle {
 
 struct LocalAIProviderWidget {
     enabled_toggle: SwitchStateHandle,
+    use_responses_api_toggle: SwitchStateHandle,
+    allowed_private_hosts_editor: ViewHandle<EditorView>,
     base_url_editor: ViewHandle<EditorView>,
     api_key_editor: ViewHandle<EditorView>,
     command_model_editor: ViewHandle<EditorView>,
@@ -177,6 +192,7 @@ impl LocalAIProviderWidget {
             timeout_ms,
             opencode_command,
             opencode_args,
+            allowed_private_hosts,
         ) = {
             let ai_settings = AISettings::as_ref(ctx);
             (
@@ -190,6 +206,7 @@ impl LocalAIProviderWidget {
                 // the `shell_words::split` save handler below: arguments with
                 // spaces, quotes, or backslashes survive an unchanged save.
                 shell_words::join(ai_settings.local_openai_opencode_args.value()),
+                ai_settings.local_openai_allowed_private_hosts.value().clone(),
             )
         };
         let base_url_editor = Self::create_editor(ctx, base_url, "http://127.0.0.1:1234/v1", false);
@@ -314,8 +331,36 @@ impl LocalAIProviderWidget {
             }
         });
 
+        let allowed_private_hosts_editor = Self::create_editor(
+            ctx,
+            allowed_private_hosts,
+            "192.168.1.50, 100.64.0.0/10",
+            false,
+        );
+        ctx.subscribe_to_view(&allowed_private_hosts_editor, |view, editor, event, ctx| {
+            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                let value = editor.as_ref(ctx).buffer_text(ctx).trim().to_string();
+                // An invalid list is not saved, so a typo cannot leave part of it applied. The
+                // text stays in the field, with the reason shown under it, for the user to fix.
+                match network_policy::parse_allowed_private_hosts(&value) {
+                    Ok(_) => {
+                        view.allowed_private_hosts_error = None;
+                        AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                            report_if_error!(settings
+                                .local_openai_allowed_private_hosts
+                                .set_value(value, ctx));
+                        });
+                    }
+                    Err(err) => view.allowed_private_hosts_error = Some(err.to_string()),
+                }
+                ctx.notify();
+            }
+        });
+
         Self {
             enabled_toggle: Default::default(),
+            use_responses_api_toggle: Default::default(),
+            allowed_private_hosts_editor,
             base_url_editor,
             api_key_editor,
             command_model_editor,
@@ -409,6 +454,80 @@ impl LocalAIProviderWidget {
         )
     }
 
+    fn render_use_responses_api_toggle(
+        &self,
+        view: &LocalAISettingsPageView,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let is_enabled = *AISettings::as_ref(app).local_openai_use_responses_api.value();
+        let label = render_body_item_label::<LocalAISettingsPageAction>(
+            "Use the Responses API".to_string(),
+            Some(appearance.theme().active_ui_text_color().into()),
+            None,
+            LocalOnlyIconState::for_setting(
+                LocalOpenAIUseResponsesApi::storage_key(),
+                LocalOpenAIUseResponsesApi::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+        );
+
+        let switch = appearance
+            .ui_builder()
+            .switch(self.use_responses_api_toggle.clone())
+            .check(is_enabled)
+            .build()
+            .on_click(move |ctx, _, _| {
+                ctx.dispatch_typed_action(LocalAISettingsPageAction::ToggleUseResponsesApi);
+            })
+            .finish();
+
+        build_toggle_element(
+            label,
+            switch,
+            appearance,
+            Some(
+                "Send requests to /v1/responses instead of /v1/chat/completions. Turn this on for models that are only served on the Responses API."
+                    .to_string(),
+            ),
+        )
+    }
+
+    fn render_allowed_private_hosts(
+        &self,
+        view: &LocalAISettingsPageView,
+        appearance: &Appearance,
+    ) -> Box<dyn Element> {
+        let mut column = Flex::column()
+            .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+            .with_spacing(8.)
+            .with_child(Self::render_input(
+                appearance,
+                "Allowed private hosts",
+                self.allowed_private_hosts_editor.clone(),
+            ))
+            .with_child(Self::render_description(
+                appearance,
+                "Local-only mode connects to this machine only. To use a model server elsewhere on your network, list its IP address or a CIDR range here, separated by commas, e.g. `192.168.1.50` or `100.64.0.0/10` (Tailscale). Only private ranges (10/8, 172.16/12, 192.168/16, 100.64/10, link-local, fc00::/7) are accepted, and host names cannot be listed. Leave empty to allow this machine only.",
+            ));
+        if let Some(error) = &view.allowed_private_hosts_error {
+            column = column.with_child(
+                Text::new(
+                    format!("Not saved: {error}"),
+                    appearance.ui_font_family(),
+                    appearance.ui_font_size(),
+                )
+                .with_color(appearance.theme().ui_error_color().into())
+                .soft_wrap(true)
+                .finish(),
+            );
+        }
+        column.finish()
+    }
+
     fn render_provider_selector(
         view: &LocalAISettingsPageView,
         appearance: &Appearance,
@@ -468,7 +587,7 @@ impl SettingsWidget for LocalAIProviderWidget {
     type View = LocalAISettingsPageView;
 
     fn search_terms(&self) -> &str {
-        "local ai local openai openai compatible provider endpoint base url api key model command prediction timeout ollama lm studio opencode sidecar"
+        "local ai local openai openai compatible provider endpoint base url api key model command prediction timeout ollama lm studio opencode sidecar responses api allowed private hosts lan tailscale network cidr"
     }
 
     fn render(
@@ -499,7 +618,9 @@ impl SettingsWidget for LocalAIProviderWidget {
                     appearance,
                     "API Key",
                     self.api_key_editor.clone(),
-                )),
+                ))
+                .with_child(self.render_use_responses_api_toggle(view, appearance, app))
+                .with_child(self.render_allowed_private_hosts(view, appearance)),
             LocalProviderKind::OpenCode => column
                 .with_child(Self::render_description(
                     appearance,

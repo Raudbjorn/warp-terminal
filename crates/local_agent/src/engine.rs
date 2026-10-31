@@ -11,6 +11,21 @@ use crate::{
     AgentEvent, ChatMessage, LocalAgentError, LocalEndpointConfig, ToolDefinition, openai,
 };
 
+/// The shared client. It is reused across turns so TCP and TLS sessions are pooled, and it
+/// follows the network policy: redirects are re-checked against it, and in local-only mode system
+/// proxies are not used. A redirect carries the request body (the transcript), so an endpoint must
+/// not be able to bounce it to a host the policy would have refused.
+fn client() -> Result<&'static reqwest::Client, LocalAgentError> {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = network_policy::apply_to_client_builder(reqwest::Client::builder())
+        .build()
+        .map_err(|err| LocalAgentError::Transport(err.to_string()))?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
 pub(crate) fn run_turn(
     transcript: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
@@ -18,13 +33,10 @@ pub(crate) fn run_turn(
 ) -> BoxStream<'static, Result<AgentEvent, LocalAgentError>> {
     Box::pin(async_stream::try_stream! {
         let request = openai::build_request(&transcript, &tools, &config);
-        // Reuse a single `reqwest::Client` across turns so TCP and TLS
-        // sessions are pooled across requests.
-        static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-        let client = CLIENT.get_or_init(reqwest::Client::new);
-        let mut builder = client
-            .post(openai::endpoint_url(&config.base_url))
-            .json(&request);
+        let url = openai::endpoint_url(&config.base_url);
+        network_policy::check_url_str(&url, "local agent request")?;
+        let client = client()?;
+        let mut builder = client.post(url).json(&request);
         if !config.api_key.trim().is_empty() {
             builder = builder.bearer_auth(config.api_key.trim());
         }

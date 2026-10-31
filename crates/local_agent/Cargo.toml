@@ -9,6 +9,7 @@ license.workspace = true
 async-stream.workspace = true
 futures.workspace = true
 log.workspace = true
+network_policy.workspace = true
 reqwest.workspace = true
 reqwest-eventsource.workspace = true
 serde.workspace = true

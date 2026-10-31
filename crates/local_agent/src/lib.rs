@@ -93,6 +93,10 @@ pub enum LocalAgentError {
     /// Network/transport failure, including mid-stream disconnects.
     #[error("transport error: {0}")]
     Transport(String),
+    /// The network policy refused the endpoint, or a redirect it returned. Deterministic, so the
+    /// host should not retry it.
+    #[error(transparent)]
+    NetworkPolicyDenied(#[from] network_policy::NetworkPolicyDenied),
     /// The endpoint returned something we could not parse.
     #[error("malformed response: {0}")]
     Parse(String),
