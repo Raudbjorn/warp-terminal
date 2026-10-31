@@ -27,12 +27,6 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::Autoupdate,
         #[cfg(feature = "changelog")]
         FeatureFlag::Changelog,
-        #[cfg(feature = "cocoa_sentry")]
-        FeatureFlag::CocoaSentry,
-        #[cfg(feature = "crash_reporting")]
-        FeatureFlag::CrashReporting,
-        #[cfg(feature = "log_expensive_frames_in_sentry")]
-        FeatureFlag::LogExpensiveFramesInSentry,
         #[cfg(feature = "record_app_active_events")]
         FeatureFlag::RecordAppActiveEvents,
         #[cfg(feature = "runtime_feature_flags")]
@@ -441,6 +435,8 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::QueueSlashCommand,
         #[cfg(feature = "queued_prompts_v2")]
         FeatureFlag::QueuedPromptsV2,
+        #[cfg(feature = "agent_prompt_steering")]
+        FeatureFlag::AgentPromptSteering,
         #[cfg(feature = "kitty_keyboard_protocol")]
         FeatureFlag::KittyKeyboardProtocol,
         #[cfg(feature = "inline_menu_headers")]

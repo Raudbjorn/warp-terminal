@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use tempfile::NamedTempFile;
+use tempfile::{NamedTempFile, TempDir};
 use warp_cli::agent::{Harness, HarnessTransport};
 use warp_cli::{
     OZ_CLI_ENV, OZ_HARNESS_ENV, OZ_PARENT_RUN_ID_ENV, OZ_RUN_ID_ENV, SERVER_ROOT_URL_OVERRIDE_ENV,
@@ -140,6 +140,16 @@ pub(super) async fn fetch_transcript_envelope<E: serde::de::DeserializeOwned>(
     })
 }
 
+/// The MCP servers resolved for a third-party harness run, keyed by server name.
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedMCPServers {
+    /// The config each harness writes into its native format.
+    pub(crate) configs: HashMap<String, JSONMCPServer>,
+    /// The `warp_id` of each server resolved from a managed MCP server or a well-known
+    /// integration, with the semantics of `MCPServerConfig.warp_id`.
+    pub(crate) warp_ids: HashMap<String, String>,
+}
+
 /// Trait for third-party agent harnesses that execute prompts via their own CLIs.
 ///
 /// Each new external harness (e.g. Claude, Codex) implements this to be used with cloud agents.
@@ -258,7 +268,7 @@ pub(crate) trait ThirdPartyHarness: Send + Sync {
         skill_dirs: &[PathBuf],
         factory_repository_contract: bool,
         resolved_secrets: &HashMap<String, ManagedSecretValue>,
-        resolved_mcp_servers: &HashMap<String, JSONMCPServer>,
+        resolved_mcp_servers: &ResolvedMCPServers,
         third_party_harness_model_config: Option<&HarnessModelConfig>,
     ) -> Result<Box<dyn HarnessRunner>, AgentDriverError>;
 }
@@ -579,7 +589,7 @@ pub(crate) fn harness_env_vars(
     selected_harness: Harness,
     transport: HarnessTransport,
     third_party_harness_model_config: Option<&HarnessModelConfig>,
-) -> Result<HashMap<OsString, OsString>> {
+) -> Result<(HashMap<OsString, OsString>, Option<TempDir>)> {
     let mut env_vars = HashMap::new();
 
     match (selected_harness, transport) {
@@ -600,14 +610,17 @@ pub(crate) fn harness_env_vars(
                 }
             }
         }
-        (Harness::Pi, _) => return pi_env_vars(),
+        (Harness::Pi, _) => {
+            let (env_vars, dir) = pi_env_vars()?;
+            return Ok((env_vars, Some(dir)));
+        }
         (
             Harness::Oz | Harness::OpenCode | Harness::Gemini | Harness::Codex | Harness::Unknown,
             _,
         ) => {}
     }
 
-    Ok(env_vars)
+    Ok((env_vars, None))
 }
 
 /// Indicates when the harness conversation is being saved.

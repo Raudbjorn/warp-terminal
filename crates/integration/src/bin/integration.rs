@@ -57,7 +57,6 @@ pub fn main() -> Result<()> {
             },
             services_mode: ServicesMode::Online,
             telemetry_config: None,
-            crash_reporting_config: None,
             autoupdate_config: None,
             mcp_static_config: None,
         },
@@ -144,6 +143,7 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_bootstrap_with_no_script_execution_block);
     register_test!(test_instant_prompt_bootstrap);
     register_test!(test_rc_files_only_sourced_once_during_bootstrapping);
+    register_test!(test_cloud_agent_fallback_commands_survive_profile_path_reset);
     register_test!(test_unescaped_prompt_bootstraps);
     register_test!(test_detect_powerlevel10k);
     register_test!(test_open_and_close_resource_center);

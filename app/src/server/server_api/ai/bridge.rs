@@ -110,6 +110,13 @@ impl AIClient for GrpcBridgeAIClient {
     // gRPC harness host; every other method forwards to the real client. The live
     // event stream is bridged separately in Phase 3 (ServerApi::stream_agent_events).
 
+    async fn list_run_previews(
+        &self,
+        task_id: &AmbientAgentTaskId,
+    ) -> anyhow::Result<ListRunPreviewsResponse> {
+        self.inner.list_run_previews(task_id).await
+    }
+
     async fn generate_commands_from_natural_language(
         &self,
         prompt: String,

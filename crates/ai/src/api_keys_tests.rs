@@ -475,6 +475,7 @@ fn serde_round_trip_with_provider_keys() {
         google: Some("AIzaSy123".into()),
         open_router: Some("sk-or-xxx".into()),
         custom_endpoints: vec![],
+        ..Default::default()
     };
     let json = serde_json::to_string(&keys).unwrap();
     let deser: ApiKeys = serde_json::from_str(&json).unwrap();
@@ -497,6 +498,7 @@ fn serde_round_trip_with_custom_endpoints() {
                 &[("llama-70b", None), ("mixtral", Some("mix"))],
             ),
         ],
+        ..Default::default()
     };
     let json = serde_json::to_string(&keys).unwrap();
     let deser: ApiKeys = serde_json::from_str(&json).unwrap();
@@ -568,6 +570,7 @@ fn provider_key_count_counts_each_provider_key() {
         google: Some("AIza".into()),
         open_router: Some("sk-or".into()),
         custom_endpoints: vec![],
+        ..Default::default()
     };
     assert_eq!(keys.provider_key_count(), 4);
 }
@@ -580,6 +583,7 @@ fn provider_key_count_ignores_blank_keys_and_endpoints() {
         google: None,
         open_router: None,
         custom_endpoints: vec![endpoint("ep", "https://a.io", "k", &[("m", None)])],
+        ..Default::default()
     };
     // Only the non-blank OpenAI key counts; the whitespace Anthropic key and the
     // custom endpoint are excluded.

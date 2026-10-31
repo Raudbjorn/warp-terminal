@@ -2432,6 +2432,8 @@ fn recover_failed_ssh_bootstrap_registers_degraded_remote_session() {
     model.ssh(SSHValue {
         socket_path: PathBuf::from("/tmp/warp-test-control-socket"),
         remote_shell: "bash".to_string(),
+        session_id: Default::default(),
+        remote_session_id: Default::default(),
         external_control_master: false,
     });
     model.init_shell(InitShellValue {

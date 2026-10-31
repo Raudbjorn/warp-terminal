@@ -292,52 +292,6 @@ fn version_is_compatible_for_transport(
             && transport.allow_tagged_server_with_untagged_client()
 }
 
-#[cfg(all(test, not(target_family = "wasm")))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn oss_without_client_version_rejects_production_remote_server_version() {
-        assert!(!version_is_compatible_for_channel(
-            Channel::Oss,
-            None,
-            "v0.2026.04.29.08.57.stable_01"
-        ));
-    }
-
-    #[test]
-    fn local_without_client_version_rejects_production_remote_server_version() {
-        assert!(!version_is_compatible_for_channel(
-            Channel::Local,
-            None,
-            "v0.2026.04.29.08.57.stable_01"
-        ));
-    }
-
-    #[test]
-    fn matching_release_versions_are_compatible() {
-        assert!(version_is_compatible_for_channel(
-            Channel::Stable,
-            Some("v0.2026.04.29.08.57.stable_01"),
-            "v0.2026.04.29.08.57.stable_01"
-        ));
-    }
-
-    #[test]
-    fn mismatched_release_versions_are_incompatible() {
-        assert!(!version_is_compatible_for_channel(
-            Channel::Stable,
-            Some("v0.2026.04.29.08.57.stable_01"),
-            "v0.2026.04.30.08.57.stable_01"
-        ));
-    }
-
-    #[test]
-    fn empty_client_and_server_versions_are_compatible() {
-        assert!(version_is_compatible_for_channel(Channel::Local, None, ""));
-    }
-}
-
 #[cfg(not(target_family = "wasm"))]
 fn client_event_kind(event: &ClientEvent) -> &'static str {
     match event {

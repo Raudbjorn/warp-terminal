@@ -2,9 +2,7 @@
 #
 # Cross-platform entrypoint for running a local Warp build.
 #
-# On macOS this delegates to `./script/macos/run`, which builds and runs Warp
-# as a real `.app` bundle (with code signing, plist updates, etc.). On Linux
-# and Windows it invokes `cargo run` directly for the appropriate binary.
+# Invokes `cargo run` directly for the appropriate binary.
 #
 # This script owns all cross-platform setup (running install_channel_config,
 # detecting internal vs OSS builds, and mapping legacy `--features` entries
@@ -143,13 +141,7 @@ export FEATURES
 export WARP_BIN_NAME
 export WARP_CHANNEL
 
-if [[ "$OS_TYPE" = "Darwin" ]]; then
-  if [[ ${#WARP_ARGS[@]} -gt 0 ]]; then
-    exec ./script/macos/run "${MAC_ARGS[@]}" -- "${WARP_ARGS[@]}"
-  else
-    exec ./script/macos/run "${MAC_ARGS[@]}"
-  fi
-elif [[ "$OS_TYPE" = "Linux" ]] || [[ "$OS_TYPE" =~ ^(MINGW64_NT|MSYS_NT) ]]; then
+if [[ "$OS_TYPE" = "Linux" ]] || [[ "$OS_TYPE" =~ ^(MINGW64_NT|MSYS_NT) ]]; then
   echo "Running cargo run --bin $WARP_BIN_NAME --features \"$FEATURES\" ${CARGO_PARAMS[*]}"
   if [[ ${#WARP_ARGS[@]} -gt 0 ]]; then
     cargo run --bin "$WARP_BIN_NAME" --features "$FEATURES" "${CARGO_PARAMS[@]}" -- "${WARP_ARGS[@]}"

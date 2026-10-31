@@ -76,3 +76,27 @@ fn data_uri_exceeds_limit_flags_only_oversized_base64_payloads() {
     assert!(!data_uri_exceeds_limit("https://example.com/a.png"));
     assert!(!data_uri_exceeds_limit("relative/path.png"));
 }
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn local_only_remote_asset_policy_rejects_http_and_preserves_file_like_urls() {
+    let public = Url::parse("https://app.warp.dev/assets/client/static/logo.png").unwrap();
+    assert!(
+        network_policy::check_url_for_mode(
+            network_policy::ServicesMode::LocalOnly,
+            &public,
+            "remote asset",
+        )
+        .is_err()
+    );
+
+    let file = Url::parse("file:///tmp/asset.png").unwrap();
+    assert_eq!(
+        network_policy::check_url_for_mode(
+            network_policy::ServicesMode::LocalOnly,
+            &file,
+            "remote asset",
+        ),
+        Ok(())
+    );
+}

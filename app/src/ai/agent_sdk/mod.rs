@@ -632,8 +632,10 @@ struct RepositoryContract {
     use_factory_repositories: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_execution_task_and_options(
     args: Option<&RunAgentArgs>,
+    harness_transport: HarnessTransport,
     config: ExecutionConfiguration,
     repository_contract: RepositoryContract,
     working_dir: PathBuf,
@@ -674,9 +676,6 @@ fn build_execution_task_and_options(
         !execution_id.is_empty() && config.execution_id.inner() == execution_id,
         "Execution configuration execution mismatch"
     );
-    let harness_transport = args
-        .and_then(|args| args.harness_transport)
-        .unwrap_or_default();
     let selected_harness = execution_config::harness(&config.harness)?;
     let model = if selected_harness == Harness::Oz {
         config
@@ -726,6 +725,7 @@ fn build_execution_task_and_options(
     let options = AgentDriverOptions {
         working_dir: working_dir.clone(),
         task_id: Some(task_id),
+        execution_id: Some(execution_id.to_owned()),
         use_factory_repositories,
         experimental: None,
         parent_run_id: config.parent_run_id.map(|id| id.into_inner()),
@@ -1133,10 +1133,6 @@ impl AgentDriverRunner {
         foreground: &ModelSpawner<E>,
         task_id: Option<AmbientAgentTaskId>,
     ) -> Result<(), AgentDriverError> {
-        #[cfg(feature = "crash_reporting")]
-        if let Some(task_id) = task_id {
-            crate::crash_reporting::set_task_id_tag(&task_id.to_string());
-        }
         foreground
             .spawn(move |_, ctx| {
                 ServerApiProvider::handle(ctx)
@@ -1459,6 +1455,7 @@ impl AgentDriverRunner {
                 .spawn(move |_, ctx| {
                     build_execution_task_and_options(
                         Some(&args),
+                        args.harness_transport.unwrap_or_default(),
                         config,
                         repository_contract,
                         working_dir,
@@ -1533,6 +1530,7 @@ impl AgentDriverRunner {
                 let driver_options = driver::AgentDriverOptions {
                     working_dir: working_dir.clone(),
                     task_id,
+                    execution_id: args.execution_id.clone(),
                     use_factory_repositories,
                     experimental: None,
                     parent_run_id: None,

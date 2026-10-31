@@ -181,8 +181,12 @@ fn idle_timeout_sender_later_send_after_supersedes_earlier() {
     // Second timer: short timeout. The first is implicitly cancelled.
     idle_timeout.end_run_after(Duration::from_millis(50), 2);
 
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(rx.try_recv().unwrap(), Some(2));
+    block_on(async {
+        assert_eventually!(
+            400 => rx.try_recv().unwrap() == Some(2),
+            "the latest idle timeout did not deliver its value"
+        );
+    });
 }
 
 #[test]
@@ -1037,6 +1041,31 @@ fn metadata_secret_collision_rejects_even_an_empty_injected_value() {
     }
     assert!(
         matches!(result, Err(AgentDriverError::EnvironmentSetupFailed(message)) if message.contains("WARP_METADATA_SECRET_TEST"))
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn llm_provider_keys_only_enter_the_environment_for_env_backed_providers() {
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+    let secrets = HashMap::from([
+        (
+            "GOOGLE".to_owned(),
+            ManagedSecretValue::llm_provider_api_key("google", "google-key", None),
+        ),
+        (
+            "ANTHROPIC".to_owned(),
+            ManagedSecretValue::llm_provider_api_key("anthropic", "anthropic-key", None),
+        ),
+    ]);
+
+    assert_eq!(
+        build_secret_env_vars(&secrets, &HashMap::new()).unwrap(),
+        HashMap::from([(
+            OsString::from("ANTHROPIC_API_KEY"),
+            OsString::from("anthropic-key")
+        )])
     );
 }
 

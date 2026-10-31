@@ -4,7 +4,7 @@ use std::io::{Cursor, Write};
 use std::path::Path;
 use std::time::Duration;
 
-use ai::api_keys::ApiKeyManager;
+use ai::api_keys::{ApiKeyManager, CustomEndpointParams};
 use command::blocking::Command;
 use prost::Message;
 use warpui::integration::{AssertionOutcome, TestStep};
@@ -436,9 +436,9 @@ pub fn set_execution_profile_auto_execute() -> TestStep {
         "Update execution profile",
         |app, _window_id| {
             AIExecutionProfilesModel::handle(app).update(app, |profiles, ctx| {
-                let default_profile_id = *profiles.default_profile(ctx).id();
+                let default_profile_id = profiles.default_profile(ctx).id().clone();
                 profiles.set_execute_commands(
-                    default_profile_id,
+                    &default_profile_id,
                     &ActionPermission::AlwaysAllow,
                     ctx,
                 );
@@ -473,10 +473,13 @@ pub fn add_custom_model_endpoint(
         move |app, _window_id| {
             ApiKeyManager::handle(app).update(app, |manager, ctx| {
                 manager.add_custom_endpoint(
-                    endpoint_name.clone(),
-                    base_url.clone(),
-                    api_key.clone(),
-                    vec![(model_name.clone(), None, Some(config_key.clone()))],
+                    CustomEndpointParams {
+                        name: endpoint_name.clone(),
+                        url: base_url.clone(),
+                        api_key: api_key.clone(),
+                        models: vec![(model_name.clone(), None, Some(config_key.clone()))],
+                        schema: Default::default(),
+                    },
                     ctx,
                 );
             });
@@ -498,6 +501,9 @@ pub fn set_preferred_agent_mode_custom_llm(config_key: &str) -> TestStep {
             let llm_id = llm_id.clone();
             let terminal_view_id = terminal_view(app, window_id, 0, 0).id();
             LLMPreferences::handle(app).update(app, |llm_preferences, ctx| {
+                let scope = ResolvedTeamScope::from_scope(
+                    &UserWorkspaces::as_ref(ctx).team_context_for_window(window_id),
+                );
                 if llm_preferences.custom_llm_info_for_id(&llm_id).is_none() {
                     // The custom LLM list rebuilds asynchronously off the
                     // ApiKeyManager update event; keep polling until it lands.
@@ -505,7 +511,12 @@ pub fn set_preferred_agent_mode_custom_llm(config_key: &str) -> TestStep {
                         "custom LLM '{llm_id}' not (yet) known to LLMPreferences"
                     ));
                 }
-                llm_preferences.update_preferred_agent_mode_llm(&llm_id, terminal_view_id, ctx);
+                llm_preferences.update_preferred_agent_mode_llm(
+                    &scope,
+                    &llm_id,
+                    terminal_view_id,
+                    ctx,
+                );
                 warpui::integration::AssertionOutcome::Success
             })
         },

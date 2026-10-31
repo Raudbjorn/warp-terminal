@@ -103,6 +103,7 @@ fn paired_execution_launch_keeps_inventory_separate_from_eager_membership() {
             let (options, _, _, _) = app.update(|ctx| {
                 super::build_execution_task_and_options(
                     Some(&args),
+                    args.harness_transport.unwrap_or_default(),
                     config,
                     super::RepositoryContract {
                         supports_deferred_repositories,
@@ -227,6 +228,7 @@ fn paired_execution_rejects_a_different_task_or_execution() {
             let result = app.update(|ctx| {
                 super::build_execution_task_and_options(
                     Some(&args),
+                    args.harness_transport.unwrap_or_default(),
                     config,
                     super::RepositoryContract {
                         supports_deferred_repositories: true,
@@ -648,6 +650,7 @@ pub(crate) fn agent_driver_options() -> AgentDriverOptions {
     AgentDriverOptions {
         working_dir: std::env::current_dir().unwrap(),
         task_id: None,
+        execution_id: None,
         use_factory_repositories: false,
         experimental: None,
         parent_run_id: None,

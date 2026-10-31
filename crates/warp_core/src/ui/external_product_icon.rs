@@ -12,7 +12,6 @@ pub enum ExternalProductIcon {
     Slack,
     Composio,
     Resend,
-    Sentry,
     YouDotCom,
 }
 
@@ -26,7 +25,6 @@ impl ExternalProductIcon {
         ("slack", Self::Slack),
         ("composio", Self::Composio),
         ("resend", Self::Resend),
-        ("sentry", Self::Sentry),
         ("you.com", Self::YouDotCom),
     ];
 
@@ -48,7 +46,6 @@ impl ExternalProductIcon {
             Self::Slack => "bundled/svg/slack-logo.svg",
             Self::Composio => "bundled/svg/composio.svg",
             Self::Resend => "bundled/svg/resend.svg",
-            Self::Sentry => "bundled/svg/sentry.svg",
             Self::YouDotCom => "bundled/svg/you-com.svg",
         }
     }

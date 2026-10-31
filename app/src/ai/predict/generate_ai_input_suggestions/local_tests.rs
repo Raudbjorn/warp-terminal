@@ -114,6 +114,7 @@ fn endpoint(name: &str, url: &str, key: &str, models: &[(&str, &str)]) -> Custom
         name: name.to_string(),
         url: url.to_string(),
         api_key: key.to_string(),
+        schema: Default::default(),
         models: models
             .iter()
             .map(|(model_name, config_key)| CustomEndpointModel {
@@ -155,7 +156,12 @@ fn returns_none_for_builtin_model() {
 fn skips_endpoints_with_empty_url() {
     let endpoints = vec![
         endpoint("NoUrl", "  ", "k", &[("m", "cfg-1")]),
-        endpoint("WithEmptyKey", "http://localhost:11434/v1", "", &[("m", "cfg-2")]),
+        endpoint(
+            "WithEmptyKey",
+            "http://localhost:11434/v1",
+            "",
+            &[("m", "cfg-2")],
+        ),
     ];
     assert!(pick_custom_endpoint("cfg-1", &endpoints).is_none());
     assert!(pick_custom_endpoint("cfg-2", &endpoints).is_some());

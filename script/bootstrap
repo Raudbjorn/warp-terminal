@@ -166,24 +166,10 @@ ensure_git_lfs() {
 
 ensure_git_lfs
 
-if [[ "$OS_TYPE" = "Darwin" ]]; then
-  print_bootstrap_preview "macOS"
-  ./script/macos/bootstrap "${PLATFORM_ARGS[@]}"
-  maybe_install_common_skills
-elif [[ "$OS_TYPE" = "Linux" ]]; then
+if [[ "$OS_TYPE" = "Linux" ]]; then
   print_bootstrap_preview "Linux"
   ./script/linux/bootstrap "${PLATFORM_ARGS[@]}"
   maybe_install_common_skills
-elif [[ "$OS_TYPE" =~ ^(MINGW64_NT|MSYS_NT) ]]; then
-  if [[ "${INSTALL_COMMON_SKILLS}" -eq 1 ]]; then
-    if [[ -n "${COMMON_SKILLS_TARGET}" ]]; then
-      ./script/windows/bootstrap.ps1 "${PLATFORM_ARGS[@]}" -InstallCommonSkills -CommonSkillsTarget "${COMMON_SKILLS_TARGET}"
-    else
-      ./script/windows/bootstrap.ps1 "${PLATFORM_ARGS[@]}" -InstallCommonSkills
-    fi
-  else
-    ./script/windows/bootstrap.ps1 "${PLATFORM_ARGS[@]}"
-  fi
 else
   echo "No bootstrap script defined for the current platform!"
   exit 1

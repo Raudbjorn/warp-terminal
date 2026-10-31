@@ -9,7 +9,7 @@ set -eo pipefail
 # Both local bootstrap and release CI install through this script so that the .app
 # bundles developers produce come from the same cargo-bundle as the shipped ones.
 #
-# 0.11.0 supports the two features script/macos/bundle depends on: the `--profile`
+# 0.11.0 supports the two features the bundle scripts depend on: the `--profile`
 # flag and CARGO_BUNDLE_SKIP_BUILD.
 CARGO_BUNDLE_VERSION="0.11.0"
 
