@@ -266,6 +266,12 @@ impl AIApiError {
 
     /// Converts a transport-level reqwest error (no HTTP response) to an AIApiError.
     fn from_transport_error(err: reqwest::Error) -> Self {
+        // A redirect the network policy refused is deterministic, so don't treat it as a transient
+        // transport failure. Non-SSE requests are already remapped by `http_client`; this covers
+        // SSE streams, which surface the raw `reqwest::Error`.
+        if let Some(denied) = http_client::redirect_denial_from(&err) {
+            return AIApiError::NetworkPolicyDenied(denied);
+        }
         // Unfortunately, `reqwest` reports some non-decoding errors as decoding errors (e.g.
         // unexpected disconnects or timeouts while deserializing a response body). Since we
         // render deserialization and transport errors differently, we try to detect those cases

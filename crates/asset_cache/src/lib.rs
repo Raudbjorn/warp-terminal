@@ -153,10 +153,9 @@ async fn fetch_file_to_memory(url: Url) -> Result<Bytes, anyhow::Error> {
             // so reqwest's expectations are met.
             //
             // `reqwest::get` would use the default redirect policy, which follows redirects
-            // without re-checking them against the network policy.
+            // without re-checking them against the network policy, and honors proxies.
             let response = async_compat::Compat::new(async move {
-                reqwest::Client::builder()
-                    .redirect(network_policy::redirect_policy())
+                network_policy::apply_to_client_builder(reqwest::Client::builder())
                     .build()?
                     .get(url)
                     .send()

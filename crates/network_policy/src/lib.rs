@@ -132,6 +132,26 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// Applies the network policy to a reqwest client builder: re-validates redirects (see
+/// [`redirect_policy`]) and, in local-only mode, disables proxies.
+///
+/// The loopback check only looks at the request URL, not the route. With `HTTP_PROXY` set, reqwest
+/// would send an allowed `http://localhost:11434` request to the proxy, which leaks the
+/// destination off-machine and can't reach this machine's loopback anyway. Local-only mode only
+/// permits loopback, so there is never a reason to proxy. The mode is fixed at startup by
+/// `ChannelState::set`, so reading it when the client is built is enough.
+///
+/// This replaces any redirect or proxy setting already on `builder`.
+#[cfg(not(target_family = "wasm"))]
+pub fn apply_to_client_builder(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let builder = builder.redirect(redirect_policy());
+    if is_local_only() {
+        builder.no_proxy()
+    } else {
+        builder
+    }
+}
+
 fn is_guarded_scheme(scheme: &str) -> bool {
     matches!(scheme, "http" | "https" | "ws" | "wss")
 }
