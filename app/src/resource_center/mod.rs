@@ -91,6 +91,12 @@ pub enum TipAction {
     // This toggles Warp Drive rather than opening it. This enum can't directly be
     // renamed because we serialize it into the welcome tips.
     OpenWarpDrive,
+    // Deprecated: the changelog was removed from this fork, but old clients
+    // persisted `Tip::Action(TipAction::Changelog)` into the
+    // `WelcomeTipsFeaturesUsed` preference. Dropping the variant would make the
+    // whole `HashSet<Tip>` fail to deserialize and silently reset every
+    // recorded tip, so the variant stays (and must not be re-used).
+    Changelog,
     // Note that this item has been deprecated from the UI and is not in any section.
     // We are leaving it in this enum to ensure that we don't re-use `Workflows` as a
     // value. Since old clients will have this value in their user defaults, we want
@@ -110,6 +116,8 @@ impl TipAction {
             TipAction::SaveNewLaunchConfig => "workspace:open_launch_config_save_modal",
             TipAction::WarpAI => "workspace:toggle_ai_assistant",
             TipAction::OpenWarpDrive => "workspace:toggle_left_panel",
+            // Deprecated; the binding no longer exists, so no shortcut resolves.
+            TipAction::Changelog => "/changelog",
             TipAction::Workflows => "input:toggle_workflows",
         }
     }
