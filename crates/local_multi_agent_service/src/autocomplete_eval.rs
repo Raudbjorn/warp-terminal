@@ -1,4 +1,6 @@
-use std::{env, fs, path::PathBuf, time::Instant};
+use std::path::PathBuf;
+use std::time::Instant;
+use std::{env, fs};
 
 use local_multi_agent_service::autocomplete::{
     AutocompleteBlockContext, LocalCommandAutocompleteRequest, LocalCommandAutocompleteResponse,

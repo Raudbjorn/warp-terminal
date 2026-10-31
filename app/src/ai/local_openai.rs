@@ -1,20 +1,20 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
 use parking_lot::{Mutex, RwLock};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 
-use crate::{
-    ai::local_opencode::{OpenCodeError, OpenCodeSidecarPool},
-    ai::predict::{
-        generate_ai_input_suggestions::{
-            GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2,
-        },
-        predict_am_queries::{PredictAMQueriesRequest, PredictAMQueriesResponse},
-    },
-    ai_assistant::{execution_context::WarpAiExecutionContext, AIGeneratedCommand},
-    drive::workflows::ai_assist::{GeneratedArgument, GeneratedCommandMetadata},
-    settings::{LocalOpenAISettingsSnapshot, LocalProviderKind},
+use crate::ai::local_opencode::{OpenCodeError, OpenCodeSidecarPool};
+use crate::ai::predict::generate_ai_input_suggestions::{
+    GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2,
 };
+use crate::ai::predict::predict_am_queries::{PredictAMQueriesRequest, PredictAMQueriesResponse};
+use crate::ai_assistant::AIGeneratedCommand;
+use crate::ai_assistant::execution_context::WarpAiExecutionContext;
+use crate::drive::workflows::ai_assist::{GeneratedArgument, GeneratedCommandMetadata};
+use crate::settings::{LocalOpenAISettingsSnapshot, LocalProviderKind};
 
 mod reasoning;
 
@@ -580,7 +580,10 @@ impl LocalOpenAIClient {
     /// conversation's cached ones; call [`Self::clear_reasoning_state`] when the conversation ends.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "no in-app multi-turn caller of the Responses API yet")
+        expect(
+            dead_code,
+            reason = "no in-app multi-turn caller of the Responses API yet"
+        )
     )]
     pub(crate) async fn chat_completion_responses(
         &self,
@@ -627,7 +630,10 @@ impl LocalOpenAIClient {
     /// conversation ends or is reset.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "no in-app multi-turn caller of the Responses API yet")
+        expect(
+            dead_code,
+            reason = "no in-app multi-turn caller of the Responses API yet"
+        )
     )]
     pub(crate) fn clear_reasoning_state(&self, conversation_id: &str) {
         self.reasoning_cache.lock().clear(conversation_id);
@@ -761,12 +767,12 @@ fn first_output_text(output: Vec<ResponsesOutputItem>) -> Result<String, LocalOp
     output
         .into_iter()
         .find_map(|item| {
-            item.content
-                .into_iter()
-                .find_map(|content| match (content.kind.as_str(), content.text) {
+            item.content.into_iter().find_map(|content| {
+                match (content.kind.as_str(), content.text) {
                     ("output_text", Some(text)) => Some(text),
                     _ => None,
-                })
+                }
+            })
         })
         .ok_or_else(|| {
             LocalOpenAIError::ResponsesShape(

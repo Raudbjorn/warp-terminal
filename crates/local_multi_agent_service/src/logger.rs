@@ -1,8 +1,6 @@
-use std::{
-    fs::{self, OpenOptions},
-    io::Write,
-    sync::Arc,
-};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::sync::Arc;
 
 use chrono::Utc;
 use serde_json::{Map, Value, json};

@@ -1,13 +1,9 @@
-use std::{
-    convert::Infallible,
-    sync::{Arc, Mutex},
-};
+use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
 
-use axum::{
-    Json, Router,
-    response::sse::{Event, Sse},
-    routing::{get, post},
-};
+use axum::response::sse::{Event, Sse};
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -436,7 +432,10 @@ async fn local_only_mode_does_not_follow_a_redirect_to_a_public_host() {
         post(|| async {
             (
                 axum::http::StatusCode::TEMPORARY_REDIRECT,
-                [(axum::http::header::LOCATION, "https://api.example.com/v1/chat/completions")],
+                [(
+                    axum::http::header::LOCATION,
+                    "https://api.example.com/v1/chat/completions",
+                )],
             )
         }),
     );

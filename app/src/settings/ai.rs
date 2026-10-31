@@ -2455,9 +2455,7 @@ impl AISettings {
         match network_policy::parse_allowed_private_hosts(raw) {
             Ok(hosts) => network_policy::set_allowed_private_hosts(hosts),
             Err(err) => {
-                log::warn!(
-                    "Ignoring invalid agents.local_openai.allowed_private_hosts: {err}"
-                );
+                log::warn!("Ignoring invalid agents.local_openai.allowed_private_hosts: {err}");
                 network_policy::set_allowed_private_hosts(Vec::new());
             }
         }

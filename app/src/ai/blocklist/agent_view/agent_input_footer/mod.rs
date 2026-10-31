@@ -66,7 +66,7 @@ use crate::appearance::Appearance;
 use crate::auth::{AuthManager, AuthStateProvider};
 use crate::completer::SessionContext;
 use crate::context_chips::display_chip::{DisplayChip, DisplayChipConfig, PromptChipShellCommand};
-use crate::context_chips::plugin_prompt::{render_plugin_chips_for_side, PromptSide};
+use crate::context_chips::plugin_prompt::{PromptSide, render_plugin_chips_for_side};
 use crate::context_chips::prompt_type::PromptType;
 use crate::context_chips::{self, ContextChipKind};
 use crate::features::FeatureFlag;

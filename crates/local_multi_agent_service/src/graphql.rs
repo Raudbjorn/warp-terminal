@@ -1,12 +1,10 @@
 use serde_json::{Value, json};
 
-use crate::{
-    config::Config,
-    provider::{LocalModelConfig, ProviderRuntime},
-    store::{
-        GenericStringObjectInput, GenericStringObjectRecord, IntegrationConfigPatch,
-        IntegrationRecord, IntegrationStore,
-    },
+use crate::config::Config;
+use crate::provider::{LocalModelConfig, ProviderRuntime};
+use crate::store::{
+    GenericStringObjectInput, GenericStringObjectRecord, IntegrationConfigPatch, IntegrationRecord,
+    IntegrationStore,
 };
 
 #[derive(Debug, Clone)]

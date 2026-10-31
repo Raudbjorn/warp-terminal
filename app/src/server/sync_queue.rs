@@ -1,4 +1,3 @@
-use warp_core::channel::ChannelState;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -11,6 +10,7 @@ use derivative::Derivative;
 use http::StatusCode;
 use lazy_static::lazy_static;
 use uuid::Uuid;
+use warp_core::channel::ChannelState;
 use warp_errors::report_error;
 use warp_graphql::scalars::time::ServerTimestamp;
 use warpui::r#async::FutureId;

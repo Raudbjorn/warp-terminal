@@ -33,14 +33,15 @@
 //! drain task prevents the child from blocking on a full pipe and owns the
 //! kill path so the `Drop` impl stays non-blocking.
 
-use futures::io::{AsyncBufReadExt, BufReader};
-use futures::AsyncReadExt;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use futures::AsyncReadExt;
+use futures::io::{AsyncBufReadExt, BufReader};
+use serde::Deserialize;
 use thiserror::Error;
 /// Default binary name resolved from `$PATH` when the user does not pin one.
 pub const DEFAULT_OPENCODE_BINARY: &str = "opencode";

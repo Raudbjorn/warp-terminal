@@ -1,4 +1,3 @@
-use warp_core::channel::ChannelState;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -8,6 +7,7 @@ use itertools::Itertools;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
 use url::Url;
+use warp_core::channel::ChannelState;
 use warp_core::context_flag::ContextFlag;
 use warp_core::settings::Setting;
 use warp_core::ui::theme::color::internal_colors;

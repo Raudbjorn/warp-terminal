@@ -96,9 +96,7 @@ impl LocalCommandAutocompleteResponse {
         } else {
             "none"
         };
-        let command = parsed_command
-            .or(fallback_command)
-            .unwrap_or_default();
+        let command = parsed_command.or(fallback_command).unwrap_or_default();
         let commands = if command.is_empty() {
             Vec::new()
         } else {
@@ -337,9 +335,7 @@ fn is_container_id(value: &str) -> bool {
 
 fn is_package_argument_prefix(prefix: &str) -> bool {
     let prefix = prefix.trim_end();
-    prefix.ends_with(" -p")
-        || prefix.ends_with(" --package")
-        || prefix.ends_with(" --package-name")
+    prefix.ends_with(" -p") || prefix.ends_with(" --package") || prefix.ends_with(" --package-name")
 }
 
 fn package_candidate(file_candidates: &[String]) -> Option<String> {

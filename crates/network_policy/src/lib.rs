@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 mod private_hosts;
@@ -195,8 +195,7 @@ fn is_loopback_url(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => {
-            ip.is_loopback()
-                || ip.to_ipv4().is_some_and(|v4| v4.is_loopback())
+            ip.is_loopback() || ip.to_ipv4().is_some_and(|v4| v4.is_loopback())
         }
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         None => false,
@@ -310,5 +309,4 @@ mod tests {
         let url = Url::parse("http://[fe80::1]:8080").unwrap();
         assert!(!is_loopback_url(&url));
     }
-
 }

@@ -1,26 +1,22 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::{
-    autocomplete::{
-        AUTOCOMPLETE_MAX_TOKENS, AUTOCOMPLETE_MODEL_ALIAS, LocalCommandAutocompleteRequest,
-        LocalCommandAutocompleteResponse, autocomplete_provider_messages,
-        deterministic_autocomplete_command,
-    },
-    config::{
-        Config, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MODEL, non_empty_str, trim_trailing_slash,
-    },
-    model::resolve_provider_model,
-    request::{ContextImage, McpToolSummary},
+use crate::autocomplete::{
+    AUTOCOMPLETE_MAX_TOKENS, AUTOCOMPLETE_MODEL_ALIAS, LocalCommandAutocompleteRequest,
+    LocalCommandAutocompleteResponse, autocomplete_provider_messages,
+    deterministic_autocomplete_command,
 };
+use crate::config::{
+    Config, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MODEL, non_empty_str, trim_trailing_slash,
+};
+use crate::model::resolve_provider_model;
+use crate::request::{ContextImage, McpToolSummary};
 
 const MODEL_CONTEXT_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -380,7 +376,8 @@ impl ProviderRuntime {
         };
         let base_url = trim_trailing_slash(base_url);
         let models_url = format!("{base_url}/models");
-        if let Err(error) = network_policy::check_url_str(&models_url, "provider model list request")
+        if let Err(error) =
+            network_policy::check_url_str(&models_url, "provider model list request")
         {
             log::warn!("{error}");
             return fallback_local_models(config);
@@ -463,7 +460,8 @@ impl ProviderRuntime {
 
         let mut context_windows_by_model = HashMap::new();
         let models_url = format!("{base_url}/models");
-        if let Err(error) = network_policy::check_url_str(&models_url, "provider model list request")
+        if let Err(error) =
+            network_policy::check_url_str(&models_url, "provider model list request")
         {
             log::warn!("{error}");
             return context_windows_by_model;
@@ -1293,10 +1291,7 @@ impl HarmonyToolCallValueParser<'_> {
             return self.parse_json_string();
         }
         let start = self.index;
-        let end = self
-            .rest()
-            .find(':')
-            .unwrap_or_else(|| self.rest().len());
+        let end = self.rest().find(':').unwrap_or_else(|| self.rest().len());
         self.index += end;
         non_empty_str(self.input[start..self.index].trim()).map(str::to_owned)
     }

@@ -5,14 +5,11 @@
 //! choice via [`agent_backends::set_grpc_harness`]; it takes effect on next launch.
 //! The in-process bridge reads the selected backend's `grpc_harness`.
 
-use warpui::{
-    presenter::ChildView, Element, Entity, TypedActionView, View, ViewContext, ViewHandle,
-};
+use warpui::presenter::ChildView;
+use warpui::{Element, Entity, TypedActionView, View, ViewContext, ViewHandle};
 
-use crate::{
-    util::agent_backends,
-    view_components::{Dropdown, DropdownItem},
-};
+use crate::util::agent_backends;
+use crate::view_components::{Dropdown, DropdownItem};
 
 /// A view wrapping a dropdown that selects the active gRPC harness.
 pub struct GrpcHarnessSelectorView {

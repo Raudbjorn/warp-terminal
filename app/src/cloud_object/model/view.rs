@@ -1,8 +1,8 @@
-use warp_core::channel::ChannelState;
 use std::cell::RefCell;
 use std::collections::HashMap;
 
 use chrono::{Duration, Utc};
+use warp_core::channel::ChannelState;
 use warp_graphql::scalars::time::ServerTimestamp;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity};
 

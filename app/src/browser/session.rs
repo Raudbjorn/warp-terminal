@@ -26,17 +26,17 @@
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::process::{Child, Command};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
-use base64::engine::general_purpose::STANDARD as BASE64;
+use anyhow::{Context, Result, anyhow};
 use base64::Engine as _;
-use serde::Deserialize;
-use serde_json::{json, Value};
+use base64::engine::general_purpose::STANDARD as BASE64;
 use dirs;
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tungstenite::{Message, WebSocket};
 use warpui::image_cache::StaticImage;
 

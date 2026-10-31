@@ -3,8 +3,9 @@
 //! 写入 PTY 时调 `build_ssh_command_line`,会用 shell-escape 引用每个 arg,
 //! 防止用户名 / host / key_path 里的空格或单引号破坏命令行。
 
-use crate::types::{AuthType, SshServerInfo};
 use std::borrow::Cow;
+
+use crate::types::{AuthType, SshServerInfo};
 
 pub fn build_ssh_args(server: &SshServerInfo) -> Vec<String> {
     let mut args: Vec<String> = vec!["ssh".into()];
@@ -73,7 +74,10 @@ mod tests {
     fn custom_port_uses_dash_p() {
         let mut s = server();
         s.port = 2222;
-        assert_eq!(build_ssh_args(&s), vec!["ssh", "-p", "2222", "alice@1.2.3.4"]);
+        assert_eq!(
+            build_ssh_args(&s),
+            vec!["ssh", "-p", "2222", "alice@1.2.3.4"]
+        );
     }
 
     #[test]
@@ -108,7 +112,10 @@ mod tests {
         s.auth_type = AuthType::Key;
         s.key_path = Some("/path with spaces/id_rsa".into());
         let line = build_ssh_command_line(&s);
-        assert!(line.contains("'/path with spaces/id_rsa'"), "actual: {line}");
+        assert!(
+            line.contains("'/path with spaces/id_rsa'"),
+            "actual: {line}"
+        );
     }
     #[test]
     fn target_starting_with_dash_gets_option_terminator() {
@@ -118,17 +125,11 @@ mod tests {
         let mut s = server();
         s.username = String::new();
         s.host = "-oProxyCommand=evil".into();
-        assert_eq!(
-            build_ssh_args(&s),
-            vec!["ssh", "--", "-oProxyCommand=evil"]
-        );
+        assert_eq!(build_ssh_args(&s), vec!["ssh", "--", "-oProxyCommand=evil"]);
 
         let mut s = server();
         s.username = "-evil".into();
         s.host = "1.2.3.4".into();
-        assert_eq!(
-            build_ssh_args(&s),
-            vec!["ssh", "--", "-evil@1.2.3.4"]
-        );
+        assert_eq!(build_ssh_args(&s), vec!["ssh", "--", "-evil@1.2.3.4"]);
     }
 }

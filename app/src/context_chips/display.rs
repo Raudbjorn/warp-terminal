@@ -12,7 +12,7 @@ use warpui::{
 };
 
 use super::display_chip::{DisplayChip, DisplayChipConfig, PromptDisplayChipEvent};
-use super::plugin_prompt::{render_plugin_chips_for_side, PluginPromptModel, PromptSide};
+use super::plugin_prompt::{PluginPromptModel, PromptSide, render_plugin_chips_for_side};
 use super::prompt_type::PromptType;
 use super::{ChipResult, ContextChipKind, git_line_changes_from_chips};
 use crate::ai::blocklist::agent_view::AgentViewController;

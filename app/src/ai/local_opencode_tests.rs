@@ -8,8 +8,7 @@ fn parses_json_announcement() {
 
 #[test]
 fn parses_announcement_with_address_alias() {
-    let ann =
-        OpenCodeAnnouncement::from_line("{\"address\":\"http://127.0.0.1:43123\"}").unwrap();
+    let ann = OpenCodeAnnouncement::from_line("{\"address\":\"http://127.0.0.1:43123\"}").unwrap();
     assert_eq!(ann.port, 43123);
 }
 
@@ -36,8 +35,7 @@ fn parses_url_with_address_field() {
     // The original regex would have matched the IPv4 octet `127`
     // instead of `43123`; the URL-aware parser must skip past
     // the host's `:` and read after it.
-    let ann =
-        OpenCodeAnnouncement::from_line(r#"{"address":"http://127.0.0.1:43123"}"#).unwrap();
+    let ann = OpenCodeAnnouncement::from_line(r#"{"address":"http://127.0.0.1:43123"}"#).unwrap();
     assert_eq!(ann.port, 43123);
 }
 
@@ -156,10 +154,7 @@ const TEST_PASSWORD: &str = "test-password";
 const TEST_BASIC_AUTH: &str = "Basic b3BlbmNvZGU6dGVzdC1wYXNzd29yZA==";
 const JSON: &str = "application/json";
 
-async fn run_generate(
-    server: &mockito::ServerGuard,
-    model: &str,
-) -> Result<String, OpenCodeError> {
+async fn run_generate(server: &mockito::ServerGuard, model: &str) -> Result<String, OpenCodeError> {
     generate_via_session(
         &http_client::Client::new(),
         &server.url(),

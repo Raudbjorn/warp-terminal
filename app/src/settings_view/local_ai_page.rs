@@ -121,7 +121,11 @@ impl TypedActionView for LocalAISettingsPageView {
             }
             LocalAISettingsPageAction::ToggleUseResponsesApi => {
                 AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                    report_if_error!(settings.local_openai_use_responses_api.toggle_and_save_value(ctx));
+                    report_if_error!(
+                        settings
+                            .local_openai_use_responses_api
+                            .toggle_and_save_value(ctx)
+                    );
                 });
                 ctx.notify();
             }
@@ -206,7 +210,10 @@ impl LocalAIProviderWidget {
                 // the `shell_words::split` save handler below: arguments with
                 // spaces, quotes, or backslashes survive an unchanged save.
                 shell_words::join(ai_settings.local_openai_opencode_args.value()),
-                ai_settings.local_openai_allowed_private_hosts.value().clone(),
+                ai_settings
+                    .local_openai_allowed_private_hosts
+                    .value()
+                    .clone(),
             )
         };
         let base_url_editor = Self::create_editor(ctx, base_url, "http://127.0.0.1:1234/v1", false);
@@ -346,9 +353,11 @@ impl LocalAIProviderWidget {
                     Ok(_) => {
                         view.allowed_private_hosts_error = None;
                         AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                            report_if_error!(settings
-                                .local_openai_allowed_private_hosts
-                                .set_value(value, ctx));
+                            report_if_error!(
+                                settings
+                                    .local_openai_allowed_private_hosts
+                                    .set_value(value, ctx)
+                            );
                         });
                     }
                     Err(err) => view.allowed_private_hosts_error = Some(err.to_string()),
@@ -460,7 +469,9 @@ impl LocalAIProviderWidget {
         appearance: &Appearance,
         app: &AppContext,
     ) -> Box<dyn Element> {
-        let is_enabled = *AISettings::as_ref(app).local_openai_use_responses_api.value();
+        let is_enabled = *AISettings::as_ref(app)
+            .local_openai_use_responses_api
+            .value();
         let label = render_body_item_label::<LocalAISettingsPageAction>(
             "Use the Responses API".to_string(),
             Some(appearance.theme().active_ui_text_color().into()),
