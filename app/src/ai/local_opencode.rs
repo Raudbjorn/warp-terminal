@@ -1,9 +1,18 @@
 //! OpenCode sidecar lifecycle for the local AI provider.
 //!
-//! OpenCode (https://opencode.io) is a CLI agent runtime that exposes an
-//! OpenAI-compatible HTTP server. When the user picks `OpenCode` as their
+//! OpenCode (https://opencode.ai) is a CLI agent runtime whose `serve`
+//! command exposes an HTTP API. It does **not** serve OpenAI Chat
+//! Completions; it is session based. When the user picks `OpenCode` as their
 //! `local_openai` provider, we spawn the binary, capture the listening port
-//! from its stdout, and route Chat Completions requests to it.
+//! from its stdout, and for each request create a throwaway session, call
+//! `POST /api/session/{id}/generate`, and delete the session again.
+//!
+//! The server listens on loopback and refuses unauthenticated requests. We
+//! pick a random password per sidecar, hand it over through
+//! `OPENCODE_SERVER_PASSWORD`, and authenticate with HTTP Basic auth, so
+//! other local processes cannot drive the sidecar. Sessions are created with
+//! a deny-all permission ruleset: OpenCode is a coding agent, and a
+//! command-generation prompt must never be able to run tools.
 //!
 //! The sidecar is pooled per working directory so that sessions in different
 //! repos do not share state (mirroring the pattern in `JMrtzsn/warpdrive`,
@@ -11,6 +20,10 @@
 //! on the canonicalized working directory; if the user changes directory
 //! mid-session, the next request spawns a fresh sidecar for the new cwd and
 //! the old one is shut down when the last clone is dropped.
+//!
+//! Note: today `LocalOpenAIClient` keys the pool on the process's current
+//! directory (`set_opencode_working_dir` has no caller yet), so in practice
+//! there is one sidecar per Warp process rather than one per repository.
 //!
 //! Sidecar lifetime: a `Sidecar` keeps the child process alive for as long
 //! as the `Sidecar` is referenced. When the last clone is dropped, the child
@@ -20,12 +33,14 @@
 //! drain task prevents the child from blocking on a full pipe and owns the
 //! kill path so the `Drop` impl stays non-blocking.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Duration;
+use futures::io::{AsyncBufReadExt, BufReader};
 use futures::AsyncReadExt;
 use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 use thiserror::Error;
 /// Default binary name resolved from `$PATH` when the user does not pin one.
 pub const DEFAULT_OPENCODE_BINARY: &str = "opencode";
@@ -34,9 +49,27 @@ pub const DEFAULT_OPENCODE_BINARY: &str = "opencode";
 /// port and announce it on stdout, which we then parse.
 pub const DEFAULT_OPENCODE_ARGS: &[&str] = &["serve", "--port", "0"];
 
-/// Time we wait for the sidecar to print its port after spawn.
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Time we wait for the sidecar to print its port after spawn. A cold first
+/// start (database migration) has been observed to take ~20s.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Longest startup line buffered while waiting for the port announcement. The
+/// announcement itself is a short line, so a sidecar that writes this much
+/// without a newline is not announcing anything.
+const MAX_ANNOUNCEMENT_LINE_BYTES: u64 = 64 * 1024;
+
+/// Environment variables OpenCode reads its Basic-auth credentials from. The
+/// username is pinned so an `OPENCODE_SERVER_USERNAME` in the user's own
+/// environment cannot make our requests fail with 401. OpenCode reads
+/// `OPENCODE_PASSWORD` first and only then `OPENCODE_SERVER_PASSWORD`, so the
+/// generated password goes into both: an inherited `OPENCODE_PASSWORD` would
+/// otherwise win and every request would be rejected.
+const SERVER_USERNAME_ENV: &str = "OPENCODE_SERVER_USERNAME";
+const SERVER_PASSWORD_ENVS: [&str; 2] = ["OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD"];
+const SERVER_USERNAME: &str = "opencode";
+
+/// Longest slice of an unparseable error body we echo into an error message.
+const ERROR_BODY_PREVIEW_CHARS: usize = 200;
 
 #[derive(Debug, Error)]
 pub enum OpenCodeError {
@@ -52,18 +85,25 @@ pub enum OpenCodeError {
     NoWorkingDirectory,
     #[error("OpenCode sidecar I/O failed: {0}")]
     Io(#[from] std::io::Error),
+    #[error(
+        "OpenCode model `{0}` must be written `providerID/modelID`, e.g. `ollama/qwen2.5-coder:7b`"
+    )]
+    InvalidModel(String),
+    #[error("OpenCode request failed: {0}")]
+    Request(String),
+    #[error("OpenCode returned no text")]
+    EmptyResponse,
 }
 
 /// JSON announcement OpenCode prints once it is bound to a port.
 /// We accept the minimum subset; unknown fields are ignored.
 #[derive(Debug, Deserialize)]
 struct OpenCodeAnnouncement {
-    /// Listening port. JSON parsing accepts a bare `{"port": N}` shape
-    /// (and the `address`/`url` aliases on the field are a no-op for
-    /// `u16` — kept for forward-compat in case a future schema ever
-    /// aliases a numeric field). URL-style and trailing-port forms
-    /// (e.g. `ready:43123`) are handled by the fallback in
-    /// `OpenCodeAnnouncement::from_line`.
+    /// Listening port. Newer OpenCode versions print a bare JSON number
+    /// (`{"port": 43123}`); the `#[serde(alias)]`s also accept a *numeric*
+    /// `address`/`url` field. String forms (`{"url":"http://127.0.0.1:43123"}`
+    /// or the plain-text `ready:43123`) cannot deserialize into `u16`, so they
+    /// fall through to the URL/heuristic parsing in `from_line`.
     #[serde(alias = "address", alias = "url")]
     port: u16,
 }
@@ -119,17 +159,20 @@ impl OpenCodeAnnouncement {
             }
         }
 
-        // Last resort: a plain trailing `:NNNN` separator (e.g.
-        // `ready:43123`).
-        if let Some(idx) = line.rfind(':') {
-            let tail = &line[idx + 1..];
-            let digits: String = tail
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if let Ok(port) = digits.parse::<u16>() {
-                if port > 0 {
-                    return Ok(OpenCodeAnnouncement { port });
+        // Last resort: the whole line is `word:NNNN` (e.g. `ready:43123`).
+        // Anchoring on the whole line keeps the tail of an unrelated log
+        // line, such as the seconds in a `12:34:56Z` timestamp, from being
+        // read as a port.
+        if let Some((word, digits)) = line.split_once(':') {
+            let is_word = !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphabetic() || c == '_' || c == '-');
+            if is_word && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(port) = digits.parse::<u16>() {
+                    if port > 0 {
+                        return Ok(OpenCodeAnnouncement { port });
+                    }
                 }
             }
         }
@@ -148,6 +191,12 @@ struct SidecarInner {
     /// `OpenCodeSidecar` is dropped; the drain task observes that
     /// closure as a shutdown signal.
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    /// Set by the drain task once the child has exited on its own (crash,
+    /// external kill). The pool uses it to evict and respawn instead of
+    /// handing out a URL nothing is listening on.
+    exited: Arc<AtomicBool>,
+    /// Basic-auth password this sidecar was started with.
+    password: String,
 }
 
 /// Handle to a running OpenCode sidecar. Cloneable; clones share the
@@ -159,14 +208,38 @@ pub struct OpenCodeSidecar {
 }
 
 impl OpenCodeSidecar {
-    /// Base URL the Chat Completions endpoint is reachable at.
-    pub fn base_url(&self) -> &str {
-        &self.inner.base_url
+    /// Run one prompt through the sidecar and return the generated text.
+    /// `model` must be `providerID/modelID`. `timeout` applies to each of the
+    /// (up to three) HTTP calls, not to the whole exchange.
+    pub async fn generate(
+        &self,
+        client: &http_client::Client,
+        model: &str,
+        prompt: &str,
+        timeout: Duration,
+    ) -> Result<String, OpenCodeError> {
+        generate_via_session(
+            client,
+            &self.inner.base_url,
+            &self.inner.password,
+            &self.inner.working_dir,
+            model,
+            prompt,
+            timeout,
+        )
+        .await
+    }
+
+    /// Whether the child process is still running. `false` once it has
+    /// exited on its own; the pool replaces such sidecars on the next lookup.
+    pub fn is_alive(&self) -> bool {
+        !self.inner.exited.load(Ordering::Acquire)
     }
 
     /// Working directory the sidecar was launched with. Kept on the
     /// public API for callers that want to log or display the
-    /// sidecar's CWD; not used by the chat-completion path.
+    /// sidecar's CWD; the session path passes it to OpenCode as the
+    /// session location.
     #[allow(dead_code)]
     pub fn working_dir(&self) -> &Path {
         &self.inner.working_dir
@@ -187,23 +260,32 @@ pub async fn spawn(
         return Err(OpenCodeError::BinaryNotFound(String::new()));
     }
 
-    let mut process = async_process::Command::new(command)
+    let password = generate_password();
+    let mut sidecar_command = async_process::Command::new(command);
+    sidecar_command
         .args(args)
         .current_dir(working_dir)
+        .env(SERVER_USERNAME_ENV, SERVER_USERNAME)
         .stdout(async_process::Stdio::piped())
         .stderr(async_process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|err| match err.kind() {
-            std::io::ErrorKind::NotFound => OpenCodeError::BinaryNotFound(command.to_string()),
-            _ => OpenCodeError::Io(err),
-        })?;
+        .kill_on_drop(true);
+    for name in SERVER_PASSWORD_ENVS {
+        sidecar_command.env(name, &password);
+    }
+    let mut process = sidecar_command.spawn().map_err(|err| match err.kind() {
+        std::io::ErrorKind::NotFound => OpenCodeError::BinaryNotFound(command.to_string()),
+        _ => OpenCodeError::Io(err),
+    })?;
 
     let stdout = process
         .stdout
         .take()
         .expect("stdout was piped in the spawn above");
-    let stderr = process.stderr.take();
+    // Drain stderr from the start: a chatty startup that fills the pipe would
+    // otherwise block the child before it can announce readiness.
+    if let Some(stderr) = process.stderr.take() {
+        discard_in_background(stderr);
+    }
 
     // Read the announcement with a timeout; on timeout, kill the child
     // and surface a structured error.
@@ -226,58 +308,59 @@ pub async fn spawn(
     // `network_policy` would refuse it.
     let base_url = format!("http://127.0.0.1:{port}");
 
-    // Spawn the background drain that owns the kill path.
+    // Keep draining stdout after the announcement so the pipe stays open and
+    // the sidecar never blocks (or gets EPIPE) writing further stdout.
+    discard_in_background(stdout);
+
+    // Spawn the background task that owns the kill path.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    tokio::spawn(drain_sidecar(process, stderr, Some(stdout), shutdown_rx));
+    let exited = Arc::new(AtomicBool::new(false));
+    tokio::spawn(supervise_sidecar(process, shutdown_rx, Arc::clone(&exited)));
 
     Ok(OpenCodeSidecar {
         inner: Arc::new(SidecarInner {
             base_url,
             working_dir: working_dir.to_path_buf(),
             shutdown_tx,
+            exited,
+            password,
         }),
     })
 }
 
-/// Read from `stdout` until we have a parseable announcement. Reads one
-/// byte at a time so the announcement can be detected whether the sidecar
-/// emits it on a fresh line or appended to the first line of output.
+/// Read `stdout` line by line until one parses as a port announcement.
+/// Lines are read as raw bytes (not `String`s) so a non-UTF-8 log line is
+/// skipped by `try_parse_buffer` rather than failing the whole startup. A
+/// line longer than `MAX_ANNOUNCEMENT_LINE_BYTES` fails the startup instead of
+/// growing the buffer until the timeout.
 async fn read_announcement(
-    mut stdout: async_process::ChildStdout,
+    stdout: async_process::ChildStdout,
 ) -> Result<(OpenCodeAnnouncement, async_process::ChildStdout), OpenCodeError> {
-    // Byte-at-a-time read so we can detect the announcement whether
-    // the sidecar emits it on its own line, appended to the first
-    // line of output, or right before EOF without a trailing
-    // newline. We clear `buffer` at every newline so the parser
-    // only ever sees one line of input — without that, a leading
-    // unparseable line (e.g. a `#` comment) would otherwise be
-    // concatenated with the real announcement and confuse the
-    // `rfind(':')` fallback in `OpenCodeAnnouncement::from_line`.
-    let mut buffer = Vec::with_capacity(256);
-    let mut byte = [0u8; 1];
+    let mut reader = BufReader::new(stdout);
+    let mut line = Vec::with_capacity(256);
     loop {
-        match stdout.read(&mut byte).await {
-            Ok(0) => {
-                // EOF before announcement. Give the buffered tail
-                // one last parse attempt so a sidecar that prints
-                // the port line and exits without a trailing
-                // newline is still recognized.
-                if let Ok(ann) = try_parse_buffer(&buffer) {
-                    return Ok((ann, stdout));
-                }
-                break;
+        // Only ever parse the current line, so a preceding log line cannot
+        // poison the parse and nothing is re-parsed.
+        line.clear();
+        let read = (&mut reader)
+            .take(MAX_ANNOUNCEMENT_LINE_BYTES)
+            .read_until(b'\n', &mut line)
+            .await;
+        match read {
+            Ok(0) => break, // EOF before announcement
+            Ok(_) if !line.ends_with(b"\n") && line.len() as u64 >= MAX_ANNOUNCEMENT_LINE_BYTES => {
+                return Err(OpenCodeError::BadAnnouncement(format!(
+                    "startup line longer than {MAX_ANNOUNCEMENT_LINE_BYTES} bytes"
+                )));
             }
             Ok(_) => {
-                buffer.push(byte[0]);
-                if byte[0] == b'\n' {
-                    if let Ok(ann) = try_parse_buffer(&buffer) {
-                        // Hand stdout back so the caller can keep draining it;
-                        // dropping it here would close the pipe and risk
-                        // EPIPE/blocking if the sidecar logs more to stdout.
-                        return Ok((ann, stdout));
-                    }
-                    // Reset so the next line is parsed in isolation.
-                    buffer.clear();
+                if let Ok(ann) = try_parse_buffer(&line) {
+                    // Hand stdout back so the caller can keep draining it;
+                    // dropping it here would close the pipe and risk
+                    // EPIPE/blocking if the sidecar logs more to stdout.
+                    // Bytes the reader buffered past this line are dropped,
+                    // which is fine: the drain task discards stdout anyway.
+                    return Ok((ann, reader.into_inner()));
                 }
             }
             Err(err) => return Err(OpenCodeError::Io(err)),
@@ -298,53 +381,39 @@ fn try_parse_buffer(buffer: &[u8]) -> Result<OpenCodeAnnouncement, OpenCodeError
     OpenCodeAnnouncement::from_line(text)
 }
 
-/// Long-running task: drains stderr (so the child never blocks), and on
-/// shutdown signal kills the child.
-async fn drain_sidecar(
+/// Read and discard `reader` until EOF so the child never blocks on a full
+/// pipe. Reserved for future log capture (e.g. piping through `tracing`).
+fn discard_in_background<R>(mut reader: R)
+where
+    R: futures::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(_n) => {}
+            }
+        }
+    });
+}
+
+/// Long-running task: flags `exited` if the child dies on its own, and on
+/// shutdown signal kills it.
+async fn supervise_sidecar(
     mut child: async_process::Child,
-    stderr: Option<async_process::ChildStderr>,
-    stdout: Option<async_process::ChildStdout>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    exited: Arc<AtomicBool>,
 ) {
-    // Drain stderr in a sibling task so a noisy OpenCode log cannot wedge
-    // the drain loop. Future work can pipe the bytes through `tracing`.
-    if let Some(mut stderr) = stderr {
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 4096];
-            loop {
-                match stderr.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_n) => {
-                        // Discarded; reserved for future log capture.
-                    }
-                }
-            }
-        });
-    }
-
-    // Keep draining stdout after the announcement so the pipe stays open and
-    // the sidecar never blocks (or gets EPIPE) writing further stdout.
-    if let Some(mut stdout) = stdout {
-        tokio::spawn(async move {
-            let mut buffer = [0u8; 4096];
-            loop {
-                match stdout.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_n) => {
-                        // Discarded; reserved for future log capture.
-                    }
-                }
-            }
-        });
-    }
-
     // Wait for either an explicit shutdown signal, or for the watch
     // channel to close (which happens when every `OpenCodeSidecar`
     // clone — and therefore every `Sender` — is dropped), or for
     // the child to exit on its own.
     let should_shutdown = tokio::select! {
         _ = child.status() => {
-            // Process exited on its own; nothing to do.
+            // Process exited on its own; mark the handle dead so the pool
+            // evicts it rather than reusing a stale URL.
+            exited.store(true, Ordering::Release);
             return;
         }
         changed = shutdown.changed() => {
@@ -367,6 +436,226 @@ async fn drain_sidecar(
     let _ = child.status().await;
 }
 
+/// Random Basic-auth password for one sidecar (~240 bits from the OS RNG).
+/// The sidecar listens on loopback, so without a password any local process
+/// could drive it.
+fn generate_password() -> String {
+    format!(
+        "{}{}",
+        uuid::Uuid::new_v4().simple(),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+/// Split `providerID/modelID`. Only the first `/` separates the two, since
+/// model IDs can contain slashes themselves (`openrouter/anthropic/claude`).
+/// A bare model name is rejected on purpose: OpenCode would otherwise fall
+/// back to its own default model, which may be a hosted one, and a "Local AI"
+/// request must go where the user pointed it.
+fn parse_model_ref(model: &str) -> Result<(&str, &str), OpenCodeError> {
+    match model.trim().split_once('/') {
+        Some((provider_id, model_id)) if !provider_id.is_empty() && !model_id.is_empty() => {
+            Ok((provider_id, model_id))
+        }
+        _ => Err(OpenCodeError::InvalidModel(model.to_string())),
+    }
+}
+
+#[derive(Deserialize)]
+struct DataEnvelope<T> {
+    data: T,
+}
+
+#[derive(Deserialize)]
+struct SessionInfo {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct GenerateData {
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct ErrorBody {
+    message: String,
+}
+
+/// Create a session, generate once, delete the session. Split out from
+/// `OpenCodeSidecar::generate` so tests can point it at a mock server.
+///
+/// A fresh session per request keeps requests from sharing context. The
+/// session is deleted on every exit, including when the returned future is
+/// dropped mid-request (see `SessionCleanup`).
+async fn generate_via_session(
+    client: &http_client::Client,
+    base_url: &str,
+    password: &str,
+    working_dir: &Path,
+    model: &str,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, OpenCodeError> {
+    let (provider_id, model_id) = parse_model_ref(model)?;
+    // The directory travels as JSON, which cannot carry arbitrary bytes. A
+    // lossy conversion would name a different directory than the one asked for.
+    let directory = working_dir.to_str().ok_or_else(|| {
+        OpenCodeError::Request(format!(
+            "working directory is not valid UTF-8: {}",
+            working_dir.display()
+        ))
+    })?;
+
+    // Deny every permission: OpenCode is an agent with file and shell tools,
+    // and this path only ever wants text back.
+    let create = client
+        .post(format!("{base_url}/api/session"))
+        .basic_auth(SERVER_USERNAME, Some(password))
+        .timeout(timeout)
+        .json(&serde_json::json!({
+            "location": { "directory": directory },
+            "model": { "id": model_id, "providerID": provider_id },
+            "permissions": [{ "action": "*", "resource": "*", "effect": "deny" }],
+        }));
+    let session: DataEnvelope<SessionInfo> = send_checked(create)
+        .await?
+        .json()
+        .await
+        .map_err(|err| OpenCodeError::Request(err.to_string()))?;
+    let session_id = session.data.id;
+    let mut cleanup = SessionCleanup::new(
+        format!("{base_url}/api/session/{session_id}"),
+        password,
+        timeout,
+    );
+
+    let generate = client
+        .post(format!("{base_url}/api/session/{session_id}/generate"))
+        .basic_auth(SERVER_USERNAME, Some(password))
+        .timeout(timeout)
+        .json(&serde_json::json!({ "prompt": prompt }));
+    let generated = async {
+        let response: DataEnvelope<GenerateData> = send_checked(generate)
+            .await?
+            .json()
+            .await
+            .map_err(|err| OpenCodeError::Request(err.to_string()))?;
+        Ok::<_, OpenCodeError>(response.data.text)
+    }
+    .await;
+
+    cleanup.delete(client).await;
+
+    let text = generated?;
+    if text.trim().is_empty() {
+        return Err(OpenCodeError::EmptyResponse);
+    }
+    Ok(text)
+}
+
+/// Deletes one OpenCode session. A pooled sidecar outlives its requests, so a
+/// session that is not deleted stays on it, with the prompt it was given,
+/// until the sidecar exits or the pool is cleared.
+///
+/// Two paths leave a session behind: the request future being dropped after
+/// the session was created (a superseded prediction is aborted this way), and
+/// the DELETE itself failing. `delete` handles the normal exit; if it did not
+/// succeed, `Drop` makes one more attempt in the background.
+struct SessionCleanup {
+    delete_url: String,
+    password: String,
+    timeout: Duration,
+    /// Captured while the request runs: `Drop` may run on a thread with no
+    /// Tokio context, such as the UI thread aborting a prediction.
+    runtime: Option<tokio::runtime::Handle>,
+    armed: bool,
+}
+
+impl SessionCleanup {
+    fn new(delete_url: String, password: &str, timeout: Duration) -> Self {
+        Self {
+            delete_url,
+            password: password.to_string(),
+            timeout,
+            runtime: tokio::runtime::Handle::try_current().ok(),
+            armed: true,
+        }
+    }
+
+    /// Delete the session now. Stays armed on failure so `Drop` retries.
+    async fn delete(&mut self, client: &http_client::Client) {
+        match delete_session(client, &self.delete_url, &self.password, self.timeout).await {
+            Ok(()) => self.armed = false,
+            Err(err) => log::warn!(
+                "failed to delete OpenCode session {}, retrying once: {err}",
+                self.delete_url
+            ),
+        }
+    }
+}
+
+impl Drop for SessionCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let Some(runtime) = self.runtime.take() else {
+            log::warn!(
+                "no async runtime to delete OpenCode session {}; it stays until the sidecar exits",
+                self.delete_url
+            );
+            return;
+        };
+        let delete_url = std::mem::take(&mut self.delete_url);
+        let password = std::mem::take(&mut self.password);
+        let timeout = self.timeout;
+        runtime.spawn(async move {
+            // `http_client::Client` is not `Clone` and the request's client is
+            // borrowed, so the cleanup brings its own. It sends no Warp headers
+            // to the sidecar.
+            let client = http_client::Client::new_external();
+            if let Err(err) = delete_session(&client, &delete_url, &password, timeout).await {
+                log::warn!(
+                    "failed to delete OpenCode session {delete_url}: {err}; it stays until the sidecar exits"
+                );
+            }
+        });
+    }
+}
+
+async fn delete_session(
+    client: &http_client::Client,
+    delete_url: &str,
+    password: &str,
+    timeout: Duration,
+) -> Result<(), OpenCodeError> {
+    let request = client
+        .delete(delete_url.to_string())
+        .basic_auth(SERVER_USERNAME, Some(password))
+        .timeout(timeout);
+    send_checked(request).await.map(|_| ())
+}
+
+/// Send the request and turn a non-2xx response into an `OpenCodeError`
+/// carrying OpenCode's own `message` (e.g. "Authentication required").
+async fn send_checked(
+    request: http_client::RequestBuilder<'_>,
+) -> Result<http_client::Response, OpenCodeError> {
+    let response = request
+        .send()
+        .await
+        .map_err(|err| OpenCodeError::Request(err.to_string()))?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response.text().await.unwrap_or_default();
+    let message = serde_json::from_str::<ErrorBody>(&body)
+        .map(|parsed| parsed.message)
+        .unwrap_or_else(|_| body.chars().take(ERROR_BODY_PREVIEW_CHARS).collect());
+    Err(OpenCodeError::Request(format!("{status}: {message}")))
+}
+
 /// Pool of `OpenCodeSidecar`s keyed by working directory. Cheap to clone;
 /// clones share the same backing map. The internal `parking_lot::Mutex` is
 /// only ever held for synchronous map lookups/inserts (never across an
@@ -374,7 +663,16 @@ async fn drain_sidecar(
 /// `clear()` run on the (non-Tokio) UI thread without spawning a task.
 #[derive(Clone, Default)]
 pub struct OpenCodeSidecarPool {
-    inner: Arc<parking_lot::Mutex<HashMap<PathBuf, OpenCodeSidecar>>>,
+    inner: Arc<parking_lot::Mutex<PoolState>>,
+}
+
+#[derive(Default)]
+struct PoolState {
+    sidecars: HashMap<PathBuf, OpenCodeSidecar>,
+    /// Bumped by `clear()`. A spawn that began under an older generation was
+    /// started with settings that have since changed, so it must not be
+    /// pooled for later requests to reuse.
+    generation: u64,
 }
 
 impl OpenCodeSidecarPool {
@@ -382,9 +680,9 @@ impl OpenCodeSidecarPool {
         Self::default()
     }
 
-    /// Borrow the sidecar for `working_dir`, spawning a new one if absent.
-    /// Errors propagate from the spawn call; the pool is left unchanged on
-    /// failure so the next call retries.
+    /// Borrow the sidecar for `working_dir`, spawning a new one if absent or
+    /// if the pooled one has exited. Errors propagate from the spawn call;
+    /// the pool is left unchanged on failure so the next call retries.
     pub async fn get_or_spawn(
         &self,
         command: &str,
@@ -393,25 +691,44 @@ impl OpenCodeSidecarPool {
     ) -> Result<OpenCodeSidecar, OpenCodeError> {
         let canonical = canonicalize_for_pool(working_dir);
 
-        if let Some(existing) = self.inner.lock().get(&canonical).cloned() {
-            return Ok(existing);
-        }
+        let generation = {
+            let state = self.inner.lock();
+            if let Some(existing) = state.sidecars.get(&canonical) {
+                if existing.is_alive() {
+                    return Ok(existing.clone());
+                }
+                // Exited since it was pooled (crash or external kill): fall
+                // through and respawn; the insert below replaces the entry.
+            }
+            state.generation
+        };
 
         let sidecar = spawn(command, args, &canonical).await?;
-        let mut guard = self.inner.lock();
-        // Another caller may have raced us to insert; prefer the
-        // existing sidecar so we do not leak a duplicate child.
-        if let Some(existing) = guard.get(&canonical).cloned() {
-            return Ok(existing);
+        let mut state = self.inner.lock();
+        if state.generation != generation {
+            // `clear()` ran while this sidecar was starting, so it carries
+            // the old settings. Serve this request with it, but do not pool
+            // it; it exits once the last clone is dropped.
+            return Ok(sidecar);
         }
-        guard.insert(canonical, sidecar.clone());
+        // Another caller may have raced us to insert; prefer the
+        // existing live sidecar so we do not leak a duplicate child.
+        if let Some(existing) = state.sidecars.get(&canonical) {
+            if existing.is_alive() {
+                return Ok(existing.clone());
+            }
+        }
+        state.sidecars.insert(canonical, sidecar.clone());
         Ok(sidecar)
     }
 
-    /// Forget every cached sidecar. Existing clones continue to live;
-    /// the next `get_or_spawn` for any key spawns a fresh sidecar.
+    /// Forget every cached sidecar and invalidate spawns still in flight.
+    /// Existing clones continue to live; the next `get_or_spawn` for any key
+    /// spawns a fresh sidecar.
     pub fn clear(&self) {
-        self.inner.lock().clear();
+        let mut state = self.inner.lock();
+        state.sidecars.clear();
+        state.generation += 1;
     }
 }
 
@@ -434,8 +751,8 @@ mod tests {
 
     #[test]
     fn parses_announcement_with_address_alias() {
-        let ann = OpenCodeAnnouncement::from_line("{\"address\":\"http://127.0.0.1:43123\"}")
-            .unwrap();
+        let ann =
+            OpenCodeAnnouncement::from_line("{\"address\":\"http://127.0.0.1:43123\"}").unwrap();
         assert_eq!(ann.port, 43123);
     }
 
@@ -462,8 +779,8 @@ mod tests {
         // The original regex would have matched the IPv4 octet `127`
         // instead of `43123`; the URL-aware parser must skip past
         // the host's `:` and read after it.
-        let ann = OpenCodeAnnouncement::from_line(r#"{"address":"http://127.0.0.1:43123"}"#)
-            .unwrap();
+        let ann =
+            OpenCodeAnnouncement::from_line(r#"{"address":"http://127.0.0.1:43123"}"#).unwrap();
         assert_eq!(ann.port, 43123);
     }
 
@@ -498,9 +815,524 @@ mod tests {
     #[tokio::test]
     async fn spawn_rejects_empty_command() {
         let result = spawn("", &[], Path::new(".")).await;
-        assert!(matches!(
-            result,
-            Err(OpenCodeError::BinaryNotFound(_))
+        assert!(matches!(result, Err(OpenCodeError::BinaryNotFound(_))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_replaces_exited_sidecar() {
+        // `sh` announces a port and exits straight away, standing in for a
+        // sidecar that crashes after becoming ready.
+        let args = vec![
+            "-c".to_string(),
+            "echo 'server listening on http://127.0.0.1:43123'".to_string(),
+        ];
+        let pool = OpenCodeSidecarPool::new();
+        let dir = std::env::temp_dir();
+
+        let first = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
+        for _ in 0..100 {
+            if !first.is_alive() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!first.is_alive());
+
+        let second = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
+        assert!(!Arc::ptr_eq(&first.inner, &second.inner));
+    }
+
+    #[test]
+    fn parse_model_ref_splits_on_first_slash() {
+        assert_eq!(
+            parse_model_ref("ollama/qwen2.5-coder:7b").unwrap(),
+            ("ollama", "qwen2.5-coder:7b")
+        );
+        assert_eq!(
+            parse_model_ref(" openrouter/anthropic/claude ").unwrap(),
+            ("openrouter", "anthropic/claude")
+        );
+    }
+
+    #[test]
+    fn parse_model_ref_rejects_bare_and_empty_halves() {
+        for bad in ["qwen2.5-coder:7b", "", "/model", "provider/", "/"] {
+            assert!(
+                matches!(parse_model_ref(bad), Err(OpenCodeError::InvalidModel(_))),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_passwords_are_long_and_distinct() {
+        let first = generate_password();
+        assert!(first.len() >= 64);
+        assert_ne!(first, generate_password());
+    }
+
+    #[test]
+    fn readiness_rule_agrees_with_request_time_parsing() {
+        use crate::settings::LocalProviderKind;
+        for model in [
+            "ollama/m",
+            " ollama/m ",
+            "a/b/c",
+            "",
+            "  ",
+            "bare",
+            "ollama/",
+            "/m",
+            "/",
+        ] {
+            assert_eq!(
+                LocalProviderKind::OpenCode.accepts_model(model),
+                parse_model_ref(model).is_ok(),
+                "{model:?}"
+            );
+        }
+    }
+
+    const TEST_PASSWORD: &str = "test-password";
+    // base64("opencode:test-password")
+    const TEST_BASIC_AUTH: &str = "Basic b3BlbmNvZGU6dGVzdC1wYXNzd29yZA==";
+    const JSON: &str = "application/json";
+
+    async fn run_generate(
+        server: &mockito::ServerGuard,
+        model: &str,
+    ) -> Result<String, OpenCodeError> {
+        generate_via_session(
+            &http_client::Client::new(),
+            &server.url(),
+            TEST_PASSWORD,
+            Path::new("/work/repo"),
+            model,
+            "list files",
+            Duration::from_secs(5),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn generate_creates_session_generates_and_deletes() {
+        let mut server = mockito::Server::new_async().await;
+        let create = server
+            .mock("POST", "/api/session")
+            .match_header("authorization", TEST_BASIC_AUTH)
+            .match_body(mockito::Matcher::Json(serde_json::json!({
+                "location": { "directory": "/work/repo" },
+                "model": { "id": "qwen2.5-coder:7b", "providerID": "ollama" },
+                "permissions": [{ "action": "*", "resource": "*", "effect": "deny" }],
+            })))
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"id":"ses_1"}}"#)
+            .create_async()
+            .await;
+        let generate = server
+            .mock("POST", "/api/session/ses_1/generate")
+            .match_header("authorization", TEST_BASIC_AUTH)
+            .match_body(mockito::Matcher::Json(
+                serde_json::json!({ "prompt": "list files" }),
+            ))
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"text":"ls -la"}}"#)
+            .create_async()
+            .await;
+        let delete = server
+            .mock("DELETE", "/api/session/ses_1")
+            .match_header("authorization", TEST_BASIC_AUTH)
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let text = run_generate(&server, "ollama/qwen2.5-coder:7b")
+            .await
+            .unwrap();
+
+        assert_eq!(text, "ls -la");
+        create.assert_async().await;
+        generate.assert_async().await;
+        delete.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn generate_failure_surfaces_message_and_still_deletes_session() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/session")
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"id":"ses_2"}}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/session/ses_2/generate")
+            .with_status(503)
+            .with_header("content-type", JSON)
+            .with_body(
+                r#"{"_tag":"ServiceUnavailableError","message":"Free usage limit reached","service":"session generation"}"#,
+            )
+            .create_async()
+            .await;
+        let delete = server
+            .mock("DELETE", "/api/session/ses_2")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let err = run_generate(&server, "opencode/flint-40b-free")
+            .await
+            .unwrap_err();
+
+        match err {
+            OpenCodeError::Request(message) => {
+                assert!(message.contains("503"), "{message}");
+                assert!(message.contains("Free usage limit reached"), "{message}");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+        delete.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn unauthorized_create_reports_opencode_message() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/session")
+            .with_status(401)
+            .with_header("content-type", JSON)
+            .with_body(r#"{"_tag":"UnauthorizedError","message":"Authentication required"}"#)
+            .create_async()
+            .await;
+
+        let err = run_generate(&server, "ollama/m").await.unwrap_err();
+
+        assert!(
+            matches!(&err, OpenCodeError::Request(m) if m.contains("Authentication required")),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_generated_text_is_an_error() {
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("POST", "/api/session")
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"id":"ses_3"}}"#)
+            .create_async()
+            .await;
+        server
+            .mock("POST", "/api/session/ses_3/generate")
+            .with_header("content-type", JSON)
+            .with_body(r#"{"data":{"text":"  \n"}}"#)
+            .create_async()
+            .await;
+        server
+            .mock("DELETE", "/api/session/ses_3")
+            .with_status(204)
+            .create_async()
+            .await;
+
+        let err = run_generate(&server, "ollama/m").await.unwrap_err();
+
+        assert!(matches!(err, OpenCodeError::EmptyResponse), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn bare_model_is_rejected_before_any_request() {
+        // No mocks registered: any request would fail the test with a 501.
+        let server = mockito::Server::new_async().await;
+        let err = run_generate(&server, "qwen2.5-coder:7b").await.unwrap_err();
+        assert!(matches!(err, OpenCodeError::InvalidModel(_)), "{err:?}");
+    }
+
+    #[test]
+    fn timestamp_in_a_log_line_is_not_a_port() {
+        for line in [
+            "2026-04-22T12:34:56Z starting",
+            "12:34:56Z",
+            "INFO 2026-04-22 12:34:56",
+        ] {
+            assert!(
+                OpenCodeAnnouncement::from_line(line).is_err(),
+                "{line:?} must not parse as an announcement"
+            );
+        }
+    }
+
+    // Shell one-liners standing in for a sidecar: announce, then stay alive.
+    #[cfg(unix)]
+    fn announce_then_sleep(prelude: &str) -> Vec<String> {
+        vec![
+            "-c".to_string(),
+            format!("{prelude} echo 'server listening on http://127.0.0.1:43123'; sleep 30"),
+        ]
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_reuses_a_live_sidecar() {
+        let args = announce_then_sleep("");
+        let pool = OpenCodeSidecarPool::new();
+        let dir = std::env::temp_dir();
+
+        let first = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
+        let second = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
+
+        assert!(Arc::ptr_eq(&first.inner, &second.inner));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pool_does_not_keep_a_sidecar_spawned_before_clear() {
+        let args = announce_then_sleep("sleep 0.3;");
+        let pool = OpenCodeSidecarPool::new();
+        let dir = std::env::temp_dir();
+
+        // `clear()` lands while the sidecar is still starting, as when the
+        // settings change mid-spawn.
+        let (spawned, ()) = tokio::join!(pool.get_or_spawn("sh", &args, &dir), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            pool.clear();
+        });
+
+        // The caller still gets a working sidecar for its in-flight request...
+        assert!(spawned.unwrap().is_alive());
+        // ...but it is not pooled for later requests to reuse.
+        assert!(pool.inner.lock().sidecars.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_survives_a_flood_of_stderr() {
+        // 200 KB on stderr is well over a pipe buffer; if stderr is not
+        // drained during startup the child blocks and never announces.
+        let args = announce_then_sleep("head -c 200000 /dev/zero >&2;");
+        let dir = std::env::temp_dir();
+
+        let spawned = tokio::time::timeout(Duration::from_secs(10), spawn("sh", &args, &dir))
+            .await
+            .expect("startup must not hang on an undrained stderr pipe");
+
+        assert!(spawned.unwrap().is_alive());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sidecar_password_is_set_under_both_env_names() {
+        // OpenCode reads OPENCODE_PASSWORD before OPENCODE_SERVER_PASSWORD, so
+        // setting only the second lets an inherited first one win.
+        let out = std::env::temp_dir().join(format!("opencode-env-{}", uuid::Uuid::new_v4()));
+        let args = announce_then_sleep(&format!(
+            "printf '%s\\n%s' \"$OPENCODE_PASSWORD\" \"$OPENCODE_SERVER_PASSWORD\" > '{}';",
+            out.display()
         ));
+
+        let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
+
+        let written = std::fs::read_to_string(&out).unwrap();
+        let _ = std::fs::remove_file(&out);
+        let password = &sidecar.inner.password;
+        assert_eq!(written, format!("{password}\n{password}"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn startup_rejects_a_line_that_never_ends() {
+        // Twice the cap with no newline, then the process stays alive. Without
+        // a cap the buffer grows until READY_TIMEOUT instead of failing fast.
+        let args = vec![
+            "-c".to_string(),
+            "head -c 140000 /dev/zero | tr '\\0' x; sleep 30".to_string(),
+        ];
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            spawn("sh", &args, &std::env::temp_dir()),
+        )
+        .await
+        .expect("an unterminated line must fail startup instead of waiting for the timeout");
+
+        assert!(
+            matches!(&result, Err(OpenCodeError::BadAnnouncement(m)) if m.contains("longer than")),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_utf8_working_dir_is_rejected_before_any_request() {
+        use std::os::unix::ffi::OsStrExt;
+        // No mocks registered: any request would fail the test with a 501.
+        let server = mockito::Server::new_async().await;
+        let dir = Path::new(std::ffi::OsStr::from_bytes(b"/work/\xff"));
+
+        let err = generate_via_session(
+            &http_client::Client::new(),
+            &server.url(),
+            TEST_PASSWORD,
+            dir,
+            "ollama/m",
+            "list files",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(&err, OpenCodeError::Request(m) if m.contains("UTF-8")),
+            "{err:?}"
+        );
+    }
+
+    /// Minimal HTTP server for what mockito cannot produce: a generate call
+    /// that never answers, and DELETEs that fail before one succeeds.
+    struct RawServer {
+        url: String,
+        generate_started: Arc<tokio::sync::Notify>,
+        deletes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn raw_server(hang_on_generate: bool, failing_deletes: usize) -> RawServer {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let server = RawServer {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            generate_started: Arc::default(),
+            deletes: Arc::default(),
+        };
+        let started = Arc::clone(&server.generate_started);
+        let deletes = Arc::clone(&server.deletes);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let started = Arc::clone(&started);
+                let deletes = Arc::clone(&deletes);
+                tokio::spawn(async move {
+                    // Read the headers, then the body they announce, so closing
+                    // the socket never resets a request that is still arriving.
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head_len, body_len) = loop {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
+                            let body_len = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(0);
+                            break (at + 4, body_len);
+                        }
+                    };
+                    while request.len() < head_len + body_len {
+                        match socket.read(&mut chunk).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+
+                    let text = String::from_utf8_lossy(&request).into_owned();
+                    let request_line = text.lines().next().unwrap_or_default();
+                    let (status, body) = if request_line.starts_with("POST /api/session ") {
+                        (200, r#"{"data":{"id":"ses_1"}}"#)
+                    } else if request_line.contains("/generate") {
+                        started.notify_one();
+                        if hang_on_generate {
+                            std::future::pending::<()>().await;
+                        }
+                        (200, r#"{"data":{"text":"ls"}}"#)
+                    } else if request_line.starts_with("DELETE ") {
+                        let seen = deletes.fetch_add(1, Ordering::SeqCst);
+                        if seen < failing_deletes {
+                            (500, r#"{"message":"boom"}"#)
+                        } else {
+                            (204, "")
+                        }
+                    } else {
+                        (404, "")
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        server
+    }
+
+    async fn wait_for_deletes(server: &RawServer, count: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while server.deletes.load(Ordering::SeqCst) < count {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "expected {count} DELETE(s), saw {}",
+                server.deletes.load(Ordering::SeqCst)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn run_raw_generate(server: &RawServer) -> Result<String, OpenCodeError> {
+        let client = http_client::Client::new();
+        generate_via_session(
+            &client,
+            &server.url,
+            TEST_PASSWORD,
+            Path::new("/work/repo"),
+            "ollama/m",
+            "list files",
+            Duration::from_secs(30),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_still_deletes_its_session() {
+        let server = raw_server(true, 0).await;
+
+        // Drop the request once the generate call is in flight, as aborting a
+        // superseded prediction does.
+        tokio::select! {
+            _ = run_raw_generate(&server) => panic!("generate never answers"),
+            _ = server.generate_started.notified() => {}
+        }
+
+        wait_for_deletes(&server, 1).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(server.deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_delete_is_retried_once_in_the_background() {
+        let server = raw_server(false, 1).await;
+
+        // The request succeeds even though its inline DELETE got a 500.
+        assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
+
+        wait_for_deletes(&server, 2).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(server.deletes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn successful_delete_is_not_repeated() {
+        let server = raw_server(false, 0).await;
+
+        assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(server.deletes.load(Ordering::SeqCst), 1);
     }
 }
