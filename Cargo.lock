@@ -8617,6 +8617,7 @@ dependencies = [
 name = "network_policy"
 version = "0.0.0"
 dependencies = [
+ "reqwest",
  "serde",
  "thiserror 2.0.17",
  "url",

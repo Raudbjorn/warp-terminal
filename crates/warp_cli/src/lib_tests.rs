@@ -819,6 +819,31 @@ fn disabled_subcommand_skips_global_option_values() {
 }
 
 #[test]
+fn value_taking_top_level_options_are_known_to_subcommand_gating() {
+    // `disabled_subcommand` scans raw argv, so it has to know which options consume the next
+    // token. Skipping an unknown one would make its value look like the subcommand and bypass the
+    // local-only gate. No such option has a short form today; `-x` is treated as a bare flag.
+    let mut command = <Args as CommandFactory>::command();
+    command.build();
+    for arg in command.get_arguments() {
+        let Some(long) = arg.get_long() else {
+            continue;
+        };
+        if !arg.get_num_args().is_some_and(|n| n.takes_values()) {
+            continue;
+        }
+        assert!(
+            arg.get_short().is_none(),
+            "`--{long}` takes a value and has a short form, which `disabled_subcommand` skips as a bare flag"
+        );
+        assert!(
+            GLOBAL_OPTIONS_WITH_VALUES.contains(&format!("--{long}").as_str()),
+            "`--{long}` takes a value but is missing from GLOBAL_OPTIONS_WITH_VALUES"
+        );
+    }
+}
+
+#[test]
 fn disabled_subcommand_detects_help_target_and_aliases() {
     assert_eq!(
         Some("agent"),
@@ -828,6 +853,36 @@ fn disabled_subcommand_detects_help_target_and_aliases() {
         Some("task"),
         disabled_subcommand(&args(&["warp", "task", "list"]), &["run", "task"])
     );
+}
+
+#[test]
+fn local_only_help_hides_every_listed_subcommand_without_panicking() {
+    let command = apply_local_only_help(<Args as CommandFactory>::command());
+    for name in LOCAL_ONLY_HIDDEN_SUBCOMMANDS {
+        let subcommand = command
+            .find_subcommand(name)
+            .unwrap_or_else(|| panic!("`{name}` is not a subcommand"));
+        assert!(subcommand.is_hide_set(), "`{name}` should be hidden");
+    }
+}
+
+#[test]
+fn local_only_hidden_subcommands_exclude_aliases() {
+    // `Command::mut_subcommand` panics on an alias, so aliases may only be in the disabled list.
+    let command = <Args as CommandFactory>::command();
+    let aliases: Vec<_> = command
+        .get_subcommands()
+        .flat_map(|subcommand| subcommand.get_all_aliases())
+        .collect();
+    assert!(aliases.contains(&"task"), "expected `task` to be an alias");
+    for alias in aliases {
+        assert!(
+            !LOCAL_ONLY_HIDDEN_SUBCOMMANDS.contains(&alias),
+            "`{alias}` is an alias and can't be hidden with `mut_subcommand`"
+        );
+    }
+    assert!(LOCAL_ONLY_DISABLED_SUBCOMMANDS.contains(&"task"));
+    assert!(LOCAL_ONLY_HIDDEN_SUBCOMMANDS.contains(&"run"));
 }
 
 #[test]
