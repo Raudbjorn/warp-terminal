@@ -5,7 +5,7 @@ use warpui::platform::WindowStyle;
 
 use super::{ApiKeyType, CreateApiKeyModal};
 use crate::auth::AuthStateProvider;
-use crate::server::telemetry::context_provider::AppTelemetryContextProvider;
+
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::test_util::settings::initialize_settings_for_tests;
 use crate::vim_registers::VimRegisters;
@@ -28,7 +28,6 @@ fn test_agent_dropdown_is_searchable() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
         app.add_singleton_model(|_| AuthStateProvider::new_for_test());
-        app.add_singleton_model(AppTelemetryContextProvider::new_context_provider);
         app.add_singleton_model(|_| Appearance::mock());
         app.add_singleton_model(|_| SyncedInputState::mock());
         app.add_singleton_model(|_| VimRegisters::new());
@@ -111,7 +110,6 @@ fn default_agent_selection_is_restored_after_modal_reset() {
     App::test((), |mut app| async move {
         initialize_settings_for_tests(&mut app);
         app.add_singleton_model(|_| AuthStateProvider::new_for_test());
-        app.add_singleton_model(AppTelemetryContextProvider::new_context_provider);
         app.add_singleton_model(|_| Appearance::mock());
         app.add_singleton_model(|_| SyncedInputState::mock());
         app.add_singleton_model(|_| VimRegisters::new());

@@ -40,7 +40,7 @@ use super::terminal_model::{HistoryEntry, SubshellInitializationInfo};
 use crate::features::FeatureFlag;
 #[cfg(feature = "local_tty")]
 use crate::remote_server::manager::{RemoteServerManager, RemoteServerManagerEvent};
-use crate::server::telemetry::{BootstrappingInfo, TelemetryEvent};
+use crate::server::telemetry::BootstrappingInfo;
 use crate::terminal::event::{ExecutedExecutorCommandEvent, RemoteServerSetupState};
 use crate::terminal::shell::{Shell, ShellType};
 use crate::terminal::warpify::SubshellSource;
@@ -426,23 +426,6 @@ impl Sessions {
             .clone()
             .map(|info| info.was_triggered_by_rc_file_snippet)
             .unwrap_or(false);
-
-        crate::send_telemetry_from_ctx!(
-            TelemetryEvent::BootstrappingSucceeded(BootstrappingInfo {
-                shell: session.shell().shell_type().name(),
-                shell_version: session.shell().version().clone(),
-                is_ssh: session.is_ssh_wrapper_session(),
-                was_triggered_by_rc_file,
-                is_subshell: session.subshell_info().is_some(),
-                is_wsl: session.is_wsl(),
-                bootstrap_duration_seconds,
-                rcfiles_duration_seconds,
-                warp_attributed_bootstrap_duration_seconds,
-                is_msys2: session.is_msys2(),
-                terminal_session_id: Some(session.id()),
-            }),
-            ctx
-        );
 
         History::handle(ctx).update(ctx, |history, ctx| {
             let session_id = session.id();

@@ -5,12 +5,12 @@
 //! policy for an action, and attaches rate-limited diagnostics when the action is conservative or
 //! corrective. Callers apply the planned action before committing its next phase.
 
-mod telemetry;
+mod diagnostics;
 mod transition;
 
-pub use telemetry::LifecycleRecoveryRecord;
-pub(in crate::terminal) use telemetry::LifecycleTelemetryEvent;
-use telemetry::LifecycleTelemetryLimiter;
+pub use diagnostics::LifecycleRecoveryRecord;
+
+use diagnostics::LifecycleDiagnosticLimiter;
 pub(in crate::terminal) use transition::{
     CommandStartKind, IgnoreReason, LifecycleAction, LifecycleInput, LifecyclePhase,
     LifecycleSnapshot, LifecycleTransition, NextBlockIdDisposition, PreexecObservation,
@@ -50,7 +50,7 @@ impl StartCommandOutcome {
 pub(super) struct BlockLifecycleCoordinator {
     phase: LifecyclePhase,
     epoch: u64,
-    telemetry_limiter: LifecycleTelemetryLimiter,
+    diagnostic_limiter: LifecycleDiagnosticLimiter,
 }
 
 impl Default for BlockLifecycleCoordinator {
@@ -58,7 +58,7 @@ impl Default for BlockLifecycleCoordinator {
         Self {
             phase: LifecyclePhase::Unknown,
             epoch: 0,
-            telemetry_limiter: LifecycleTelemetryLimiter::default(),
+            diagnostic_limiter: LifecycleDiagnosticLimiter::default(),
         }
     }
 }
@@ -133,7 +133,7 @@ impl BlockLifecycleCoordinator {
                     snapshot,
                 )
             })
-            .and_then(|record| self.telemetry_limiter.record(record));
+            .and_then(|record| self.diagnostic_limiter.record(record));
 
         LifecycleTransition {
             previous_phase,

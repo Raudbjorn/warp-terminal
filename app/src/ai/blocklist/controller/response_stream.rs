@@ -17,7 +17,7 @@ use crate::ai::agent::api::{self, ConvertToAPITypeError, generate_multi_agent_ou
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent::{AIIdentifiers, CancellationReason};
 use crate::network::NetworkStatus;
-use crate::send_telemetry_from_ctx;
+
 use crate::server::retry_strategies::backoff_after_attempts;
 use crate::server::server_api::{AIApiError, ServerApiProvider};
 use crate::server::team_scope::RequestTeamScope;
@@ -434,21 +434,6 @@ impl ResponseStream {
     }
 
     /// Helper function to emit AgentModeError telemetry for error that is retryable (not user visible).
-    fn emit_retryable_agent_mode_error_telemetry(
-        &self,
-        error: String,
-        ctx: &mut ModelContext<Self>,
-    ) {
-        send_telemetry_from_ctx!(
-            crate::TelemetryEvent::AgentModeError {
-                identifiers: self.ai_identifiers.clone(),
-                error,
-                is_user_visible: false,
-                will_attempt_to_resume: false,
-            },
-            ctx
-        );
-    }
 
     fn retry(&mut self, ctx: &mut ModelContext<Self>) {
         self.recovery = self.recovery.next_attempt();
@@ -508,13 +493,13 @@ impl ResponseStream {
                 self.log_recovery(action, &format!("{delay:?}"), error);
                 // Only emit error telemetry here if we're recovering in-request. Final
                 // errors that aren't being retried are emitted elsewhere.
-                self.emit_retryable_agent_mode_error_telemetry(format!("{error:?}"), ctx);
+
                 self.defer_retry_after_backoff(delay, ctx);
                 RecoveryOutcome::InFlight
             }
             RecoveryAction::RetryWhenOnline => {
                 self.log_recovery(action, "connectivity", error);
-                self.emit_retryable_agent_mode_error_telemetry(format!("{error:?}"), ctx);
+
                 self.defer_retry_until_online(ctx);
                 RecoveryOutcome::InFlight
             }
@@ -841,17 +826,7 @@ impl ResponseStream {
                                 Some(warp_multi_agent_api::response_event::stream_finished::Reason::Done(_)) | None
                             ) {
                                 // Emit retry success telemetry if this was a successful completion after retries
-                                if self.retries_sent > 0
-                                    && let Some(original_error) = &self.original_error {
-                                        send_telemetry_from_ctx!(
-                                            crate::TelemetryEvent::AgentModeRequestRetrySucceeded {
-                                                identifiers: self.ai_identifiers.clone(),
-                                                retry_count: self.retries_sent,
-                                                original_error: original_error.clone(),
-                                            },
-                                            ctx
-                                        );
-                                    }
+
                             }
                         }
                     }

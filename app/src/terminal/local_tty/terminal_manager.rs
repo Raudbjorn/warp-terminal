@@ -40,9 +40,9 @@ use crate::context_chips::ContextChipKind;
 use crate::context_chips::prompt::Prompt;
 use crate::features::FeatureFlag;
 use crate::persistence::ModelEvent;
-use crate::send_telemetry_on_executor;
+
 use crate::server::telemetry::{
-    CloudAgentShellRecoveryFailureClass, PtySpawnMode as TelemetryPtySpawnMode, TelemetryEvent,
+    CloudAgentShellRecoveryFailureClass, PtySpawnMode as TelemetryPtySpawnMode,
 };
 use crate::settings::{DebugSettings, SshSettings};
 use crate::terminal::available_shells::{AvailableShell, AvailableShells};
@@ -88,7 +88,6 @@ impl PtySpawnHooks for AppPtySpawnHooks {
             PtySpawnMode::FallbackToDirect => TelemetryPtySpawnMode::FallbackToDirect,
             PtySpawnMode::Direct => TelemetryPtySpawnMode::Direct,
         };
-        crate::send_telemetry_from_app_ctx!(TelemetryEvent::PtySpawned { mode }, ctx);
     }
 }
 
@@ -465,15 +464,7 @@ impl<S> TerminalManager<S> {
                     !model.is_receiving_in_band_command_output()
                         && model.is_active_block_bootstrapped()
                 },
-                move |max_bytes_per_second| {
-                    send_telemetry_on_executor!(
-                        auth_state,
-                        TelemetryEvent::PtyThroughput {
-                            max_bytes_per_second,
-                        },
-                        telemetry_executor
-                    );
-                },
+                move |max_bytes_per_second| {},
                 ctx.background_executor().to_owned(),
             );
         }
@@ -1448,19 +1439,7 @@ fn get_shell_starter_internal(
         ShellStarterSource::Fallback {
             unsupported_shell,
             starter,
-        } => {
-            if let Some(unsupported_shell) = unsupported_shell {
-                send_telemetry_on_executor!(
-                    auth_state,
-                    TelemetryEvent::UnsupportedShell {
-                        shell: unsupported_shell
-                    },
-                    background_executor
-                );
-            }
-
-            ShellStarter::Direct(starter)
-        }
+        } => ShellStarter::Direct(starter),
     }
 }
 

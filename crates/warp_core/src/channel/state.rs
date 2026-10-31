@@ -47,7 +47,6 @@ impl ChannelState {
                 server_config: WarpServerConfig::production(),
                 oz_config: OzConfig::production(),
                 services_mode: ServicesMode::Online,
-                telemetry_config: None,
                 autoupdate_config: None,
                 mcp_static_config: None,
             },
@@ -181,16 +180,6 @@ impl ChannelState {
         CHANNEL_STATE.lock().config.logfile_name.clone()
     }
 
-    pub fn telemetry_file_name() -> Cow<'static, str> {
-        CHANNEL_STATE
-            .lock()
-            .config
-            .telemetry_config
-            .as_ref()
-            .map(|tc| tc.telemetry_file_name.clone())
-            .unwrap_or_default()
-    }
-
     pub fn services_mode() -> ServicesMode {
         CHANNEL_STATE.lock().config.services_mode
     }
@@ -204,14 +193,6 @@ impl ChannelState {
             bail!("{service_name} are disabled in local-only services mode");
         }
         Ok(())
-    }
-
-    /// Returns whether this build has a telemetry config and can therefore ship
-    /// telemetry events. Builds like OpenWarp intentionally ship with
-    /// `telemetry_config: None`, in which case UI that controls telemetry
-    /// should be hidden since the toggle has no effect.
-    pub fn is_telemetry_available() -> bool {
-        !Self::is_local_only() && CHANNEL_STATE.lock().config.telemetry_config.is_some()
     }
 
     /// Always `false` in this fork: the Sentry crash-reporting subsystem has been

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use pathfinder_geometry::vector::Vector2F;
 use warp_core::features::FeatureFlag;
-use warp_core::send_telemetry_from_ctx;
+
 use warp_core::ui::Icon;
 use warp_editor::editor::NavigationKey;
 use warpui::elements::{
@@ -30,7 +30,7 @@ use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent_conversations_model::{
     AgentConversationEntryId, AgentConversationNavigationSubject, AgentConversationsModel,
 };
-use crate::ai::agent_management::telemetry::{AgentManagementTelemetryEvent, OpenedFrom};
+use crate::ai::agent_management::telemetry::OpenedFrom;
 use crate::ai::blocklist::history_model::BlocklistAIHistoryModel;
 use crate::ai::conversation_rename::rename_conversation;
 use crate::appearance::Appearance;
@@ -619,29 +619,6 @@ impl ConversationListView {
         self.focus_query_editor(ctx);
     }
 
-    fn send_open_telemetry(id: &AgentConversationEntryId, ctx: &mut ViewContext<Self>) {
-        match id {
-            AgentConversationEntryId::Conversation(conversation_id) => {
-                send_telemetry_from_ctx!(
-                    AgentManagementTelemetryEvent::ConversationOpened {
-                        conversation_id: conversation_id.to_string(),
-                        opened_from: OpenedFrom::ConversationList,
-                    },
-                    ctx
-                );
-            }
-            AgentConversationEntryId::AmbientRun(task_id) => {
-                send_telemetry_from_ctx!(
-                    AgentManagementTelemetryEvent::CloudRunOpened {
-                        task_id: task_id.to_string(),
-                        opened_from: OpenedFrom::ConversationList,
-                    },
-                    ctx
-                );
-            }
-        }
-    }
-
     /// Activate the currently selected item by dispatching the appropriate WorkspaceAction
     /// (i.e. opening the selected conversation or starting a new conversation).
     fn activate_selected_item(&mut self, ctx: &mut ViewContext<Self>) {
@@ -662,7 +639,6 @@ impl ConversationListView {
                     None,
                     ctx,
                 ) {
-                    Self::send_open_telemetry(&entry.id, ctx);
                     ctx.dispatch_typed_action(&action);
                 }
             }
@@ -1129,7 +1105,6 @@ impl TypedActionView for ConversationListView {
                         Some(ShareableObject::AIConversation(ai_conversation_id)),
                         ctx,
                     );
-                    dialog.report_open(SharingDialogSource::ConversationList, ctx);
                 });
                 ctx.focus(&self.sharing_dialog);
                 ctx.notify();
@@ -1190,7 +1165,6 @@ impl TypedActionView for ConversationListView {
                     return;
                 };
 
-                Self::send_open_telemetry(id, ctx);
                 ctx.dispatch_typed_action(&action);
             }
             ConversationListViewAction::ArrowUp => {

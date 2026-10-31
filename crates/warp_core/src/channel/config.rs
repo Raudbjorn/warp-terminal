@@ -20,9 +20,6 @@ pub struct ChannelConfig {
     /// Whether online services are enabled for this channel.
     #[serde(default)]
     pub services_mode: ServicesMode,
-    /// Configuration for telemetry sending, or [`None`] if telemetry should be
-    /// disabled for this build.
-    pub telemetry_config: Option<TelemetryConfig>,
     /// Configuration for autoupdate functionality.
     pub autoupdate_config: Option<AutoupdateConfig>,
     /// Configuration for statically-bundled MCP OAuth credentials.
@@ -107,12 +104,6 @@ impl OzConfig {
             workload_audience_url: None,
         }
     }
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-pub struct TelemetryConfig {
-    /// Name of the local telemetry debug log (written when `SendTelemetryToFile` is enabled).
-    pub telemetry_file_name: Cow<'static, str>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]

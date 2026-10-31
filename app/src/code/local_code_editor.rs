@@ -84,15 +84,12 @@ const HOVER_DEBOUNCE_PERIOD: Duration = Duration::from_millis(500);
 /// auto-save. Mirrors VS Code's default `files.autoSaveDelay` of 1000ms.
 const AUTO_SAVE_DEBOUNCE_PERIOD: Duration = Duration::from_millis(1000);
 
-use warp_core::send_telemetry_from_ctx;
-
 use super::ImmediateSaveError;
 use super::diff_viewer::DiffViewer;
 use super::editor::scroll::{ScrollPosition, ScrollTrigger};
 use super::editor::view::{CodeEditorEvent, CodeEditorView};
 use super::find_references_view::{FindReferencesView, FindReferencesViewEvent};
 use super::language_server_extension::ProcessedDiagnostic;
-use super::lsp_telemetry::LspTelemetryEvent;
 
 type SaveCallback =
     Box<dyn FnOnce(SaveOutcome, &mut ViewContext<LocalCodeEditorView>) + Send + Sync + 'static>;
@@ -778,16 +775,6 @@ impl LocalCodeEditorView {
         request_offset: CharOffset,
         ctx: &mut ViewContext<Self>,
     ) {
-        if let Some(server) = &self.lsp_server {
-            send_telemetry_from_ctx!(
-                LspTelemetryEvent::FindReferencesShown {
-                    server_type: server.as_ref(ctx).server_name(),
-                    num_references: references.len(),
-                },
-                ctx
-            );
-        }
-
         // Get workspace root for relative path display from the LSP server
         let workspace_root = self
             .lsp_server
@@ -2162,16 +2149,6 @@ impl LocalCodeEditorView {
             lsp_position,
             move |_me, result, ctx| {
                 let had_result = matches!(&result, Ok(locations) if !locations.is_empty());
-
-                if let Some(server_type) = server_type_name {
-                    send_telemetry_from_ctx!(
-                        LspTelemetryEvent::GotoDefinition {
-                            server_type,
-                            had_result,
-                        },
-                        ctx
-                    );
-                }
 
                 match result {
                     Ok(locations) => {

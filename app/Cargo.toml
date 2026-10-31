@@ -525,7 +525,6 @@ default = [
     "agent_mode_pre_plan_xml",
     "command_correction_key",
     "kitty_images",
-    "global_ai_analytics_collection",
     "grep_tool",
     "validate_autosuggestions",
     "clear_autosuggestion_on_escape",
@@ -726,8 +725,6 @@ suggested_agent_mode_workflows = []
 extern_plist = []
 fast_dev = ["skip_login"]
 full_screen_zen_mode = []
-global_ai_analytics_banner = []
-global_ai_analytics_collection = []
 grep_tool = []
 # This feature is enabled in graphical builds of Warp, and groups together other features
 # that are not needed in headless builds. Because Cargo features are additive, the default
@@ -755,7 +752,6 @@ agent_mode_evals = [
     "cross_repo_context",
     "cloud_object_models/agent_mode_evals",
     "rust-embed/debug-embed",
-    "warpui/log_named_telemetry_events",
     "warp_logging/agent_mode_evals",
     "warp_multi_agent_client/agent_mode_evals",
     "warp_server_client/agent_mode_evals",
@@ -828,7 +824,6 @@ omw_plugins = ["plugin_host"]
 # NOTE: This may slow down program execution.
 pprof_cpu_profiling = ["dep:pprof"]
 predict_am_queries = []
-record_app_active_events = []
 recording_mode = []
 remote_codebase_indexing = ["full_source_code_embedding"]
 
@@ -921,7 +916,6 @@ search_codebase_ui = []
 linked_code_blocks = []
 tabbed_editor_view = []
 selection_as_context = []
-send_telemetry_to_file = []
 multi_profile = []
 pr_comments_v2 = []
 pr_comments_skill = []

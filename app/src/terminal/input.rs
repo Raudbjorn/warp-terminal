@@ -176,7 +176,6 @@ use crate::ai::blocklist::handoff::{
     HandoffLaunchAttachments, PendingCloudLaunch, suggest_handoff_environment,
 };
 use crate::ai::blocklist::prompt::prompt_alert::{PromptAlertEvent, PromptAlertView};
-use crate::ai::blocklist::telemetry_banner::should_collect_ai_ugc_telemetry;
 use crate::ai::blocklist::{
     AttachmentType, BLOCK_CONTEXT_ATTACHMENT_REGEX, BlocklistAIActionModel,
     BlocklistAIContextEvent, BlocklistAIContextModel, BlocklistAIController,
@@ -216,7 +215,7 @@ use crate::ai::predict::prompt_suggestions::{
     has_pending_code_or_unit_test_prompt_suggestion,
     is_accept_prompt_suggestion_bound_to_ctrl_enter,
 };
-use crate::ai::skills::{SkillOpenOrigin, SkillTelemetryEvent};
+use crate::ai::skills::SkillOpenOrigin;
 use crate::ai_assistant::execution_context::execution_context_for_session;
 use crate::appearance::{Appearance, AppearanceEvent};
 use crate::channel::{Channel, ChannelState};
@@ -276,7 +275,7 @@ use crate::server::telemetry::{
     AICommandSearchEntrypoint, AgentModeAutoDetectionFalsePositivePayload,
     AgentModeAutoDetectionSettingOrigin, AnonymousUserSignupEntrypoint, CommandXRayTrigger,
     EnvVarTelemetryMetadata, PaletteSource, QueuedPromptSendNowTrigger,
-    SlashCommandAcceptedDetails, SlashMenuSource, TelemetryEvent, WorkflowTelemetryMetadata,
+    SlashCommandAcceptedDetails, SlashMenuSource, WorkflowTelemetryMetadata,
 };
 use crate::session_management::SessionNavigationPromptElements;
 use crate::settings::{
@@ -374,7 +373,7 @@ use crate::workspaces::user_workspaces::{
     ResolvedTeamScope, TeamContext, UserWorkspaces, UserWorkspacesEvent,
 };
 #[allow(unused_imports)]
-use crate::{AgentModeEntrypoint, ServerApiProvider, cmd_or_ctrl_shift, send_telemetry_from_ctx};
+use crate::{AgentModeEntrypoint, ServerApiProvider, cmd_or_ctrl_shift};
 
 /// Drop target data for dropping content on the [`Input`].
 #[derive(Debug, Clone)]
@@ -4370,15 +4369,7 @@ impl Input {
         if !dispatched {
             return;
         }
-        if let Some(origin) = origin {
-            send_telemetry_from_ctx!(
-                TelemetryEvent::QueuedPromptSentNow {
-                    origin: origin.into(),
-                    trigger,
-                },
-                ctx
-            );
-        }
+
         QueuedQueryModel::handle(ctx).update(ctx, |model, ctx| {
             model.remove_fired_row(conversation_id, query_id, ctx);
         });
@@ -5294,17 +5285,6 @@ impl Input {
             let is_udi_enabled =
                 InputSettings::as_ref(ctx).is_universal_developer_input_enabled(ctx);
             let current_input_mode = self.ai_input_model.as_ref(ctx).input_type();
-
-            send_telemetry_from_ctx!(
-                TelemetryEvent::AtMenuInteracted {
-                    action: "opened".to_string(),
-                    item_count: None,
-                    query_length: None,
-                    is_udi_enabled,
-                    current_input_mode,
-                },
-                ctx
-            );
         } else if self.suggestions_mode_model.as_ref(ctx).is_ai_context_menu() {
             self.close_ai_context_menu(ctx);
         }
@@ -5347,14 +5327,6 @@ impl Input {
             self.system_insert("/", ctx);
             let is_in_agent_view = FeatureFlag::AgentView.is_enabled()
                 && self.agent_view_controller.as_ref(ctx).is_fullscreen();
-            send_telemetry_from_ctx!(
-                TelemetryEvent::OpenSlashMenu {
-                    source: SlashMenuSource::SlashButton,
-                    is_inline_ui_enabled: true,
-                    is_in_agent_view,
-                },
-                ctx
-            );
         }
     }
 
@@ -5367,10 +5339,6 @@ impl Input {
             InlineConversationMenuEvent::NavigateToConversation { item_id } => {
                 let is_in_agent_view = FeatureFlag::AgentView.is_enabled()
                     && self.agent_view_controller.as_ref(ctx).is_fullscreen();
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::InlineConversationMenuItemSelected { is_in_agent_view },
-                    ctx
-                );
 
                 if self
                     .suggestions_mode_model
@@ -5645,14 +5613,6 @@ impl Input {
             self.focus_input_box(ctx);
         } else {
             // Open the skill file in editor (from /open-skill command)
-            send_telemetry_from_ctx!(
-                SkillTelemetryEvent::Opened {
-                    reference: skill_reference.clone(),
-                    name: Some(skill_name.clone()),
-                    origin: SkillOpenOrigin::OpenSkillCommand,
-                },
-                ctx
-            );
 
             ctx.dispatch_typed_action(&TerminalAction::OpenEditSkillPane {
                 skill_reference: skill_reference.clone(),
@@ -5848,10 +5808,7 @@ impl Input {
         });
         let is_in_agent_view = FeatureFlag::AgentView.is_enabled()
             && self.agent_view_controller.as_ref(ctx).is_fullscreen();
-        send_telemetry_from_ctx!(
-            TelemetryEvent::InlineConversationMenuOpened { is_in_agent_view },
-            ctx
-        );
+
         ctx.notify();
     }
 
@@ -5907,15 +5864,6 @@ impl Input {
 
                 let is_in_agent_view = FeatureFlag::AgentView.is_enabled()
                     && self.agent_view_controller.as_ref(ctx).is_active();
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::SlashCommandAccepted {
-                        command_details: SlashCommandAcceptedDetails::StaticCommand {
-                            command_name: commands::FORK_FROM.name.to_owned(),
-                        },
-                        is_in_agent_view,
-                    },
-                    ctx
-                );
 
                 self.suggestions_mode_model.update(ctx, |model, ctx| {
                     model.set_mode(InputSuggestionsMode::Closed, ctx);
@@ -6206,15 +6154,6 @@ impl Input {
 
                 let is_in_agent_view = FeatureFlag::AgentView.is_enabled()
                     && self.agent_view_controller.as_ref(ctx).is_active();
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::SlashCommandAccepted {
-                        command_details: SlashCommandAcceptedDetails::StaticCommand {
-                            command_name: commands::REWIND.name.to_owned(),
-                        },
-                        is_in_agent_view,
-                    },
-                    ctx
-                );
 
                 self.suggestions_mode_model.update(ctx, |model, ctx| {
                     model.set_mode(InputSuggestionsMode::Closed, ctx);
@@ -6601,14 +6540,6 @@ impl Input {
         self.focus_input_box(ctx);
         // TODO(advait): Avoid using user-simulated codepaths here. Revisit function to use here.
         self.submit_ai_query_with_routing(Some(suggestion_type), ctx);
-
-        send_telemetry_from_ctx!(
-            TelemetryEvent::ZeroStatePromptSuggestionUsed {
-                suggestion_type,
-                triggered_from
-            },
-            ctx
-        );
 
         ctx.notify()
     }
@@ -7242,12 +7173,6 @@ impl Input {
                 if switch_to_auto {
                     self.set_input_mode_natural_language_detection(ctx);
                 } else if *input_type == InputType::AI {
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::AgentModeClickedEntrypoint {
-                            entrypoint: AgentModeEntrypoint::UDITerminalInputSwitcher,
-                        },
-                        ctx
-                    );
                 }
             }
             UniversalDeveloperInputButtonBarEvent::EnableAutoDetection => {
@@ -8086,33 +8011,6 @@ impl Input {
                         is_from_ai,
                         predicted_command: response.most_likely_action.clone(),
                     });
-
-                let should_collect_ugc = should_collect_ai_ugc_telemetry(
-                    ctx,
-                    PrivacySettings::as_ref(ctx).is_telemetry_enabled,
-                );
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::AgentModePrediction {
-                        was_suggestion_accepted: self.was_intelligent_autosuggestion_accepted,
-                        request_duration_ms,
-                        is_from_ai,
-                        does_actual_command_match_prediction: response.most_likely_action
-                            == command,
-                        does_actual_command_match_history_prediction:
-                            history_based_autosuggestion_state.history_command_prediction == command,
-                        history_prediction_likelihood: history_based_autosuggestion_state
-                            .history_command_prediction_likelihood,
-                        total_history_count: history_based_autosuggestion_state.total_history_count,
-                        actual_next_command_run: should_collect_ugc.then_some(command.to_string()),
-                        history_based_autosuggestion_state: should_collect_ugc
-                            .then_some(history_based_autosuggestion_state.clone()),
-                        generate_ai_input_suggestions_request: should_collect_ugc
-                            .then_some(*request),
-                        generate_ai_input_suggestions_response: should_collect_ugc
-                            .then(|| response.clone())
-                    },
-                    ctx
-                );
             }
             // Reset state for whether the user accepted the intelligent autosuggestion.
             self.was_intelligent_autosuggestion_accepted = false;
@@ -8147,7 +8045,7 @@ impl Input {
             // We don't want to submit the command if precmd has not
             // been received. Instead, we want the user to be aware
             // that the prompt might not be up to date.
-            send_telemetry_from_ctx!(TelemetryEvent::TriedToExecuteBeforePrecmd, ctx);
+
             did_execute = false;
         }
 
@@ -8442,24 +8340,6 @@ impl Input {
             } => {
                 let workflow_id = workflow.server_id();
                 let workflow_source = *workflow_source;
-                let space = workflow_id.and_then(|id| {
-                    CloudViewModel::as_ref(ctx)
-                        .object_space(&id.to_string(), ctx)
-                        .map(Into::into)
-                });
-
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::WorkflowSelected(WorkflowTelemetryMetadata {
-                        workflow_source,
-                        workflow_categories: workflow.as_workflow().tags().cloned(),
-                        workflow_selection_source: WorkflowSelectionSource::Voltron,
-                        workflow_id,
-                        workflow_space: space,
-                        enum_ids: workflow.as_workflow().get_server_enum_ids()
-                    }),
-                    ctx
-                );
-
                 self.show_workflows_info_box_on_workflow_selection(
                     *workflow.clone(),
                     workflow_source,
@@ -8834,10 +8714,6 @@ impl Input {
                             .map_or(Space::Personal, |object| object.space(ctx))
                             .into(),
                     };
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::EnvVarWorkflowParameterization(telemetry_metadata),
-                        ctx
-                    );
                 }
             }
         }
@@ -9065,17 +8941,6 @@ impl Input {
                     return;
                 }
 
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::ConfirmSuggestion {
-                        mode: self
-                            .suggestions_mode_model
-                            .as_ref(ctx)
-                            .mode()
-                            .to_telemetry_mode(),
-                        match_type: *match_type,
-                    },
-                    ctx
-                );
                 self.close_input_suggestions(/*should_focus_input=*/ true, ctx);
             }
             InputSuggestionsEvent::ConfirmAndExecuteSuggestion {
@@ -9085,18 +8950,6 @@ impl Input {
                 if !self.confirm_and_execute_suggestion(suggestion, ctx) {
                     return;
                 }
-
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::ConfirmSuggestion {
-                        mode: self
-                            .suggestions_mode_model
-                            .as_ref(ctx)
-                            .mode()
-                            .to_telemetry_mode(),
-                        match_type: *match_type,
-                    },
-                    ctx
-                );
 
                 self.close_input_suggestions(/*should_focus_input=*/ true, ctx);
 
@@ -9818,13 +9671,6 @@ impl Input {
 
     // TODO - Implement PageUp functionality for input suggestions menu
     fn editor_page_up(&mut self, ctx: &mut ViewContext<Self>) {
-        let event = self.editor.read(ctx, |editor, ctx| {
-            TelemetryEvent::PageUpDownInEditorPressed {
-                is_empty_editor: editor.is_empty(ctx),
-                is_down: false,
-            }
-        });
-        send_telemetry_from_ctx!(event, ctx);
         if self.suggestions_mode_model.as_ref(ctx).is_visible() {
             self.editor
                 .update(ctx, |input, ctx| input.move_page_up(ctx));
@@ -9937,52 +9783,6 @@ impl Input {
     /// Also emits `AgentModeChangedInputType` if the user is part of the analytics experiment.
     ///
     /// This is intended to be called whenever the user manually toggles the input to new_input_type. Because the user is manually toggling
-    /// back to shell mode after input has been autodetected as natural language, we infer that the
-    /// current input text may not have been correctly classified as natural language.
-    /// For users opted in to the analytics experiment, we collect the input buffer text whenever the input type is toggled
-    /// in either direction.
-    fn maybe_send_autodetection_telemetry_on_manual_toggle(
-        &self,
-        new_input_type: InputType,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        let input_buffer_text = self.buffer_text(ctx);
-        let buffer_length = input_buffer_text.len();
-        let input =
-            should_collect_ai_ugc_telemetry(ctx, PrivacySettings::as_ref(ctx).is_telemetry_enabled)
-                .then_some(input_buffer_text);
-        let is_udi_enabled = InputSettings::as_ref(ctx).is_universal_developer_input_enabled(ctx);
-        send_telemetry_from_ctx!(
-            TelemetryEvent::AgentModeChangedInputType {
-                input,
-                buffer_length,
-                is_manually_changed: true,
-                new_input_type,
-                active_block_id: self.model.lock().block_list().active_block_id().clone(),
-                is_udi_enabled,
-            },
-            ctx
-        );
-
-        let ai_input_model = self.ai_input_model.as_ref(ctx);
-        if matches!(new_input_type, InputType::Shell) && !ai_input_model.is_input_type_locked() {
-            let current_input_text = self.buffer_text(ctx);
-            if !current_input_text.is_empty() {
-                let event_payload = if ChannelState::channel().is_dogfood() {
-                    AgentModeAutoDetectionFalsePositivePayload::InternalDogfoodUsers {
-                        input_text: current_input_text,
-                    }
-                } else {
-                    AgentModeAutoDetectionFalsePositivePayload::ExternalUsers
-                };
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::AgentModePotentialAutoDetectionFalsePositive(event_payload),
-                    ctx
-                );
-            }
-        }
-    }
-
     /// Takes the current collpased/expanded state of the info box and saves it to the user's settings so that last value can be
     /// reused the next time the user opens a workflow.
     fn update_workflows_info_box_expanded_setting(
@@ -10147,13 +9947,6 @@ impl Input {
 
     // TODO - Implement PageDown functionality for input suggestions menu
     fn editor_page_down(&mut self, ctx: &mut ViewContext<Self>) {
-        let event = self.editor.read(ctx, |editor, ctx| {
-            TelemetryEvent::PageUpDownInEditorPressed {
-                is_empty_editor: editor.is_empty(ctx),
-                is_down: true,
-            }
-        });
-        send_telemetry_from_ctx!(event, ctx);
         if self.suggestions_mode_model.as_ref(ctx).is_visible() {
             self.editor
                 .update(ctx, |input, ctx| input.move_page_down(ctx));
@@ -11781,7 +11574,6 @@ impl Input {
             EditorEvent::DeleteAllLeft => {
                 if self.ai_input_model.as_ref(ctx).is_ai_input_enabled() {
                     let new_input_type = InputType::Shell;
-                    self.maybe_send_autodetection_telemetry_on_manual_toggle(new_input_type, ctx);
                     self.ai_input_model.update(ctx, |ai_input_model, ctx| {
                         ai_input_model.set_input_config_for_classic_mode(
                             InputConfig {
@@ -12464,7 +12256,6 @@ impl Input {
                 ai_input_model.set_input_config_for_classic_mode(new_input_config, ctx);
                 new_input_type
             });
-            self.maybe_send_autodetection_telemetry_on_manual_toggle(new_input_type, ctx);
         }
     }
 
@@ -14428,8 +14219,6 @@ impl Input {
                 #[cfg(not(all(feature = "local_fs", not(target_family = "wasm"))))]
                 let attachments = vec![];
 
-                self.emit_input_buffer_submitted_telemetry(ctx);
-
                 // Clear the buffer and pending attachments after collecting them.
                 self.editor.update(ctx, |editor, ctx| {
                     editor.clear_buffer(ctx);
@@ -14487,7 +14276,6 @@ impl Input {
             if !self.try_execute_command(&command, ctx) {
                 return;
             }
-            self.emit_input_buffer_submitted_telemetry(ctx);
 
             if FeatureFlag::AgentMode.is_enabled()
                 && AISettings::as_ref(ctx).is_ai_autodetection_enabled(ctx)
@@ -15099,7 +14887,7 @@ impl Input {
         self.ai_input_model.update(ctx, |model, ctx| {
             model.handle_input_buffer_submitted(ctx);
         });
-        self.emit_input_buffer_submitted_telemetry(ctx);
+
         self.editor.update(ctx, |editor, ctx| {
             editor.clear_buffer(ctx);
         });
@@ -15181,7 +14969,7 @@ impl Input {
             .update(ctx, |context, ctx| context.take_pending_attachments(ctx));
         self.ai_input_model
             .update(ctx, |model, ctx| model.handle_input_buffer_submitted(ctx));
-        self.emit_input_buffer_submitted_telemetry(ctx);
+
         self.editor
             .update(ctx, |editor, ctx| editor.clear_buffer(ctx));
         let query = QueuedQuery::new_with_attachments(
@@ -15234,7 +15022,6 @@ impl Input {
         if prompt.is_empty() {
             return false;
         }
-        self.emit_input_buffer_submitted_telemetry(ctx);
 
         self.editor.update(ctx, |editor, ctx| {
             editor.clear_buffer(ctx);
@@ -15353,7 +15140,6 @@ impl Input {
         IgnoredSuggestionsModel::handle(ctx).update(ctx, |model, ctx| {
             model.remove_ignored_suggestion(ai_query.clone(), SuggestionType::AIQuery, ctx);
         });
-        self.emit_input_buffer_submitted_telemetry(ctx);
 
         self.ai_input_model.update(ctx, |model, ctx| {
             model.handle_input_buffer_submitted(ctx);
@@ -15384,14 +15170,6 @@ impl Input {
         if let Some(workflow_state) = self.workflows_state.selected_workflow_state.as_ref()
             && let WorkflowType::Cloud(workflow) = &workflow_state.workflow_type
         {
-            send_telemetry_from_ctx!(
-                TelemetryEvent::ExecutedWarpDrivePrompt {
-                    id: workflow.id.into_server().map(Into::into),
-                    selection_source: workflow_state.workflow_selection_source,
-                },
-                ctx
-            );
-
             UpdateManager::handle(ctx).update(ctx, move |update_manager, ctx| {
                 update_manager.record_object_action(
                     workflow.cloud_object_type_and_id(),
@@ -15429,7 +15207,7 @@ impl Input {
         // We're committed to sending the prompt, so finalize any in-flight image-attachment
         // processing. This drops images that haven't finished processing; already-processed ones
         // are collected as pending context below. (Local-action slash commands returned above.)
-        self.emit_input_buffer_submitted_telemetry(ctx);
+
         self.editor.update(ctx, |editor, ctx| {
             editor.abort_attached_images_future_handle(ctx);
         });
@@ -15557,21 +15335,6 @@ impl Input {
                 ctx.emit(Event::SubmitCloudFollowup { prompt });
             },
         )
-    }
-
-    fn emit_input_buffer_submitted_telemetry(&self, ctx: &mut ViewContext<Self>) {
-        let input_model = self.ai_input_model.as_ref(ctx);
-        let block_id = self.model.lock().active_block_id().clone();
-        send_telemetry_from_ctx!(
-            TelemetryEvent::InputBufferSubmitted {
-                input_type: input_model.input_type(),
-                is_locked: input_model.is_input_type_locked(),
-                input_type_decision_source: input_model.last_ai_autodetection_source(),
-                was_lock_set_with_empty_buffer: input_model.was_lock_set_with_empty_buffer(),
-                block_id,
-            },
-            ctx
-        );
     }
 
     /// Uploads `images`/`files` (when the cloud pane supports it) and emits `Event::SendAgentPrompt`
@@ -16328,32 +16091,6 @@ impl Input {
         let (workflow_id, workflow_command) = {
             match self.workflows_state.selected_workflow_state.as_ref() {
                 Some(selected_workflow_state) => {
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::WorkflowExecuted(WorkflowTelemetryMetadata {
-                            workflow_source: selected_workflow_state.workflow_source,
-                            workflow_categories: selected_workflow_state
-                                .workflow_type
-                                .as_workflow()
-                                .tags()
-                                .cloned(),
-                            workflow_selection_source: selected_workflow_state
-                                .workflow_selection_source,
-                            // This is only `Some()` for WarpDrive workflows; we don't track
-                            // ID for execution of local workflows because they have no such
-                            // unique ID.
-                            workflow_id: selected_workflow_state.workflow_type.server_id(),
-                            workflow_space: match &selected_workflow_state.workflow_type {
-                                WorkflowType::Cloud(workflow) => Some(workflow.space(ctx).into()),
-                                _ => None,
-                            },
-                            enum_ids: selected_workflow_state
-                                .workflow_type
-                                .as_workflow()
-                                .get_server_enum_ids()
-                        }),
-                        ctx
-                    );
-
                     let workflow_type = &selected_workflow_state.workflow_type;
                     let workflow_id = match workflow_type {
                         WorkflowType::Cloud(workflow) => Some(workflow.id),
@@ -16914,7 +16651,7 @@ impl Input {
         } else {
             AICommandSearchEntrypoint::Keybinding
         };
-        send_telemetry_from_ctx!(TelemetryEvent::AICommandSearchOpened { entrypoint }, ctx);
+
         ctx.notify();
     }
 
@@ -17056,23 +16793,7 @@ impl TypedActionView for Input {
                     self.open_conversation_menu(ctx);
                 }
             }
-            InputAction::ToggleInputAutoDetection => {
-                if let Ok(new_value) =
-                    AISettings::handle(ctx).update(ctx, |ai_settings, model_ctx| {
-                        ai_settings
-                            .ai_autodetection_enabled_internal
-                            .toggle_and_save_value(model_ctx)
-                    })
-                {
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::AgentModeToggleAutoDetectionSetting {
-                            is_autodetection_enabled: new_value,
-                            origin: AgentModeAutoDetectionSettingOrigin::Banner
-                        },
-                        ctx
-                    );
-                }
-            }
+            InputAction::ToggleInputAutoDetection => {}
             InputAction::CycleNextCommandSuggestion => {
                 self.cycle_next_command_suggestion(ctx);
             }

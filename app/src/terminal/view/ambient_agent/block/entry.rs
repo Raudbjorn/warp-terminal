@@ -1,5 +1,5 @@
 use settings::Setting;
-use warp_core::send_telemetry_from_ctx;
+
 use warp_core::ui::Icon;
 use warp_core::ui::appearance::Appearance;
 use warpui::elements::{
@@ -19,7 +19,7 @@ use super::super::{AmbientAgentViewModelEvent, Status};
 use crate::ai::agent::conversation::ConversationStatus;
 use crate::ai::agent_conversations_model::{AgentConversationsModel, AgentConversationsModelEvent};
 use crate::ai::ambient_agents::AmbientAgentTaskId;
-use crate::ai::ambient_agents::telemetry::{CloudAgentTelemetryEvent, CloudModeEntryPoint};
+use crate::ai::ambient_agents::telemetry::CloudModeEntryPoint;
 use crate::ai::blocklist::agent_view::{AgentViewEntryOrigin, render_block_container};
 use crate::pane_group::pane::{PaneConfiguration, PaneConfigurationEvent, PaneStack};
 use crate::terminal::view::ambient_agent::AmbientAgentViewModel;
@@ -354,12 +354,6 @@ impl TypedActionView for AmbientAgentEntryBlock {
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
             AmbientAgentEntryBlockAction::OpenAmbientAgent => {
-                send_telemetry_from_ctx!(
-                    CloudAgentTelemetryEvent::EnteredCloudMode {
-                        entry_point: CloudModeEntryPoint::EntryBlock,
-                    },
-                    ctx
-                );
                 if let Some(stack) = self.pane_stack.upgrade(ctx) {
                     stack.update(ctx, |stack, ctx| {
                         stack.push(

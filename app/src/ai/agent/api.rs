@@ -39,9 +39,9 @@ use crate::ai::execution_profiles::AIExecutionProfileAppExt;
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::ai::mcp::TemplatableMCPServerManager;
-use crate::send_telemetry_from_app_ctx;
+
 use crate::server::server_api::AIApiError;
-use crate::server::telemetry::TelemetryEvent;
+
 use crate::settings::AISettings;
 use crate::terminal::safe_mode_settings::get_secret_obfuscation_mode;
 use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
@@ -554,13 +554,6 @@ fn report_computer_use_unavailable(task_id: AmbientAgentTaskId, sandboxed: bool,
     if !newly_reported {
         return;
     }
-    send_telemetry_from_app_ctx!(
-        TelemetryEvent::ComputerUseUnavailable {
-            ambient_agent_task_id: task_id,
-            sandboxed,
-        },
-        app
-    );
 }
 
 fn non_empty_string(value: String) -> Option<String> {

@@ -22,14 +22,14 @@ use warp_cli::artifact::{
 use warp_cli::task::{MessageCommand, MessageSendArgs, MessageWatchArgs, TaskCommand};
 use warp_cli::{Args, CliCommand, Command};
 use warp_core::features::FeatureFlag;
-use warp_core::telemetry::TelemetryEvent;
+
 use warp_graphql::ai::AgentTaskState;
 use warpui::{App, SingletonEntity, WindowId};
 
 use super::driver::agent_setup::configured_skills::selected_execution_skills;
 use super::{
     AgentDriverRunner, CommandAuthentication, command_authentication, command_requires_auth,
-    command_to_telemetry_event, reconcile_task_harness, resolve_agent_driver_team_scope,
+    reconcile_task_harness, resolve_agent_driver_team_scope,
 };
 use crate::ai::agent_sdk::driver::environment::WorkspaceConfiguration;
 use crate::ai::agent_sdk::driver::harness::HarnessKind;
@@ -1303,80 +1303,6 @@ fn artifact_upload_requires_auth() {
 }
 
 #[test]
-#[serial_test::serial]
-fn run_message_send_telemetry_uses_canonical_harness_from_env() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("OZ_HARNESS", "  CLAUDE  ") };
-    let event = command_to_telemetry_event(&CliCommand::Run(TaskCommand::Message(
-        MessageCommand::Send(MessageSendArgs {
-            to: vec!["run-456".to_string()],
-            subject: "subject".to_string(),
-            body: "body".to_string(),
-            sender_run_id: "run-123".to_string(),
-        }),
-    )));
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::remove_var("OZ_HARNESS") };
-
-    assert_eq!(event.payload(), Some(json!({ "harness": "claude" })));
-}
-
-#[test]
-#[serial_test::serial]
-fn run_message_send_telemetry_supports_claude_code_alias() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("OZ_HARNESS", "CLAUDE_CODE") };
-    let event = command_to_telemetry_event(&CliCommand::Run(TaskCommand::Message(
-        MessageCommand::Send(MessageSendArgs {
-            to: vec!["run-456".to_string()],
-            subject: "subject".to_string(),
-            body: "body".to_string(),
-            sender_run_id: "run-123".to_string(),
-        }),
-    )));
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::remove_var("OZ_HARNESS") };
-
-    assert_eq!(event.payload(), Some(json!({ "harness": "claude" })));
-}
-
-#[test]
-#[serial_test::serial]
-fn run_message_send_telemetry_supports_opencode_harness() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::set_var("OZ_HARNESS", "opencode") };
-    let event = command_to_telemetry_event(&CliCommand::Run(TaskCommand::Message(
-        MessageCommand::Send(MessageSendArgs {
-            to: vec!["run-456".to_string()],
-            subject: "subject".to_string(),
-            body: "body".to_string(),
-            sender_run_id: "run-123".to_string(),
-        }),
-    )));
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::remove_var("OZ_HARNESS") };
-
-    assert_eq!(event.payload(), Some(json!({ "harness": "opencode" })));
-}
-
-#[test]
-#[serial_test::serial]
-fn run_message_send_telemetry_defaults_to_unknown_harness() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::remove_var("OZ_HARNESS") };
-    let event = command_to_telemetry_event(&CliCommand::Run(TaskCommand::Message(
-        MessageCommand::Send(MessageSendArgs {
-            to: vec!["run-456".to_string()],
-            subject: "subject".to_string(),
-            body: "body".to_string(),
-            sender_run_id: "run-123".to_string(),
-        }),
-    )));
-
-    assert_eq!(event.payload(), Some(json!({ "harness": "unknown" })));
-}
-
-#[test]
 fn reconcile_task_harness_adopts_task_harness_when_cli_uses_default() {
     let mut selected_harness = Harness::Oz;
     let harness = reconcile_task_harness(
@@ -1440,19 +1366,4 @@ fn reconcile_task_harness_keeps_the_requested_transport() {
         panic!("ACP transport should produce a third-party harness");
     };
     assert!(!harness.drives_cli_agent_session());
-}
-
-#[test]
-#[serial_test::serial]
-fn run_message_watch_telemetry_defaults_to_unknown_harness() {
-    // TODO: Audit that the environment access only happens in single-threaded code.
-    unsafe { std::env::remove_var("OZ_HARNESS") };
-    let event = command_to_telemetry_event(&CliCommand::Run(TaskCommand::Message(
-        MessageCommand::Watch(MessageWatchArgs {
-            run_id: "run-123".to_string(),
-            since_sequence: 0,
-        }),
-    )));
-
-    assert_eq!(event.payload(), Some(json!({ "harness": "unknown" })));
 }

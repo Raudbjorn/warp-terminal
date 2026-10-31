@@ -45,7 +45,6 @@ pub fn main() -> Result<()> {
                 workload_audience_url: None,
             },
             services_mode: ServicesMode::Online,
-            telemetry_config: None,
             autoupdate_config: None,
             mcp_static_config: None,
         },
