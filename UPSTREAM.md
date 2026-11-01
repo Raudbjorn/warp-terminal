@@ -55,11 +55,15 @@ and keep this file current.
    above) as its second parent, and branch from it. Resync 3 did the same
    (`c856dbf1`).
 
+   Replace the two placeholders first; the commands are not valid shell until
+   you do.
+
    ```bash
-   BASE=89de3f5c9945eeee277e713f111d707d39857dff
+   BASE=<SHA from the last row of the table above>
+   NEW=resync-<N>   # a branch name that does not exist yet
    G=$(git commit-tree 'master^{tree}' -p master -p "$BASE" \
          -m "graft: master tree with true upstream base $BASE")
-   git switch -c resync-4 "$G"
+   git switch -c "$NEW" "$G"
    git merge-base HEAD upstream/master   # must print $BASE
    git merge upstream/master
    ```
