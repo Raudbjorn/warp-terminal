@@ -45,14 +45,22 @@ Profiles are read from `~/.ssh/config`. Saving a profile updates its host stanza
 preserves unrecognized directives, and keeps a backup at `~/.ssh/config.warp.bak`.
 Hand-written stanzas are imported for use and editing; only Warp-managed stanzas
 can be deleted from the panel. Pattern and multi-alias stanzas stay in the file
-but are not listed as editable profiles. Leave the port blank to inherit SSH
-configuration. Profile metadata and recent-host history stay local.
-Optional saved passwords require an explicit username and port and are bound to the
-profile’s host, username, and port. They use the platform secure store, with an owner-only file
-fallback where supported. On Unix, SSH requests saved passwords through an
-askpass helper after verifying the destination process; nested or unidentifiable
-processes authenticate manually. Host-key confirmations and other prompts remain
-interactive.
+but are not listed as editable profiles. Leave the hostname or port blank to
+inherit SSH configuration. Additional IdentityFile entries survive unrelated
+edits; change multi-key lists directly in the config file. Remove references to a
+saved jump host before renaming it. Profile metadata and recent-host history stay local.
+Password authentication uses SSH's normal terminal prompt; identity files and
+SSH-agent authentication are supported. Automatic saved-password release is
+unavailable because the shell-launched connection cannot securely bind a helper
+request to the exact SSH process. Previously stored passwords can be cleared in
+the editor but are never read by the manager.
+
+Remote-tab reopening uses the original connection's control socket and refuses
+restoration if effective SSH settings have changed since launch. It accepts at
+most eight terminal panes per restoration and limits remote stdout to 4 MiB and
+stderr to 16 KiB while reading. A missing control socket causes an error rather
+than a new connection. SSH config saves recheck the file before replacing it,
+though external editors that ignore Warp's lock can still race the final rename.
 
 The manager is adapted from [Changroro/warp](https://github.com/Changroro/warp),
 with its implementation in `app/src/ssh_manager/` and small integration modules in

@@ -24,6 +24,14 @@ fn destination_input_leads_with_quick_connect_and_offers_save() {
     let profiles = vec![profile("staging-api", "10.0.3.45")];
     let items = build_items("deploy@10.0.3.45:2222", &profiles, &SshHostUsage::default());
     assert_eq!(row_kinds(&items), ["quick", "host", "save"]);
+    let actual = rows(&items).collect::<Vec<_>>();
+    assert!(matches!(actual[0], Row::QuickConnect { args } if args == "deploy@10.0.3.45 -p 2222"));
+    assert!(matches!(actual[1], Row::Host { profile, .. } if profile.id == profiles[0].id));
+    assert!(
+        matches!(actual[2], Row::SaveAndConnect { input, destination }
+        if input == "deploy@10.0.3.45:2222" && destination.host == "10.0.3.45"
+        && destination.user.as_deref() == Some("deploy") && destination.port == 2222)
+    );
 }
 
 #[test]
@@ -34,11 +42,17 @@ fn plain_search_lists_matches_before_quick_connect() {
     ];
     let items = build_items("staging", &profiles, &SshHostUsage::default());
     assert_eq!(row_kinds(&items), ["host", "quick", "save"]);
+    assert!(
+        matches!(rows(&items).next(), Some(Row::Host { profile, .. }) if profile.id == profiles[0].id)
+    );
 }
 
 #[test]
 fn saved_destinations_are_not_offered_for_saving() {
-    let profiles = vec![profile("box", "box")];
+    let mut saved = profile("box", "box");
+    saved.host_is_explicit = false;
+    saved.port_is_explicit = false;
+    let profiles = vec![saved];
     let items = build_items("box", &profiles, &SshHostUsage::default());
     assert_eq!(row_kinds(&items), ["host", "quick"]);
 }
@@ -96,6 +110,31 @@ fn editor_navigation_moves_launcher_selection_instead_of_editing_input() {
     });
 }
 
+struct ActionCapture {
+    launcher: ViewHandle<SshLauncherView>,
+    actions: Vec<SshManagerAction>,
+}
+
+impl Entity for ActionCapture {
+    type Event = ();
+}
+impl TypedActionView for ActionCapture {
+    type Action = WorkspaceAction;
+    fn handle_action(&mut self, action: &WorkspaceAction, _ctx: &mut ViewContext<Self>) {
+        if let WorkspaceAction::SshManager(action) = action {
+            self.actions.push(action.clone());
+        }
+    }
+}
+impl View for ActionCapture {
+    fn ui_name() -> &'static str {
+        "SshLauncherActionCapture"
+    }
+    fn render(&self, _app: &AppContext) -> Box<dyn Element> {
+        warpui::elements::ChildView::new(&self.launcher).finish()
+    }
+}
+
 #[test]
 fn ctrl_enter_activates_save_and_connect() {
     use std::cell::Cell;
@@ -108,7 +147,11 @@ fn ctrl_enter_activates_save_and_connect() {
 
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
-        let (_, launcher) = app.add_window(WindowStyle::NotStealFocus, SshLauncherView::new);
+        let (_, capture) = app.add_window(WindowStyle::NotStealFocus, |ctx| ActionCapture {
+            launcher: ctx.add_typed_action_view(SshLauncherView::new),
+            actions: Vec::new(),
+        });
+        let launcher = capture.read(&app, |view, _| view.launcher.clone());
         let closed = Rc::new(Cell::new(false));
         app.update(|ctx| {
             let closed = closed.clone();
@@ -127,5 +170,19 @@ fn ctrl_enter_activates_save_and_connect() {
             view.handle_editor_event(&EditorEvent::CtrlEnter, ctx)
         });
         assert!(closed.get());
+        capture.read(&app, |view, _| {
+            assert!(matches!(view.actions.as_slice(), [SshManagerAction::SaveHost { input, connect: true }] if input == "root@host"));
+        });
     });
+}
+
+#[test]
+fn explicitly_typed_default_port_is_not_confused_with_an_inherited_port() {
+    let mut saved = profile("box", "box");
+    saved.port_is_explicit = false;
+    let items = build_items("box:22", &[saved], &SshHostUsage::default());
+    assert!(matches!(rows(&items).next(), Some(Row::QuickConnect { args }) if args == "box -p 22"));
+    assert!(rows(&items).any(
+        |row| matches!(row, Row::SaveAndConnect { destination, .. } if destination.port_is_explicit)
+    ));
 }

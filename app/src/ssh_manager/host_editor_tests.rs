@@ -42,3 +42,35 @@ fn editing_a_profile_preserves_an_inherited_port_until_explicitly_set() {
         });
     });
 }
+
+#[test]
+fn editing_inherited_host_keeps_it_implicit_and_passwords_are_terminal_only() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (_, modal) = app.add_window(WindowStyle::NotStealFocus, SshProfileModalView::new);
+        let mut profile = SshHostProfile::new("work".into(), "work".into());
+        profile.host_is_explicit = false;
+        modal.update(&mut app, |view, ctx| {
+            view.open_edit(profile, vec![], ctx);
+            assert_eq!(view.host_editor.as_ref(ctx).buffer_text(ctx), "");
+            assert!(!view.build_profile(ctx).unwrap().host_is_explicit);
+            assert!(matches!(view.password_intent(), PasswordIntent::Keep));
+            view.handle_action(&SshProfileModalAction::ClearPassword, ctx);
+            assert!(matches!(view.password_intent(), PasswordIntent::Clear));
+            view.host_editor.update(ctx, |editor, ctx| {
+                editor.set_buffer_text_ignoring_undo("server", ctx)
+            });
+            let explicit = view.build_profile(ctx).unwrap();
+            assert!(explicit.host_is_explicit);
+            assert_eq!(explicit.host, "server");
+        });
+    });
+}
+
+#[test]
+fn linked_jump_hosts_connect_by_the_saved_alias() {
+    let profile = SshHostProfile::new("gateway".into(), "10.0.0.1".into());
+    let jump = SshProfileModalView::jump_host_from_profile(&profile);
+    assert_eq!(jump.host, "gateway");
+    assert_eq!(jump.source_profile_id, Some(profile.id));
+}

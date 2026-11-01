@@ -114,6 +114,7 @@ fn proxy_jump_roundtrips_including_per_hop_identity_files() {
             host: "bastion".to_string(),
             user: Some("ops".to_string()),
             port: 2222,
+            port_is_explicit: true,
             identity_file: Some("~/.ssh/bastion_key".to_string()),
         },
         SshJumpHost {
@@ -121,6 +122,7 @@ fn proxy_jump_roundtrips_including_per_hop_identity_files() {
             host: "relay".to_string(),
             user: None,
             port: default_ssh_port(),
+            port_is_explicit: false,
             identity_file: None,
         },
     ];
@@ -269,6 +271,7 @@ fn control_characters_in_profile_fields_are_rejected() {
         host: injected.to_string(),
         user: None,
         port: default_ssh_port(),
+        port_is_explicit: false,
         identity_file: None,
     }];
     assert!(upsert_profile_at(&path, &by_name).is_err());
@@ -327,6 +330,7 @@ fn ipv6_jump_hosts_roundtrip_with_brackets() {
             host: "2001:db8::1".to_string(),
             user: Some("ops".to_string()),
             port: 2222,
+            port_is_explicit: true,
             identity_file: None,
         },
         SshJumpHost {
@@ -334,6 +338,7 @@ fn ipv6_jump_hosts_roundtrip_with_brackets() {
             host: "2001:db8::2".to_string(),
             user: None,
             port: default_ssh_port(),
+            port_is_explicit: false,
             identity_file: None,
         },
     ];
@@ -604,6 +609,7 @@ fn jump_host_source_profile_ids_roundtrip_through_comments() {
             host: "relay".to_string(),
             user: None,
             port: default_ssh_port(),
+            port_is_explicit: false,
             identity_file: None,
         },
         SshJumpHost {
@@ -611,6 +617,7 @@ fn jump_host_source_profile_ids_roundtrip_through_comments() {
             host: "bastion".to_string(),
             user: Some("ops".to_string()),
             port: 2222,
+            port_is_explicit: true,
             identity_file: Some("~/.ssh/bastion_key".to_string()),
         },
     ];
@@ -695,11 +702,7 @@ fn rewritten_ids_stop_the_normalizer_from_reassigning_on_every_load() {
 
     let mut profiles = load_profiles_at(&path).unwrap();
     assert_eq!(normalize_ssh_host_profiles(&mut profiles).len(), 2);
-    let ids = profiles
-        .iter()
-        .map(|profile| profile.id)
-        .collect::<Vec<_>>();
-    rewrite_profile_ids_at(&path, &ids).unwrap();
+    rewrite_profile_ids_at(&path, &profiles).unwrap();
 
     let mut reloaded = load_profiles_at(&path).unwrap();
     assert_eq!(reloaded, profiles);
@@ -719,13 +722,9 @@ fn rewriting_unchanged_ids_leaves_the_file_alone() {
         Uuid::new_v4()
     );
     let path = write_config(dir.path(), &source);
-    let ids = load_profiles_at(&path)
-        .unwrap()
-        .iter()
-        .map(|profile| profile.id)
-        .collect::<Vec<_>>();
+    let profiles = load_profiles_at(&path).unwrap();
 
-    rewrite_profile_ids_at(&path, &ids).unwrap();
+    rewrite_profile_ids_at(&path, &profiles).unwrap();
 
     assert_eq!(read(&path), source);
     assert!(!sibling_path(&path, BACKUP_SUFFIX).exists());
@@ -737,7 +736,16 @@ fn rewriting_ids_against_a_config_that_changed_underneath_is_an_error() {
     let source = "Host a\n    HostName 10.0.0.1\n";
     let path = write_config(dir.path(), source);
 
-    assert!(rewrite_profile_ids_at(&path, &[Uuid::new_v4(), Uuid::new_v4()]).is_err());
+    assert!(
+        rewrite_profile_ids_at(
+            &path,
+            &[
+                SshHostProfile::new("a".into(), "a".into()),
+                SshHostProfile::new("b".into(), "b".into())
+            ]
+        )
+        .is_err()
+    );
     assert_eq!(read(&path), source);
     assert!(!sibling_path(&path, BACKUP_SUFFIX).exists());
 }
@@ -886,11 +894,11 @@ fn external_destination_edits_invalidate_the_credential_key() {
 }
 
 #[test]
-fn saving_and_clearing_managed_directives_remove_duplicates() {
+fn saving_and_clearing_scalar_directives_remove_duplicates() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_config(
         dir.path(),
-        "Host work\n    HostName host\n    IdentityFile key-one # first key\n    IdentityFile key-two\n    ProxyJump first\n    ProxyJump second\n    IdentitiesOnly yes\n",
+        "Host work\n    HostName host\n    IdentityFile key-one # first key\n    ProxyJump first\n    ProxyJump second\n    IdentitiesOnly yes\n",
     );
     let mut profile = load_profiles_at(&path).unwrap().remove(0);
     profile.identity_file = Some("replacement".into());
@@ -940,6 +948,7 @@ fn saving_jumps_never_changes_a_hand_written_proxy_command() {
         host: "jump".into(),
         user: None,
         port: 22,
+        port_is_explicit: false,
         identity_file: None,
     });
     assert!(
@@ -982,4 +991,106 @@ fn directives_after_include_remain_in_the_host_profile() {
     assert!(contents.contains(
         "Include extra.conf\n    User deploy\n    Port 2222\nHost other\n    User nobody\n"
     ));
+}
+
+#[test]
+fn unrelated_edits_preserve_all_additive_identity_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let identities =
+        "    IdentityFile key-one # first key\n    IdentityFile key-two # fallback key\n";
+    let path = write_config(
+        dir.path(),
+        &format!("Host work\n{identities}    User old\n"),
+    );
+    let mut profile = load_profiles_at(&path).unwrap().remove(0);
+    profile.user = Some("new".into());
+    upsert_profile_at(&path, &profile).unwrap();
+    assert!(read(&path).contains(identities));
+    let preserved = read(&path);
+    for identity in [Some("replacement".into()), None] {
+        profile.identity_file = identity;
+        assert!(
+            upsert_profile_at(&path, &profile)
+                .unwrap_err()
+                .to_string()
+                .contains("multiple IdentityFile")
+        );
+        assert_eq!(read(&path), preserved);
+    }
+}
+
+#[test]
+fn unrelated_edit_does_not_materialize_an_inherited_hostname() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), "Include hosts.conf\nHost work\n    User old\n");
+    let mut profile = load_profiles_at(&path).unwrap().remove(0);
+    assert!(!profile.host_is_explicit);
+    profile.tags.push("prod".into());
+    upsert_profile_at(&path, &profile).unwrap();
+    assert!(!read(&path).contains("HostName"));
+    profile.host = "explicit.example".into();
+    profile.host_is_explicit = true;
+    upsert_profile_at(&path, &profile).unwrap();
+    assert!(read(&path).contains("HostName explicit.example"));
+}
+
+#[test]
+fn first_imported_alias_rename_updates_the_original_stanza() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        "Host old\n    HostName server\n    ForwardAgent no\n",
+    );
+    let mut profile = load_profiles_at(&path).unwrap().remove(0);
+    profile.name = "new".into();
+    upsert_profile_at(&path, &profile).unwrap();
+    assert!(!read(&path).contains("Host old"));
+    assert!(read(&path).contains("Host new\n    HostName server\n    ForwardAgent no\n"));
+    assert_eq!(load_profiles_at(&path).unwrap(), vec![profile]);
+}
+
+#[test]
+fn id_rewrite_rejects_same_count_alias_reordering() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), "Host first\nHost second\n");
+    let profiles = load_profiles_at(&path).unwrap();
+    let reordered = "Host second\nHost first\n";
+    fs::write(&path, reordered).unwrap();
+    assert!(rewrite_profile_ids_at(&path, &profiles).is_err());
+    assert_eq!(read(&path), reordered);
+}
+
+#[test]
+fn external_edit_during_mutation_is_not_overwritten() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), "Host work\n    User old\n");
+    let external = "Host work\n    User external\n";
+    let result = edit(&path, |config| {
+        let Segment::Host(block) = &mut config.segments[0] else {
+            panic!("host expected")
+        };
+        block.set_directive("User", Some("warp"));
+        fs::write(&path, external)?;
+        Ok(())
+    });
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("changed outside Warp")
+    );
+    assert_eq!(read(&path), external);
+}
+
+#[test]
+fn proxy_jump_retains_an_explicit_default_port() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(dir.path(), "Host work\n    ProxyJump gateway:22,relay\n");
+    let mut profile = load_profiles_at(&path).unwrap().remove(0);
+    assert!(profile.jump_hosts[0].port_is_explicit);
+    assert!(!profile.jump_hosts[1].port_is_explicit);
+    profile.tags.push("prod".into());
+    upsert_profile_at(&path, &profile).unwrap();
+    assert!(read(&path).contains("ProxyJump gateway:22,relay"));
+    assert_eq!(load_profiles_at(&path).unwrap(), vec![profile]);
 }

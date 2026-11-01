@@ -404,25 +404,35 @@ impl Workspace {
         let Some(profile) = self.saved_ssh_profile(profile_id, ctx) else {
             return;
         };
-        let matches_live_connection = SshOpenConnections::terminals(profile_id, ctx)
+        let captured_config = SshOpenConnections::terminals(profile_id, ctx)
             .into_iter()
-            .any(|terminal| {
+            .find_map(|terminal| {
                 let terminal = terminal.as_ref(ctx);
-                terminal.ssh_profile_matches(&profile)
-                    && terminal.ssh_upload_control_path(ctx).as_ref() == Some(&control_path)
+                (terminal.ssh_profile_matches(&profile)
+                    && terminal.ssh_upload_control_path(ctx).as_ref() == Some(&control_path))
+                .then(|| terminal.ssh_profile_config().map(str::to_owned))
+                .flatten()
             });
-        if !matches_live_connection {
+        let Some(captured_config) = captured_config else {
             self.show_ssh_toast(DismissibleToast::error(
                 "This SSH connection no longer matches the saved host. Reconnect before reopening its tabs.".into()
             ), ctx);
             return;
-        }
+        };
         self.show_ssh_toast(
             DismissibleToast::default(format!("Reading Warp tabs on {}…", profile.name)),
             ctx,
         );
+        let fetch_profile = profile.clone();
         ctx.spawn(
-            remote_sessions::fetch(control_path),
+            async move {
+                anyhow::ensure!(remote_sessions::effective_config(fetch_profile.clone()).await? == captured_config,
+                    "SSH settings changed since this connection started; reconnect before reopening tabs");
+                let sessions = remote_sessions::fetch(control_path).await?;
+                anyhow::ensure!(remote_sessions::effective_config(fetch_profile).await? == captured_config,
+                    "SSH settings changed while its tabs were loading; reconnect before reopening tabs");
+                Ok::<_, anyhow::Error>(sessions)
+            },
             move |me, result, ctx| match result {
                 Ok(sessions) if sessions.tabs.is_empty() => me.show_ssh_toast(
                     DismissibleToast::error(format!(
@@ -462,6 +472,17 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         if !self.can_open_ssh_tab(ctx) {
+            return;
+        }
+        let pane_count: usize = sessions.tabs.iter().map(|tab| tab.directories.len()).sum();
+        if pane_count > remote_sessions::MAX_RESTORED_PANES {
+            self.show_ssh_toast(
+                DismissibleToast::error(format!(
+                    "Cannot reopen more than {} SSH panes at once",
+                    remote_sessions::MAX_RESTORED_PANES
+                )),
+                ctx,
+            );
             return;
         }
         self.record_ssh_connection(SshDestination::Profile(profile.id), ctx);

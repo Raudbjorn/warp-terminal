@@ -32,7 +32,8 @@ pub struct DisconnectReason {
 
 /// Finds the last line of ssh output that explains why the connection ended.
 pub fn disconnect_reason(output: &str) -> Option<DisconnectReason> {
-    output.lines().rev().find_map(|line| {
+    let mut fallback = None;
+    for line in output.lines().rev() {
         let line = line.trim();
         let lower = line.to_lowercase();
         let ssh_diagnostic = [
@@ -50,19 +51,18 @@ pub fn disconnect_reason(output: &str) -> Option<DisconnectReason> {
                 .iter()
                 .any(|pattern| lower.contains(pattern))
         {
-            Some(DisconnectReason {
+            return Some(DisconnectReason {
                 message: line.to_string(),
                 is_network_failure: true,
-            })
+            });
         } else if lower.contains("permission denied") || lower.starts_with("connection to ") {
-            Some(DisconnectReason {
+            fallback.get_or_insert_with(|| DisconnectReason {
                 message: line.to_string(),
                 is_network_failure: false,
-            })
-        } else {
-            None
+            });
         }
-    })
+    }
+    fallback
 }
 
 #[cfg(test)]

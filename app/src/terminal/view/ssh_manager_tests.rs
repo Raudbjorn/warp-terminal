@@ -178,27 +178,6 @@ fn suppression_matches_equivalent_ssh_argv() {
     })
 }
 
-#[test]
-fn suppression_matches_commands_with_the_password_helper_prefix() {
-    App::test((), |mut app| async move {
-        initialize_app_for_terminal_view(&mut app);
-        let terminal = add_window_with_terminal(&mut app, None);
-        let mut profile = SshHostProfile::new("box".to_string(), "10.0.0.5".to_string());
-        profile.user = Some("root".to_string());
-        let command = format!(
-            "{}{SSH_PROFILE_BARE_COMMAND}",
-            askpass::env_prefix(&profile).unwrap()
-        );
-
-        terminal.update(&mut app, |view, ctx| {
-            arm_warpify_disabled_profile(view, &command, ctx);
-            start_block_with_command(view, &command, ctx);
-
-            assert!(!model_honors_remote_init_shell(view));
-        });
-    })
-}
-
 /// Neither matcher recognizes an absolute `ssh` path: the string differs and the parser requires
 /// a bare `ssh` argv[0].
 #[test]
@@ -269,8 +248,12 @@ fn startup_directory_is_entered_once_per_connection_on_the_first_remote_prompt()
 
             view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(local), None), ctx);
             view.active_block_metadata = Some(BlockMetadata::new(Some(local), None));
+            watch_quick_connect_in(view, Some("/srv/app"));
             start_block_with_command(view, "ssh root@remote", ctx);
-            assert!(!sent(view), "a reconnect enters the directory again");
+            assert!(
+                !sent(view),
+                "a newly armed reconnect enters the directory again"
+            );
         });
     })
 }
@@ -294,8 +277,22 @@ fn reconnect_banner_shows_when_the_local_shell_prompts_after_a_watched_ssh_comma
             view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(local), None), ctx);
             assert!(view.ssh_profile.reconnect_banner.is_some());
 
+            let watched_block = view
+                .ssh_profile
+                .connection
+                .as_ref()
+                .unwrap()
+                .block_id
+                .clone();
             start_block_with_command(view, "ssh root@remote", ctx);
-            assert!(view.ssh_profile.reconnect_banner.is_none());
+            assert!(view.ssh_profile.reconnect_banner.is_some());
+            let connection = view.ssh_profile.connection.as_ref().unwrap();
+            assert!(
+                connection.disconnected,
+                "a typed ssh command cannot revive the managed watch"
+            );
+            assert_eq!(connection.block_id, watched_block);
+            assert!(connection.local_session_id.is_none());
         });
     })
 }
@@ -331,18 +328,21 @@ fn warpified_connections_go_through_the_ssh_wrapper() {
 }
 
 #[test]
-fn an_old_suppression_timer_cannot_expire_a_rearmed_identical_command() {
+fn suppression_is_consumed_by_the_matching_block_without_a_launch_deadline() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let terminal = add_window_with_terminal(&mut app, None);
         terminal.update(&mut app, |view, ctx| {
             view.arm_ssh_profile_connection(SSH_PROFILE_TEST_COMMAND.into(), false, ctx);
-            let old_generation = view.ssh_profile.suppression_generation;
-            view.arm_ssh_profile_connection(SSH_PROFILE_TEST_COMMAND.into(), false, ctx);
-            view.expire_ssh_profile_arm(old_generation);
             assert!(view.ssh_profile_warpify_disabled_command_matches(SSH_PROFILE_TEST_COMMAND));
-            view.expire_ssh_profile_arm(view.ssh_profile.suppression_generation);
+            start_block_with_command(view, SSH_PROFILE_TEST_COMMAND, ctx);
             assert!(view.ssh_profile.warpify_disabled_command.is_none());
+            assert!(!view.handle_ssh_manager_block_started(
+                &BlockId::new(),
+                SSH_PROFILE_TEST_COMMAND,
+                SSH_PROFILE_TEST_COMMAND,
+                ctx
+            ));
         });
     });
 }
@@ -372,7 +372,34 @@ fn startup_directory_does_not_append_to_another_pending_command() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let terminal = add_window_with_terminal(&mut app, None);
+        let submitted = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let observed = submitted.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let super::super::Event::ExecuteCommand(event) = event {
+                    observed.borrow_mut().push(event.command.clone());
+                }
+            });
+        });
         terminal.update(&mut app, |view, ctx| {
+            // Match History's existing init_session_with test setup: command execution requires
+            // an appendable session even though no on-disk history needs to be read here.
+            let session_id = view
+                .model
+                .lock()
+                .block_list()
+                .active_block()
+                .session_id()
+                .unwrap();
+            let session_info =
+                crate::terminal::model::session::SessionInfo::new_for_test().with_id(session_id);
+            view.sessions.update(ctx, |sessions, _| {
+                sessions.register_session_for_test(session_info)
+            });
+            let session = view.sessions.as_ref(ctx).get(session_id).unwrap();
+            crate::terminal::history::History::handle(ctx).update(ctx, |history, ctx| {
+                history.init_session_with(session, std::future::ready(Vec::new()), ctx);
+            });
             watch_quick_connect_in(view, Some("/srv/app"));
             view.active_block_metadata = Some(BlockMetadata::new(Some(SessionId::from(1)), None));
             start_block_with_command(view, "ssh root@remote", ctx);
@@ -386,6 +413,38 @@ fn startup_directory_does_not_append_to_another_pending_command() {
             assert!(
                 !view
                     .ssh_profile
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .startup_directory_sent
+            );
+            view.input
+                .update(ctx, |input, ctx| input.execute_pending_command(ctx));
+            assert!(!view.input.as_ref(ctx).has_pending_command());
+            view.model
+                .lock()
+                .simulate_block("echo pending", "pending\n");
+            view.input.update(ctx, |input, ctx| {
+                input.clear_buffer_and_reset_undo_stack(ctx)
+            });
+            view.active_block_metadata = Some(BlockMetadata::new(Some(SessionId::from(2)), None));
+            view.handle_ssh_manager_precmd(
+                &BlockMetadata::new(Some(SessionId::from(2)), None),
+                ctx,
+            );
+            assert!(
+                view.input.as_ref(ctx).has_pending_command()
+                    || submitted
+                        .borrow()
+                        .iter()
+                        .any(|command| command == "cd -- /srv/app")
+            );
+            if view.input.as_ref(ctx).has_pending_command() {
+                assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), "cd -- /srv/app");
+            }
+            start_block_with_command(view, "cd -- /srv/app", ctx);
+            assert!(
+                view.ssh_profile
                     .connection
                     .as_ref()
                     .unwrap()
@@ -425,10 +484,22 @@ fn non_warpified_remote_session_requests_poll_without_a_remote_prompt() {
             watch_quick_connect(view);
             view.ssh_profile.connection.as_mut().unwrap().profile_id = Some(Uuid::new_v4());
             view.read_remote_sessions_when_ready(ctx);
+            assert!(
+                view.ssh_profile.control_path_poll.is_none(),
+                "pending launches have no discovery deadline"
+            );
+            assert!(
+                view.ssh_profile
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .read_remote_sessions_when_ready
+            );
+            view.active_block_metadata = Some(BlockMetadata::new(Some(SessionId::from(1)), None));
+            start_block_with_command(view, "ssh root@remote", ctx);
             assert!(view.ssh_profile.control_path_poll.is_some());
             assert!(
-                !view
-                    .ssh_profile
+                view.ssh_profile
                     .connection
                     .as_ref()
                     .unwrap()
@@ -560,5 +631,142 @@ fn cli_agent_native_image_paste_is_preserved_in_a_managed_ssh_session() {
             vec![0x16]
         };
         assert_eq!(*writes.borrow(), vec![expected]);
+    });
+}
+
+#[test]
+fn session_endpoint_uses_the_captured_profile_and_omits_inherited_ports() {
+    let mut profile = SshHostProfile::new("original".into(), "original.example".into());
+    profile.user = Some("alice".into());
+    profile.port_is_explicit = false;
+    let mut watch = SshConnectionWatch::new(
+        String::new(),
+        Some(profile.id),
+        profile.name.clone(),
+        None,
+        None,
+    );
+    watch.captured_profile = Some(profile.clone());
+    profile.host = "edited.example".into();
+    profile.user = Some("bob".into());
+    assert_eq!(
+        session_endpoint_label(watch.captured_profile.as_ref().unwrap()),
+        "alice@original.example"
+    );
+    let captured = watch.captured_profile.as_mut().unwrap();
+    captured.port_is_explicit = true;
+    captured.port = 2222;
+    assert_eq!(
+        session_endpoint_label(captured),
+        "alice@original.example:2222"
+    );
+}
+
+#[test]
+fn remote_subshells_retain_the_original_wrapper_socket() {
+    use crate::terminal::model::session::{IsSSHWrapperSession, SessionInfo};
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let socket = tempfile::NamedTempFile::new().unwrap();
+        terminal.update(&mut app, |view, ctx| {
+            watch_quick_connect(view);
+            let local = SessionId::from(1);
+            let remote = SessionId::from(2);
+            let nested = SessionId::from(3);
+            let mut session = SessionInfo::new_for_test();
+            session.session_id = remote;
+            session.is_ssh_wrapper_session = IsSSHWrapperSession::Yes {
+                socket_path: socket.path().to_path_buf(),
+                external_control_master: false,
+            };
+            view.sessions.update(ctx, |sessions, _| {
+                sessions.register_session_for_test(session)
+            });
+            view.active_block_metadata = Some(BlockMetadata::new(Some(local), None));
+            start_block_with_command(view, "ssh root@remote", ctx);
+            view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(remote), None), ctx);
+            view.active_block_metadata = Some(BlockMetadata::new(Some(nested), None));
+            view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(nested), None), ctx);
+            assert_eq!(
+                view.ssh_profile
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .remote_session_id,
+                Some(remote)
+            );
+            assert_eq!(
+                view.ssh_upload_control_path(ctx),
+                Some(socket.path().to_path_buf())
+            );
+        });
+    });
+}
+
+#[test]
+fn retries_reset_only_after_confirmed_establishment_stays_stable() {
+    for established in [false, true] {
+        App::test((), move |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal = add_window_with_terminal(&mut app, None);
+            terminal.update(&mut app, |view, ctx| {
+                watch_quick_connect(view);
+                let local = SessionId::from(1);
+                view.active_block_metadata = Some(BlockMetadata::new(Some(local), None));
+                view.model.lock().simulate_long_running_block(
+                    "ssh root@remote",
+                    "ssh: connect to host remote port 22: Connection timed out\n",
+                );
+                start_block_with_command(view, "ssh root@remote", ctx);
+                let connection = view.ssh_profile.connection.as_mut().unwrap();
+                connection.attempt = MAX_AUTO_RECONNECT_ATTEMPTS;
+                connection.established_at = established.then(|| Instant::now() - STABLE_CONNECTION);
+                view.model.lock().command_finished(
+                    crate::terminal::model::ansi::CommandFinishedValue {
+                        completion_metadata: crate::terminal::model::ansi::CompletionMetadata {
+                            exit_code: 255.into(),
+                            next_block_id: BlockId::new(),
+                        },
+                        session_id: None,
+                    },
+                );
+                view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(local), None), ctx);
+                assert_eq!(
+                    view.ssh_profile.connection.as_ref().unwrap().attempt,
+                    if established {
+                        1
+                    } else {
+                        MAX_AUTO_RECONNECT_ATTEMPTS
+                    }
+                );
+            });
+        });
+    }
+}
+
+#[test]
+fn disconnect_tail_does_not_materialize_old_transcript_rows() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, _| {
+            let output = format!(
+                "{}client_loop: send disconnect: Broken pipe\n",
+                "old output\n".repeat(10_000)
+            );
+            let mut model = view.model.lock();
+            model.simulate_long_running_block("ssh root@remote", &output);
+            let block = model.block_list().active_block();
+            let tail = block
+                .output_grid()
+                .contents_to_string_force_full_grid_contents(false, Some(DISCONNECT_SCAN_CHARS));
+            assert!(tail.len() < output.len() / 2);
+            assert!(
+                disconnect_reason(&last_chars(&tail, DISCONNECT_SCAN_CHARS))
+                    .unwrap()
+                    .is_network_failure
+            );
+        });
     });
 }

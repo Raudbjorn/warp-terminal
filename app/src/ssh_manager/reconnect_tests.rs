@@ -39,7 +39,8 @@ fn remote_application_errors_are_not_network_disconnects() {
         assert_eq!(disconnect_reason(output), None);
     }
     assert!(
-        !disconnect_reason(
+        // A generic trailing close does not erase the preceding SSH network diagnosis.
+        disconnect_reason(
             "client_loop: send disconnect: Broken pipe\nConnection to host closed.\n"
         )
         .unwrap()

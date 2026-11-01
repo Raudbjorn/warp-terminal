@@ -12883,9 +12883,7 @@ impl TerminalView {
                         let alias_value = session.alias_value(first_word)?;
                         Some(format!("{alias_value}{rest}"))
                     });
-                let warpify_command = crate::ssh_manager::askpass::strip_env_prefix(
-                    expanded_command.as_deref().unwrap_or(command.as_str()),
-                );
+                let warpify_command = expanded_command.as_deref().unwrap_or(command.as_str());
 
                 // Check if the current running command spawns a subshell eligible for Warpification.
                 let shell_family = self.shell_family(ctx);
@@ -27459,9 +27457,7 @@ impl TerminalView {
                 let alias_value = session.alias_value(first_word)?;
                 Some(format!("{alias_value}{rest}"))
             });
-        let warpify_command = crate::ssh_manager::askpass::strip_env_prefix(
-            expanded_command.as_deref().unwrap_or(command),
-        );
+        let warpify_command = expanded_command.as_deref().unwrap_or(command);
         let shell_family = self.shell_family_for_password_prompt_polling(ctx);
         let warpify_settings = WarpifySettings::as_ref(ctx);
         let is_compatible_subshell_command = warpify_settings

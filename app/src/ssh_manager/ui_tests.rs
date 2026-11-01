@@ -25,6 +25,7 @@ fn host_subtitle_shows_port_and_first_jump_host() {
         host: "bastion".to_string(),
         user: None,
         port: 22,
+        port_is_explicit: false,
         identity_file: None,
     });
     assert_eq!(host_subtitle(&profile), "admin@10.0.3.30:22 · via bastion");

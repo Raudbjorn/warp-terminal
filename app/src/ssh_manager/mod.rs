@@ -1,7 +1,6 @@
 //! Fork-owned SSH host manager. Upstream files only hold thin hooks into this module; see
 //! the SSH profiles section in `README.md` for provenance and usage.
 
-pub mod askpass;
 pub mod config_file;
 pub mod control_master;
 pub mod host_editor;

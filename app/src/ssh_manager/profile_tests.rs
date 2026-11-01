@@ -12,6 +12,7 @@ fn jump_host(
         host: host.to_string(),
         user: user.map(str::to_string),
         port,
+        port_is_explicit: port != default_ssh_port(),
         identity_file: identity_file.map(str::to_string),
     }
 }
@@ -164,6 +165,7 @@ fn normalize_ssh_profiles_migrates_missing_or_duplicate_ids() {
             id: Uuid::nil(),
             name: "missing".to_string(),
             host: "one.example.com".to_string(),
+            host_is_explicit: true,
             user: None,
             port: 0,
             port_is_explicit: true,
@@ -175,6 +177,7 @@ fn normalize_ssh_profiles_migrates_missing_or_duplicate_ids() {
             id,
             name: "first".to_string(),
             host: "two.example.com".to_string(),
+            host_is_explicit: true,
             user: None,
             port: 22,
             port_is_explicit: true,
@@ -186,6 +189,7 @@ fn normalize_ssh_profiles_migrates_missing_or_duplicate_ids() {
             id,
             name: "duplicate".to_string(),
             host: "three.example.com".to_string(),
+            host_is_explicit: true,
             user: None,
             port: 22,
             port_is_explicit: true,
@@ -450,6 +454,7 @@ fn quick_connect_destination_parses_user_host_and_port() {
             user: Some("deploy".to_string()),
             host: "10.0.3.45".to_string(),
             port: 2222,
+            port_is_explicit: true,
         })
     );
     assert_eq!(parse("box").map(|d| (d.user, d.port)), Some((None, 22)));
@@ -472,7 +477,10 @@ fn quick_connect_args_turns_host_port_into_a_port_flag() {
         quick_connect_args("deploy@10.0.3.45:2222").as_deref(),
         Some("deploy@10.0.3.45 -p 2222")
     );
-    assert_eq!(quick_connect_args("ssh box:22").as_deref(), Some("box"));
+    assert_eq!(
+        quick_connect_args("ssh box:22").as_deref(),
+        Some("box -p 22")
+    );
 }
 
 #[test]
@@ -510,14 +518,15 @@ fn quick_connect_quotes_ipv6_shell_globs() {
 }
 
 #[test]
-fn saved_profile_connects_by_alias_while_forwarding_to_the_real_host() {
+fn saved_profile_connects_by_alias_and_forwards_to_the_effective_destination() {
     let mut profile = SshHostProfile::new("private-db".into(), "10.0.0.5".into());
     profile.user = Some("deploy".into());
     profile.jump_hosts = vec![jump_host("gateway", Some("jump"), 22, Some("~/.ssh/jump"))];
     let command = profile.to_saved_ssh_command();
     let args = shell_words::split(&command).unwrap();
     assert_eq!(args.last().map(String::as_str), Some("deploy@private-db"));
-    assert!(proxy_command_value(&command).contains("-W 10.0.0.5:22"));
+    // OpenSSH may obtain HostName from an earlier matching rule, even with explicit Port.
+    assert!(proxy_command_value(&command).contains("[%h]:%p"));
 }
 
 #[test]
@@ -558,4 +567,50 @@ fn jump_identity_forwarding_uses_the_effective_destination_port_when_inherited()
     let proxy = shell_words::split(&proxy_command_value(&command)).unwrap();
     let forward = proxy.windows(2).find(|pair| pair[0] == "-W").unwrap();
     assert_eq!(forward[1], "[%h]:%p");
+}
+
+#[test]
+fn quick_connect_preserves_explicit_port_provenance_when_saved() {
+    for (input, explicit, port) in [
+        ("box", false, 22),
+        ("box:22", true, 22),
+        ("box:2222", true, 2222),
+        ("[::1]", false, 22),
+        ("[::1]:22", true, 22),
+        ("::1", false, 22),
+    ] {
+        let destination = QuickConnectDestination::parse(input).unwrap();
+        assert_eq!(destination.port_is_explicit, explicit, "{input}");
+        let profile = destination.to_profile();
+        assert_eq!(profile.port_is_explicit, explicit, "{input}");
+        assert_eq!(profile.port, port);
+        assert!(!profile.host_is_explicit);
+        let args = shell_words::split(&quick_connect_args(input).unwrap()).unwrap();
+        assert_eq!(args.iter().any(|arg| arg == "-p"), explicit, "{input}");
+        let saved_args = shell_words::split(&profile.to_saved_ssh_command()).unwrap();
+        assert_eq!(
+            saved_args.iter().any(|arg| arg == "-p"),
+            explicit,
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn saved_jump_aliases_preserve_inherited_and_explicit_default_ports() {
+    let mut profile = SshHostProfile::new("work".into(), "host".into());
+    let mut jump = jump_host("gateway", None, 22, None);
+    jump.source_profile_id = Some(Uuid::new_v4());
+    profile.jump_hosts = vec![jump.clone()];
+    assert!(profile.to_saved_ssh_command().contains("-J gateway --"));
+    profile.jump_hosts[0].port_is_explicit = true;
+    assert!(profile.to_saved_ssh_command().contains("-J gateway:22 --"));
+    profile.jump_hosts[0].identity_file = Some("~/.ssh/key".into());
+    assert!(proxy_command_value(&profile.to_saved_ssh_command()).contains("-p 22"));
+    profile.jump_hosts[0].port_is_explicit = false;
+    assert!(!proxy_command_value(&profile.to_saved_ssh_command()).contains("-p 22"));
+    // Inner alias resolution occurs in its own SSH process, then expands the preceding hop's -W.
+    profile.jump_hosts.push(jump);
+    assert!(proxy_command_value(&profile.to_saved_ssh_command()).contains("[%%h]:%%p"));
+    assert!(!proxy_command_value(&profile.to_saved_ssh_command()).contains("-W gateway:22"));
 }
