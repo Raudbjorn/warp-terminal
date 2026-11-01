@@ -38,6 +38,7 @@ use crate::ai::execution_profiles::{
 };
 use crate::ai::llms::{
     DisableReason, LLMContextWindow, LLMId, LLMInfo, LLMPreferences, LLMPreferencesEvent,
+    effective_disable_reason_for_model,
 };
 use crate::ai::paths::host_native_absolute_path;
 use crate::editor::{
@@ -1754,9 +1755,12 @@ impl ExecutionProfileEditorView {
             let llm_prefs = llm_prefs.as_ref(ctx);
             let choices = get_choices(llm_prefs, &scope, ctx);
 
-            let has_upgrade_gated_models = choices
-                .iter()
-                .any(|llm| matches!(llm.disable_reason, Some(DisableReason::RequiresUpgrade)));
+            let has_upgrade_gated_models = choices.iter().any(|llm| {
+                matches!(
+                    effective_disable_reason_for_model(llm, None, &scope, ctx),
+                    Some(DisableReason::RequiresUpgrade)
+                )
+            });
 
             let items = available_model_menu_items(
                 choices,

@@ -12,8 +12,9 @@ use warpui::{Action, AppContext, Element, SingletonEntity as _};
 use crate::ai::agent::conversation::AIConversation;
 use crate::ai::custom_model_routers::is_custom_router_id;
 use crate::ai::llms::{
-    DisableReason, LLMId, LLMInfo, LLMPreferences, ModelIconFlags, is_model_allowed_for_scope,
-    model_leading_icon, should_show_bedrock_icon_for_model,
+    DisableReason, LLMId, LLMInfo, LLMPreferences, ModelIconFlags,
+    effective_disable_reason_for_model, is_model_allowed_for_scope, model_leading_icon,
+    should_show_bedrock_icon_for_model,
     should_show_gemini_enterprise_agent_platform_icon_for_model, should_show_key_icon_for_model,
 };
 use crate::menu::{MenuItem, MenuItemFields, MenuTooltipPosition};
@@ -179,11 +180,13 @@ fn make_item_fields<A: Action + Clone>(
         MenuItemFields::new(label).with_icon(leading_icon)
     };
 
+    let disable_reason = effective_disable_reason_for_model(llm, conversation, scope, app);
+
     item = item
         .with_on_select_action(action(llm))
-        .with_disabled(llm.disable_reason.is_some());
+        .with_disabled(disable_reason.is_some());
 
-    if let Some(reason) = &llm.disable_reason {
+    if let Some(reason) = &disable_reason {
         item = item
             .with_tooltip(reason.tooltip_text())
             .with_tooltip_position(MenuTooltipPosition::Above);
