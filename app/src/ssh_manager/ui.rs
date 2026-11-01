@@ -46,7 +46,21 @@ pub fn badge_label(profile: &SshHostProfile) -> String {
 
 /// `user@host:port`, plus the first jump host.
 pub fn host_subtitle(profile: &SshHostProfile) -> String {
-    let mut subtitle = format!("{}:{}", profile.target(), profile.port);
+    let host = if profile.host.contains(':') && !profile.host.starts_with('[') {
+        format!("[{}]", profile.host)
+    } else {
+        profile.host.clone()
+    };
+    let user = profile
+        .user
+        .as_deref()
+        .filter(|user| !user.is_empty())
+        .map(|user| format!("{user}@"))
+        .unwrap_or_default();
+    let mut subtitle = format!("{user}{host}");
+    if profile.port_is_explicit {
+        subtitle.push_str(&format!(":{}", profile.port));
+    }
     if let Some(jump_host) = profile.jump_hosts.first() {
         subtitle.push_str(" · via ");
         subtitle.push_str(&jump_host.host);

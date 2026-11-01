@@ -27,3 +27,22 @@ fn logouts_and_auth_failures_are_not_retried() {
 fn unrelated_output_has_no_reason() {
     assert_eq!(disconnect_reason("ls\nfoo bar\n"), None);
 }
+
+#[test]
+fn remote_application_errors_are_not_network_disconnects() {
+    for output in [
+        "connection reset",
+        "broken pipe",
+        "app: connection refused",
+        "server log: no route to host",
+    ] {
+        assert_eq!(disconnect_reason(output), None);
+    }
+    assert!(
+        !disconnect_reason(
+            "client_loop: send disconnect: Broken pipe\nConnection to host closed.\n"
+        )
+        .unwrap()
+        .is_network_failure
+    );
+}

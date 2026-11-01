@@ -149,11 +149,12 @@ fn proxy_jump_roundtrips_including_per_hop_identity_files() {
 }
 
 #[test]
-fn default_port_is_not_written_out() {
+fn newly_saved_explicit_default_port_is_written_out() {
     let profile = SshHostProfile::new("app".to_string(), "10.0.0.9".to_string());
     let block = HostBlock::new_for(&profile, LF).unwrap();
     let rendered = serialize(&config_of(vec![Segment::Host(block)]));
-    assert!(!rendered.contains("Port"));
+    // An explicitly chosen 22 must not silently inherit a different global Port.
+    assert!(rendered.contains("    Port 22\n"));
 }
 
 #[test]
@@ -299,7 +300,7 @@ Host prod # main box
 }
 
 #[test]
-fn include_ends_the_stanza_so_new_directives_land_before_it() {
+fn new_directives_are_inserted_before_include_without_ending_the_stanza() {
     let source = "Host a\n    HostName 1.1.1.1\n\nInclude ~/.ssh/conf.d/*.conf\n";
     let mut config = parse(source);
     assert_eq!(host_blocks(&config).len(), 1);
@@ -829,10 +830,10 @@ fn saved_alias_retains_unmodeled_connection_options() {
     upsert_profile_at(&path, &profile).unwrap();
     assert!(read(&path).contains("    IdentitiesOnly yes\n"));
     assert!(read(&path).contains("    ProxyCommand custom-proxy %h %p\n"));
-    // Pin the displayed port even when global SSH config supplies a different default.
+    // An absent stanza Port must retain OpenSSH global and included defaults.
     assert_eq!(
         profile.to_saved_ssh_command(),
-        "command ssh -p 22 -- deploy@production"
+        "command ssh -- deploy@production"
     );
 }
 
@@ -882,4 +883,103 @@ fn external_destination_edits_invalidate_the_credential_key() {
         assert_eq!(edited.id, original.id);
         assert_ne!(ssh_profile_password_key(&edited), original_key);
     }
+}
+
+#[test]
+fn saving_and_clearing_managed_directives_remove_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        "Host work\n    HostName host\n    IdentityFile key-one # first key\n    IdentityFile key-two\n    ProxyJump first\n    ProxyJump second\n    IdentitiesOnly yes\n",
+    );
+    let mut profile = load_profiles_at(&path).unwrap().remove(0);
+    profile.identity_file = Some("replacement".into());
+    profile.jump_hosts.clear();
+    upsert_profile_at(&path, &profile).unwrap();
+    assert_eq!(read(&path).matches("IdentityFile").count(), 1);
+    assert!(read(&path).contains("IdentityFile replacement # first key"));
+    assert!(!read(&path).contains("ProxyJump"));
+    assert!(read(&path).contains("IdentitiesOnly yes"));
+    profile.identity_file = None;
+    upsert_profile_at(&path, &profile).unwrap();
+    assert!(!read(&path).contains("IdentityFile"));
+}
+
+#[test]
+fn inherited_port_stays_implicit_through_loading_and_editing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        "Port 2222\nHost work\n    HostName host\n    User deploy\n",
+    );
+    let mut profile = load_profiles_at(&path).unwrap().remove(0);
+    assert!(!profile.port_is_explicit);
+    assert_eq!(profile.to_saved_ssh_command(), "command ssh -- deploy@work");
+    profile.tags.push("prod".into());
+    upsert_profile_at(&path, &profile).unwrap();
+    assert_eq!(read(&path).matches("Port ").count(), 1);
+    assert!(!load_profiles_at(&path).unwrap()[0].port_is_explicit);
+    profile.port_is_explicit = true;
+    upsert_profile_at(&path, &profile).unwrap();
+    let explicit = load_profiles_at(&path).unwrap().remove(0);
+    assert!(explicit.port_is_explicit);
+    assert_eq!(
+        explicit.to_saved_ssh_command(),
+        "command ssh -p 22 -- deploy@work"
+    );
+}
+
+#[test]
+fn saving_jumps_never_changes_a_hand_written_proxy_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = "Host work\n    HostName host\n    ProxyCommand custom-proxy %h %p\n";
+    let path = write_config(dir.path(), source);
+    let mut profile = load_profiles_at(&path).unwrap().remove(0);
+    profile.jump_hosts.push(SshJumpHost {
+        source_profile_id: None,
+        host: "jump".into(),
+        user: None,
+        port: 22,
+        identity_file: None,
+    });
+    assert!(
+        upsert_profile_at(&path, &profile)
+            .unwrap_err()
+            .to_string()
+            .contains("ProxyCommand")
+    );
+    assert_eq!(read(&path), source);
+}
+
+#[test]
+fn multi_alias_stanzas_are_preserved_but_not_imported_as_one_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!(
+        "# warp-id: {}\nHost web web.internal\n    HostName host\nHost single\n    HostName other\n",
+        Uuid::new_v4()
+    );
+    let path = write_config(dir.path(), &source);
+    let profiles = load_profiles_at(&path).unwrap();
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].name, "single");
+    assert!(load_owned_profile_ids_at(&path).unwrap().is_empty());
+    assert_eq!(serialize(&parse(&source)), source);
+}
+
+#[test]
+fn directives_after_include_remain_in_the_host_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        "Host work\n    HostName host\n    Include extra.conf\n    User deploy\n    Port 2222\nHost other\n    User nobody\n",
+    );
+    let mut profile = load_profiles_at(&path).unwrap().remove(0);
+    assert_eq!(profile.user.as_deref(), Some("deploy"));
+    assert_eq!(profile.port, 2222);
+    profile.tags.push("prod".into());
+    upsert_profile_at(&path, &profile).unwrap();
+    let contents = read(&path);
+    assert!(contents.contains(
+        "Include extra.conf\n    User deploy\n    Port 2222\nHost other\n    User nobody\n"
+    ));
 }

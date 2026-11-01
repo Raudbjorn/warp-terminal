@@ -35,9 +35,20 @@ pub fn disconnect_reason(output: &str) -> Option<DisconnectReason> {
     output.lines().rev().find_map(|line| {
         let line = line.trim();
         let lower = line.to_lowercase();
-        if NETWORK_FAILURES
-            .iter()
-            .any(|pattern| lower.contains(pattern))
+        let ssh_diagnostic = [
+            "ssh: ",
+            "client_loop: ",
+            "packet_write_wait: ",
+            "read from remote host ",
+            "connection to ",
+            "timeout, server ",
+        ]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix));
+        if ssh_diagnostic
+            && NETWORK_FAILURES
+                .iter()
+                .any(|pattern| lower.contains(pattern))
         {
             Some(DisconnectReason {
                 message: line.to_string(),

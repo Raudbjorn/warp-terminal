@@ -95,6 +95,8 @@ pub fn remote_image_path(mime_type: &str) -> String {
         "image/jpeg" => "jpg",
         "image/gif" => "gif",
         "image/webp" => "webp",
+        "image/tiff" => "tiff",
+        "image/svg+xml" => "svg",
         _ => "png",
     };
     format!("/tmp/warp-image-{}.{extension}", Uuid::new_v4().simple())

@@ -131,3 +131,23 @@ fn bounds_remote_session_size_and_split_depth() {
         .collect();
     assert!(parse_remote_output(&output(rows)).is_err());
 }
+
+#[test]
+fn rejects_multiple_roots_in_one_tab() {
+    let duplicate_roots = output(vec![
+        row(1, 1, None, Some(("terminal", "/first")), false),
+        row(2, 1, None, Some(("terminal", "/second")), false),
+    ]);
+    assert!(parse_remote_output(&duplicate_roots).is_err());
+}
+
+#[test]
+fn accepts_a_root_after_its_child_in_the_listing() {
+    let sessions = parse_remote_output(&output(vec![
+        row(1, 1, Some(2), Some(("terminal", "/child")), false),
+        row(2, 1, None, None, true),
+    ]))
+    .unwrap();
+    assert_eq!(sessions.tabs.len(), 1);
+    assert_eq!(sessions.tabs[0].directories, vec![Some("/child".into())]);
+}

@@ -166,6 +166,7 @@ fn normalize_ssh_profiles_migrates_missing_or_duplicate_ids() {
             host: "one.example.com".to_string(),
             user: None,
             port: 0,
+            port_is_explicit: true,
             identity_file: None,
             jump_hosts: vec![jump_host("jump.example.com", None, 0, None)],
             tags: Vec::new(),
@@ -176,6 +177,7 @@ fn normalize_ssh_profiles_migrates_missing_or_duplicate_ids() {
             host: "two.example.com".to_string(),
             user: None,
             port: 22,
+            port_is_explicit: true,
             identity_file: None,
             jump_hosts: Vec::new(),
             tags: Vec::new(),
@@ -186,6 +188,7 @@ fn normalize_ssh_profiles_migrates_missing_or_duplicate_ids() {
             host: "three.example.com".to_string(),
             user: None,
             port: 22,
+            port_is_explicit: true,
             identity_file: None,
             jump_hosts: Vec::new(),
             tags: Vec::new(),
@@ -531,4 +534,28 @@ fn credential_keys_distinguish_destination_field_boundaries() {
 fn saved_profile_port_cannot_be_overridden_by_global_ssh_defaults() {
     let profile = SshHostProfile::new("work".into(), "host".into());
     assert_eq!(profile.to_saved_ssh_command(), "command ssh -p 22 -- work");
+}
+
+#[test]
+fn inherited_and_explicit_ports_cannot_share_credentials() {
+    let mut profile = SshHostProfile::new("work".into(), "host".into());
+    let explicit = ssh_profile_password_key(&profile);
+    profile.port_is_explicit = false;
+    assert_ne!(ssh_profile_password_key(&profile), explicit);
+    assert_eq!(profile.to_saved_ssh_command(), "command ssh -- work");
+}
+
+#[test]
+fn jump_identity_forwarding_uses_the_effective_destination_port_when_inherited() {
+    let mut profile = SshHostProfile::new("work".into(), "host".into());
+    profile.port_is_explicit = false;
+    profile
+        .jump_hosts
+        .push(jump_host("bastion", Some("user"), 2222, Some("~/.ssh/key")));
+    let command = profile.to_saved_ssh_command();
+    let outer_args = shell_words::split(&command).unwrap();
+    assert!(!outer_args.iter().any(|arg| arg == "-p"));
+    let proxy = shell_words::split(&proxy_command_value(&command)).unwrap();
+    let forward = proxy.windows(2).find(|pair| pair[0] == "-W").unwrap();
+    assert_eq!(forward[1], "[%h]:%p");
 }

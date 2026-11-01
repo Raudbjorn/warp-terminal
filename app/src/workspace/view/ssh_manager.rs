@@ -5,6 +5,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use settings::Setting as _;
 use uuid::Uuid;
+use warp_core::context_flag::ContextFlag;
 use warp_core::ui::theme::AnsiColorIdentifier;
 use warpui::elements::{Align, ChildView, Container, MouseStateHandle, SavePosition};
 use warpui::fonts::Properties;
@@ -243,12 +244,12 @@ impl Workspace {
         .finish()
     }
 
-    fn ensure_ssh_panel_in_config(ctx: &mut AppContext) {
+    fn ensure_ssh_panel_in_config(ctx: &mut AppContext) -> anyhow::Result<()> {
         let config = TabSettings::as_ref(ctx)
             .header_toolbar_chip_selection
             .clone();
         if config.contains_item(&HeaderToolbarItemKind::SshProfiles) {
-            return;
+            return Ok(());
         }
         let mut left = config.left_items();
         left.push(HeaderToolbarItemKind::SshProfiles);
@@ -257,18 +258,28 @@ impl Workspace {
             right: config.right_items(),
         };
         TabSettings::handle(ctx).update(ctx, |settings, ctx| {
-            if let Err(err) = settings
+            settings
                 .header_toolbar_chip_selection
                 .set_value(selection, ctx)
-            {
-                log::error!("Failed to add SSH profiles to the toolbar: {err:#}");
-            }
-        });
+        })
     }
 
-    fn toggle_ssh_profiles_panel(&mut self, ctx: &mut ViewContext<Self>) {
+    pub(super) fn ssh_profiles_panel_is_focused(&self, ctx: &mut AppContext) -> bool {
+        self.ssh_manager.panel_open && self.ssh_manager.panel_view.is_self_or_child_focused(ctx)
+    }
+
+    fn persist_ssh_panel_placement(&self, ctx: &mut ViewContext<Self>) {
+        if let Err(err) = Self::ensure_ssh_panel_in_config(ctx) {
+            log::error!("Failed to add SSH profiles to the toolbar: {err:#}");
+            self.show_ssh_toast(DismissibleToast::error(format!(
+                "Couldn't save the SSH toolbar placement: {err:#}. The panel is open for this session."
+            )), ctx);
+        }
+    }
+
+    pub(super) fn toggle_ssh_profiles_panel(&mut self, ctx: &mut ViewContext<Self>) {
         if !self.ssh_manager.panel_open {
-            Self::ensure_ssh_panel_in_config(ctx);
+            self.persist_ssh_panel_placement(ctx);
         }
         self.ssh_manager.panel_open = !self.ssh_manager.panel_open;
         if !self.ssh_manager.panel_open {
@@ -280,7 +291,7 @@ impl Workspace {
     }
 
     fn open_ssh_profiles_panel(&mut self, ctx: &mut ViewContext<Self>) {
-        Self::ensure_ssh_panel_in_config(ctx);
+        self.persist_ssh_panel_placement(ctx);
         if !self.ssh_manager.panel_open {
             self.ssh_manager.panel_open = true;
             ctx.notify();
@@ -291,6 +302,7 @@ impl Workspace {
     }
 
     fn open_ssh_launcher(&mut self, ctx: &mut ViewContext<Self>) {
+        self.close_all_overlays(ctx);
         self.ssh_manager.launcher.open();
         self.ssh_manager.launcher.view.update(ctx, |modal, ctx| {
             modal
@@ -300,7 +312,7 @@ impl Workspace {
         ctx.notify();
     }
 
-    fn close_ssh_launcher(&mut self, ctx: &mut ViewContext<Self>) {
+    pub(super) fn close_ssh_launcher(&mut self, ctx: &mut ViewContext<Self>) {
         if !self.ssh_manager.launcher.is_open() {
             return;
         }
@@ -367,14 +379,18 @@ impl Workspace {
     }
 
     fn open_remote_ssh_sessions(&mut self, profile_id: Uuid, ctx: &mut ViewContext<Self>) {
+        let Some(profile) = self.saved_ssh_profile(profile_id, ctx) else {
+            return;
+        };
         let live_control_path = SshOpenConnections::terminals(profile_id, ctx)
             .into_iter()
+            .filter(|terminal| terminal.as_ref(ctx).ssh_profile_matches(&profile))
             .find_map(|terminal| terminal.as_ref(ctx).ssh_upload_control_path(ctx));
         if let Some(control_path) = live_control_path {
             self.read_remote_ssh_sessions(profile_id, control_path, ctx);
         } else if let Some(terminal_view) = self.connect_ssh_profile(profile_id, ctx) {
-            terminal_view.update(ctx, |terminal_view, _| {
-                terminal_view.read_remote_sessions_when_ready();
+            terminal_view.update(ctx, |terminal_view, ctx| {
+                terminal_view.read_remote_sessions_when_ready(ctx);
             });
         }
     }
@@ -388,6 +404,19 @@ impl Workspace {
         let Some(profile) = self.saved_ssh_profile(profile_id, ctx) else {
             return;
         };
+        let matches_live_connection = SshOpenConnections::terminals(profile_id, ctx)
+            .into_iter()
+            .any(|terminal| {
+                let terminal = terminal.as_ref(ctx);
+                terminal.ssh_profile_matches(&profile)
+                    && terminal.ssh_upload_control_path(ctx).as_ref() == Some(&control_path)
+            });
+        if !matches_live_connection {
+            self.show_ssh_toast(DismissibleToast::error(
+                "This SSH connection no longer matches the saved host. Reconnect before reopening its tabs.".into()
+            ), ctx);
+            return;
+        }
         self.show_ssh_toast(
             DismissibleToast::default(format!("Reading Warp tabs on {}…", profile.name)),
             ctx,
@@ -402,7 +431,19 @@ impl Workspace {
                     )),
                     ctx,
                 ),
-                Ok(sessions) => me.open_remote_ssh_tabs(&profile, sessions, ctx),
+                Ok(sessions) => {
+                    if me.saved_ssh_profile(profile.id, ctx).as_ref() != Some(&profile) {
+                        me.show_ssh_toast(
+                            DismissibleToast::error(
+                                "The SSH profile changed while its tabs were loading. Try again."
+                                    .into(),
+                            ),
+                            ctx,
+                        );
+                        return;
+                    }
+                    me.open_remote_ssh_tabs(&profile, sessions, ctx);
+                }
                 Err(err) => me.show_ssh_toast(
                     DismissibleToast::error(format!(
                         "Couldn't read Warp tabs on {}: {err:#}",
@@ -420,6 +461,9 @@ impl Workspace {
         sessions: RemoteSessions,
         ctx: &mut ViewContext<Self>,
     ) {
+        if !self.can_open_ssh_tab(ctx) {
+            return;
+        }
         self.record_ssh_connection(SshDestination::Profile(profile.id), ctx);
         let tab_count = sessions.tabs.len();
         let host_tab_color = host_color(profile);
@@ -453,6 +497,7 @@ impl Workspace {
             ctx,
         );
         ctx.notify();
+        ctx.dispatch_global_action("workspace:save_app", ());
     }
 
     fn connect_ssh_profile(
@@ -467,7 +512,6 @@ impl Workspace {
             return None;
         };
 
-        self.record_ssh_connection(SshDestination::Profile(profile_id), ctx);
         let color = host_color(&profile);
         let Some(terminal_view) = self.open_ssh_tab(&profile.name, color, ctx) else {
             log::warn!(
@@ -475,6 +519,7 @@ impl Workspace {
             );
             return None;
         };
+        self.record_ssh_connection(SshDestination::Profile(profile_id), ctx);
         terminal_view.update(ctx, |terminal_view, ctx| {
             terminal_view.connect_ssh_profile(&profile, ctx);
         });
@@ -485,8 +530,8 @@ impl Workspace {
         let Some(args) = quick_connect_args(input) else {
             return;
         };
-        self.record_ssh_connection(SshDestination::QuickConnect(args.clone()), ctx);
         if let Some(terminal_view) = self.open_ssh_tab(&args, None, ctx) {
+            self.record_ssh_connection(SshDestination::QuickConnect(args.clone()), ctx);
             terminal_view.update(ctx, |terminal_view, ctx| {
                 terminal_view.connect_ssh_destination(args, ctx);
             });
@@ -495,12 +540,26 @@ impl Workspace {
         }
     }
 
+    fn can_open_ssh_tab(&self, ctx: &mut ViewContext<Self>) -> bool {
+        if ContextFlag::CreateNewSession.is_enabled() {
+            return true;
+        }
+        self.show_ssh_toast(
+            DismissibleToast::error("Cannot open a new terminal session".into()),
+            ctx,
+        );
+        false
+    }
+
     fn open_ssh_tab(
         &mut self,
         title: &str,
         color: Option<AnsiColorIdentifier>,
         ctx: &mut ViewContext<Self>,
     ) -> Option<ViewHandle<TerminalView>> {
+        if !self.can_open_ssh_tab(ctx) {
+            return None;
+        }
         let window_id = ctx.window_id();
         self.add_new_session_tab_internal_with_default_session_mode_behavior(
             NewSessionSource::Tab,

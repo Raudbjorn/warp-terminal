@@ -20,7 +20,10 @@ use warpui_extras::secure_storage::AppContextExt as _;
 use zeroize::Zeroizing;
 
 use crate::appearance::Appearance;
-use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
+use crate::editor::{
+    EditorView, Event as EditorEvent, PropagateAndNoOpNavigationKeys, SingleLineEditorOptions,
+    TextOptions,
+};
 use crate::ssh_manager::panel::jump_host_points_at;
 use crate::ssh_manager::profile::{
     SshHostProfile, SshJumpHost, default_ssh_port, ssh_profile_password_key,
@@ -110,7 +113,7 @@ impl SshProfileModalView {
         let name_editor = Self::editor("Label", false, ctx);
         let host_editor = Self::editor("Host", false, ctx);
         let user_editor = Self::editor("Username", false, ctx);
-        let port_editor = Self::editor("22", false, ctx);
+        let port_editor = Self::editor("From SSH config", false, ctx);
         let password_editor = Self::editor("Password", true, ctx);
         let identity_file_editor = Self::editor("~/.ssh/id_ed25519", false, ctx);
         let tags_editor = Self::editor("prod, db", false, ctx);
@@ -184,6 +187,8 @@ impl SshProfileModalView {
         let editor = ctx.add_view(|ctx| {
             EditorView::single_line(
                 SingleLineEditorOptions {
+                    propagate_and_no_op_vertical_navigation_keys:
+                        PropagateAndNoOpNavigationKeys::Always,
                     text: TextOptions::ui_text(None, Appearance::as_ref(ctx)),
                     soft_wrap: true,
                     is_password,
@@ -241,7 +246,15 @@ impl SshProfileModalView {
             &self.user_editor,
             ctx,
         );
-        self.set_editor_text(&profile.port.to_string(), &self.port_editor, ctx);
+        self.set_editor_text(
+            &if profile.port_is_explicit {
+                profile.port.to_string()
+            } else {
+                String::new()
+            },
+            &self.port_editor,
+            ctx,
+        );
         let stored_password = match ctx
             .secure_storage()
             .read_value(&ssh_profile_password_key(&profile))
@@ -405,6 +418,7 @@ impl SshProfileModalView {
             host,
             user,
             port: self.parse_port(app)?,
+            port_is_explicit: !self.editor_text(&self.port_editor, app).is_empty(),
             identity_file,
             jump_hosts: self.selected_jump_hosts.clone(),
             tags,
@@ -1040,3 +1054,7 @@ impl View for SshProfileDeleteModalView {
             .finish()
     }
 }
+
+#[cfg(test)]
+#[path = "host_editor_tests.rs"]
+mod tests;

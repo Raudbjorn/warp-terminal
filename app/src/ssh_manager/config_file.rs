@@ -20,7 +20,6 @@ const DEFAULT_INDENT: &str = "    ";
 const LF: &str = "\n";
 const CRLF: &str = "\r\n";
 const HOST_PATTERN_CHARS: [char; 3] = ['*', '?', '!'];
-const STANZA_BOUNDARY_KEYWORDS: [&str; 2] = ["Match", "Include"];
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const PRIVATE_DIR_MODE: u32 = 0o700;
 const DERIVED_ID_NAMESPACE: &str = "dev.warp.ssh-config.hand-written-host:";
@@ -210,7 +209,7 @@ impl ConfigFile {
 
 impl HostBlock {
     fn is_pattern(&self) -> bool {
-        alias_is_pattern(&self.alias)
+        alias_is_pattern(&self.alias) || self.alias.split_whitespace().count() != 1
     }
 
     fn directive(&self, name: &str) -> Option<String> {
@@ -223,34 +222,41 @@ impl HostBlock {
     /// Replace a directive's value in place, keeping its inline comment; append if absent; drop if `None`.
     fn set_directive(&mut self, name: &str, value: Option<impl AsRef<str>>) {
         let value = value.as_ref().map(AsRef::as_ref);
-        let existing = self.body.iter().enumerate().find_map(|(idx, line)| {
-            let directive = parse_directive(line)?;
-            let (_, range) = directive.value?;
-            directive
-                .key
-                .eq_ignore_ascii_case(name)
-                .then_some((idx, range))
+        let mut written = false;
+        self.body.retain_mut(|line| {
+            let Some(directive) = parse_directive(line) else {
+                return true;
+            };
+            if !directive.key.eq_ignore_ascii_case(name) {
+                return true;
+            }
+            if !written
+                && let Some(value) = value
+                && let Some((_, range)) = directive.value
+            {
+                *line = replace_range(line, range, value);
+                written = true;
+                return true;
+            }
+            false
         });
-
-        match (existing, value) {
-            (Some((idx, range)), Some(value)) => {
-                let replaced = replace_range(&self.body[idx], range, value);
-                self.body[idx] = replaced;
-            }
-            (Some((idx, _)), None) => {
-                self.body.remove(idx);
-            }
-            (None, Some(value)) => {
-                let indent = self.indent();
-                let insert_at = self
-                    .body
-                    .iter()
-                    .rposition(|line| !line.trim().is_empty())
-                    .map(|idx| idx + 1)
-                    .unwrap_or(0);
-                self.insert_body_line(insert_at, format!("{indent}{name} {value}"));
-            }
-            (None, None) => {}
+        if !written && let Some(value) = value {
+            let indent = self.indent();
+            // Included files can change the active Host context; insert our new options before them.
+            let insert_at = self
+                .body
+                .iter()
+                .position(|line| {
+                    parse_directive(line)
+                        .is_some_and(|directive| directive.key.eq_ignore_ascii_case("Include"))
+                })
+                .unwrap_or_else(|| {
+                    self.body
+                        .iter()
+                        .rposition(|line| !line.trim().is_empty())
+                        .map_or(0, |idx| idx + 1)
+                });
+            self.insert_body_line(insert_at, format!("{indent}{name} {value}"));
         }
     }
 
@@ -360,6 +366,7 @@ impl HostBlock {
             host,
             user: self.directive("User"),
             port,
+            port_is_explicit: self.directive("Port").is_some(),
             identity_file: self.directive("IdentityFile"),
             jump_hosts,
             tags: self.tags.clone(),
@@ -381,6 +388,13 @@ impl HostBlock {
             );
         }
 
+        if !profile.jump_hosts.is_empty() && self.directive("ProxyCommand").is_some() {
+            anyhow::bail!(
+                "Cannot save jump hosts for `{}` while its hand-written ProxyCommand is present",
+                self.alias
+            );
+        }
+
         self.warp_id = Some(profile.id);
         self.tags = profile.tags.clone();
         self.meta_rewritten = true;
@@ -388,11 +402,9 @@ impl HostBlock {
 
         self.set_directive("HostName", Some(&profile.host));
         self.set_directive("User", non_empty(profile.user.as_deref()));
-        let port_already_written = self.directive("Port").is_some();
         self.set_directive(
             "Port",
-            (profile.port != default_ssh_port() || port_already_written)
-                .then(|| profile.port.to_string()),
+            profile.port_is_explicit.then(|| profile.port.to_string()),
         );
         self.set_directive(
             "IdentityFile",
@@ -850,13 +862,9 @@ fn parse_host_header(trimmed: &str) -> Option<String> {
     key.eq_ignore_ascii_case("Host").then_some(value)
 }
 
-/// `Match`/`Include` end the preceding `Host` stanza and their bodies belong to no profile.
+/// `Match` ends the preceding `Host`; `Include` continues its context unless the included file changes it.
 fn is_stanza_boundary(trimmed: &str) -> bool {
-    parse_directive(trimmed).is_some_and(|directive| {
-        STANZA_BOUNDARY_KEYWORDS
-            .iter()
-            .any(|keyword| directive.key.eq_ignore_ascii_case(keyword))
-    })
+    parse_directive(trimmed).is_some_and(|directive| directive.key.eq_ignore_ascii_case("Match"))
 }
 
 struct DirectiveSpan<'a> {

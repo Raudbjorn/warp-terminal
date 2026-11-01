@@ -7,7 +7,8 @@ use settings::Setting as _;
 use uuid::Uuid;
 use warp_core::ui::theme::AnsiColorIdentifier;
 use warp_core::ui::theme::color::internal_colors;
-use warpui::r#async::Timer;
+use warp_util::path::ShellFamily;
+use warpui::r#async::{SpawnedFutureHandle, Timer};
 use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
     Border, Container, CrossAxisAlignment, Expanded, Flex, MainAxisSize, ParentElement, Text,
@@ -41,7 +42,7 @@ use crate::ssh_manager::ui::{
     ansi_color, badge_label, host_color, render_badge, render_chip, render_dot,
 };
 use crate::ssh_manager::{SshManagerAction, askpass};
-use crate::terminal::model::block::BlockMetadata;
+use crate::terminal::model::block::{BlockId, BlockMetadata};
 use crate::terminal::model::session::SessionId;
 use crate::terminal::warpify::settings::WarpifySettings;
 use crate::workspace::WorkspaceAction;
@@ -51,8 +52,27 @@ use crate::workspace::WorkspaceAction;
 pub(super) struct SshProfileSessionState {
     warpification_enabled_at_arm: bool,
     warpify_disabled_command: Option<String>,
+    suppression_generation: u64,
+    suppression_timer: Option<SpawnedFutureHandle>,
+    control_path_poll: Option<SpawnedFutureHandle>,
+    reconnect_timer: Option<SpawnedFutureHandle>,
+    attached: bool,
     connection: Option<SshConnectionWatch>,
     reconnect_banner: Option<ViewHandle<SshReconnectBanner>>,
+}
+
+impl Drop for SshProfileSessionState {
+    fn drop(&mut self) {
+        if let Some(timer) = self.suppression_timer.take() {
+            timer.abort();
+        }
+        if let Some(poll) = self.control_path_poll.take() {
+            poll.abort();
+        }
+        if let Some(timer) = self.reconnect_timer.take() {
+            timer.abort();
+        }
+    }
 }
 
 /// The SSH command this terminal ran from the SSH manager, kept so it can be rerun after the
@@ -60,6 +80,8 @@ pub(super) struct SshProfileSessionState {
 struct SshConnectionWatch {
     command: String,
     profile_id: Option<Uuid>,
+    captured_profile: Option<SshHostProfile>,
+    block_id: Option<BlockId>,
     /// Shown to the user: the profile name, or the quick-connect arguments.
     target: String,
     control_path: Option<PathBuf>,
@@ -90,6 +112,8 @@ impl SshConnectionWatch {
         Self {
             command,
             profile_id,
+            captured_profile: None,
+            block_id: None,
             target,
             control_path,
             local_session_id: None,
@@ -116,21 +140,34 @@ const CONTROL_PATH_ATTEMPTS: u32 = 30;
 /// With SSH Warpification on, the command goes through Warp's `ssh` shell wrapper instead: the
 /// wrapper owns the ControlMaster, and only wrapper sessions get the SSH extension that provides
 /// remote file browsing.
-fn connection_command(command: String, through_wrapper: bool) -> (String, Option<PathBuf>) {
-    if through_wrapper {
-        let command = command
-            .strip_prefix("command ")
-            .unwrap_or(&command)
-            .to_string();
-        return (command, None);
-    }
-    match new_control_path() {
-        Some(control_path) => (
-            with_control_master(&command, &control_path),
-            Some(control_path),
-        ),
-        None => (command, None),
-    }
+fn connection_command(
+    command: String,
+    through_wrapper: bool,
+    shell_family: ShellFamily,
+) -> anyhow::Result<(String, Option<PathBuf>)> {
+    let (command, control_path) = if through_wrapper {
+        (normalize_ssh_command(&command).to_string(), None)
+    } else {
+        match new_control_path() {
+            Some(control_path) => (
+                with_control_master(&command, &control_path),
+                Some(control_path),
+            ),
+            None => (command, None),
+        }
+    };
+    let command = match shell_family {
+        ShellFamily::Posix => command,
+        ShellFamily::PowerShell => {
+            // `command` and POSIX quoting are not valid PowerShell invocation syntax.
+            shell_words::split(normalize_ssh_command(&command))?
+                .iter()
+                .map(|word| shell_family.escape(word).into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    };
+    Ok((command, control_path))
 }
 
 fn last_chars(value: &str, max_chars: usize) -> String {
@@ -145,35 +182,69 @@ impl TerminalView {
         self.ssh_profile
             .connection
             .as_ref()
-            .filter(|connection| !connection.disconnected)
+            .filter(|connection| connection.local_session_id.is_some() && !connection.disconnected)
             .and_then(|connection| connection.profile_id)
     }
 
-    /// Handles a command starting. Returns whether `command` belongs to an SSH profile connection
-    /// that has Warpification disabled, and if so suppresses the remote shell bootstrap until the
-    /// command finishes.
+    /// Whether the live socket still belongs to the saved destination and connection options.
+    pub fn ssh_profile_matches(&self, profile: &SshHostProfile) -> bool {
+        self.ssh_profile
+            .connection
+            .as_ref()
+            .is_some_and(|connection| {
+                !connection.disconnected
+                    && connection.local_session_id.is_some()
+                    && connection
+                        .captured_profile
+                        .as_ref()
+                        .is_some_and(|captured| {
+                            ssh_profile_password_key(captured) == ssh_profile_password_key(profile)
+                                && captured.to_saved_ssh_command() == profile.to_saved_ssh_command()
+                        })
+            })
+    }
+
+    /// Counts a connection only after its command starts, and suppresses bootstrap for that block.
     pub(super) fn handle_ssh_manager_block_started(
         &mut self,
+        block_id: &BlockId,
         command: &str,
         warpify_command: &str,
+        ctx: &mut ViewContext<Self>,
     ) -> bool {
         let local_session_id = self.active_block_session_id();
         if let Some(connection) = self.ssh_profile.connection.as_mut()
             && [command, warpify_command].into_iter().any(|command| {
-                normalize_ssh_command(command) == normalize_ssh_command(&connection.command)
+                same_ssh_command(
+                    askpass::strip_env_prefix(command),
+                    askpass::strip_env_prefix(&connection.command),
+                )
             })
         {
             connection.local_session_id = local_session_id;
+            connection.block_id = Some(block_id.clone());
             connection.started_at = Some(Instant::now());
             connection.startup_directory_sent = false;
             connection.disconnected = false;
             connection.reconnect_generation += 1;
+            let profile_id = connection.profile_id;
             self.remove_ssh_reconnect_banner();
-        } else if let Some(connection) = self.ssh_profile.connection.as_mut()
-            && connection.disconnected
-        {
-            // The user moved on in the local shell, so don't rerun ssh under them.
-            connection.reconnect_generation += 1;
+            if self.ssh_profile.attached {
+                SshOpenConnections::connected(ctx.handle(), profile_id, ctx);
+            }
+        } else if let Some(connection) = self.ssh_profile.connection.as_mut() {
+            if connection.disconnected {
+                connection.reconnect_generation += 1;
+            } else if connection.local_session_id != local_session_id
+                && connection
+                    .startup_directory
+                    .as_ref()
+                    .is_some_and(|directory| {
+                        command.trim() == format!("cd -- {}", shell_quote_arg(directory))
+                    })
+            {
+                connection.startup_directory_sent = true;
+            }
         }
 
         let suppress = !self.ssh_profile.warpification_enabled_at_arm
@@ -182,7 +253,7 @@ impl TerminalView {
         if suppress {
             self.model
                 .lock()
-                .ignore_bootstrapping_messages_until_command_finished();
+                .ignore_bootstrapping_messages_until_command_finished(block_id.clone());
             log::info!(
                 "Suppressing SSH profile shell bootstrap because SSH Warpification is disabled"
             );
@@ -206,12 +277,21 @@ impl TerminalView {
         let enable_ssh_warpification = *WarpifySettings::as_ref(ctx)
             .enable_ssh_warpification
             .value();
-        let (command, control_path) =
-            connection_command(profile.to_saved_ssh_command(), enable_ssh_warpification);
-        let askpass_prefix = self
-            .has_saved_ssh_password(profile, ctx)
-            .then(|| askpass::env_prefix(profile))
-            .flatten();
+        let (command, control_path) = match connection_command(
+            profile.to_saved_ssh_command(),
+            enable_ssh_warpification,
+            self.shell_family(ctx),
+        ) {
+            Ok(connection) => connection,
+            Err(err) => {
+                self.show_error_toast(format!("Couldn't prepare the SSH command: {err}"), ctx);
+                return;
+            }
+        };
+        let askpass_prefix = (self.shell_family(ctx) == ShellFamily::Posix
+            && self.has_saved_ssh_password(profile, ctx))
+        .then(|| askpass::env_prefix(profile))
+        .flatten();
         log::info!(
             "Connecting SSH profile: profile_id={}, enable_ssh_warpification={enable_ssh_warpification}, saved_password={}",
             profile.id,
@@ -219,14 +299,15 @@ impl TerminalView {
         );
         let command = format!("{}{command}", askpass_prefix.unwrap_or_default());
         self.arm_ssh_profile_connection(command.clone(), enable_ssh_warpification, ctx);
-        self.ssh_profile.connection = Some(SshConnectionWatch::new(
+        let mut connection = SshConnectionWatch::new(
             command.clone(),
             Some(profile.id),
             profile.name.clone(),
             control_path,
             directory,
-        ));
-        SshOpenConnections::connected(ctx.handle(), Some(profile.id), ctx);
+        );
+        connection.captured_profile = Some(profile.clone());
+        self.ssh_profile.connection = Some(connection);
         self.execute_command_or_set_pending(&command, ctx);
     }
 
@@ -235,8 +316,17 @@ impl TerminalView {
         let through_wrapper = *WarpifySettings::as_ref(ctx)
             .enable_ssh_warpification
             .value();
-        let (command, control_path) =
-            connection_command(format!("command ssh {args}"), through_wrapper);
+        let (command, control_path) = match connection_command(
+            format!("command ssh {args}"),
+            through_wrapper,
+            self.shell_family(ctx),
+        ) {
+            Ok(connection) => connection,
+            Err(err) => {
+                self.show_error_toast(format!("Couldn't prepare the SSH command: {err}"), ctx);
+                return;
+            }
+        };
         self.arm_ssh_profile_connection(command.clone(), through_wrapper, ctx);
         self.ssh_profile.connection = Some(SshConnectionWatch::new(
             command.clone(),
@@ -245,15 +335,19 @@ impl TerminalView {
             control_path,
             None,
         ));
-        SshOpenConnections::connected(ctx.handle(), None, ctx);
         self.execute_command_or_set_pending(&command, ctx);
     }
 
     /// Counts this terminal's connection as open only while the terminal is in a tab. Closed tabs
     /// stay alive for a while so they can be reopened, with ssh still running.
     pub fn set_ssh_manager_attached(&mut self, attached: bool, ctx: &mut ViewContext<Self>) {
+        self.ssh_profile.attached = attached;
         match self.ssh_profile.connection.as_ref() {
-            Some(connection) if attached && !connection.disconnected => {
+            Some(connection)
+                if attached
+                    && !connection.disconnected
+                    && connection.local_session_id.is_some() =>
+            {
                 let profile_id = connection.profile_id;
                 SshOpenConnections::connected(ctx.handle(), profile_id, ctx);
             }
@@ -262,9 +356,18 @@ impl TerminalView {
     }
 
     /// Reads the host's WarpOss tabs through this connection once its remote shell is ready.
-    pub fn read_remote_sessions_when_ready(&mut self) {
-        if let Some(connection) = self.ssh_profile.connection.as_mut() {
+    pub fn read_remote_sessions_when_ready(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(connection) = self.ssh_profile.connection.as_mut() else {
+            return;
+        };
+        if self.ssh_profile.warpification_enabled_at_arm {
             connection.read_remote_sessions_when_ready = true;
+        } else if let Some(profile_id) = connection.profile_id {
+            self.read_remote_sessions_once_control_path_is_known(
+                profile_id,
+                CONTROL_PATH_ATTEMPTS,
+                ctx,
+            );
         }
     }
 
@@ -276,6 +379,9 @@ impl TerminalView {
         attempts_left: u32,
         ctx: &mut ViewContext<Self>,
     ) {
+        if let Some(poll) = self.ssh_profile.control_path_poll.take() {
+            poll.abort();
+        }
         if let Some(control_path) = self.ssh_upload_control_path(ctx) {
             ctx.dispatch_typed_action(&WorkspaceAction::SshManager(
                 SshManagerAction::ReadRemoteSessions {
@@ -298,34 +404,37 @@ impl TerminalView {
             );
             return;
         }
-        ctx.spawn(
+        self.ssh_profile.control_path_poll = Some(ctx.spawn(
             async {
                 Timer::after(CONTROL_PATH_RETRY_INTERVAL).await;
             },
             move |me, _, ctx| {
+                me.ssh_profile.control_path_poll = None;
                 me.read_remote_sessions_once_control_path_is_known(
                     profile_id,
                     attempts_left - 1,
                     ctx,
                 )
             },
-        );
+        ));
     }
 
     /// The ControlMaster socket of the live connection: Warp's own, or the SSH wrapper's.
     pub fn ssh_upload_control_path(&self, app: &AppContext) -> Option<PathBuf> {
-        let connection = self
-            .ssh_profile
-            .connection
-            .as_ref()
-            .filter(|connection| connection.local_session_id.is_some())?;
-        connection.control_path.clone().or_else(|| {
-            let session = self
-                .sessions
-                .as_ref(app)
-                .get(self.active_block_session_id()?)?;
-            session.ssh_wrapper_socket_path().map(PathBuf::from)
-        })
+        let connection = self.ssh_profile.connection.as_ref().filter(|connection| {
+            connection.local_session_id.is_some() && !connection.disconnected
+        })?;
+        connection
+            .control_path
+            .clone()
+            .or_else(|| {
+                let session = self
+                    .sessions
+                    .as_ref(app)
+                    .get(self.active_block_session_id()?)?;
+                session.ssh_wrapper_socket_path().map(PathBuf::from)
+            })
+            .filter(|path| path.exists())
     }
 
     /// Sends a clipboard image to the remote host of a connected SSH manager session and pastes its
@@ -410,12 +519,15 @@ impl TerminalView {
             } else {
                 connection.startup_directory.clone()
             };
-            connection.startup_directory_sent = true;
             let read_remote_sessions =
                 std::mem::take(&mut connection.read_remote_sessions_when_ready)
                     .then_some(connection.profile_id)
                     .flatten();
-            if let Some(directory) = directory {
+            if let Some(directory) = directory
+                && !self.input.as_ref(ctx).has_pending_command()
+                && self.input.as_ref(ctx).buffer_text(ctx).trim().is_empty()
+                && self.pending_command_queue.is_empty()
+            {
                 self.execute_command_or_set_pending(
                     &format!("cd -- {}", shell_quote_arg(&directory)),
                     ctx,
@@ -431,22 +543,26 @@ impl TerminalView {
             return;
         }
 
-        let recent_output = {
+        let (recent_output, ssh_failed) = {
             let model = self.model.lock();
-            let blocks = model.block_list().blocks();
-            blocks
+            model
+                .block_list()
+                .blocks()
                 .iter()
-                .rev()
-                .take(3)
-                .rev()
-                .map(|block| last_chars(&block.output_to_string(), DISCONNECT_SCAN_CHARS))
-                .collect::<Vec<_>>()
-                .join("\n")
+                .find(|block| Some(block.id()) == connection.block_id.as_ref())
+                .map(|block| {
+                    (
+                        last_chars(&block.output_to_string(), DISCONNECT_SCAN_CHARS),
+                        block.exit_code() == 255.into(),
+                    )
+                })
+                .unwrap_or_default()
         };
         let reason = disconnect_reason(&recent_output);
-        let is_network_failure = reason
-            .as_ref()
-            .is_some_and(|reason| reason.is_network_failure);
+        let is_network_failure = ssh_failed
+            && reason
+                .as_ref()
+                .is_some_and(|reason| reason.is_network_failure);
 
         let Some(connection) = self.ssh_profile.connection.as_mut() else {
             return;
@@ -520,15 +636,21 @@ impl TerminalView {
             )
         });
         let wait = remaining.min(Duration::from_secs(1));
-        ctx.spawn(
+        self.ssh_profile.reconnect_timer = Some(ctx.spawn(
             async move {
                 Timer::after(wait).await;
             },
-            move |me, _, ctx| me.tick_ssh_auto_reconnect(generation, attempt, deadline, ctx),
-        );
+            move |me, _, ctx| {
+                me.ssh_profile.reconnect_timer = None;
+                me.tick_ssh_auto_reconnect(generation, attempt, deadline, ctx);
+            },
+        ));
     }
 
     fn cancel_ssh_auto_reconnect(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(timer) = self.ssh_profile.reconnect_timer.take() {
+            timer.abort();
+        }
         if let Some(connection) = self.ssh_profile.connection.as_mut() {
             connection.reconnect_generation += 1;
         }
@@ -571,6 +693,9 @@ impl TerminalView {
     }
 
     fn remove_ssh_reconnect_banner(&mut self) {
+        if let Some(timer) = self.ssh_profile.reconnect_timer.take() {
+            timer.abort();
+        }
         let Some(banner) = self.ssh_profile.reconnect_banner.take() else {
             return;
         };
@@ -608,17 +733,18 @@ impl TerminalView {
                 .find(|profile| profile.id == profile_id)
                 .cloned()
         });
+        if profile_id.is_some() && profile.is_none() {
+            self.cancel_ssh_auto_reconnect(ctx);
+            self.show_error_toast(
+                format!("Can't reconnect: the SSH host \"{target}\" was removed."),
+                ctx,
+            );
+            return;
+        }
         self.remove_ssh_reconnect_banner();
-        match (profile, profile_id) {
-            (Some(profile), _) => self.connect_ssh_profile_in(&profile, directory, ctx),
-            (None, Some(_)) => {
-                self.show_error_toast(
-                    format!("Can't reconnect: the SSH host \"{target}\" was removed."),
-                    ctx,
-                );
-                return;
-            }
-            (None, None) => self.connect_ssh_destination(target, ctx),
+        match profile {
+            Some(profile) => self.connect_ssh_profile_in(&profile, directory, ctx),
+            None => self.connect_ssh_destination(target, ctx),
         }
         if let Some(connection) = self.ssh_profile.connection.as_mut() {
             connection.attempt = attempt;
@@ -759,21 +885,35 @@ impl TerminalView {
         ssh_warpification_enabled: bool,
         ctx: &mut ViewContext<Self>,
     ) {
+        if let Some(timer) = self.ssh_profile.suppression_timer.take() {
+            timer.abort();
+        }
+        if let Some(poll) = self.ssh_profile.control_path_poll.take() {
+            poll.abort();
+        }
+        self.ssh_profile.suppression_generation =
+            self.ssh_profile.suppression_generation.wrapping_add(1);
         self.ssh_profile.warpification_enabled_at_arm = ssh_warpification_enabled;
         self.ssh_profile.warpify_disabled_command = (!ssh_warpification_enabled).then_some(command);
         if !ssh_warpification_enabled {
-            let command_to_clear = self.ssh_profile.warpify_disabled_command.clone();
-            ctx.spawn(
+            let generation = self.ssh_profile.suppression_generation;
+            self.ssh_profile.suppression_timer = Some(ctx.spawn(
                 async {
                     Timer::after(SSH_PROFILE_WARPIFY_DISABLED_COMMAND_TTL).await;
                 },
                 move |terminal_view, _, _| {
-                    if terminal_view.ssh_profile.warpify_disabled_command == command_to_clear {
-                        terminal_view.ssh_profile.warpify_disabled_command = None;
-                        terminal_view.ssh_profile.warpification_enabled_at_arm = false;
-                    }
+                    terminal_view.expire_ssh_profile_arm(generation);
                 },
-            );
+            ));
+        }
+    }
+
+    fn expire_ssh_profile_arm(&mut self, generation: u64) {
+        if self.ssh_profile.suppression_generation == generation {
+            self.ssh_profile.warpify_disabled_command = None;
+            if let Some(timer) = self.ssh_profile.suppression_timer.take() {
+                timer.abort();
+            }
         }
     }
 

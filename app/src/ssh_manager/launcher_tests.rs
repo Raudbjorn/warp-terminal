@@ -61,3 +61,71 @@ fn empty_input_shows_pinned_recent_quick_connects_and_all_hosts() {
         ["host", "host", "recent-quick", "host", "all"]
     );
 }
+
+#[test]
+fn editor_navigation_moves_launcher_selection_instead_of_editing_input() {
+    use warpui::App;
+    use warpui::platform::WindowStyle;
+
+    use crate::editor::EditorAction;
+    use crate::test_util::terminal::initialize_app_for_terminal_view;
+
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (_, launcher) = app.add_window(WindowStyle::NotStealFocus, SshLauncherView::new);
+        launcher.update(&mut app, |view, ctx| {
+            view.editor.update(ctx, |editor, ctx| {
+                editor.set_buffer_text_ignoring_undo("root@host", ctx)
+            });
+        });
+        launcher.update(&mut app, |view, ctx| {
+            view.editor.update(ctx, |editor, ctx| {
+                editor.handle_action(&EditorAction::Down, ctx)
+            });
+        });
+        launcher.read(&app, |view, _| assert_eq!(view.selected, 1));
+        launcher.update(&mut app, |view, ctx| {
+            view.editor.update(ctx, |editor, ctx| {
+                editor.handle_action(&EditorAction::Tab, ctx)
+            });
+        });
+        launcher.read(&app, |view, ctx| {
+            assert_eq!(view.selected, 0);
+            assert_eq!(view.query(ctx), "root@host");
+        });
+    });
+}
+
+#[test]
+fn ctrl_enter_activates_save_and_connect() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use warpui::App;
+    use warpui::platform::WindowStyle;
+
+    use crate::test_util::terminal::initialize_app_for_terminal_view;
+
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (_, launcher) = app.add_window(WindowStyle::NotStealFocus, SshLauncherView::new);
+        let closed = Rc::new(Cell::new(false));
+        app.update(|ctx| {
+            let closed = closed.clone();
+            ctx.subscribe_to_view(&launcher, move |_, event, _| {
+                if matches!(event, SshLauncherEvent::Close) {
+                    closed.set(true);
+                }
+            });
+        });
+        launcher.update(&mut app, |view, ctx| {
+            view.editor.update(ctx, |editor, ctx| {
+                editor.set_buffer_text_ignoring_undo("root@host", ctx)
+            });
+        });
+        launcher.update(&mut app, |view, ctx| {
+            view.handle_editor_event(&EditorEvent::CtrlEnter, ctx)
+        });
+        assert!(closed.get());
+    });
+}
