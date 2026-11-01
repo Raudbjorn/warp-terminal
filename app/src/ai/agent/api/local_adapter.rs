@@ -54,6 +54,9 @@ pub(crate) struct TurnPlan {
     /// transcript rebuild sees them (user query, tool call results).
     pub input_echo_messages: Vec<api::Message>,
     pub config_key: String,
+    /// [`endpoint_fingerprint`] of the endpoint serving this turn, stamped on
+    /// the replay items it produces.
+    pub model_fingerprint: String,
 }
 
 /// Identity of one turn shared by every turn kind: which conversation and
@@ -144,7 +147,14 @@ fn plan_agent_turn(
     let mut transcript = vec![local_agent::ChatMessage::System(
         local_agent::build_system_prompt(&environment),
     )];
-    let known_call_ids = append_task_history(&mut transcript, tasks, &tools, &route.config_key);
+    let model_fingerprint = endpoint_fingerprint(&route.endpoint);
+    let known_call_ids = append_task_history(
+        &mut transcript,
+        tasks,
+        &tools,
+        &route.config_key,
+        &model_fingerprint,
+    );
 
     let mut input_echo_messages = Vec::new();
     for user_input in user_inputs {
@@ -245,6 +255,7 @@ fn plan_agent_turn(
         is_first_turn,
         input_echo_messages,
         config_key: route.config_key.clone(),
+        model_fingerprint,
     })
 }
 
@@ -280,7 +291,14 @@ fn plan_suggestion_turn(
     let mut transcript = vec![local_agent::ChatMessage::System(
         local_agent::build_suggestion_system_prompt(&environment),
     )];
-    append_task_history(&mut transcript, tasks, &tools, &route.config_key);
+    let model_fingerprint = endpoint_fingerprint(&route.endpoint);
+    append_task_history(
+        &mut transcript,
+        tasks,
+        &tools,
+        &route.config_key,
+        &model_fingerprint,
+    );
 
     let instruction = match trigger {
         Trigger::ShellCommandCompleted(completed) => {
@@ -346,6 +364,7 @@ fn plan_suggestion_turn(
         is_first_turn,
         input_echo_messages,
         config_key: route.config_key.clone(),
+        model_fingerprint,
     })
 }
 
@@ -452,13 +471,21 @@ fn reasoning_message(
 struct HistoryState<'a> {
     tools: &'a ToolRegistry,
     /// Custom model serving this turn; only replay items it produced are
-    /// handed back to the engine.
+    /// handed back to the engine. `config_key` alone does not identify it
+    /// (editing an endpoint keeps the key), so the fingerprint must match too.
     config_key: &'a str,
+    model_fingerprint: &'a str,
     /// Ids of the tool calls already in the transcript, so results are only
     /// emitted for calls the provider has seen.
     known_call_ids: Vec<String>,
     /// Replay items read since the last assistant message; the next assistant
     /// message adopts them so they precede its text and tool calls.
+    ///
+    /// Known limit: a turn that interleaves reasoning with output (reasoning,
+    /// text, reasoning, tool call) is replayed flattened, as one assistant
+    /// message with every reasoning item ahead of the text and calls. The
+    /// usual order within a response is reasoning first, which this keeps;
+    /// the interleaved case has not been checked against a real provider.
     pending_replay_items: Vec<serde_json::Value>,
 }
 
@@ -485,10 +512,12 @@ fn append_task_history(
     tasks: &[api::Task],
     tools: &ToolRegistry,
     config_key: &str,
+    model_fingerprint: &str,
 ) -> Vec<String> {
     let mut state = HistoryState {
         tools,
         config_key,
+        model_fingerprint,
         known_call_ids: Vec::new(),
         pending_replay_items: Vec::new(),
     };
@@ -527,7 +556,9 @@ fn append_history_message(
             }
         }
         Some(Message::AgentReasoning(_)) => {
-            if let Some(item) = decode_replay_item(message, state.config_key) {
+            if let Some(item) =
+                decode_replay_item(message, state.config_key, state.model_fingerprint)
+            {
                 state.pending_replay_items.push(item);
             }
         }
@@ -583,43 +614,108 @@ fn append_history_message(
 /// restore and forks without any change to the proto. The envelope keeps
 /// foreign payloads (server-routed turns of the same conversation) from being
 /// mistaken for ours: they fail to deserialize and are ignored.
+///
+/// Both identity fields are required, so payloads written before
+/// `model_fingerprint` existed also fail to deserialize and are dropped rather
+/// than replayed to a target nobody can vouch for. Losing them costs only the
+/// provider-side reasoning continuity of the turns that wrote them.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedReplayItem {
-    /// `config_key` of the custom model that produced the item. Encrypted
-    /// reasoning is only valid for the model that emitted it, so items are
-    /// replayed only to that same model.
+    /// `config_key` of the custom model that produced the item. It survives
+    /// edits to the endpoint, so it names the model entry, not the target.
     config_key: String,
+    /// [`endpoint_fingerprint`] of the endpoint that produced the item.
+    /// Encrypted reasoning is only valid for the target that emitted it, so
+    /// items are replayed only to that same target.
+    model_fingerprint: String,
     local_agent_replay_item: serde_json::Value,
+}
+
+/// 64-bit FNV-1a. Written out because fingerprints are persisted: std's
+/// `DefaultHasher` promises the same output neither across Rust releases nor
+/// across processes.
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    bytes.iter().fold(OFFSET_BASIS, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
+}
+
+/// Reduces a base URL to the part that names the server: scheme and host
+/// lower-cased, userinfo, query and fragment dropped (credentials ride in all
+/// three), trailing slashes trimmed.
+fn identity_base_url(base_url: &str) -> String {
+    let url = base_url.trim();
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let (authority, path) = rest.split_at(rest.find('/').unwrap_or(rest.len()));
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let scheme_prefix = if scheme.is_empty() {
+        String::new()
+    } else {
+        format!("{}://", scheme.to_ascii_lowercase())
+    };
+    format!(
+        "{scheme_prefix}{}{}",
+        host.to_ascii_lowercase(),
+        path.trim_end_matches('/')
+    )
+}
+
+/// Stable identity of the target a replay item was issued by: wire schema,
+/// base URL and model slug, as 16 hex digits of FNV-1a. The API key is
+/// deliberately not part of it: the fingerprint is persisted in the task tree
+/// and must never carry anything derived from a credential. (A different
+/// account behind the same URL is therefore not detected.)
+fn endpoint_fingerprint(endpoint: &local_agent::LocalEndpointConfig) -> String {
+    let schema = match endpoint.schema {
+        local_agent::EndpointSchema::ChatCompletions => "chat_completions",
+        local_agent::EndpointSchema::Responses => "responses",
+    };
+    let identity = format!(
+        "{schema}\0{}\0{}",
+        identity_base_url(&endpoint.base_url),
+        endpoint.model_slug.trim()
+    );
+    format!("{:016x}", fnv1a_64(identity.as_bytes()))
 }
 
 fn encode_replay_item(
     config_key: &str,
+    model_fingerprint: &str,
     item: serde_json::Value,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string(&PersistedReplayItem {
         config_key: config_key.to_string(),
+        model_fingerprint: model_fingerprint.to_string(),
         local_agent_replay_item: item,
     })
 }
 
 /// Reads the replay item an `AgentReasoning` message carries, if it was
-/// produced by `config_key`'s model.
-fn decode_replay_item(message: &api::Message, config_key: &str) -> Option<serde_json::Value> {
+/// produced by the target `config_key` and `model_fingerprint` identify.
+fn decode_replay_item(
+    message: &api::Message,
+    config_key: &str,
+    model_fingerprint: &str,
+) -> Option<serde_json::Value> {
     if message.server_message_data.is_empty() {
         return None;
     }
     let Ok(persisted) = serde_json::from_str::<PersistedReplayItem>(&message.server_message_data)
     else {
         log::debug!(
-            "local agent loop: ignoring foreign server_message_data on reasoning message {}",
+            "local agent loop: ignoring foreign or legacy server_message_data on reasoning message {}",
             message.id
         );
         return None;
     };
-    if persisted.config_key != config_key {
+    if persisted.config_key != config_key || persisted.model_fingerprint != model_fingerprint {
         log::debug!(
-            "local agent loop: skipping replay item from model {} (serving {config_key})",
-            persisted.config_key
+            "local agent loop: skipping replay item from model {} ({}), serving {config_key} ({model_fingerprint})",
+            persisted.config_key,
+            persisted.model_fingerprint
         );
         return None;
     }
@@ -863,6 +959,18 @@ impl ToolRegistry {
                     message: err.to_string(),
                 }
             })
+        }
+
+        // Honour only tools offered this turn. The model can name any tool it has
+        // seen in training or earlier turns; a suggestion turn is read-only and
+        // must not run shell commands, and regular turns do not offer
+        // `suggest_prompt`.
+        if !self
+            .definitions()
+            .iter()
+            .any(|definition| definition.name == call.name)
+        {
+            return Err(AdapterError::UnknownTool(call.name.clone()));
         }
 
         let tool = match call.name.as_str() {
@@ -2024,6 +2132,7 @@ pub(crate) struct EventMapper {
     root_task_id: String,
     is_first_turn: bool,
     config_key: String,
+    model_fingerprint: String,
     echo_messages: Vec<api::Message>,
     registry: ToolRegistry,
     /// Id of the `AgentOutput` message currently receiving text appends.
@@ -2032,6 +2141,12 @@ pub(crate) struct EventMapper {
     open_reasoning: Option<OpenReasoning>,
     input_tokens: u64,
     output_tokens: u64,
+    /// Set once a terminal event (`Finished`, or the stream error that makes
+    /// the host retry) has been emitted. The engine can keep producing events
+    /// after the mapper gave up on the turn, e.g. `Usage` and `Done` after a
+    /// tool call that failed to map; those must not reach the client, or a
+    /// rolled-back transaction would be committed and `Finished` sent twice.
+    terminated: bool,
 }
 
 impl EventMapper {
@@ -2042,13 +2157,21 @@ impl EventMapper {
             root_task_id: plan.root_task_id.clone(),
             is_first_turn: plan.is_first_turn,
             config_key: plan.config_key.clone(),
+            model_fingerprint: plan.model_fingerprint.clone(),
             echo_messages: plan.input_echo_messages.clone(),
             registry: plan.tools.clone(),
             streaming_message_id: None,
             open_reasoning: None,
             input_tokens: 0,
             output_tokens: 0,
+            terminated: false,
         }
+    }
+
+    /// Whether a terminal event has been emitted; every later engine event is
+    /// dropped, so the engine stream can be dropped too.
+    pub fn is_terminated(&self) -> bool {
+        self.terminated
     }
 
     /// Events emitted before the first engine event: `Init`,
@@ -2104,7 +2227,7 @@ impl EventMapper {
     /// `AgentReasoning` messages that also carry the turn's replay items,
     /// completed tool calls become `AddMessagesToTask`, `Done` becomes
     /// `CommitTransaction` + `Finished`, errors become `RollbackTransaction` +
-    /// terminal events.
+    /// terminal events. Nothing is emitted after a terminal event.
     pub fn on_event(
         &mut self,
         event: Result<local_agent::AgentEvent, local_agent::LocalAgentError>,
@@ -2112,6 +2235,9 @@ impl EventMapper {
         use api::client_action::Action;
         use local_agent::AgentEvent;
 
+        if self.terminated {
+            return vec![];
+        }
         match event {
             Ok(AgentEvent::TextDelta(text)) => {
                 let mut events: Vec<Event> = self.close_reasoning(None).into_iter().collect();
@@ -2151,6 +2277,7 @@ impl EventMapper {
                 vec![]
             }
             Ok(AgentEvent::Done) => {
+                self.terminated = true;
                 let mut events: Vec<Event> = self.close_reasoning(None).into_iter().collect();
                 events.push(client_actions(vec![Action::CommitTransaction(
                     api::client_action::CommitTransaction {},
@@ -2183,6 +2310,7 @@ impl EventMapper {
                 // the host un-retried. The mapper's opening events count as
                 // client actions, so the host recovers by resuming rather than
                 // re-sending (see `local_route::RESUME_UNSUPPORTED`).
+                self.terminated = true;
                 vec![
                     client_actions(vec![Action::RollbackTransaction(
                         api::client_action::RollbackTransaction {},
@@ -2261,7 +2389,7 @@ impl EventMapper {
     /// summary text gets its own message with empty text, which the UI does
     /// not render.
     fn on_replay_item(&mut self, item: serde_json::Value) -> Vec<Event> {
-        let payload = match encode_replay_item(&self.config_key, item) {
+        let payload = match encode_replay_item(&self.config_key, &self.model_fingerprint, item) {
             Ok(payload) => payload,
             Err(err) => {
                 log::warn!(
@@ -2324,6 +2452,7 @@ impl EventMapper {
         &mut self,
         reason: api::response_event::stream_finished::Reason,
     ) -> Vec<Event> {
+        self.terminated = true;
         vec![
             client_actions(vec![api::client_action::Action::RollbackTransaction(
                 api::client_action::RollbackTransaction {},
@@ -2406,7 +2535,9 @@ pub(crate) fn generate_local_agent_output(
 /// Chains the mapper's opening events with the mapped engine events. The
 /// returned stream owns the engine stream and spawns nothing, so dropping it
 /// (the client's cancellation path) drops the engine stream, which aborts the
-/// in-flight HTTP request.
+/// in-flight HTTP request. The engine stream is dropped the same way as soon
+/// as the mapper emits a terminal event, instead of being drained for events
+/// that would be discarded.
 fn response_stream(
     mut mapper: EventMapper,
     engine_events: futures::stream::BoxStream<
@@ -2415,8 +2546,18 @@ fn response_stream(
     >,
 ) -> ResponseStream {
     let initial_events = mapper.initial_events();
-    let mapped_events =
-        engine_events.flat_map(move |event| futures::stream::iter(mapper.on_event(event)));
+    let mapped_events = futures::stream::unfold(
+        (mapper, engine_events),
+        |(mut mapper, mut engine)| async move {
+            if mapper.is_terminated() {
+                return None;
+            }
+            let event = engine.next().await?;
+            let events = mapper.on_event(event);
+            Some((futures::stream::iter(events), (mapper, engine)))
+        },
+    )
+    .flatten();
     Box::pin(futures::stream::iter(initial_events).chain(mapped_events))
 }
 

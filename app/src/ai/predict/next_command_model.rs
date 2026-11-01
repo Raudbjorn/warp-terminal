@@ -403,8 +403,8 @@ impl NextCommandModel {
         ctx: &mut ModelContext<Self>,
     ) {
         let server_api = self.server_api.clone();
-        let team_scope =
-            RequestTeamScope::from_scope(&self.ai_controller.as_ref(ctx).team_context(ctx));
+        let team_context = self.ai_controller.as_ref(ctx).team_context(ctx);
+        let team_scope = RequestTeamScope::from_scope(&team_context);
 
         // Resolve whether this prediction should run against the user's custom
         // endpoint instead of the Warp server. Must happen here (with `ctx`)
@@ -414,7 +414,7 @@ impl NextCommandModel {
             super::generate_ai_input_suggestions::local::resolve_local_input_endpoint(
                 ctx,
                 terminal_view_id,
-                &team_scope,
+                &team_context,
             );
         let terminal_model = self.model.clone();
         let cached_next_command_context = self.cached_zerostate_next_command_context.clone();

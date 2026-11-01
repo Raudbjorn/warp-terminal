@@ -16,16 +16,28 @@ use super::{GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsRespons
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::llms::LLMPreferences;
 use crate::server::server_api::AIApiError;
-use crate::server::team_scope::RequestTeamScope;
+use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
 
 /// Resolves the local endpoint to use for a next-command prediction, or `None`
-/// to fall back to the server. Returns a config only when the active base model
-/// belongs to one of the user's custom endpoints.
+/// to fall back to the server. Returns a config only when custom endpoints are
+/// permitted for `scope` and the active base model belongs to one of the user's
+/// custom endpoints.
+///
+/// `scope` is the live team scope rather than a resolved `RequestTeamScope`
+/// because the endpoint policy is read per team.
 pub(crate) fn resolve_local_input_endpoint(
     ctx: &AppContext,
     terminal_view_id: Option<EntityId>,
-    scope: &RequestTeamScope,
+    scope: &(impl TeamScope + ?Sized),
 ) -> Option<LocalEndpointConfig> {
+    // The same gate agent requests apply (`ai::agent::api`): without it, a user or team that
+    // may not use custom endpoints would still have next-command predictions sent to one.
+    let user_workspaces = UserWorkspaces::as_ref(ctx);
+    if !(user_workspaces.is_byo_endpoint_enabled(ctx)
+        && user_workspaces.are_member_byo_endpoints_allowed(scope))
+    {
+        return None;
+    }
     let active_model_id = LLMPreferences::as_ref(ctx)
         .get_active_base_model_for_team_uid(scope.team_uid(), ctx, terminal_view_id)
         .id
