@@ -419,6 +419,7 @@ fn append_history_message(
                 transcript.push(local_agent::ChatMessage::Assistant {
                     text: output.text.clone(),
                     tool_calls: vec![],
+                    replay_items: vec![],
                 });
             }
         }
@@ -442,6 +443,7 @@ fn append_history_message(
                 transcript.push(local_agent::ChatMessage::Assistant {
                     text: String::new(),
                     tool_calls: vec![request],
+                    replay_items: vec![],
                 });
             }
         }
@@ -1587,6 +1589,8 @@ impl EventMapper {
             // Reasoning is not surfaced in v1; the engine already keeps it
             // out of the final text.
             Ok(AgentEvent::ReasoningDelta(_)) => vec![],
+            // Persisting replay items is wired up by the Responses adapter work.
+            Ok(AgentEvent::ReplayItem(_)) => vec![],
             Ok(AgentEvent::ToolCall(call)) => {
                 // Any text after this belongs to a new output message.
                 self.streaming_message_id = None;

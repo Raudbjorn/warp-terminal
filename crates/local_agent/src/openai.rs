@@ -101,7 +101,9 @@ pub(crate) fn build_request(
                 tool_calls: vec![],
                 tool_call_id: None,
             },
-            ChatMessage::Assistant { text, tool_calls } => OutgoingMessage {
+            ChatMessage::Assistant {
+                text, tool_calls, ..
+            } => OutgoingMessage {
                 role: "assistant",
                 content: (!text.is_empty()).then(|| text.clone()),
                 tool_calls: tool_calls

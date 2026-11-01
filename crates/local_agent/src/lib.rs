@@ -1,5 +1,5 @@
 //! A local agent loop that talks directly to an OpenAI-compatible API
-//! (Chat Completions), independent of the Warp API server.
+//! (Chat Completions or Responses), independent of the Warp API server.
 //!
 //! This crate is deliberately free of `warp_multi_agent_api` (protobuf) types:
 //! it operates on its own neutral model. The conversion between Warp's
@@ -18,6 +18,16 @@ mod prompt;
 use futures::stream::BoxStream;
 pub use prompt::{EnvironmentInfo, build_suggestion_system_prompt, build_system_prompt};
 
+/// Wire protocol spoken by a custom endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EndpointSchema {
+    /// `POST {base}/chat/completions`.
+    #[default]
+    ChatCompletions,
+    /// `POST {base}/responses` (OpenAI Responses API).
+    Responses,
+}
+
 /// Connection parameters for one OpenAI-compatible endpoint, resolved by the
 /// host from the user's custom endpoint configuration.
 #[derive(Debug, Clone)]
@@ -28,6 +38,7 @@ pub struct LocalEndpointConfig {
     pub api_key: String,
     /// Model name as the provider knows it (e.g. `llama-3.3-70b`).
     pub model_slug: String,
+    pub schema: EndpointSchema,
 }
 
 /// One entry of the LLM transcript, in provider-neutral form.
@@ -38,6 +49,11 @@ pub enum ChatMessage {
     Assistant {
         text: String,
         tool_calls: Vec<ToolCallRequest>,
+        /// Provider items the next request must replay verbatim, e.g. the
+        /// Responses API's reasoning items (with `encrypted_content`) emitted
+        /// as [`AgentEvent::ReplayItem`] earlier in the same turn. Ignored by
+        /// the Chat Completions engine.
+        replay_items: Vec<serde_json::Value>,
     },
     Tool {
         tool_call_id: String,
@@ -70,6 +86,11 @@ pub enum AgentEvent {
     ReasoningDelta(String),
     /// Emitted once a streamed tool call is fully accumulated.
     ToolCall(ToolCallRequest),
+    /// An opaque provider item (a Responses reasoning item) the host must
+    /// persist and hand back via [`ChatMessage::Assistant::replay_items`] on
+    /// the follow-up turn. Emitted in stream order, before the turn's
+    /// [`AgentEvent::ToolCall`]s.
+    ReplayItem(serde_json::Value),
     Usage {
         input_tokens: u64,
         output_tokens: u64,

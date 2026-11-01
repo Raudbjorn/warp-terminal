@@ -88,6 +88,7 @@ pub(crate) fn resolve_local_route(request: &api::Request) -> Option<LocalRoute> 
                         base_url: provider.base_url.clone(),
                         api_key: provider.api_key.clone(),
                         model_slug: custom_model.slug.clone(),
+                        schema: local_agent::EndpointSchema::ChatCompletions,
                     },
                     config_key: custom_model.config_key.clone(),
                 })

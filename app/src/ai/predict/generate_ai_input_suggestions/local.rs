@@ -68,6 +68,7 @@ pub(crate) fn pick_custom_endpoint(
                     base_url: base_url.to_string(),
                     api_key: api_key.to_string(),
                     model_slug: model_slug.to_string(),
+                    schema: local_agent::EndpointSchema::ChatCompletions,
                 });
             }
         }
