@@ -9,14 +9,18 @@
 //! - turn the engine's [`local_agent::AgentEvent`] stream into the
 //!   `ResponseEvent` sequence the existing client machinery consumes
 //!   (StreamInit, transactions, CreateTask/AddMessagesToTask/
-//!   AppendToMessageContent, Finished).
+//!   AppendToMessageContent, Finished),
+//! - persist the provider items the next request must replay (Responses
+//!   reasoning items) inside the task tree and read them back when the
+//!   transcript is rebuilt — see [`PersistedReplayItem`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 use warp_multi_agent_api as api;
@@ -130,12 +134,7 @@ fn plan_agent_turn(
     let mut transcript = vec![local_agent::ChatMessage::System(
         local_agent::build_system_prompt(&environment),
     )];
-    let mut known_call_ids = Vec::new();
-    for task in tasks {
-        for message in &task.messages {
-            append_history_message(&mut transcript, &mut known_call_ids, message, &tools);
-        }
-    }
+    let known_call_ids = append_task_history(&mut transcript, tasks, &tools, &route.config_key);
 
     let mut input_echo_messages = Vec::new();
     for user_input in user_inputs {
@@ -271,12 +270,7 @@ fn plan_suggestion_turn(
     let mut transcript = vec![local_agent::ChatMessage::System(
         local_agent::build_suggestion_system_prompt(&environment),
     )];
-    let mut known_call_ids = Vec::new();
-    for task in tasks {
-        for message in &task.messages {
-            append_history_message(&mut transcript, &mut known_call_ids, message, &tools);
-        }
-    }
+    append_task_history(&mut transcript, tasks, &tools, &route.config_key);
 
     let instruction = match trigger {
         Trigger::ShellCommandCompleted(completed) => {
@@ -399,19 +393,91 @@ fn new_task_message(task_id: &str, content: api::message::Message) -> api::Messa
     }
 }
 
+fn reasoning_message(
+    task_id: &str,
+    reasoning: String,
+    finished_duration: Option<prost_types::Duration>,
+    server_message_data: String,
+) -> api::Message {
+    api::Message {
+        server_message_data,
+        ..new_task_message(
+            task_id,
+            api::message::Message::AgentReasoning(api::message::AgentReasoning {
+                reasoning,
+                finished_duration,
+            }),
+        )
+    }
+}
+
+/// Transcript-building state carried across task-tree messages.
+struct HistoryState<'a> {
+    tools: &'a ToolRegistry,
+    /// Custom model serving this turn; only replay items it produced are
+    /// handed back to the engine.
+    config_key: &'a str,
+    /// Ids of the tool calls already in the transcript, so results are only
+    /// emitted for calls the provider has seen.
+    known_call_ids: Vec<String>,
+    /// Replay items read since the last assistant message; the next assistant
+    /// message adopts them so they precede its text and tool calls.
+    pending_replay_items: Vec<serde_json::Value>,
+}
+
+impl HistoryState<'_> {
+    /// Replay items that were never followed by an assistant message (the
+    /// stream ended after reasoning) must not leak into a later turn: a
+    /// reasoning item without a following output item is rejected by the
+    /// Responses API.
+    fn discard_dangling_replay_items(&mut self) {
+        if !self.pending_replay_items.is_empty() {
+            log::debug!(
+                "local agent loop: dropping {} replay item(s) with no following assistant message",
+                self.pending_replay_items.len()
+            );
+            self.pending_replay_items.clear();
+        }
+    }
+}
+
+/// Appends every task's messages to the transcript and returns the ids of the
+/// tool calls they contain.
+fn append_task_history(
+    transcript: &mut Vec<local_agent::ChatMessage>,
+    tasks: &[api::Task],
+    tools: &ToolRegistry,
+    config_key: &str,
+) -> Vec<String> {
+    let mut state = HistoryState {
+        tools,
+        config_key,
+        known_call_ids: Vec::new(),
+        pending_replay_items: Vec::new(),
+    };
+    for task in tasks {
+        for message in &task.messages {
+            append_history_message(transcript, &mut state, message);
+        }
+    }
+    state.discard_dangling_replay_items();
+    state.known_call_ids
+}
+
 /// Appends one task-tree message to the transcript. Messages the local loop
-/// does not understand (reasoning, todos, server events, ...) are skipped;
-/// tool calls of kinds the registry cannot express are skipped together with
+/// does not understand (todos, server events, ...) are skipped; reasoning
+/// messages contribute only the replay item they carry, never their text.
+/// Tool calls of kinds the registry cannot express are skipped together with
 /// their results so the transcript never references an undefined call id.
 fn append_history_message(
     transcript: &mut Vec<local_agent::ChatMessage>,
-    known_call_ids: &mut Vec<String>,
+    state: &mut HistoryState<'_>,
     message: &api::Message,
-    tools: &ToolRegistry,
 ) {
     use api::message::Message;
     match message.message.as_ref() {
         Some(Message::UserQuery(query)) => {
+            state.discard_dangling_replay_items();
             transcript.push(local_agent::ChatMessage::User(query.query.clone()));
         }
         Some(Message::AgentOutput(output)) => {
@@ -419,36 +485,47 @@ fn append_history_message(
                 transcript.push(local_agent::ChatMessage::Assistant {
                     text: output.text.clone(),
                     tool_calls: vec![],
-                    replay_items: vec![],
+                    replay_items: std::mem::take(&mut state.pending_replay_items),
                 });
             }
         }
+        Some(Message::AgentReasoning(_)) => {
+            if let Some(item) = decode_replay_item(message, state.config_key) {
+                state.pending_replay_items.push(item);
+            }
+        }
         Some(Message::ToolCall(tool_call)) => {
-            let Some(request) = tools.to_request_tool_call(tool_call) else {
+            let Some(request) = state.tools.to_request_tool_call(tool_call) else {
                 log::warn!(
                     "local agent loop: dropping unsupported historic tool call {}",
                     tool_call.tool_call_id
                 );
                 return;
             };
-            known_call_ids.push(request.id.clone());
+            state.known_call_ids.push(request.id.clone());
+            let replay_items = std::mem::take(&mut state.pending_replay_items);
             // Parallel calls and text from the same LLM turn must live in
             // one assistant message, or strict OpenAI-compatible servers
             // reject the tool results that follow.
-            if let Some(local_agent::ChatMessage::Assistant { tool_calls, .. }) =
-                transcript.last_mut()
+            if let Some(local_agent::ChatMessage::Assistant {
+                tool_calls,
+                replay_items: assistant_replay_items,
+                ..
+            }) = transcript.last_mut()
             {
                 tool_calls.push(request);
+                assistant_replay_items.extend(replay_items);
             } else {
                 transcript.push(local_agent::ChatMessage::Assistant {
                     text: String::new(),
                     tool_calls: vec![request],
-                    replay_items: vec![],
+                    replay_items,
                 });
             }
         }
         Some(Message::ToolCallResult(result)) => {
-            if !known_call_ids.contains(&result.tool_call_id) {
+            state.discard_dangling_replay_items();
+            if !state.known_call_ids.contains(&result.tool_call_id) {
                 return;
             }
             transcript.push(local_agent::ChatMessage::Tool {
@@ -456,10 +533,67 @@ fn append_history_message(
                 content: render_tool_result_text(result),
             });
         }
-        // Reasoning, model markers, todos, server events, etc. carry no
-        // information the next LLM call needs.
+        // Model markers, todos, server events, etc. carry no information the
+        // next LLM call needs.
         _ => {}
     }
+}
+
+/// `server_message_data` payload of an `AgentReasoning` message that carries a
+/// provider replay item (a Responses `reasoning` item with
+/// `encrypted_content`). The proto defines that field as an opaque payload the
+/// client round-trips untouched, so it survives conversation persistence,
+/// restore and forks without any change to the proto. The envelope keeps
+/// foreign payloads (server-routed turns of the same conversation) from being
+/// mistaken for ours: they fail to deserialize and are ignored.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedReplayItem {
+    /// `config_key` of the custom model that produced the item. Encrypted
+    /// reasoning is only valid for the model that emitted it, so items are
+    /// replayed only to that same model.
+    config_key: String,
+    local_agent_replay_item: serde_json::Value,
+}
+
+fn encode_replay_item(
+    config_key: &str,
+    item: serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&PersistedReplayItem {
+        config_key: config_key.to_string(),
+        local_agent_replay_item: item,
+    })
+}
+
+/// Reads the replay item an `AgentReasoning` message carries, if it was
+/// produced by `config_key`'s model.
+fn decode_replay_item(message: &api::Message, config_key: &str) -> Option<serde_json::Value> {
+    if message.server_message_data.is_empty() {
+        return None;
+    }
+    let Ok(persisted) = serde_json::from_str::<PersistedReplayItem>(&message.server_message_data)
+    else {
+        log::debug!(
+            "local agent loop: ignoring foreign server_message_data on reasoning message {}",
+            message.id
+        );
+        return None;
+    };
+    if persisted.config_key != config_key {
+        log::debug!(
+            "local agent loop: skipping replay item from model {} (serving {config_key})",
+            persisted.config_key
+        );
+        return None;
+    }
+    if !persisted.local_agent_replay_item.is_object() {
+        log::warn!(
+            "local agent loop: ignoring malformed replay item on reasoning message {}",
+            message.id
+        );
+        return None;
+    }
+    Some(persisted.local_agent_replay_item)
 }
 
 fn environment_from_context(context: Option<&api::InputContext>) -> local_agent::EnvironmentInfo {
@@ -1467,6 +1601,23 @@ fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
 /// are direct fields of `Message` (the oneof name itself is not addressable).
 const AGENT_OUTPUT_TEXT_MASK: &str = "agent_output.text";
 
+/// Field-mask path for appending streamed summary text to an `AgentReasoning`
+/// message.
+const AGENT_REASONING_TEXT_MASK: &str = "agent_reasoning.reasoning";
+
+/// Field-mask path marking an `AgentReasoning` message as finished, which the
+/// UI renders as "Thought for N seconds" instead of a live "Thinking" header.
+const AGENT_REASONING_DURATION_MASK: &str = "agent_reasoning.finished_duration";
+
+/// Field-mask path for attaching a [`PersistedReplayItem`] to a message.
+const SERVER_MESSAGE_DATA_MASK: &str = "server_message_data";
+
+/// An `AgentReasoning` message still receiving streamed summary text.
+struct OpenReasoning {
+    message_id: String,
+    started_at: Instant,
+}
+
 /// Stateful mapper from engine events to the proto `ResponseEvent` sequence.
 /// Pure (no I/O), so golden tests can drive it directly.
 pub(crate) struct EventMapper {
@@ -1479,6 +1630,8 @@ pub(crate) struct EventMapper {
     registry: ToolRegistry,
     /// Id of the `AgentOutput` message currently receiving text appends.
     streaming_message_id: Option<String>,
+    /// Reasoning message currently receiving summary text appends.
+    open_reasoning: Option<OpenReasoning>,
     input_tokens: u64,
     output_tokens: u64,
 }
@@ -1494,6 +1647,7 @@ impl EventMapper {
             echo_messages: plan.input_echo_messages.clone(),
             registry: plan.tools.clone(),
             streaming_message_id: None,
+            open_reasoning: None,
             input_tokens: 0,
             output_tokens: 0,
         }
@@ -1548,9 +1702,11 @@ impl EventMapper {
     }
 
     /// Maps one engine event; text deltas become `AddMessagesToTask` then
-    /// `AppendToMessageContent`, completed tool calls become
-    /// `AddMessagesToTask`, `Done` becomes `CommitTransaction` + `Finished`,
-    /// errors become `RollbackTransaction` + terminal events.
+    /// `AppendToMessageContent`, reasoning summaries stream the same way into
+    /// `AgentReasoning` messages that also carry the turn's replay items,
+    /// completed tool calls become `AddMessagesToTask`, `Done` becomes
+    /// `CommitTransaction` + `Finished`, errors become `RollbackTransaction` +
+    /// terminal events.
     pub fn on_event(
         &mut self,
         event: Result<local_agent::AgentEvent, local_agent::LocalAgentError>,
@@ -1559,46 +1715,26 @@ impl EventMapper {
         use local_agent::AgentEvent;
 
         match event {
-            Ok(AgentEvent::TextDelta(text)) => match self.streaming_message_id.clone() {
-                Some(message_id) => vec![client_actions(vec![Action::AppendToMessageContent(
-                    api::client_action::AppendToMessageContent {
-                        task_id: self.root_task_id.clone(),
-                        message: Some(api::Message {
-                            id: message_id,
-                            ..new_task_message(
-                                &self.root_task_id,
-                                api::message::Message::AgentOutput(api::message::AgentOutput {
-                                    text,
-                                }),
-                            )
-                        }),
-                        mask: Some(prost_types::FieldMask {
-                            paths: vec![AGENT_OUTPUT_TEXT_MASK.to_string()],
-                        }),
-                    },
-                )])],
-                None => {
-                    let message = new_task_message(
-                        &self.root_task_id,
-                        api::message::Message::AgentOutput(api::message::AgentOutput { text }),
-                    );
-                    self.streaming_message_id = Some(message.id.clone());
-                    vec![self.add_messages(vec![message])]
-                }
-            },
-            // Reasoning is not surfaced in v1; the engine already keeps it
-            // out of the final text.
-            Ok(AgentEvent::ReasoningDelta(_)) => vec![],
-            // Persisting replay items is wired up by the Responses adapter work.
-            Ok(AgentEvent::ReplayItem(_)) => vec![],
+            Ok(AgentEvent::TextDelta(text)) => {
+                let mut events: Vec<Event> = self.close_reasoning(None).into_iter().collect();
+                events.push(self.text_delta_event(text));
+                events
+            }
+            Ok(AgentEvent::ReasoningDelta(delta)) => self.on_reasoning_delta(delta),
+            Ok(AgentEvent::ReplayItem(item)) => self.on_replay_item(item),
             Ok(AgentEvent::ToolCall(call)) => {
                 // Any text after this belongs to a new output message.
                 self.streaming_message_id = None;
                 match self.registry.to_proto_tool_call(&call) {
-                    Ok(tool_call) => vec![self.add_messages(vec![new_task_message(
-                        &self.root_task_id,
-                        api::message::Message::ToolCall(tool_call),
-                    )])],
+                    Ok(tool_call) => {
+                        let mut events: Vec<Event> =
+                            self.close_reasoning(None).into_iter().collect();
+                        events.push(self.add_messages(vec![new_task_message(
+                            &self.root_task_id,
+                            api::message::Message::ToolCall(tool_call),
+                        )]));
+                        events
+                    }
                     Err(err) => self.finish_with_rollback(
                         api::response_event::stream_finished::Reason::InternalError(
                             api::response_event::stream_finished::InternalError {
@@ -1617,14 +1753,16 @@ impl EventMapper {
                 vec![]
             }
             Ok(AgentEvent::Done) => {
-                vec![
-                    client_actions(vec![Action::CommitTransaction(
-                        api::client_action::CommitTransaction {},
-                    )]),
+                let mut events: Vec<Event> = self.close_reasoning(None).into_iter().collect();
+                events.push(client_actions(vec![Action::CommitTransaction(
+                    api::client_action::CommitTransaction {},
+                )]));
+                events.push(
                     self.finished(api::response_event::stream_finished::Reason::Done(
                         api::response_event::stream_finished::Done {},
                     )),
-                ]
+                );
+                events
             }
             Err(local_agent::LocalAgentError::InvalidApiKey { model_slug }) => self
                 .finish_with_rollback(api::response_event::stream_finished::Reason::InvalidApiKey(
@@ -1650,6 +1788,124 @@ impl EventMapper {
                 ]
             }
         }
+    }
+
+    /// Streams one text delta: the first creates the `AgentOutput` message,
+    /// later ones append to it.
+    fn text_delta_event(&mut self, text: String) -> Event {
+        let Some(message_id) = self.streaming_message_id.clone() else {
+            let message = new_task_message(
+                &self.root_task_id,
+                api::message::Message::AgentOutput(api::message::AgentOutput { text }),
+            );
+            self.streaming_message_id = Some(message.id.clone());
+            return self.add_messages(vec![message]);
+        };
+        client_actions(vec![api::client_action::Action::AppendToMessageContent(
+            api::client_action::AppendToMessageContent {
+                task_id: self.root_task_id.clone(),
+                message: Some(api::Message {
+                    id: message_id,
+                    ..new_task_message(
+                        &self.root_task_id,
+                        api::message::Message::AgentOutput(api::message::AgentOutput { text }),
+                    )
+                }),
+                mask: Some(prost_types::FieldMask {
+                    paths: vec![AGENT_OUTPUT_TEXT_MASK.to_string()],
+                }),
+            },
+        )])
+    }
+
+    /// Streams one reasoning-summary delta into the open `AgentReasoning`
+    /// message, opening it first if needed. The text is display-only: the
+    /// transcript rebuild never reads it back (see [`HistoryState`]).
+    fn on_reasoning_delta(&mut self, delta: String) -> Vec<Event> {
+        if delta.is_empty() {
+            return vec![];
+        }
+        // Text that follows reasoning belongs to a new output message, which
+        // keeps the task tree in chronological order.
+        self.streaming_message_id = None;
+        let Some(open) = self.open_reasoning.as_ref() else {
+            let message = reasoning_message(&self.root_task_id, delta, None, String::new());
+            self.open_reasoning = Some(OpenReasoning {
+                message_id: message.id.clone(),
+                started_at: Instant::now(),
+            });
+            return vec![self.add_messages(vec![message])];
+        };
+        vec![client_actions(vec![
+            api::client_action::Action::AppendToMessageContent(
+                api::client_action::AppendToMessageContent {
+                    task_id: self.root_task_id.clone(),
+                    message: Some(api::Message {
+                        id: open.message_id.clone(),
+                        ..reasoning_message(&self.root_task_id, delta, None, String::new())
+                    }),
+                    mask: Some(prost_types::FieldMask {
+                        paths: vec![AGENT_REASONING_TEXT_MASK.to_string()],
+                    }),
+                },
+            ),
+        ])]
+    }
+
+    /// Persists a provider replay item in the task tree so the next turn's
+    /// transcript rebuild can hand it back to the engine. It rides on the
+    /// reasoning message that displays the item's summary; an item without
+    /// summary text gets its own message with empty text, which the UI does
+    /// not render.
+    fn on_replay_item(&mut self, item: serde_json::Value) -> Vec<Event> {
+        let payload = match encode_replay_item(&self.config_key, item) {
+            Ok(payload) => payload,
+            Err(err) => {
+                log::warn!(
+                    "local agent loop: dropping replay item that failed to serialize: {err}"
+                );
+                return self.close_reasoning(None).into_iter().collect();
+            }
+        };
+        if self.open_reasoning.is_some() {
+            return self.close_reasoning(Some(payload)).into_iter().collect();
+        }
+        self.streaming_message_id = None;
+        let message = reasoning_message(
+            &self.root_task_id,
+            String::new(),
+            Some(prost_types::Duration::default()),
+            payload,
+        );
+        vec![self.add_messages(vec![message])]
+    }
+
+    /// Marks the open reasoning message as finished (and attaches the replay
+    /// item payload, if any). Returns `None` when no reasoning is open.
+    fn close_reasoning(&mut self, server_message_data: Option<String>) -> Option<Event> {
+        let open = self.open_reasoning.take()?;
+        let mut paths = vec![AGENT_REASONING_DURATION_MASK.to_string()];
+        if server_message_data.is_some() {
+            paths.push(SERVER_MESSAGE_DATA_MASK.to_string());
+        }
+        let finished_duration = prost_types::Duration::try_from(open.started_at.elapsed()).ok();
+        let message = api::Message {
+            id: open.message_id,
+            server_message_data: server_message_data.unwrap_or_default(),
+            ..reasoning_message(
+                &self.root_task_id,
+                String::new(),
+                finished_duration,
+                String::new(),
+            )
+        };
+        Some(client_actions(vec![
+            api::client_action::Action::UpdateTaskMessage(api::client_action::UpdateTaskMessage {
+                task_id: self.root_task_id.clone(),
+                message: Some(message),
+                mask: Some(prost_types::FieldMask { paths }),
+            }),
+        ]))
     }
 
     fn add_messages(&self, messages: Vec<api::Message>) -> Event {
