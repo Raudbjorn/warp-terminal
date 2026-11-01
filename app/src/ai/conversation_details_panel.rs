@@ -1031,19 +1031,6 @@ impl ConversationDetailsPanel {
     ) {
         match event {
             AgentDetailsButtonEvent::Open => {
-                // Send telemetry based on panel mode
-                match &self.data.mode {
-                    PanelMode::Conversation {
-                        ai_conversation_id: Some(conversation_id),
-                        ..
-                    } => {}
-                    PanelMode::Task {
-                        task_id: Some(task_id),
-                        ..
-                    } => {}
-                    _ => {}
-                }
-
                 if let Some(action) = &self.data.open_action {
                     ctx.dispatch_typed_action(action);
                 }
@@ -1067,18 +1054,6 @@ impl ConversationDetailsPanel {
                 // only in management view cards
             }
             AgentDetailsButtonEvent::CopyLink { link } => {
-                match &self.data.mode {
-                    PanelMode::Conversation {
-                        ai_conversation_id: Some(conversation_id),
-                        ..
-                    } => {}
-                    PanelMode::Task {
-                        task_id: Some(task_id),
-                        ..
-                    } => {}
-                    _ => {}
-                }
-
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(link.clone()));
             }

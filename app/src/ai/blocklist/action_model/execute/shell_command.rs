@@ -231,8 +231,7 @@ impl ShellCommandExecutor {
                     scope,
                     ctx,
                 );
-                if let CommandExecutionPermission::Allowed(reason) = autoexecution_permission {
-                } else if let CommandExecutionPermission::Denied(reason) = autoexecution_permission
+                if let CommandExecutionPermission::Denied(reason) = autoexecution_permission
                     && AppExecutionMode::as_ref(ctx).is_autonomous()
                 {
                     log::warn!("Command denied during autonomous execution, reason: {reason:?}");

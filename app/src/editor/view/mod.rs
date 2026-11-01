@@ -3125,27 +3125,16 @@ impl EditorView {
             let ai_context_menu = ctx.add_typed_action_view(AIContextMenu::new);
             ctx.subscribe_to_view(
                 &ai_context_menu,
-                |me, _, event: &AIContextMenuEvent, ctx| {
-                    let is_udi_enabled =
-                        InputSettings::as_ref(ctx).is_universal_developer_input_enabled(ctx);
-                    let current_input_mode = if me.is_ai_input {
-                        InputType::AI
-                    } else {
-                        InputType::Shell
-                    };
+                |_, _, event: &AIContextMenuEvent, ctx| {
                     match event {
-                        AIContextMenuEvent::Close {
-                            item_count,
-                            query_length,
-                        } => {
+                        AIContextMenuEvent::Close { .. } => {
                             ctx.emit(Event::SetAIContextMenuOpen(false));
                             ctx.focus_self();
                             ctx.notify();
                         }
                         AIContextMenuEvent::ResultAccepted {
                             action,
-                            item_count,
-                            query_length,
+                            ..
                         } => {
                             ctx.emit(Event::AcceptAIContextMenuItem(action.clone()));
                             ctx.focus_self();

@@ -30,7 +30,7 @@ use super::shell::{ShellStarter, ShellStarterSource};
 use super::spawner::{PtySpawnHooks, PtySpawnMode};
 #[cfg(unix)]
 use super::terminal_attributes::TerminalAttributesPoller;
-use super::{mio_channel, recorder};
+use super::mio_channel;
 use crate::ai::aws_credentials::AwsCredentialRefresher as _;
 use crate::ai::blocklist::SerializedBlockListItem;
 use crate::auth::AuthStateProvider;
@@ -452,22 +452,6 @@ impl<S> TerminalManager<S> {
         ApiKeyManager::handle(ctx).update(ctx, |manager, ctx| {
             manager.register_model_event_dispatcher(&model_events, model.clone(), ctx);
         });
-
-        // This is purely for measuring throughput on WarpDev.
-        if FeatureFlag::RecordPtyThroughput.is_enabled() {
-            let auth_state = AuthStateProvider::as_ref(ctx).get().clone();
-            let telemetry_executor = Arc::clone(ctx.background_executor());
-            recorder::record_pty_throughput(
-                inactive_pty_reads_rx.clone().activate(),
-                model.clone(),
-                |model| {
-                    !model.is_receiving_in_band_command_output()
-                        && model.is_active_block_bootstrapped()
-                },
-                move |max_bytes_per_second| {},
-                ctx.background_executor().to_owned(),
-            );
-        }
 
         // If this session should be a shared-session creator, configure its initial
         // shared-session state before the surface is constructed, so that bootstrap

@@ -26,7 +26,6 @@ mod context_chips;
 mod crash_recovery;
 mod debug_dump;
 mod default_terminal;
-mod download_method;
 mod drive;
 #[cfg(windows)]
 mod dynamic_libraries;
@@ -2012,14 +2011,6 @@ pub(crate) fn initialize_app(
                 crash_recovery.on_frame_drawn(window_id, ctx);
             });
         })
-    } else {
-        // If the app was opened while logged out, record an event for measuring new users.
-        // This is sent immediately in case they quit the app on the signup screen.
-
-        download_method::determine_and_report(
-            auth_state.clone(),
-            ctx.background_executor().clone(),
-        );
     }
 
     #[cfg(not(target_family = "wasm"))]

@@ -1071,7 +1071,6 @@ impl AgentManagementView {
                         None
                     };
                     let action_buttons_view = self.create_action_buttons_view(
-                        card.item_id,
                         card.action_buttons_config,
                         ctx,
                     );
@@ -1107,13 +1106,12 @@ impl AgentManagementView {
 
     fn create_action_buttons_view(
         &self,
-        item_id: ManagementCardItemId,
         config: ActionButtonsConfig,
         ctx: &mut ViewContext<Self>,
     ) -> ViewHandle<ConversationActionButtonsRow> {
         let view = ctx.add_typed_action_view(ConversationActionButtonsRow::new);
-        ctx.subscribe_to_view(&view, move |me, _, event, ctx| {
-            me.handle_action_buttons_event(&item_id, event, ctx);
+        ctx.subscribe_to_view(&view, |me, _, event, ctx| {
+            me.handle_action_buttons_event(event, ctx);
         });
         view.update(ctx, |row, ctx| row.set_config(config, ctx));
         view
@@ -1144,7 +1142,6 @@ impl AgentManagementView {
 
     fn handle_action_buttons_event(
         &mut self,
-        item_id: &ManagementCardItemId,
         event: &AgentDetailsButtonEvent,
         ctx: &mut ViewContext<Self>,
     ) {
@@ -1173,11 +1170,6 @@ impl AgentManagementView {
                 ctx.notify();
             }
             AgentDetailsButtonEvent::CopyLink { link } => {
-                match item_id {
-                    ManagementCardItemId::Conversation(conversation_id) => {}
-                    ManagementCardItemId::AmbientRun(task_id) => {}
-                }
-
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(link.clone()));
             }

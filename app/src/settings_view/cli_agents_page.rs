@@ -255,7 +255,7 @@ impl TypedActionView for CLIAgentsPageView {
                         .should_render_cli_agent_footer
                         .toggle_and_save_value(ctx)
                 }) {
-                    Ok(new_value) => {}
+                    Ok(_) => {}
                     Err(e) => {
                         log::warn!("Failed to set value for CLI Agent Footer setting: {e:?}");
                     }

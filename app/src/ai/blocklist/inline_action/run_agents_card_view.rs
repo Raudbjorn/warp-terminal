@@ -256,8 +256,6 @@ pub struct RunAgentsCardView {
     action_model: ModelHandle<BlocklistAIActionModel>,
     block_model: Rc<dyn AIBlockModel<View = AIBlock>>,
     create_environment_modal: ViewHandle<CreateEnvironmentModal>,
-    /// Guards `OrchestrationEntered` against double-fires on re-renders.
-    /// Guards the terminal decision event against double-fires.
     /// One-shot guard: cancelling the auto-popped modal must not re-pop.
     /// Reset on harness / execution-mode change.
     has_auto_opened_create_modal: bool,

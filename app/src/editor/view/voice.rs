@@ -432,7 +432,7 @@ impl EditorView {
         match result {
             VoiceSessionResult::Audio {
                 wav_base64,
-                session_duration_ms,
+                ..
             } => {
                 // Start transcription
                 let voice_transcriber = VoiceTranscriber::handle(ctx).as_ref(ctx);
@@ -465,9 +465,7 @@ impl EditorView {
                     self.set_voice_input_state(state, ctx);
                 }
             }
-            VoiceSessionResult::Aborted {
-                session_duration_ms,
-            } => {
+            VoiceSessionResult::Aborted { .. } => {
                 log::info!("Aborted listening for voice input");
 
                 if state.lifecycle.fail() {

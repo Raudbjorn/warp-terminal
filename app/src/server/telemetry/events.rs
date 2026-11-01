@@ -129,12 +129,6 @@ pub struct AppStartupInfo {
     pub timing_data: Vec<TimingDataPoint>,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
-pub enum DownloadSource {
-    Website,
-    Homebrew,
-}
-
 // For use when recording what type of cloud object a particular telemetry is for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TelemetryCloudObjectType {

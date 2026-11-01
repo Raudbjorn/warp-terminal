@@ -1644,9 +1644,8 @@ impl TypedActionView for AgentProfilesPageView {
             }
             AgentProfilesPageAction::SetCodingPermission(p) => {
                 BlocklistAIPermissions::handle(ctx).update(ctx, |model, ctx| {
-                    match model.set_coding_permissions(*p, ctx) {
-                        Ok(_) => {}
-                        Err(e) => report_error!(e),
+                    if let Err(e) = model.set_coding_permissions(*p, ctx) {
+                        report_error!(e);
                     }
                 });
             }

@@ -2151,9 +2151,6 @@ impl TypedActionView for NotebookView {
                 ctx.emit(NotebookEvent::Pane(PaneEvent::FocusActiveSession))
             }
             NotebookAction::ContextMenu(action) => {
-                if matches!(action, ContextMenuAction::Open(_)) {
-                    ();
-                }
                 self.context_menu.handle_action(action, ctx);
             }
             NotebookAction::Duplicate => self.duplicate_object(ctx),

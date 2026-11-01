@@ -64,10 +64,6 @@ pub enum FeatureFlag {
     /// lib will use the user's history as a last-ditch effort to find a reasonable correction.
     CommandCorrectionsHistoryRule,
 
-    /// Used to gate an experiment we're doing on WarpDev ONLY
-    /// to get a sense of PTY throughput over time.
-    RecordPtyThroughput,
-
     /// Whether to fetch generic string objects from the server.
     FetchGenericStringObjects,
 

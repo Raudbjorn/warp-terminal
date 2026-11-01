@@ -6709,9 +6709,10 @@ impl TypedActionView for AIBlock {
                 {
                     *checked = !*checked;
                     BlocklistAIPermissions::handle(ctx).update(ctx, |model, ctx| {
-                        match model.set_should_autoexecute_readonly_commands(*checked, ctx) {
-                            Ok(_) => {}
-                            Err(e) => report_error!(e),
+                        if let Err(e) =
+                            model.set_should_autoexecute_readonly_commands(*checked, ctx)
+                        {
+                            report_error!(e);
                         }
                     });
                 }
@@ -6727,9 +6728,8 @@ impl TypedActionView for AIBlock {
                         AgentModeCodingPermissionsType::AlwaysAskBeforeReading
                     };
                     BlocklistAIPermissions::handle(ctx).update(ctx, |model, ctx| {
-                        match model.set_coding_permissions(permission, ctx) {
-                            Ok(_) => {}
-                            Err(e) => report_error!(e),
+                        if let Err(e) = model.set_coding_permissions(permission, ctx) {
+                            report_error!(e);
                         }
                     });
                 }
@@ -6747,9 +6747,8 @@ impl TypedActionView for AIBlock {
                         _ => AgentModeCodingPermissionsType::AlwaysAskBeforeReading,
                     };
                     BlocklistAIPermissions::handle(ctx).update(ctx, |model, ctx| {
-                        match model.set_coding_permissions(permission, ctx) {
-                            Ok(_) => {}
-                            Err(e) => report_error!(e),
+                        if let Err(e) = model.set_coding_permissions(permission, ctx) {
+                            report_error!(e);
                         }
                     });
                 }

@@ -466,10 +466,6 @@ pub struct AIAgentOutput {
     /// Information about the model that generated this output.
     pub model_info: Option<OutputModelInfo>,
 
-    /// Telemetry events related to the AI Agent Output that we want to send after completion.
-    #[derivative(Debug = "ignore")]
-    #[derivative(PartialEq = "ignore")]
-
     /// The number of requests that the request cost.
     pub request_cost: Option<RequestCost>,
 }

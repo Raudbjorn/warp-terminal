@@ -207,7 +207,6 @@ impl GrepExecutor {
                         GrepResult::Error(ref e) => {
                             log::warn!("Executing grep resulted in error: {e:?}");
                         }
-                        GrepResult::Success { .. } => {}
                         _ => {}
                     }
                     AIAgentActionResultType::Grep(grep_result)

@@ -25,7 +25,6 @@ fn enabled_features() -> HashSet<FeatureFlag> {
     flags.extend([
         #[cfg(feature = "autoupdate")]
         FeatureFlag::Autoupdate,
-        #[cfg(feature = "record_app_active_events")]
         #[cfg(feature = "runtime_feature_flags")]
         FeatureFlag::RuntimeFeatureFlags,
         #[cfg(feature = "sequential_storage")]
