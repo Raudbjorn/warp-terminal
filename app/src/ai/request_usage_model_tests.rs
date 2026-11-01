@@ -1372,11 +1372,13 @@ fn test_has_any_ai_remaining_true_with_grok_subscription_connected() {
 }
 
 #[test]
-fn test_has_any_ai_remaining_false_with_grok_subscription_but_byo_disabled() {
+fn test_has_any_ai_remaining_true_with_grok_subscription_on_workspace_with_byok_policy_disabled() {
     App::test((), |mut app| async move {
-        // No BYO policy: the Grok token can't be sent, so it must not count as
-        // available AI.
-        let (_uid, workspace) = create_test_workspace();
+        // The workspace's plan explicitly disables BYOK, but BYOK is open to every signed-in
+        // user: the Grok token is still sent, so it counts as available AI.
+        let (_uid, mut workspace) = create_test_workspace();
+        workspace.billing_metadata.tier.byo_api_key_policy =
+            Some(ByoApiKeyPolicy { enabled: false });
 
         add_user_workspaces_with_workspace(&mut app, workspace);
         let request_usage_model = add_request_usage_model(&mut app);
@@ -1396,8 +1398,8 @@ fn test_has_any_ai_remaining_false_with_grok_subscription_but_byo_disabled() {
             model.bonus_grants.clear();
 
             assert!(
-                !model.has_any_ai_remaining(&TeamlessScopeForTest, ctx),
-                "expected has_any_ai_remaining to be false when a Grok subscription is connected but BYO is disabled",
+                model.has_any_ai_remaining(&TeamlessScopeForTest, ctx),
+                "expected has_any_ai_remaining to be true when a Grok subscription is connected, whatever the workspace's BYO policy",
             );
         });
     });
@@ -1406,7 +1408,8 @@ fn test_has_any_ai_remaining_false_with_grok_subscription_but_byo_disabled() {
 #[test]
 fn test_has_any_ai_remaining_true_with_byo_key_and_no_workspace() {
     App::test((), |mut app| async move {
-        let _guard = FeatureFlag::SoloUserByok.override_enabled(true);
+        // The flag is forced off: a signed-in solo user's BYOK does not depend on it.
+        let _guard = FeatureFlag::SoloUserByok.override_enabled(false);
 
         // No workspace — user is not on a team.
         app.add_singleton_model(UserWorkspaces::default_mock);
