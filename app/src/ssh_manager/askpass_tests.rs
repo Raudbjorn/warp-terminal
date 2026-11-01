@@ -81,3 +81,112 @@ fn saved_passwords_require_an_explicit_account() {
     assert!(env_prefix(&profile(None, "host")).is_none());
     assert!(env_prefix(&profile(Some(""), "host")).is_none());
 }
+
+fn command(args: &[&str]) -> Vec<OsString> {
+    args.iter().map(OsString::from).collect()
+}
+
+#[test]
+fn caller_endpoint_requires_explicit_port_and_the_saved_alias() {
+    let mut profile = profile(Some("user"), "host");
+    profile.port = 2222;
+    assert!(is_destination_command(
+        &command(&[
+            "/usr/bin/ssh",
+            "-o",
+            "ControlMaster=auto",
+            "-p",
+            "2222",
+            "--",
+            "user@box",
+            "remote bootstrap"
+        ]),
+        &profile
+    ));
+    for args in [
+        vec!["ssh", "-p", "22", "--", "user@box"],
+        vec!["ssh", "--", "user@box"],
+        vec!["ssh", "-p", "2222", "--", "user@other"],
+        vec!["ssh", "-p", "2222", "-p", "22", "--", "user@box"],
+        vec!["ssh", "-o", " Port=22", "-p", "2222", "--", "user@box"],
+        vec!["ssh", "-o", "User=other", "-p", "2222", "--", "user@box"],
+        vec!["ssh", "-l", "other", "-p", "2222", "--", "user@box"],
+        vec!["sh", "-p", "2222", "--", "user@box"],
+    ] {
+        assert!(
+            !is_destination_command(&command(&args), &profile),
+            "{args:?}"
+        );
+    }
+    profile.port_is_explicit = false;
+    assert!(env_prefix(&profile).is_none());
+    assert!(!is_destination_command(
+        &command(&["ssh", "-p", "2222", "--", "user@box"]),
+        &profile
+    ));
+}
+
+#[test]
+fn nested_ssh_callers_and_unavailable_or_cyclic_ancestry_cannot_release_credentials() {
+    let profile = profile(Some("user"), "host");
+    let ssh = command(&["ssh", "-p", "22", "--", "user@box"]);
+    assert!(caller_is_destination(&profile, 10, |pid| match pid {
+        10 => Some((11, ssh.clone())),
+        11 => Some((1, command(&["bash"]))),
+        _ => None,
+    }));
+    assert!(!caller_is_destination(&profile, 10, |pid| match pid {
+        10 => Some((11, ssh.clone())),
+        11 => Some((12, command(&["sh", "-c", "proxy"]))),
+        12 => Some((1, ssh.clone())),
+        _ => None,
+    }));
+    assert!(!caller_is_destination(&profile, 10, |pid| (pid == 10).then(|| (11, ssh.clone()))));
+    let mut lookups = 0;
+    assert!(!caller_is_destination(&profile, 10, |pid| {
+        lookups += 1;
+        Some((
+            pid + 1,
+            if pid == 10 {
+                ssh.clone()
+            } else {
+                command(&["bash"])
+            },
+        ))
+    }));
+    assert_eq!(lookups, MAX_PROCESS_ANCESTORS + 1);
+}
+
+#[test]
+fn reused_process_ids_do_not_reuse_another_connections_prompt_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Uuid::new_v4();
+    let second = Uuid::new_v4();
+    assert!(claim_first_prompt(dir.path(), first, 123).unwrap());
+    assert!(!claim_first_prompt(dir.path(), first, 123).unwrap());
+    assert!(claim_first_prompt(dir.path(), second, 123).unwrap());
+    assert!(!claim_first_prompt(dir.path(), second, 123).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn every_connection_gets_a_new_nonce_without_breaking_command_detection() {
+    let profile = profile(Some("user"), "host");
+    let first = env_prefix(&profile).unwrap();
+    let second = env_prefix(&profile).unwrap();
+    assert_ne!(first, second);
+    assert!(first.contains(&format!("{CONNECTION_ENV}=")));
+    assert_eq!(
+        strip_env_prefix(&format!("{first}ssh -p 22 -- user@box")),
+        "ssh -p 22 -- user@box"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn the_real_test_process_is_not_an_ssh_credential_caller() {
+    assert!(!destination_process(
+        &profile(Some("user"), "host"),
+        std::process::id()
+    ));
+}

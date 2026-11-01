@@ -161,7 +161,7 @@ fn suppression_matches_the_armed_command_through_the_command_builtin_prefix() {
 }
 
 #[test]
-fn suppression_falls_back_to_the_parsed_ssh_target() {
+fn suppression_matches_equivalent_ssh_argv() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let terminal = add_window_with_terminal(&mut app, None);
@@ -172,7 +172,7 @@ fn suppression_falls_back_to_the_parsed_ssh_target() {
 
             assert!(
                 !model_honors_remote_init_shell(view),
-                "re-spaced commands still match through the parsed SSH target"
+                "re-spaced commands still match while retaining every SSH option"
             );
         });
     })
@@ -261,6 +261,10 @@ fn startup_directory_is_entered_once_per_connection_on_the_first_remote_prompt()
             );
 
             view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(remote), None), ctx);
+            // Scheduling is not completion: mark the startup directory only when its own block starts.
+            assert!(!sent(view));
+            view.active_block_metadata = Some(BlockMetadata::new(Some(remote), None));
+            start_block_with_command(view, "cd -- /srv/app", ctx);
             assert!(sent(view));
 
             view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(local), None), ctx);
@@ -316,8 +320,245 @@ fn reconnect_banner_ignores_local_prompts_before_the_watched_command_starts() {
 
 #[test]
 fn warpified_connections_go_through_the_ssh_wrapper() {
-    let (command, control_path) =
-        connection_command("command ssh -p 2222 -- root@host".to_string(), true);
+    let (command, control_path) = connection_command(
+        "command ssh -p 2222 -- root@host".to_string(),
+        true,
+        ShellFamily::Posix,
+    )
+    .unwrap();
     assert_eq!(command, "ssh -p 2222 -- root@host");
     assert_eq!(control_path, None);
+}
+
+#[test]
+fn an_old_suppression_timer_cannot_expire_a_rearmed_identical_command() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            view.arm_ssh_profile_connection(SSH_PROFILE_TEST_COMMAND.into(), false, ctx);
+            let old_generation = view.ssh_profile.suppression_generation;
+            view.arm_ssh_profile_connection(SSH_PROFILE_TEST_COMMAND.into(), false, ctx);
+            view.expire_ssh_profile_arm(old_generation);
+            assert!(view.ssh_profile_warpify_disabled_command_matches(SSH_PROFILE_TEST_COMMAND));
+            view.expire_ssh_profile_arm(view.ssh_profile.suppression_generation);
+            assert!(view.ssh_profile.warpify_disabled_command.is_none());
+        });
+    });
+}
+
+#[test]
+fn pending_connections_are_registered_only_after_their_command_starts() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            let id = Uuid::new_v4();
+            watch_quick_connect(view);
+            view.ssh_profile.connection.as_mut().unwrap().profile_id = Some(id);
+            view.active_block_metadata = Some(BlockMetadata::new(Some(SessionId::from(1)), None));
+            view.set_ssh_manager_attached(true, ctx);
+            assert_eq!(SshOpenConnections::open_count(id, ctx), 0);
+            start_block_with_command(view, "ssh root@remote", ctx);
+            assert_eq!(SshOpenConnections::open_count(id, ctx), 1);
+            view.set_ssh_manager_attached(false, ctx);
+            assert_eq!(SshOpenConnections::open_count(id, ctx), 0);
+        });
+    });
+}
+
+#[test]
+fn startup_directory_does_not_append_to_another_pending_command() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            watch_quick_connect_in(view, Some("/srv/app"));
+            view.active_block_metadata = Some(BlockMetadata::new(Some(SessionId::from(1)), None));
+            start_block_with_command(view, "ssh root@remote", ctx);
+            view.set_pending_command("echo pending", ctx);
+            let before = view.input.as_ref(ctx).buffer_text(ctx);
+            view.handle_ssh_manager_precmd(
+                &BlockMetadata::new(Some(SessionId::from(2)), None),
+                ctx,
+            );
+            assert_eq!(view.input.as_ref(ctx).buffer_text(ctx), before);
+            assert!(
+                !view
+                    .ssh_profile
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .startup_directory_sent
+            );
+        });
+    });
+}
+
+#[test]
+fn a_missing_profile_keeps_its_reconnect_banner() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            watch_quick_connect(view);
+            let connection = view.ssh_profile.connection.as_mut().unwrap();
+            connection.profile_id = Some(Uuid::new_v4());
+            connection.disconnected = true;
+            view.show_ssh_reconnect_banner("removed".into(), None, false, ctx);
+            let banner_id = view.ssh_profile.reconnect_banner.as_ref().unwrap().id();
+            view.reconnect_ssh(true, ctx);
+            assert_eq!(
+                view.ssh_profile.reconnect_banner.as_ref().unwrap().id(),
+                banner_id
+            );
+        });
+    });
+}
+
+#[test]
+fn non_warpified_remote_session_requests_poll_without_a_remote_prompt() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            watch_quick_connect(view);
+            view.ssh_profile.connection.as_mut().unwrap().profile_id = Some(Uuid::new_v4());
+            view.read_remote_sessions_when_ready(ctx);
+            assert!(view.ssh_profile.control_path_poll.is_some());
+            assert!(
+                !view
+                    .ssh_profile
+                    .connection
+                    .as_ref()
+                    .unwrap()
+                    .read_remote_sessions_when_ready
+            );
+        });
+    });
+}
+
+#[test]
+fn powershell_connections_use_its_invocation_and_escaping_rules() {
+    let (command, _) = connection_command(
+        "command ssh -i 'key with spaces' -- 'user@host'".into(),
+        true,
+        ShellFamily::PowerShell,
+    )
+    .unwrap();
+    assert!(command.starts_with("ssh "));
+    assert!(command.contains("key` with` spaces"));
+    assert!(!command.starts_with("command "));
+}
+
+#[test]
+fn reconnect_uses_only_the_watched_block_and_ssh_failure_status() {
+    for (ssh_output, exit_code, expected_attempts) in [
+        ("", 255, 0),
+        ("client_loop: send disconnect: Broken pipe\n", 0, 0),
+        ("client_loop: send disconnect: Broken pipe\n", 255, 1),
+    ] {
+        App::test((), move |mut app| async move {
+            initialize_app_for_terminal_view(&mut app);
+            let terminal = add_window_with_terminal(&mut app, None);
+            terminal.update(&mut app, |view, ctx| {
+                view.model
+                    .lock()
+                    .simulate_block("old", "client_loop: send disconnect: Broken pipe\n");
+                watch_quick_connect(view);
+                let local = SessionId::from(1);
+                view.active_block_metadata = Some(BlockMetadata::new(Some(local), None));
+                view.model
+                    .lock()
+                    .simulate_long_running_block("ssh root@remote", ssh_output);
+                start_block_with_command(view, "ssh root@remote", ctx);
+                view.model.lock().command_finished(
+                    crate::terminal::model::ansi::CommandFinishedValue {
+                        completion_metadata: crate::terminal::model::ansi::CompletionMetadata {
+                            exit_code: exit_code.into(),
+                            next_block_id: BlockId::new(),
+                        },
+                        session_id: None,
+                    },
+                );
+                view.handle_ssh_manager_precmd(&BlockMetadata::new(Some(local), None), ctx);
+                assert_eq!(
+                    view.ssh_profile.connection.as_ref().unwrap().attempt,
+                    expected_attempts
+                );
+            });
+        });
+    }
+}
+
+#[test]
+fn cli_agent_native_image_paste_is_preserved_in_a_managed_ssh_session() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use warpui::TypedActionView as _;
+
+    use crate::terminal::cli_agent::CLIAgent;
+    use crate::terminal::cli_agent_sessions::{
+        CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
+        CLIAgentSessionsModel,
+    };
+    use crate::terminal::view::{Event, TerminalAction};
+
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let socket = tempfile::NamedTempFile::new().unwrap();
+        let writes = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+        let captured = writes.clone();
+        app.update(|ctx| {
+            ctx.subscribe_to_view(&terminal, move |_, event, _| {
+                if let Event::WriteBytesToPty { bytes } = event {
+                    captured.borrow_mut().push(bytes.to_vec());
+                }
+            });
+        });
+        terminal.update(&mut app, |view, ctx| {
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(
+                    view.view_id,
+                    CLIAgentSession {
+                        agent: CLIAgent::Claude,
+                        status: CLIAgentSessionStatus::InProgress,
+                        session_context: CLIAgentSessionContext::default(),
+                        input_state: CLIAgentInputState::Closed,
+                        should_auto_toggle_input: false,
+                        listener: None,
+                        remote_host: None,
+                        plugin_version: None,
+                        draft_text: None,
+                        custom_command_prefix: None,
+                        received_rich_notification: false,
+                    },
+                    ctx,
+                );
+            });
+            view.model.lock().simulate_long_running_block("claude", "");
+            watch_quick_connect(view);
+            let connection = view.ssh_profile.connection.as_mut().unwrap();
+            connection.local_session_id = Some(SessionId::from(1));
+            connection.control_path = Some(socket.path().to_path_buf());
+            assert!(view.ssh_upload_control_path(ctx).is_some());
+            ctx.clipboard().write(ClipboardContent {
+                images: Some(vec![warpui::clipboard::ImageData {
+                    data: vec![0x89, 0x50, 0x4e, 0x47],
+                    mime_type: "image/png".into(),
+                    filename: None,
+                }]),
+                ..Default::default()
+            });
+            view.handle_action(&TerminalAction::Paste, ctx);
+        });
+        let expected = if cfg!(windows) {
+            vec![0x1b, b'v']
+        } else {
+            vec![0x16]
+        };
+        assert_eq!(*writes.borrow(), vec![expected]);
+    });
 }

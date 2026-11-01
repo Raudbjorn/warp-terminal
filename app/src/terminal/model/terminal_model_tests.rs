@@ -2476,3 +2476,57 @@ fn recover_failed_ssh_bootstrap_registers_degraded_remote_session() {
         IsSSHWrapperSession::Yes { .. }
     ));
 }
+
+#[test]
+fn managed_ssh_suppression_survives_rejected_completion_until_its_block_finishes() {
+    let mut terminal = TerminalModel::mock(None, None);
+    terminal.start_command_execution();
+    terminal.preexec(PreexecValue {
+        command: "ssh host".into(),
+        session_id: None,
+    });
+    let block_id = terminal.active_block_id().clone();
+    terminal.ignore_bootstrapping_messages_until_command_finished(block_id.clone());
+    terminal.command_finished(CommandFinishedValue {
+        completion_metadata: CompletionMetadata {
+            exit_code: 0.into(),
+            next_block_id: block_id.clone(),
+        },
+        session_id: None,
+    });
+    assert_eq!(
+        terminal.suppressed_ssh_bootstrap_block.as_ref(),
+        Some(&block_id)
+    );
+    terminal.command_finished(CommandFinishedValue {
+        completion_metadata: CompletionMetadata {
+            exit_code: 255.into(),
+            next_block_id: BlockId::new(),
+        },
+        session_id: None,
+    });
+    assert!(terminal.suppressed_ssh_bootstrap_block.is_none());
+}
+
+#[test]
+fn managed_ssh_suppression_ignores_completion_of_another_block() {
+    let mut terminal = TerminalModel::mock(None, None);
+    terminal.start_command_execution();
+    terminal.preexec(PreexecValue {
+        command: "other".into(),
+        session_id: None,
+    });
+    let watched = BlockId::new();
+    terminal.ignore_bootstrapping_messages_until_command_finished(watched.clone());
+    terminal.command_finished(CommandFinishedValue {
+        completion_metadata: CompletionMetadata {
+            exit_code: 0.into(),
+            next_block_id: BlockId::new(),
+        },
+        session_id: None,
+    });
+    assert_eq!(
+        terminal.suppressed_ssh_bootstrap_block.as_ref(),
+        Some(&watched)
+    );
+}

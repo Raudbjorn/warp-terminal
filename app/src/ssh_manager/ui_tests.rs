@@ -41,3 +41,21 @@ fn common_group_names_get_different_colors() {
     assert_ne!(color("prod"), color("home"));
     assert_ne!(color("staging"), color("home"));
 }
+
+#[test]
+fn host_subtitle_brackets_ipv6_addresses() {
+    let mut profile = SshHostProfile::new("v6".into(), "2001:db8::1".into());
+    assert_eq!(host_subtitle(&profile), "[2001:db8::1]:22");
+    profile.user = Some("deploy".into());
+    profile.port = 2222;
+    assert_eq!(host_subtitle(&profile), "deploy@[2001:db8::1]:2222");
+    profile.host = "[2001:db8::1]".into();
+    assert_eq!(host_subtitle(&profile), "deploy@[2001:db8::1]:2222");
+}
+
+#[test]
+fn host_subtitle_does_not_claim_a_port_for_an_inherited_setting() {
+    let mut profile = SshHostProfile::new("work".into(), "host".into());
+    profile.port_is_explicit = false;
+    assert_eq!(host_subtitle(&profile), "host");
+}

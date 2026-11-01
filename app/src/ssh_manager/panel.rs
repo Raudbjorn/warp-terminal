@@ -525,19 +525,19 @@ impl SshProfilesPanelView {
         ctx: &mut ViewContext<Self>,
     ) -> Result<(), String> {
         if matches!(password, PasswordIntent::Set(_))
-            && profile.user.as_deref().is_none_or(str::is_empty)
+            && (profile.user.as_deref().is_none_or(str::is_empty) || !profile.port_is_explicit)
         {
-            return Err("Set a username before saving a password for this host.".to_string());
+            return Err(
+                "Set an explicit username and port before saving a password for this host."
+                    .to_string(),
+            );
         }
         let mut profile = profile;
         let mut password = password;
         if let SshProfileModalMode::Edit(id) = mode {
             profile.id = id;
             if let Some(previous) = Self::profiles(ctx).into_iter().find(|old| {
-                old.id == id
-                    && (old.host != profile.host
-                        || old.user != profile.user
-                        || old.port != profile.port)
+                old.id == id && ssh_profile_password_key(old) != ssh_profile_password_key(&profile)
             }) {
                 // Fail before changing the destination if its old credential cannot be removed.
                 self.remove_profile_password(&previous, ctx).map_err(|err| {

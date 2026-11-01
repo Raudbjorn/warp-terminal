@@ -44,11 +44,15 @@ preserved when opening the panel.
 Profiles are read from `~/.ssh/config`. Saving a profile updates its host stanza,
 preserves unrecognized directives, and keeps a backup at `~/.ssh/config.warp.bak`.
 Hand-written stanzas are imported for use and editing; only Warp-managed stanzas
-can be deleted from the panel. Profile metadata and recent-host history stay local.
-Optional saved passwords require an explicit username and are bound to the
+can be deleted from the panel. Pattern and multi-alias stanzas stay in the file
+but are not listed as editable profiles. Leave the port blank to inherit SSH
+configuration. Profile metadata and recent-host history stay local.
+Optional saved passwords require an explicit username and port and are bound to the
 profile’s host, username, and port. They use the platform secure store, with an owner-only file
 fallback where supported. On Unix, SSH requests saved passwords through an
-askpass helper; host-key confirmations and other prompts remain interactive.
+askpass helper after verifying the destination process; nested or unidentifiable
+processes authenticate manually. Host-key confirmations and other prompts remain
+interactive.
 
 The manager is adapted from [Changroro/warp](https://github.com/Changroro/warp),
 with its implementation in `app/src/ssh_manager/` and small integration modules in

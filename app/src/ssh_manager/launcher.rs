@@ -20,7 +20,10 @@ use warpui::{
 };
 
 use crate::appearance::Appearance;
-use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
+use crate::editor::{
+    EditorView, Event as EditorEvent, PropagateAndNoOpNavigationKeys, SingleLineEditorOptions,
+    TextOptions,
+};
 use crate::settings::SshSettings;
 use crate::ssh_manager::SshManagerAction;
 use crate::ssh_manager::open_connections::SshOpenConnections;
@@ -100,6 +103,8 @@ impl SshLauncherView {
         let editor = ctx.add_view(|ctx| {
             EditorView::single_line(
                 SingleLineEditorOptions {
+                    propagate_and_no_op_vertical_navigation_keys:
+                        PropagateAndNoOpNavigationKeys::Always,
                     text: TextOptions::ui_text(Some(15.), Appearance::as_ref(ctx)),
                     ..Default::default()
                 },
@@ -142,7 +147,7 @@ impl SshLauncherView {
         match event {
             EditorEvent::Escape => ctx.emit(SshLauncherEvent::Close),
             EditorEvent::Enter => self.activate(self.selected, ctx),
-            EditorEvent::CmdEnter => {
+            EditorEvent::CmdEnter | EditorEvent::CtrlEnter => {
                 let items = self.items(ctx);
                 if let Some(index) =
                     rows(&items).position(|row| matches!(row, Row::SaveAndConnect { .. }))

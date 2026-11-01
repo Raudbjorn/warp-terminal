@@ -438,8 +438,8 @@ pub struct TerminalModel {
     /// cleared at the next precmd, because it is only relevant for the block where it was set.
     ignore_bootstrapping_messages: bool,
 
-    /// Cleared in `command_finished`.
-    ignore_bootstrapping_messages_until_command_finished: bool,
+    /// Only an accepted completion of this block releases managed-SSH bootstrap suppression.
+    suppressed_ssh_bootstrap_block: Option<BlockId>,
 
     // This session's startup directory path. If None, the startup directory is treated as default
     // (the user's home directory).
@@ -1107,7 +1107,7 @@ impl TerminalModel {
             active_shell_launch_data: None,
             pending_session_info: None,
             ignore_bootstrapping_messages: false,
-            ignore_bootstrapping_messages_until_command_finished: false,
+            suppressed_ssh_bootstrap_block: None,
             session_startup_path,
             is_receiving_in_band_command_output: IsReceivingInBandCommandOutput::No,
             #[cfg(windows)]
@@ -1511,14 +1511,13 @@ impl TerminalModel {
         self.ignore_bootstrapping_messages = true;
     }
 
-    /// Suppresses bootstrapping hooks until the next `command_finished`.
-    pub fn ignore_bootstrapping_messages_until_command_finished(&mut self) {
-        self.ignore_bootstrapping_messages_until_command_finished = true;
+    /// Suppresses bootstrapping hooks until an accepted completion of the watched block.
+    pub fn ignore_bootstrapping_messages_until_command_finished(&mut self, block_id: BlockId) {
+        self.suppressed_ssh_bootstrap_block = Some(block_id);
     }
 
     fn should_ignore_bootstrapping_messages(&self) -> bool {
-        self.ignore_bootstrapping_messages
-            || self.ignore_bootstrapping_messages_until_command_finished
+        self.ignore_bootstrapping_messages || self.suppressed_ssh_bootstrap_block.is_some()
     }
 
     /// Reacts to the PTY going away. For a shared ambient agent session with shell respawn
@@ -2490,6 +2489,9 @@ impl TerminalModel {
 
     /// Applies the normal command-completion pipeline and its once-per-command side effects.
     fn complete_command(&mut self, data: CompletionMetadata) {
+        if self.suppressed_ssh_bootstrap_block.as_ref() == Some(self.block_list.active_block_id()) {
+            self.suppressed_ssh_bootstrap_block = None;
+        }
         // If we ssh from a doesn't-understand-bracketed-paste shell into one
         // that enables it, then get disconnected, we'll be stuck in a state
         // of bracketed paste being enabled, but the local shell doesn't know
@@ -3090,8 +3092,6 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn command_finished(&mut self, data: CommandFinishedValue) {
-        self.ignore_bootstrapping_messages_until_command_finished = false;
-
         let disposition = self
             .block_list
             .classify_next_block_id(&data.completion_metadata.next_block_id);

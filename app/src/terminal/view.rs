@@ -12894,12 +12894,13 @@ impl TerminalView {
                     .is_compatible_subshell_command(command, shell_family)
                     || warpify_settings
                         .is_compatible_subshell_command(warpify_command, shell_family);
-                let is_ssh_profile_command_with_warpify_disabled =
-                    self.handle_ssh_manager_block_started(command, warpify_command);
                 let command_is_denylisted = warpify_settings
                     .is_denylisted_subshell_command(command)
-                    || warpify_settings.is_denylisted_subshell_command(warpify_command)
-                    || is_ssh_profile_command_with_warpify_disabled;
+                    || warpify_settings.is_denylisted_subshell_command(warpify_command);
+                let is_ssh_profile_command_with_warpify_disabled =
+                    self.handle_ssh_manager_block_started(block_id, command, warpify_command, ctx);
+                let command_is_denylisted =
+                    command_is_denylisted || is_ssh_profile_command_with_warpify_disabled;
                 // Never warpify or surface warpification for agent-requested commands.
                 let has_ai_metadata = self
                     .model
@@ -17622,7 +17623,10 @@ impl TerminalView {
         } else {
             let clipboard_content = ctx.clipboard().read();
 
-            if !should_paste_in_input && self.paste_image_over_ssh(&clipboard_content, ctx) {
+            if !is_cli_agent_paste
+                && !should_paste_in_input
+                && self.paste_image_over_ssh(&clipboard_content, ctx)
+            {
                 return;
             }
 

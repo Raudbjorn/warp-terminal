@@ -30,7 +30,9 @@ fn ssh_parser_still_finds_the_target_with_control_master_options() {
 fn remote_image_path_uses_mime_extension() {
     assert!(remote_image_path("image/png").ends_with(".png"));
     assert!(remote_image_path("image/jpeg").ends_with(".jpg"));
-    assert!(remote_image_path("image/tiff").ends_with(".png"));
+    // The bytes are uploaded unchanged, so the suffix must describe their actual encoding.
+    assert!(remote_image_path("image/tiff").ends_with(".tiff"));
+    assert!(remote_image_path("image/svg+xml").ends_with(".svg"));
     assert!(remote_image_path("image/png").starts_with("/tmp/warp-image-"));
 }
 

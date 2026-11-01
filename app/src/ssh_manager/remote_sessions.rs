@@ -1,7 +1,7 @@
 //! Reads the tabs of the WarpOss app running on an SSH host from that host's session database, so
 //! they can be reopened here as SSH tabs with the same titles, colors, and splits.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context as _, ensure};
@@ -105,11 +105,15 @@ pub fn parse_remote_output(output: &str) -> anyhow::Result<RemoteSessions> {
         }
     }
 
+    let mut rooted_tabs = HashSet::new();
+    for row in rows.iter().filter(|row| row.parent.is_none()) {
+        ensure!(
+            rooted_tabs.insert(row.tab_id),
+            "multiple roots for one remote tab"
+        );
+    }
     let mut tabs = Vec::new();
-    for (index, row) in rows.iter().enumerate() {
-        if row.parent.is_some() || rows[..index].iter().any(|seen| seen.tab_id == row.tab_id) {
-            continue;
-        }
+    for row in rows.iter().filter(|row| row.parent.is_none()) {
         let tab_rows = rows
             .iter()
             .filter(|node| node.tab_id == row.tab_id)

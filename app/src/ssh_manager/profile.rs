@@ -61,6 +61,9 @@ pub struct SshHostProfile {
     pub user: Option<String>,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
+    /// False leaves the effective port to OpenSSH config instead of overriding it with 22.
+    #[serde(default)]
+    pub port_is_explicit: bool,
     pub identity_file: Option<String>,
     #[serde(default)]
     pub jump_hosts: Vec<SshJumpHost>,
@@ -78,6 +81,7 @@ impl SshHostProfile {
             host,
             user: None,
             port: default_ssh_port(),
+            port_is_explicit: true,
             identity_file: None,
             jump_hosts: Vec::new(),
             tags: Vec::new(),
@@ -106,12 +110,15 @@ impl SshHostProfile {
     }
 
     pub fn to_ssh_command(&self) -> String {
-        self.ssh_command(self.target(), false)
+        self.ssh_command(self.target(), self.port != default_ssh_port())
     }
 
     /// Uses the saved alias so OpenSSH also applies directives the editor does not model.
     pub fn to_saved_ssh_command(&self) -> String {
-        self.ssh_command(ssh_target(&self.user, &self.name, self.port, false), true)
+        self.ssh_command(
+            ssh_target(&self.user, &self.name, self.port, false),
+            self.port_is_explicit,
+        )
     }
 
     fn ssh_command(&self, destination: String, explicit_port: bool) -> String {
@@ -129,7 +136,7 @@ impl SshHostProfile {
             argv.push(identity_file.to_string());
         }
 
-        if explicit_port || self.port != default_ssh_port() {
+        if explicit_port {
             argv.push("-p".to_string());
             argv.push(self.port.to_string());
         }
@@ -146,7 +153,9 @@ impl SshHostProfile {
                     "ProxyCommand={}",
                     proxy_command_for_jump_hosts(
                         &self.jump_hosts,
-                        &host_with_port(&self.host, self.port)
+                        self.port_is_explicit
+                            .then(|| host_with_port(&self.host, self.port))
+                            .as_deref()
                     )
                 ));
             } else {
@@ -170,13 +179,15 @@ impl SshHostProfile {
     }
 }
 
-fn proxy_command_for_jump_hosts(jump_hosts: &[SshJumpHost], destination: &str) -> String {
+fn proxy_command_for_jump_hosts(jump_hosts: &[SshJumpHost], destination: Option<&str>) -> String {
     let mut proxy_command: Option<String> = None;
     for (index, jump_host) in jump_hosts.iter().enumerate() {
-        let next_destination = jump_hosts
-            .get(index + 1)
-            .map(SshJumpHost::host_port)
-            .unwrap_or_else(|| destination.to_string());
+        let next_destination = match jump_hosts.get(index + 1) {
+            Some(next) => escape_openssh_percent(&next.host_port()),
+            None => destination
+                .map(escape_openssh_percent)
+                .unwrap_or_else(|| "[%h]:%p".to_string()),
+        };
 
         let mut argv = vec!["ssh".to_string()];
         if let Some(previous_proxy_command) = proxy_command.take() {
@@ -188,7 +199,7 @@ fn proxy_command_for_jump_hosts(jump_hosts: &[SshJumpHost], destination: &str) -
         }
         jump_host.push_proxy_command_options(&mut argv);
         argv.push("-W".to_string());
-        argv.push(escape_openssh_percent(&next_destination));
+        argv.push(next_destination);
         argv.push("--".to_string());
         argv.push(escape_openssh_percent(&jump_host.destination()));
 
@@ -257,6 +268,7 @@ pub fn ssh_profile_password_key(profile: &SshHostProfile) -> String {
         destination.update(value.as_bytes());
     }
     destination.update(profile.port.to_be_bytes());
+    destination.update([u8::from(profile.port_is_explicit)]);
     format!(
         "ssh-profile-password:{}:{:x}",
         profile.id,

@@ -15160,6 +15160,7 @@ impl Workspace {
 
     /// Close all overlays in this workspace and the active pane group.
     fn close_all_overlays(&mut self, ctx: &mut ViewContext<Self>) {
+        self.close_ssh_launcher(ctx);
         self.current_workspace_state.close_all_modals();
         self.close_tab_bar_overflow_menu(ctx);
         self.close_all_chip_menus(ctx);
@@ -23253,6 +23254,20 @@ impl Workspace {
             }
         }
 
+        // A failed settings write must not make an explicitly opened SSH panel invisible.
+        if !hide_vertical_tabs
+            && !TabSettings::as_ref(app)
+                .header_toolbar_chip_selection
+                .contains_item(&HeaderToolbarItemKind::SshProfiles)
+        {
+            Self::add_panel_with_separator(
+                &mut panels_view,
+                &mut prev_panel_added,
+                self.render_ssh_profiles_panel(),
+                app,
+            );
+        }
+
         // Theme chooser (workspace-level, not configurable).
         // Uses wrap_in_panel_surface which adds margin for its own visual separation,
         // so we add a separator before it only if a config panel is to its left, then
@@ -25554,7 +25569,9 @@ impl TypedActionView for Workspace {
                 }
             }
             ClosePanel => {
-                if self.left_panel_view.is_self_or_child_focused(ctx) {
+                if self.ssh_profiles_panel_is_focused(ctx) {
+                    self.toggle_ssh_profiles_panel(ctx);
+                } else if self.left_panel_view.is_self_or_child_focused(ctx) {
                     self.close_left_panel(ctx);
                 } else if self.right_panel_view.is_self_or_child_focused(ctx) {
                     let pane_group_handle = self.active_tab_pane_group().clone();
