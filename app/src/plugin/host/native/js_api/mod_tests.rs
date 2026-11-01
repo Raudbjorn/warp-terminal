@@ -53,6 +53,19 @@ fn ok_response(body: &[u8]) -> Vec<u8> {
     response
 }
 
+/// Declares `declared` bytes of body and sends none of them.
+fn headers_only_response(declared: u64) -> Vec<u8> {
+    format!("HTTP/1.1 200 OK\r\nContent-Length: {declared}\r\nConnection: close\r\n\r\n")
+        .into_bytes()
+}
+
+/// A body with no declared length: the end of the connection ends it.
+fn unsized_response(body: &[u8]) -> Vec<u8> {
+    let mut response = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
+    response.extend_from_slice(body);
+    response
+}
+
 fn redirect_response(location: &str) -> Vec<u8> {
     format!("HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
         .into_bytes()
@@ -114,6 +127,38 @@ fn a_body_over_the_limit_is_refused_and_one_at_the_limit_is_not() {
     let at_limit_port = spawn_server(move |_| ok_response(&at_limit));
     let over_limit = vec![b'x'; MAX_FETCH_BODY_BYTES as usize + 1];
     let over_limit_port = spawn_server(move |_| ok_response(&over_limit));
+
+    with_services_mode(ServicesMode::LocalOnly, || {
+        let ok = fetch_url(&format!("http://127.0.0.1:{at_limit_port}/")).unwrap();
+        assert_eq!(ok.body.len() as u64, MAX_FETCH_BODY_BYTES);
+
+        let err = fetch_url(&format!("http://127.0.0.1:{over_limit_port}/"))
+            .err()
+            .expect("an oversized body must be refused");
+        assert!(err.contains("larger than"), "{err}");
+    });
+}
+
+#[test]
+fn a_declared_length_over_the_limit_is_refused_without_reading_the_body() {
+    // The server sends no body. Were the body read, the call would fail on the truncated body
+    // ("failed to read the response") instead of on the size.
+    let port = spawn_server(|_| headers_only_response(MAX_FETCH_BODY_BYTES + 1));
+
+    let err = with_services_mode(ServicesMode::LocalOnly, || {
+        fetch_url(&format!("http://127.0.0.1:{port}/")).err()
+    })
+    .expect("a declared length over the limit must be refused");
+
+    assert!(err.contains("larger than"), "{err}");
+}
+
+#[test]
+fn an_undeclared_length_is_capped_while_the_body_is_read() {
+    let at_limit = vec![b'x'; MAX_FETCH_BODY_BYTES as usize];
+    let at_limit_port = spawn_server(move |_| unsized_response(&at_limit));
+    let over_limit = vec![b'x'; MAX_FETCH_BODY_BYTES as usize + 1];
+    let over_limit_port = spawn_server(move |_| unsized_response(&over_limit));
 
     with_services_mode(ServicesMode::LocalOnly, || {
         let ok = fetch_url(&format!("http://127.0.0.1:{at_limit_port}/")).unwrap();
