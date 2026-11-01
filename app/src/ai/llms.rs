@@ -185,6 +185,35 @@ pub fn should_show_key_icon_for_model(
     byo_key_source_for_model(llm, conversation, scope, app).is_some()
 }
 
+/// The disable reason that applies to `llm` once the user's own credentials are accounted for.
+///
+/// A `RequiresUpgrade` model is reachable without upgrading when a BYO key or endpoint serves
+/// it (see [`should_show_key_icon_for_model`]), so that reason is cleared. Every other reason
+/// still applies: an admin-disabled model stays disabled whatever keys the user holds.
+pub fn effective_disable_reason_for_model(
+    llm: &LLMInfo,
+    conversation: Option<&AIConversation>,
+    scope: &dyn TeamScope,
+    app: &AppContext,
+) -> Option<DisableReason> {
+    effective_disable_reason(llm.disable_reason.as_ref(), || {
+        should_show_key_icon_for_model(llm, conversation, scope, app)
+    })
+}
+
+/// The pure half of [`effective_disable_reason_for_model`], split out so the rule is testable
+/// without an app context. `is_using_byo_credentials` is only consulted for `RequiresUpgrade`,
+/// so callers pay for the credential lookup only on models that could be unlocked by it.
+fn effective_disable_reason(
+    disable_reason: Option<&DisableReason>,
+    is_using_byo_credentials: impl FnOnce() -> bool,
+) -> Option<DisableReason> {
+    match disable_reason {
+        Some(DisableReason::RequiresUpgrade) if is_using_byo_credentials() => None,
+        reason => reason.cloned(),
+    }
+}
+
 /// Whether requests for `llm` in `conversation` are billed to the user's connected ChatGPT
 /// subscription.
 pub fn is_using_chatgpt_subscription_for_model(
