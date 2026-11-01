@@ -24,3 +24,6 @@ pub mod worker;
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod pending_save_tests;

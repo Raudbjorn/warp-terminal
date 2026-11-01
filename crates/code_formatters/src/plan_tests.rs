@@ -62,7 +62,17 @@ fn prettier_from_the_nearest_node_modules() {
     let invocation = invocation(auto(&project, "packages/app/src/a.ts", None));
     assert_eq!(invocation.tool, Tool::Prettier);
     assert_eq!(invocation.program, nested);
-    assert_eq!(args(&invocation), ["--stdin-filepath", &display(&file)]);
+    // Explicit config paths prevent Prettier from independently searching outside the scope.
+    assert_eq!(
+        args(&invocation),
+        [
+            "--stdin-filepath",
+            &display(&file),
+            "--config",
+            &display(&project.path(".prettierrc")),
+            "--no-editorconfig"
+        ]
+    );
     assert_eq!(invocation.cwd, project.root());
     assert!(!invocation.uses_temp_copy());
 }
@@ -75,7 +85,54 @@ fn prettier_falls_back_to_a_global_install_on_the_injected_path() {
 
     let invocation = invocation(auto(&project, "src/a.tsx", Some(&path_env)));
     assert_eq!(invocation.program, project.path("global/bin/prettier"));
+    assert!(
+        args(&invocation)
+            .windows(2)
+            .any(|pair| pair == ["--config", &display(&project.path("package.json"))])
+    );
     assert_eq!(auto(&project, "src/a.tsx", None), Selection::LanguageServer);
+}
+
+#[test]
+fn prettier_does_not_implicitly_load_configuration_above_a_nested_checkout() {
+    let project = Project::new();
+    project.write(
+        ".prettierrc.cjs",
+        "throw new Error('outside approved checkout');",
+    );
+    project.write(".editorconfig", "[*]\nindent_size = 9\n");
+    project.mkdir("nested/.git");
+    project.write(
+        "nested/package.json",
+        r#"{"devDependencies":{"prettier":"^3"}}"#,
+    );
+    project.script("nested/node_modules/.bin/prettier", UPPERCASE);
+
+    for preference in [Preference::Auto, Preference::Tool("prettier".to_owned())] {
+        let invocation = invocation(select_with(&project, "nested/a.ts", None, &preference));
+        assert_eq!(
+            args(&invocation),
+            [
+                "--stdin-filepath",
+                &display(&project.path("nested/a.ts")),
+                "--no-config",
+                "--no-editorconfig"
+            ]
+        );
+    }
+
+    project.write("nested/.prettierrc", "{}");
+    let invocation = invocation(auto(&project, "nested/a.ts", None));
+    assert_eq!(
+        args(&invocation),
+        [
+            "--stdin-filepath",
+            &display(&project.path("nested/a.ts")),
+            "--config",
+            &display(&project.path("nested/.prettierrc")),
+            "--no-editorconfig"
+        ]
+    );
 }
 
 #[test]

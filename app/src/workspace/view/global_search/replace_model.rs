@@ -13,6 +13,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use file_write_guard::WriteGuard;
+use futures::FutureExt as _;
+use futures::future::{Either, Shared};
 use instant::Instant;
 use project_replace::apply::{
     AppliedBufferEdits, DEFAULT_MAX_FILE_BYTES, FileTarget, OpenBuffer, Progress, ReplaceError,
@@ -25,7 +28,9 @@ use project_replace::report::{RefusalReason, RefusedFile, SkipReason, SkippedFil
 use project_replace::scope::ScopeGlobs;
 use project_replace::undo::{UndoOutcome, UndoReport, undo_latest};
 use warp_editor::content::diff::text_diff;
+use warp_files::{FileModel, SaveFuture};
 use warp_util::file::FileId;
+use warp_util::file::FileSaveError;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
 use crate::code::global_buffer_model::{BufferTextEditError, GlobalBufferModel};
@@ -35,6 +40,10 @@ const JOURNAL_DIRECTORY: &str = "project_replace_journal";
 
 /// How often the progress of a run is reported while it goes through its files.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+/// One deadline for the entire batch; pending I/O remains quarantined after the UI stops waiting.
+const SAVE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const SAVE_CANCEL_POLL: Duration = Duration::from_millis(100);
+type ObservedSave = Shared<SaveFuture>;
 
 /// Set while a replace or an undo runs anywhere in the app. Two of them at once could each
 /// change a file the other is about to check.
@@ -207,6 +216,13 @@ impl ProjectReplace {
         ctx.emit(ProjectReplaceEvent::Progress);
     }
 
+    fn cancellation(&self) -> Arc<AtomicBool> {
+        match &self.state {
+            RunState::Replacing { cancel, .. } | RunState::Undoing { cancel, .. } => cancel.clone(),
+            RunState::Idle => Arc::new(AtomicBool::new(true)),
+        }
+    }
+
     fn handle_progress(&mut self, latest: Progress, ctx: &mut ModelContext<Self>) {
         match &mut self.state {
             RunState::Idle => {}
@@ -235,6 +251,9 @@ impl ProjectReplace {
             }
         };
 
+        let deadline = Instant::now() + SAVE_WAIT_TIMEOUT;
+        let cancel = self.cancellation();
+        let transaction = outcome.transaction_directory();
         let mut pending = Vec::new();
         let mut skipped = Vec::new();
         for buffer_edits in &outcome.buffer_edits {
@@ -255,9 +274,30 @@ impl ProjectReplace {
                 .collect();
             // A buffer that was in step with its file is saved, so that it stays in step. One
             // with unsaved changes keeps them unsaved, along with the replacement.
-            let save = !open_file.has_unsaved_changes;
+            let guard = match reserve_save(
+                open_file.file_id,
+                !open_file.has_unsaved_changes,
+                &transaction,
+                &cancel,
+                ctx,
+            ) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    skipped.push(SkippedFile {
+                        path: buffer_edits.path.clone(),
+                        reason: SkipReason::WriteFailed(error),
+                    });
+                    continue;
+                }
+            };
             let edited = GlobalBufferModel::handle(ctx).update(ctx, |model, ctx| {
-                model.apply_text_edits(open_file.file_id, &open_buffer.text, edits, save, ctx)
+                model.apply_text_edits(
+                    open_file.file_id,
+                    &open_buffer.text,
+                    edits,
+                    guard.as_ref(),
+                    ctx,
+                )
             });
             match edited {
                 Ok((text_after, completion)) => pending.push((
@@ -268,9 +308,17 @@ impl ProjectReplace {
                         occurrences: buffer_edits.edits.len(),
                         save_error: None,
                     },
-                    completion,
+                    observe_save(completion, guard.as_ref(), ctx),
+                    guard,
                 )),
-                Err(BufferTextEditError::NotLoaded | BufferTextEditError::TextChanged) => {
+                Err(
+                    BufferTextEditError::NotLoaded
+                    | BufferTextEditError::TextChanged
+                    | BufferTextEditError::PendingWrite,
+                ) => {
+                    if let Some(guard) = guard {
+                        guard.cancel_before_dispatch();
+                    }
                     skipped.push(SkippedFile {
                         path: buffer_edits.path.clone(),
                         reason: SkipReason::EditedWhileReplacing,
@@ -284,11 +332,17 @@ impl ProjectReplace {
             async move {
                 let _permit = permit;
                 let mut applied = Vec::new();
-                for (mut edits, completion) in pending {
-                    edits.save_error = completion.await.err().map(|error| error.to_string());
+                let mut guards = Vec::new();
+                for (mut edits, completion, guard) in pending {
+                    edits.save_error = await_save(completion, deadline, &cancel).await.err();
                     applied.push(edits);
+                    guards.extend(guard);
                 }
-                outcome.finish(applied, skipped)
+                let report = outcome.finish(applied, skipped);
+                for guard in guards {
+                    guard.journal_finished();
+                }
+                report
             },
             |me, report, ctx| {
                 me.finish_run();
@@ -421,25 +475,50 @@ impl ProjectReplace {
             }
         };
 
+        let deadline = Instant::now() + SAVE_WAIT_TIMEOUT;
+        let cancel = self.cancellation();
+        let transaction = outcome.transaction_directory();
         let mut pending = Vec::new();
         let mut refused = Vec::new();
         for (restore, edits) in outcome.buffer_restores.iter().zip(restoring_edits) {
             let Some(open_file) = open_files.get(&restore.buffer_path) else {
                 continue;
             };
+            let guard =
+                match reserve_save(open_file.file_id, restore.save, &transaction, &cancel, ctx) {
+                    Ok(guard) => guard,
+                    Err(error) => {
+                        refused.push(RefusedFile {
+                            path: restore.buffer_path.clone(),
+                            reason: RefusalReason::WriteFailed(error),
+                        });
+                        continue;
+                    }
+                };
             // As when replacing: an editor in step with its file stays in step with it.
             let edited = GlobalBufferModel::handle(ctx).update(ctx, |model, ctx| {
                 model.apply_text_edits(
                     open_file.file_id,
                     &restore.current_text,
                     edits,
-                    restore.save,
+                    guard.as_ref(),
                     ctx,
                 )
             });
             match edited {
-                Ok((_, completion)) => pending.push((restore.buffer_path.clone(), completion)),
-                Err(BufferTextEditError::NotLoaded | BufferTextEditError::TextChanged) => {
+                Ok((_, completion)) => pending.push((
+                    restore.buffer_path.clone(),
+                    observe_save(completion, guard.as_ref(), ctx),
+                    guard,
+                )),
+                Err(
+                    BufferTextEditError::NotLoaded
+                    | BufferTextEditError::TextChanged
+                    | BufferTextEditError::PendingWrite,
+                ) => {
+                    if let Some(guard) = guard {
+                        guard.cancel_before_dispatch();
+                    }
                     refused.push(RefusedFile {
                         path: restore.buffer_path.clone(),
                         reason: RefusalReason::EditedSinceReplace,
@@ -454,8 +533,10 @@ impl ProjectReplace {
             async move {
                 let _permit = permit;
                 let mut restored = Vec::new();
-                for (path, completion) in pending {
-                    match completion.await {
+                let mut guards = Vec::new();
+                for (path, completion, guard) in pending {
+                    guards.extend(guard);
+                    match await_save(completion, deadline, &cancel).await {
                         Ok(()) => restored.push(path),
                         Err(error) => refused.push(RefusedFile {
                             path,
@@ -465,7 +546,11 @@ impl ProjectReplace {
                         }),
                     }
                 }
-                outcome.finish(&restored, refused)
+                let report = outcome.finish(&restored, refused);
+                for guard in guards {
+                    guard.journal_finished();
+                }
+                report
             },
             move |me, report, ctx| {
                 me.finish_run();
@@ -497,6 +582,92 @@ impl Drop for ProjectReplace {
             RunState::Replacing { cancel, .. } | RunState::Undoing { cancel, .. } => {
                 cancel.store(true, Ordering::Relaxed);
             }
+        }
+    }
+}
+
+fn reserve_save(
+    file_id: FileId,
+    save: bool,
+    transaction: &std::path::Path,
+    cancel: &AtomicBool,
+    ctx: &AppContext,
+) -> Result<Option<WriteGuard>, String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("cancelled before changing the buffer".to_owned());
+    }
+    let path = FileModel::as_ref(ctx)
+        .file_path(file_id)
+        .ok_or("the file is no longer open")?;
+    if save {
+        WriteGuard::acquire(path, transaction.to_path_buf())
+            .map(Some)
+            .map_err(str::to_owned)
+    } else if file_write_guard::is_quarantined(&path) {
+        Err("a previous save for this file is still pending".to_owned())
+    } else {
+        Ok(None)
+    }
+}
+
+fn observe_save(
+    completion: SaveFuture,
+    guard: Option<&WriteGuard>,
+    ctx: &AppContext,
+) -> ObservedSave {
+    let observed = completion.shared();
+    if let Some(guard) = guard {
+        let guard = guard.clone();
+        let monitor = observed.clone();
+        // Backing I/O cannot be cancelled; this bounded monitor must outlive the initiating model.
+        ctx.background_executor()
+            .spawn_boxed(Box::pin(monitor_save(monitor, guard)))
+            .detach();
+    }
+    observed
+}
+
+async fn monitor_save(completion: ObservedSave, guard: WriteGuard) {
+    match completion.await {
+        Err(error) if matches!(error.as_ref(), FileSaveError::CompletionLost) => {
+            log::warn!(
+                "save completion lost; retaining file quarantine and undo journal until restart"
+            );
+        }
+        _ => guard.write_finished(),
+    }
+}
+
+async fn await_save(
+    completion: ObservedSave,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    loop {
+        if let Some(result) = completion.clone().now_or_never() {
+            return result.map_err(|error| error.to_string());
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(
+                "stopped waiting; the pending save and its undo journal remain protected"
+                    .to_owned(),
+            );
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                "timed out waiting; the pending save and its undo journal remain protected"
+                    .to_owned(),
+            );
+        }
+        match futures::future::select(
+            completion.clone(),
+            Box::pin(async_io::Timer::after(remaining.min(SAVE_CANCEL_POLL))),
+        )
+        .await
+        {
+            Either::Left((result, _)) => return result.map_err(|error| error.to_string()),
+            Either::Right(_) => {}
         }
     }
 }
@@ -572,5 +743,88 @@ mod tests {
         assert!(RunPermit::acquire(&LOCK).is_none());
         drop(worker_permit);
         assert!(RunPermit::acquire(&LOCK).is_some());
+    }
+    #[test]
+    fn timeout_and_cancel_release_the_run_but_not_a_late_writes_quarantine() {
+        for cancelled in [false, true] {
+            static LOCK: AtomicBool = AtomicBool::new(false);
+            let path = PathBuf::from(format!("pending-save-{cancelled}"));
+            let transaction = PathBuf::from(format!("journal-save-{cancelled}"));
+            let guard = WriteGuard::acquire(path.clone(), transaction.clone()).unwrap();
+            let (tx, rx) = futures::channel::oneshot::channel();
+            let completion: SaveFuture = Box::pin(async move {
+                rx.await
+                    .unwrap_or_else(|_| Err(Arc::new(FileSaveError::CompletionLost)))
+            });
+            let observed = completion.shared();
+            let monitor = monitor_save(observed.clone(), guard.clone());
+            let permit = RunPermit::acquire(&LOCK).unwrap();
+            let cancel = AtomicBool::new(cancelled);
+            let deadline = if cancelled {
+                Instant::now() + SAVE_WAIT_TIMEOUT
+            } else {
+                Instant::now() + Duration::from_millis(5)
+            };
+            assert!(
+                futures::executor::block_on(await_save(observed.clone(), deadline, &cancel))
+                    .is_err()
+            );
+            assert!(
+                await_save(observed, deadline, &cancel)
+                    .now_or_never()
+                    .is_some(),
+                "later files reuse the expired/cancelled batch deadline"
+            );
+            // The phase retains the failed/pending journal entries before releasing its run permit.
+            guard.journal_finished();
+            drop(permit);
+            assert!(RunPermit::acquire(&LOCK).is_some());
+            assert!(file_write_guard::is_quarantined(&path));
+            assert!(file_write_guard::transaction_is_pinned(&transaction));
+            let unrelated = WriteGuard::acquire(
+                PathBuf::from(format!("unrelated-{cancelled}")),
+                PathBuf::from("unrelated-journal"),
+            )
+            .unwrap();
+            unrelated.cancel_before_dispatch();
+            tx.send(Ok(())).unwrap();
+            futures::executor::block_on(monitor);
+            assert!(!file_write_guard::is_quarantined(&path));
+            assert!(!file_write_guard::transaction_is_pinned(&transaction));
+        }
+    }
+
+    #[test]
+    fn a_lost_completion_keeps_the_path_and_journal_quarantined() {
+        let path = PathBuf::from("lost-save");
+        let transaction = PathBuf::from("lost-save-journal");
+        let guard = WriteGuard::acquire(path.clone(), transaction.clone()).unwrap();
+        let completion: SaveFuture =
+            Box::pin(async { Err(Arc::new(FileSaveError::CompletionLost)) });
+        guard.journal_finished();
+        futures::executor::block_on(monitor_save(completion.shared(), guard.clone()));
+        assert!(file_write_guard::is_quarantined(&path));
+        assert!(file_write_guard::transaction_is_pinned(&transaction));
+        // Test cleanup only: production never marks unknown I/O finished.
+        guard.write_finished();
+    }
+    #[test]
+    fn cancellation_wakes_a_wait_that_is_already_pending() {
+        let completion: SaveFuture = Box::pin(futures::future::pending());
+        let cancel = AtomicBool::new(false);
+        let (result, ()) = futures::executor::block_on(async {
+            futures::join!(
+                await_save(
+                    completion.shared(),
+                    Instant::now() + SAVE_WAIT_TIMEOUT,
+                    &cancel
+                ),
+                async {
+                    async_io::Timer::after(Duration::from_millis(5)).await;
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            )
+        });
+        assert!(result.unwrap_err().contains("stopped waiting"));
     }
 }

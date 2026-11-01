@@ -43,6 +43,35 @@ fn capture_groups_are_expanded_for_a_regex_search() {
 }
 
 #[test]
+fn preview_and_replacement_share_numbered_capture_normalization() {
+    let search = search(r"(?P<word>\w+)", true);
+    for (template, expected) in [
+        ("$1_total", "width_total"),
+        ("${1}_total", "width_total"),
+        ("${word}_total", "width_total"),
+        ("$$1_total", "$1_total"),
+        ("$$$1_total", "$width_total"),
+        ("$1é", "widthé"),
+    ] {
+        let replace = replace(template, false);
+        let preview = Previewer::new(&search, &replace).replacement_for("width", 0..5);
+        let applied = crate::engine::MatchFinder::new(&search, Some(&replace))
+            .unwrap()
+            .find("width")
+            .unwrap();
+        assert_eq!(preview, expected, "template {template:?}");
+        assert_eq!(preview, applied[0].replacement, "template {template:?}");
+    }
+}
+
+#[test]
+fn a_preview_without_matching_context_keeps_the_typed_capture_reference() {
+    let previewer = Previewer::new(&search(r"(\w+)", true), &replace("$1_total", false));
+    assert_eq!(previewer.replacement_for("word", 0..2), "$1_total");
+    assert_eq!(previewer.replacement_for("word", 9..12), "$1_total");
+}
+
+#[test]
 fn the_replacement_is_left_unexpanded_when_the_match_is_not_found_again() {
     let previewer = Previewer::new(&search(r"(\w+)", true), &replace("<$1>", false));
     // The range covers only part of what the pattern matches there.

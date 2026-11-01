@@ -200,7 +200,10 @@ impl Journal {
             .map(|id| directory_size(&self.root.join(id)))
             .collect::<io::Result<_>>()?;
         while ids.len() > max_count || sizes.iter().sum::<u64>() > max_bytes {
-            let Some(index) = ids.iter().position(|id| Some(id.as_str()) != protected) else {
+            let Some(index) = ids.iter().position(|id| {
+                Some(id.as_str()) != protected
+                    && !file_write_guard::transaction_is_pinned(&self.root.join(id))
+            }) else {
                 return Err(io::Error::new(
                     io::ErrorKind::StorageFull,
                     "the undo journal is full",
@@ -265,6 +268,10 @@ pub struct TransactionWriter {
 }
 
 impl TransactionWriter {
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     pub fn id(&self) -> &str {
         &self.id
     }
@@ -378,6 +385,10 @@ pub struct Transaction {
 }
 
 impl Transaction {
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+
     fn load(id: String, directory: PathBuf) -> io::Result<Self> {
         let manifest = fs::read(directory.join(MANIFEST_FILE))?;
         let mut description = None;

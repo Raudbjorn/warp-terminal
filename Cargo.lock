@@ -4965,6 +4965,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "file_write_guard"
+version = "0.1.0"
+dependencies = [
+ "dunce",
+]
+
+[[package]]
 name = "filedescriptor"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10557,6 +10564,7 @@ dependencies = [
 name = "project_replace"
 version = "0.1.0"
 dependencies = [
+ "file_write_guard",
  "grep",
  "hex",
  "ignore",
@@ -15206,6 +15214,7 @@ dependencies = [
  "env_logger",
  "event-listener",
  "field_mask",
+ "file_write_guard",
  "firebase",
  "float-cmp",
  "freedesktop-desktop-entry",
@@ -15703,6 +15712,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-fs",
+ "file_write_guard",
  "futures",
  "log",
  "notify-debouncer-full",

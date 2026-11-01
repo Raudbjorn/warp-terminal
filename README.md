@@ -57,8 +57,12 @@ This fork selectively integrates the following features from
   tools, plugins, or executable configuration, invoke **Format document** and
   approve that project for the current application session. Ordinary saves use
   the existing language-server path until approval; the global setting does not
-  grant permission. Discovery runs off the UI thread with a bounded wait. A failed
-  or stale result cannot replace newer editor text. Typing-triggered autosave skips formatting;
+  grant permission. Approved projects also work when opened through a symlink.
+  Prettier receives an explicit in-project configuration or disables configuration
+  lookup. Its implicit EditorConfig lookup is disabled; put those settings in
+  the project's Prettier configuration instead. Discovery runs off the UI thread
+  with a bounded wait. A failed or stale result cannot replace newer editor text.
+  Typing-triggered autosave skips formatting;
   saves during tab closure flush immediately without waiting for a formatter.
 - **Multi-repository Git:** open source control from a terminal in a local folder
   containing repositories or linked worktrees. Each repository has its own
@@ -76,9 +80,16 @@ inherit the state directory's ACL. Project replacement clears ordinary buffer
 undo history; use the replacement journal to undo it. Undo refuses files that
 have grown beyond its 256 MiB read limit.
 
-Replacement and undo wait for required buffer saves to finish. Failed saves are
-reported and retain their journal entries for retry; intentionally dirty buffers
-stay unsaved. Disk replacement checks resolved containment and rechecks file
+Replacement and undo wait up to 30 seconds for each batch of required buffer saves,
+and cancellation stops that wait promptly. Pending writes keep their files and
+undo copies protected until their actual completion is known, while unrelated
+files can be replaced subject to the journal limits. At most 32 guarded saves can
+be retained at once; additional clean buffers in a batch are skipped and can be
+retried after the batch finishes. A lost completion signal keeps protection in place until application
+restart. Failed saves are reported and retain their journal entries for retry;
+intentionally dirty buffers stay unsaved. These protections are local to this
+application and do not serialize external filesystem changes. Disk replacement
+checks resolved containment and rechecks file
 identity and content after preparing the temporary file. A concurrent filesystem
 change in the final check-to-rename interval is still possible.
 

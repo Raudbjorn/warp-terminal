@@ -106,6 +106,7 @@ enum-iterator.workspace = true
 event-listener.workspace = true
 field_mask.workspace = true
 float-cmp.workspace = true
+file_write_guard.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
 futures.workspace = true

@@ -739,6 +739,18 @@ impl FileModel {
         version: ContentVersion,
         ctx: &mut ModelContext<Self>,
     ) -> Result<SaveFuture, FileSaveError> {
+        self.save_with_guard(file_id, content, version, None, ctx)
+    }
+
+    /// The originating project write may bypass its own quarantine for this exact file.
+    pub fn save_with_guard(
+        &mut self,
+        file_id: FileId,
+        content: String,
+        version: ContentVersion,
+        guard: Option<&file_write_guard::WriteGuard>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<SaveFuture, FileSaveError> {
         let backend = self
             .file_state
             .get(file_id)
@@ -751,23 +763,40 @@ impl FileModel {
                     .file_path(file_id)
                     .ok_or(FileSaveError::NoFilePath(file_id))?;
 
+                if let Some(guard) = guard {
+                    if !guard.authorizes(&file_path) {
+                        return Err(FileSaveError::Other(
+                            "save guard does not authorize this file".to_owned(),
+                        ));
+                    }
+                } else if file_write_guard::is_quarantined(&file_path) {
+                    return Err(FileSaveError::Other(
+                        "a previous save for this file is still pending".to_owned(),
+                    ));
+                }
                 ctx.spawn(
                     async move {
-                        if let Err(err) = Self::ensure_parent_directories(&file_path).await {
-                            return Err(FileSaveError::IOError {
-                                error: err,
-                                path: file_path,
-                            });
-                        }
-                        async_fs::write(&file_path, content).await.map_err(|err| {
-                            FileSaveError::IOError {
-                                error: err,
-                                path: file_path,
+                        let result = async {
+                            if let Err(err) = Self::ensure_parent_directories(&file_path).await {
+                                return Err(FileSaveError::IOError {
+                                    error: err,
+                                    path: file_path,
+                                });
                             }
-                        })
+                            async_fs::write(&file_path, content).await.map_err(|err| {
+                                FileSaveError::IOError {
+                                    error: err,
+                                    path: file_path,
+                                }
+                            })
+                        }
+                        .await
+                        .map_err(Arc::new);
+                        // The completion observes actual I/O, even if the model disappeared.
+                        let _ = tx.send(result.clone());
+                        result
                     },
-                    move |me, write_result: Result<(), FileSaveError>, ctx| {
-                        let result = write_result.map_err(Arc::new);
+                    move |me, result: Result<(), Arc<FileSaveError>>, ctx| {
                         match &result {
                             Ok(()) => {
                                 me.set_version(file_id, version);
@@ -781,7 +810,6 @@ impl FileModel {
                                 error: err.clone(),
                             }),
                         };
-                        let _ = tx.send(result);
                     },
                 );
             }
@@ -815,11 +843,8 @@ impl FileModel {
         }
 
         Ok(async move {
-            rx.await.unwrap_or_else(|_| {
-                Err(Arc::new(FileSaveError::Other(
-                    "Save completion was lost".to_string(),
-                )))
-            })
+            rx.await
+                .unwrap_or_else(|_| Err(Arc::new(FileSaveError::CompletionLost)))
         }
         .boxed())
     }
@@ -835,6 +860,19 @@ impl FileModel {
         version: ContentVersion,
         ctx: &mut ModelContext<Self>,
     ) -> Result<SaveFuture, FileSaveError> {
+        if self
+            .file_path(file_id)
+            .is_some_and(|path| file_write_guard::is_quarantined(&path))
+        {
+            return Err(FileSaveError::Other(
+                "a previous save for this file is still pending".to_owned(),
+            ));
+        }
+        if file_write_guard::is_quarantined(&new_path) {
+            return Err(FileSaveError::Other(
+                "a previous save for the destination is still pending".to_owned(),
+            ));
+        }
         let backend = self
             .file_state
             .get(file_id)
@@ -919,6 +957,17 @@ impl FileModel {
                         });
                     }
 
+                    let resolved_target = async_fs::canonicalize(&new_path).await.unwrap_or_else(|_| new_path.clone());
+                    if file_write_guard::is_quarantined(&resolved_target) {
+                        return Err(FileSaveError::Other("a previous save for the destination is still pending".to_owned()));
+                    }
+                    // The entry path may be an alias retargeted since the model opened it.
+                    let resolved_source = async_fs::canonicalize(&file_path).await.map_err(|error| {
+                        FileSaveError::IOError { error, path: file_path.clone() }
+                    })?;
+                    if file_write_guard::is_quarantined(&resolved_source) {
+                        return Err(FileSaveError::Other("a previous save for the source is still pending".to_owned()));
+                    }
                     // Write the updated contents to the old path first.
                     async_fs::write(&file_path, content).await.map_err(|err| {
                         FileSaveError::IOError {
@@ -965,6 +1014,14 @@ impl FileModel {
         version: ContentVersion,
         ctx: &mut ModelContext<Self>,
     ) -> Result<SaveFuture, FileSaveError> {
+        if self
+            .file_path(file_id)
+            .is_some_and(|path| file_write_guard::is_quarantined(&path))
+        {
+            return Err(FileSaveError::Other(
+                "a previous save for this file is still pending".to_owned(),
+            ));
+        }
         let backend = self
             .file_state
             .get(file_id)

@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 grep = "0.4.1"
+file_write_guard.workspace = true
 hex.workspace = true
 ignore = "0.4.20"
 log.workspace = true

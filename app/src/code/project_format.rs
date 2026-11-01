@@ -82,10 +82,10 @@ impl LocalCodeEditorView {
             return true;
         }
         let authorized_roots = authorized_projects();
-        // Ordinary saves never ask to run code from an unapproved project.
-        if matches!(trigger, FormatTrigger::Save(_))
-            && !authorized_roots.iter().any(|root| file.starts_with(root))
-        {
+        // Canonical path authorization belongs to the background worker: a file opened through
+        // a directory symlink need not lexically start with its approved canonical project root.
+        // Ordinary saves with no approvals can skip discovery entirely.
+        if matches!(trigger, FormatTrigger::Save(_)) && authorized_roots.is_empty() {
             return false;
         }
         let Some(text) = self.buffer_text(ctx) else {
@@ -129,13 +129,7 @@ impl LocalCodeEditorView {
     /// Starts capturing the user's shell `PATH` when a project formatter may handle this file, so
     /// that the first save does not have to wait for it.
     pub(super) fn warm_up_project_formatter(&self, ctx: &mut ViewContext<Self>) {
-        let Some(settings) = self.project_format_settings(ctx) else {
-            return;
-        };
-        if !authorized_projects()
-            .iter()
-            .any(|root| settings.file.starts_with(root))
-        {
+        if self.project_format_settings(ctx).is_none() || authorized_projects().is_empty() {
             return;
         }
         // The shell state caches the captured `PATH`, so the future itself is not needed.

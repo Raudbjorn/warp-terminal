@@ -193,7 +193,8 @@ impl Planner<'_> {
         if !forced && !plugins.is_empty() && !config::node_package_available(&self.scope, plugins) {
             return Err(Skip::NotOptedIn);
         }
-        let opt_in = if config::prettier_config(&self.scope).is_some() {
+        let config = config::prettier_config(&self.scope);
+        let opt_in = if config.is_some() {
             OptIn::Configured
         } else if forced || config::node_dependency(&self.scope, &["prettier"]) {
             OptIn::Available
@@ -207,13 +208,18 @@ impl Planner<'_> {
             .find_file(&[".prettierignore"])
             .and_then(|ignore| parent_dir(&ignore))
             .unwrap_or_else(|| self.root());
-        Ok(self.planned(
-            Tool::Prettier,
-            program,
-            vec!["--stdin-filepath".into(), self.file.into()],
-            cwd,
-            opt_in,
-        ))
+        let mut args = vec!["--stdin-filepath".into(), self.file.into()];
+        // Prettier's own ancestor search does not stop at our authorized repository boundary.
+        // Pin the selected config (including package.json), or explicitly disable that search.
+        if let Some(config) = config {
+            args.extend(["--config".into(), config.into()]);
+        } else {
+            args.push("--no-config".into());
+        }
+        // EditorConfig also walks ancestors, even with --config. Prettier has no option to
+        // constrain that walk to this scope, so use the explicit Prettier config alone.
+        args.push("--no-editorconfig".into());
+        Ok(self.planned(Tool::Prettier, program, args, cwd, opt_in))
     }
 
     fn biome(&self, forced: bool) -> Result<Planned, Skip> {

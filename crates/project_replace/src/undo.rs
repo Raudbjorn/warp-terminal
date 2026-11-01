@@ -57,6 +57,10 @@ impl UndoReport {
 }
 
 impl UndoOutcome {
+    pub fn transaction_directory(&self) -> PathBuf {
+        self.transaction.directory().to_path_buf()
+    }
+
     /// Records what the editors did with [`UndoOutcome::buffer_restores`] and drops what was
     /// undone from the journal. Files that were refused stay in it, so that undoing can be tried
     /// again. `restored` and `refused` name restores by their [`BufferRestore::buffer_path`].
@@ -113,7 +117,17 @@ pub fn undo_latest(
             break;
         }
 
-        let open_buffer = open_buffers.get(&canonical(&entry.path)).copied();
+        let canonical_path = canonical(&entry.path);
+        if file_write_guard::is_quarantined(&canonical_path) {
+            refused.push(RefusedFile {
+                path: entry.path.clone(),
+                reason: RefusalReason::WriteFailed(
+                    "a previous save for this file is still pending".to_owned(),
+                ),
+            });
+            continue;
+        }
+        let open_buffer = open_buffers.get(&canonical_path).copied();
         match undo_entry(&transaction, entry, open_buffer) {
             Ok(Undone::Restored) => {
                 undone.push(entry.index);
@@ -159,6 +173,7 @@ fn undo_entry(
 
     match (entry.kind, open_buffer) {
         (EntryKind::Buffer | EntryKind::SavedBuffer, Some(buffer)) => {
+            let save = entry.kind == EntryKind::SavedBuffer || !buffer.has_unsaved_changes;
             let current = sha256_hex(buffer.text.as_bytes());
             let needs_save = entry.kind == EntryKind::SavedBuffer && buffer.has_unsaved_changes;
             if current == entry.pre_sha256 && !needs_save {
@@ -167,13 +182,20 @@ fn undo_entry(
             if current != entry.post_sha256 && current != entry.pre_sha256 {
                 return Err(RefusalReason::EditedSinceReplace);
             }
+            if save {
+                read_rewritable(
+                    &entry.path,
+                    crate::journal::JournalLimits::default().max_transaction_bytes,
+                )
+                .map_err(|reason| RefusalReason::WriteFailed(reason.describe()))?;
+            }
             let restored_text = String::from_utf8(pre_image)
                 .map_err(|err| RefusalReason::JournalDamaged(err.to_string()))?;
             Ok(Undone::InBuffer(BufferRestore {
                 buffer_path: buffer.path.clone(),
                 current_text: buffer.text.clone(),
                 restored_text,
-                save: entry.kind == EntryKind::SavedBuffer || !buffer.has_unsaved_changes,
+                save,
                 entry_index: entry.index,
                 entry_path: entry.path.clone(),
             }))

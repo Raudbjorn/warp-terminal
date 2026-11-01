@@ -312,6 +312,25 @@ fn formatter_override_does_not_grant_execution_permission() {
 }
 
 #[test]
+fn approved_project_can_be_formatted_through_a_directory_symlink() {
+    let project = prettier_project("#!/bin/sh\necho ran > formatter-ran\ncat\n");
+    project.mkdir(".git");
+    project.write("a.ts", "text\n");
+    let aliases = Project::new();
+    std::os::unix::fs::symlink(project.root(), aliases.path("checkout")).unwrap();
+    let mut request = request(&aliases, "checkout/a.ts", "text\n");
+    request.project_root = Some(aliases.path("checkout"));
+    assert!(!request.file.starts_with(project.root()));
+
+    let outcome = futures_lite::future::block_on(format_authorized_in_background(
+        request,
+        HashSet::from([project.root()]),
+    ));
+    assert!(matches!(outcome, FormatOutcome::Unchanged { .. }));
+    assert!(project.path("formatter-ran").exists());
+}
+
+#[test]
 fn authorizing_a_parent_does_not_authorize_another_checkout_or_symlink_target() {
     let trusted = Project::new();
     let other = prettier_project("#!/bin/sh\necho ran > formatter-ran\ncat\n");

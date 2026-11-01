@@ -134,6 +134,10 @@ impl ReplaceReport {
 }
 
 impl ReplaceOutcome {
+    pub fn transaction_directory(&self) -> PathBuf {
+        self.writer.directory().to_path_buf()
+    }
+
     /// Records what the editors did with [`ReplaceOutcome::buffer_edits`] and closes the undo
     /// journal of the replace. `skipped` are the files whose editor could not apply them.
     pub fn finish(
@@ -220,7 +224,11 @@ pub fn replace_in_files(
         let result = match scoped_path(&roots, &scope, &target.path) {
             Err(reason) => Err(reason),
             Ok(resolved_path) => {
-                if let Some(buffer) = open_buffers.for_path(&target.path) {
+                if file_write_guard::is_quarantined(&resolved_path) {
+                    Err(SkipReason::WriteFailed(
+                        "a previous save for this file is still pending".to_owned(),
+                    ))
+                } else if let Some(buffer) = open_buffers.for_path(&target.path) {
                     plan_buffer_edits(
                         &finder,
                         target,
@@ -420,6 +428,10 @@ fn plan_buffer_edits(
             bytes: buffer.text.len() as u64,
             limit: max_file_bytes,
         });
+    }
+    if !buffer.has_unsaved_changes {
+        // A pending save is quarantined by canonical path, so hard-linked aliases cannot be allowed.
+        read_rewritable(&target.path, max_file_bytes)?;
     }
     // The search does not count the byte order mark as part of the first line.
     let searched = buffer

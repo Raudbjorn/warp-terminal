@@ -46,6 +46,7 @@ cloud_object_models = { path = "crates/cloud_object_models" }
 code_formatters = { path = "crates/code_formatters" }
 computer_use = { path = "crates/computer_use" }
 field_mask = { path = "crates/field_mask" }
+file_write_guard = { path = "crates/file_write_guard" }
 firebase = { path = "crates/firebase" }
 fuzzy_match = { path = "crates/fuzzy_match" }
 handlebars = { path = "crates/handlebars" }

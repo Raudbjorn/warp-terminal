@@ -537,3 +537,21 @@ fn undo_refuses_a_file_that_grew_beyond_the_read_budget() {
         assert_eq!(fs::metadata(path).unwrap().len(), huge_size);
     }
 }
+
+#[cfg(any(unix, windows))]
+#[test]
+fn undo_does_not_dispatch_a_buffer_save_after_a_hard_link_was_added() {
+    for originally_dirty in [false, true] {
+        let project = Project::new();
+        let path = project.write("file.txt", "foo\n");
+        let replaced = replace_foo_in_editor(&project, "file.txt", "foo\n", originally_dirty);
+        std::fs::write(&path, &replaced).unwrap();
+        std::fs::hard_link(&path, project.path("alias.txt")).unwrap();
+        let outcome = undo(&project, &[open_buffer(&path, &replaced, false)]).unwrap();
+        assert!(outcome.buffer_restores.is_empty());
+        assert_eq!(outcome.refused.len(), 1);
+        outcome.finish(&[], Vec::new());
+        assert_eq!(project.read_text("alias.txt"), replaced);
+        assert!(project.journal.latest().unwrap().is_some());
+    }
+}

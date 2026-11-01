@@ -10,6 +10,7 @@ license.workspace = true
 anyhow = "1.0"
 async-channel.workspace = true
 async-fs.workspace = true
+file_write_guard.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 warpui_core.workspace = true

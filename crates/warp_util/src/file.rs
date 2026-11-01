@@ -8,6 +8,8 @@ use warp_errors::{ErrorExt, register_error};
 pub enum FileSaveError {
     #[error("No file path associated with file when saving file {0:?}")]
     NoFilePath(FileId),
+    #[error("Save completion was lost; the filesystem operation may still be running")]
+    CompletionLost,
     #[error("IO error when saving file.")]
     IOError {
         #[source]
@@ -25,7 +27,9 @@ pub enum FileSaveError {
 impl ErrorExt for FileSaveError {
     fn is_actionable(&self) -> bool {
         match self {
-            FileSaveError::NoFilePath(_) | FileSaveError::Other(_) => true,
+            FileSaveError::NoFilePath(_)
+            | FileSaveError::Other(_)
+            | FileSaveError::CompletionLost => true,
             FileSaveError::IOError { .. } | FileSaveError::RemoteError(_) => false,
         }
     }

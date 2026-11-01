@@ -318,6 +318,8 @@ pub enum BufferTextEditError {
     NotLoaded,
     #[error("the buffer no longer holds the text the edits were made for")]
     TextChanged,
+    #[error("a previous save for this file is still pending")]
+    PendingWrite,
 }
 
 /// A text edit using 1-indexed character offsets (matching `CharOffset`).
@@ -984,9 +986,19 @@ impl GlobalBufferModel {
         file_id: FileId,
         expected_text: &str,
         edits: Vec<(Range<usize>, String)>,
-        save: bool,
+        save: Option<&file_write_guard::WriteGuard>,
         ctx: &mut ModelContext<Self>,
     ) -> Result<(String, warp_files::SaveFuture), BufferTextEditError> {
+        let path = FileModel::as_ref(ctx)
+            .file_path(file_id)
+            .ok_or(BufferTextEditError::NotLoaded)?;
+        if let Some(guard) = save {
+            if !guard.authorizes(&path) {
+                return Err(BufferTextEditError::PendingWrite);
+            }
+        } else if file_write_guard::is_quarantined(&path) {
+            return Err(BufferTextEditError::PendingWrite);
+        }
         let buffer = self
             .buffer_handle_for_id(file_id, ctx)
             .ok_or(BufferTextEditError::NotLoaded)?;
@@ -1002,14 +1014,14 @@ impl GlobalBufferModel {
         }
 
         let text = buffer.as_ref(ctx).text().into_string();
-        let completion: warp_files::SaveFuture = if save {
+        let completion: warp_files::SaveFuture = if let Some(guard) = save {
             let content = buffer.as_ref(ctx).text_with_line_ending().into_string();
             let version = buffer.as_ref(ctx).version();
             // Project replacement only supplies local buffers. Keep the per-request future
             // instead of the fire-and-forget editor save path.
-            match FileModel::handle(ctx)
-                .update(ctx, |model, ctx| model.save(file_id, content, version, ctx))
-            {
+            match FileModel::handle(ctx).update(ctx, |model, ctx| {
+                model.save_with_guard(file_id, content, version, Some(guard), ctx)
+            }) {
                 Ok(completion) => completion,
                 Err(error) => Box::pin(async move { Err(Arc::new(error)) }),
             }

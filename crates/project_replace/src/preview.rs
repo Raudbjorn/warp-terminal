@@ -23,6 +23,7 @@ pub struct Previewer {
     /// Present for a regular expression search, whose replacement refers to capture groups.
     matcher: Option<RegexMatcher>,
     replacement: String,
+    template: String,
     preserve_case: bool,
 }
 
@@ -41,6 +42,7 @@ impl Previewer {
         Self {
             matcher,
             replacement: replace.replacement.clone(),
+            template: replace.template(search),
             preserve_case: replace.preserve_case,
         }
     }
@@ -57,7 +59,7 @@ impl Previewer {
         let expanded = self
             .matcher
             .as_ref()
-            .and_then(|matcher| expand(matcher, line_text, &range, &self.replacement))
+            .and_then(|matcher| expand(matcher, line_text, &range, &self.template))
             .unwrap_or_else(|| self.replacement.clone());
         if self.preserve_case {
             preserve_case(matched, &expanded)

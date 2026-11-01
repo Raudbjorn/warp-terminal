@@ -400,3 +400,54 @@ fn a_copy_that_cannot_fit_the_total_budget_leaves_its_transaction_intact() {
     );
     assert!(directory_size(&journal.root.join(writer.id())).unwrap() <= limits.max_total_bytes);
 }
+
+#[test]
+fn pending_saves_pin_their_undo_transaction_against_count_and_byte_pruning() {
+    for byte_limit in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let limits = JournalLimits {
+            max_transactions: if byte_limit { 5 } else { 1 },
+            max_transaction_bytes: 2_000,
+            max_total_bytes: if byte_limit { 3_000 } else { 20_000 },
+        };
+        let journal = journal_in(directory.path(), limits);
+        let id = record_one(&journal, "pending", &[b'x'; 2_000]);
+        let transaction = journal.root.join(&id);
+        let guard = file_write_guard::WriteGuard::acquire(
+            directory.path().join("pending-file"),
+            transaction.clone(),
+        )
+        .unwrap();
+        guard.journal_finished();
+        let next = journal.begin(description("unrelated"));
+        if byte_limit {
+            let mut next = next.unwrap();
+            assert!(
+                next.record(
+                    Path::new("other"),
+                    EntryKind::Disk,
+                    &[b'y'; 2_000],
+                    sha256_hex(b"after"),
+                    1
+                )
+                .is_err()
+            );
+        } else {
+            assert!(next.is_err());
+        }
+        assert!(transaction.exists());
+        assert_eq!(journal.latest().unwrap().unwrap().id, id);
+        guard.write_finished();
+        let mut next = journal.begin(description("retry")).unwrap();
+        next.record(
+            Path::new("other"),
+            EntryKind::Disk,
+            &[b'y'; 2_000],
+            sha256_hex(b"after"),
+            1,
+        )
+        .unwrap();
+        next.finish().unwrap();
+        assert!(!transaction.exists());
+    }
+}
