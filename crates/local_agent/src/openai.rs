@@ -314,7 +314,7 @@ pub(crate) fn parse_chunk(data: &str) -> Result<ChunkResponse, LocalAgentError> 
         .map_err(|err| LocalAgentError::Parse(format!("malformed chunk: {err}: {data}")))
 }
 
-fn looks_like_context_overflow(body: &str) -> bool {
+pub(crate) fn looks_like_context_overflow(body: &str) -> bool {
     let body = body.to_ascii_lowercase();
     [
         "context_length_exceeded",
