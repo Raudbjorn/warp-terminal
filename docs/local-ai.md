@@ -1,32 +1,27 @@
 # Local AI
 
-This fork's OSS build never talks to Warp's servers. Single-shot AI features
-work only against endpoints you configure. The Warp Agent uses the *OpenAI Base
-URL* from its profile, and an empty value sends prompts to
-`https://api.openai.com/v1`. There are **two separate AI code paths** with
-separate settings, and the network rules differ between them, so read the first
-two sections before configuring anything.
+This fork's OSS build never talks to Warp's servers. AI features work only
+against endpoints you configure yourself, with one default to know about: the
+*OpenAI Base URL* of an Agent Profile falls back to `https://api.openai.com/v1`
+when it is empty (see [Bundled local service](#bundled-local-service)). There
+are **three separate AI code paths** with separate settings, and the network
+rules differ between them, so read the first two sections before configuring
+anything.
 
 Everything below was read from the source on `master`. Where behavior is
 known to be incomplete, the text says so and links the tracking issue.
 
 ## Which setting controls which feature
 
-| | Single-shot features | Agent loop |
-|---|---|---|
-| What it powers | Natural-language to command, workflow metadata, command prediction | Warp Agent conversations (multi-step, tool use) and local command autocomplete |
-| Where the code runs | In the app: `LocalOpenAIClient` (`app/src/ai/local_openai.rs`) | A bundled child process, `warp-local-multi-agent` (`crates/local_multi_agent_service`), started and supervised by `app/src/local_multi_agent`. It listens on `127.0.0.1:8787` by default and the app talks to it as if it were the Warp server |
-| Where you configure it | **Settings → Local AI**, or `[agents.local_openai]` in `settings.toml` | **Settings → Agents → Agent Profiles**, section *LOCAL INFERENCE* (API keys, *OpenAI Base URL*, model aliases). Custom endpoints can also be added under **Settings → Agents → Warp Agent → Custom Inference** when the workspace policy allows it |
-| Providers | OpenAI-compatible Chat Completions, or OpenCode | OpenAI-compatible Chat Completions (profiles also hold Anthropic and Google keys) |
-| Network policy | Enforced: loopback only (see [Network behavior](#network-behavior-in-the-oss-build)) | Not enforced today: any `http`/`https` URL is accepted |
+| | Single-shot features | Warp Agent conversations | Bundled local service |
+|---|---|---|---|
+| What it powers | Natural-language to command, workflow metadata, command prediction | Multi-step agent conversations with tool use, and passive suggestions | Local command autocomplete (off by default), model discovery and the *Test* button in Agent Profiles, and a stand-in for the Warp server URL |
+| Where the code runs | In the app: `LocalOpenAIClient` (`app/src/ai/local_openai.rs`) | In the app: the `local_agent` crate (`crates/local_agent`), chosen by `app/src/ai/agent/api/local_route.rs` | A bundled child process, `warp-local-multi-agent` (`crates/local_multi_agent_service`), started by `app/src/local_multi_agent` when the app starts. It listens on `127.0.0.1:8787` by default |
+| Where you configure it | **Settings → Local AI**, or `[agents.local_openai]` in `settings.toml` | **Settings → Agents → Warp Agent → Custom Inference → Add custom endpoint** (base URL, API key, model names), when the workspace policy allows it | **Settings → Agents → Agent Profiles**, section *LOCAL INFERENCE* (API key, *OpenAI Base URL*, model aliases, *Autocomplete* switch) |
+| Providers | OpenAI-compatible Chat Completions, or OpenCode | Custom endpoints that use the OpenAI Chat Completions schema | OpenAI-compatible Chat Completions |
+| Network policy | Enforced: loopback only (see [Network behavior](#network-behavior-in-the-oss-build)) | Not enforced: the engine uses a plain `reqwest` client | Not enforced: the service and the app's health and `/models` calls use plain `reqwest` clients ([#32](https://github.com/Raudbjorn/warp-terminal/issues/32)) |
 
-Changing the Local AI page does not change the agent loop, and the reverse.
-
-> **Default endpoint of the agent loop.** If *OpenAI Base URL* is empty in the
-> profile, the agent loop sends requests to `https://api.openai.com/v1`
-> (`DEFAULT_OPENAI_BASE_URL` in `app/src/local_multi_agent/mod.rs`). Set the
-> base URL before using the Warp Agent if you do not want your prompts to go
-> there.
+Changing one of these settings does not change the other two.
 
 ## Single-shot features: Local AI settings
 
@@ -108,23 +103,67 @@ session API instead.
   - *stdout could not be parsed*: `opencode_args` must make OpenCode print the
     bound port, as the default `--port 0` does.
 
-## Agent loop
+## Warp Agent conversations
 
-The agent loop runs in the bundled `warp-local-multi-agent` service. Defaults
-come from `crates/local_multi_agent_service/config-schema.json`:
+Conversations run inside the app. `route_request`
+(`app/src/ai/agent/api/local_route.rs`) serves a request with the `local_agent`
+crate only when both of these hold:
+
+- the selected model belongs to one of your custom endpoints, and that endpoint
+  uses the **OpenAI Chat Completions** schema;
+- the input is a user query, a tool-call result or a passive-suggestion result.
+
+Every other request is refused with an error that starts *Local agent loop is
+enabled, so this request was not sent to the Warp server*. It is not forwarded
+to Warp and not to the bundled service. That covers any model that is not one of
+your custom endpoints' models (Warp-hosted and `auto` models included), custom
+endpoints that use the OpenAI Responses or Anthropic Messages schema (the
+settings page offers them, but this build does not route them), and requests
+such as code review, environment creation, skills and orchestration.
+
+To use the Warp Agent, add a custom endpoint under **Settings → Agents → Warp
+Agent → Custom Inference** with the Chat Completions schema, for example
+`http://localhost:11434/v1` for Ollama, and select one of its models. The
+profile's *LOCAL INFERENCE* settings are not used for conversations.
+
+The engine makes one model call per request. The app runs the tool calls the
+model asks for and continues the conversation with their results.
+
+## Bundled local service
+
+In the OSS build the app starts `warp-local-multi-agent` at launch and points
+its Warp server URL at it (`127.0.0.1:8787` by default). Conversations do not
+run there (see above). The app uses the service for:
+
+- **Command autocomplete**, when the *Autocomplete* switch of the profile is on.
+  It is off by default. The profile's API key, base URL and model aliases are
+  sent along with each request.
+- **Model discovery and the *Test* button** in Agent Profiles, which call the
+  service's `/health` and then `GET {base URL}/models` with the API key as a
+  bearer token.
+- The "no-cloud" GraphQL surface (`/graphql/v2`) that the service provides for
+  local integrations.
+
+Defaults come from `crates/local_multi_agent_service/config-schema.json`:
 
 | Setting | Default |
 |---|---|
 | Service address | `127.0.0.1:8787` |
-| Tools | enabled |
-| History kept per conversation | 80 messages |
-| Max completion tokens | 2048 |
-| Provider base URL | empty in the schema, which the app treats as `https://api.openai.com/v1` |
+| Provider base URL | empty in the schema, which both the app and the service treat as `https://api.openai.com/v1` |
 
 Per-profile *OpenAI API key*, *OpenAI Base URL* and the model aliases
 (`auto`, `auto-efficient`, `auto-coding`, `auto-reasoning`, `auto-autocomplete`)
 are edited in **Settings → Agents → Agent Profiles**. Point the base URL at any
 OpenAI-compatible server, for example `http://localhost:11434/v1` for Ollama.
+
+> **Default endpoint.** If *OpenAI Base URL* is empty in the profile, the
+> *Test* button and the service's provider calls (autocomplete, when it is
+> switched on) default to `https://api.openai.com/v1`, and send your API key
+> there if you set one (`DEFAULT_OPENAI_BASE_URL` in `app/src/local_multi_agent/mod.rs`,
+> `DEFAULT_BASE_URL` in `crates/local_multi_agent_service/src/config.rs`). Set
+> the base URL before pressing *Test* or turning on *Autocomplete* if you do not
+> want that. Warp Agent conversations are not affected: they use only the custom
+> endpoints you add.
 
 ## Network behavior in the OSS build
 
@@ -138,12 +177,17 @@ and auto-update configuration unset. Concretely:
   Tailscale and public addresses are denied with `NetworkPolicyDenied`, and so
   is a hostname that merely resolves to loopback. Every redirect hop is checked
   again, and system proxy settings are ignored.
-- **The agent loop is not covered by that check.** The service makes its own
-  requests to the provider, and the app's health check, model-list refresh and
-  autocomplete calls to the service use plain `reqwest` clients that skip the
-  policy, redirect re-validation and proxy bypass
-  ([#32](https://github.com/Raudbjorn/warp-terminal/issues/32)). Whether LAN and
-  Tailscale endpoints should become an explicit opt-in is open in
+- **Warp Agent conversations and the bundled service are not covered by that
+  check. This is a known limitation.** The conversation engine
+  (`crates/local_agent`) and the service make their own requests to the
+  provider, and the app's health check, model-list refresh and autocomplete
+  calls to the service use plain `reqwest` clients too. None of them applies
+  `network_policy`, re-validates redirects or bypasses system proxies. A
+  provider URL you configure can therefore point at a non-loopback host, and the
+  API key and prompt content go there, possibly through `HTTP(S)_PROXY` and
+  after redirects. Routing the app and service calls through the policy is
+  tracked in [#32](https://github.com/Raudbjorn/warp-terminal/issues/32). Whether
+  LAN and Tailscale endpoints should become an explicit opt-in is open in
   [#33](https://github.com/Raudbjorn/warp-terminal/issues/33).
 - **No account or Warp server.** There is no login step, and Warp server URLs
   are the local-only configuration.
@@ -158,7 +202,8 @@ and auto-update configuration unset. Concretely:
 |---|---|
 | Single-shot Local AI, OpenAI-compatible | Loopback only |
 | Single-shot Local AI, OpenCode | Loopback to the sidecar; the sidecar reaches whatever its configured provider uses |
-| Agent loop | Whatever base URL the profile sets (not policy-checked; `https://api.openai.com/v1` when empty) |
+| Warp Agent conversations | Whatever base URL the custom endpoint sets (not policy-checked) |
+| Bundled service (autocomplete, *Test*, model discovery) | Whatever base URL the profile sets (not policy-checked; `https://api.openai.com/v1` when empty) |
 | Telemetry, auto-update | Not configured in the OSS channel |
 
 ## Keeping this page accurate

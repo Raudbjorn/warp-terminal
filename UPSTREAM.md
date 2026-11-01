@@ -74,7 +74,9 @@ and keep this file current.
      the changelog feature (`e9830944`).
    - Keep the fork's local-only behavior: `ServicesMode::LocalOnly` in
      `app/src/bin/oss.rs`, the `network_policy` crate, the local AI client and
-     agent loop (`app/src/ai/local_openai.rs`, `app/src/local_multi_agent`,
+     agent loop (`app/src/ai/local_openai.rs`, `crates/local_agent` with its
+     routing and adapter in `app/src/ai/agent/api/local_route.rs` and
+     `local_adapter.rs`, `app/src/local_multi_agent`,
      `crates/local_multi_agent_service`), the plugin host (`omw_plugins`
      feature) and the SSH changes.
 5. Expect conflicts in `Cargo.toml` and `Cargo.lock`, `app/Cargo.toml`,

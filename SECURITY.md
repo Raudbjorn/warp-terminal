@@ -19,8 +19,8 @@ In scope: code in this repository, including the fork-specific parts:
 
 - the local-only network policy (`crates/network_policy`, `crates/http_client`)
   and anything that lets a request leave the machine when it should not;
-- the local AI client, the OpenCode sidecar, and the bundled local agent
-  service;
+- the local AI client, the in-app agent engine (`crates/local_agent`), the
+  OpenCode sidecar, and the bundled local service;
 - extraction and handling of downloaded archives;
 - the plugin host.
 
