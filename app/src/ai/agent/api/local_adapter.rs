@@ -2177,7 +2177,12 @@ impl EventMapper {
                 ),
             Err(err) => {
                 // Transport-level failures surface as stream errors so the
-                // existing retry machinery in `ResponseStream` applies.
+                // existing retry machinery in `ResponseStream` applies. The
+                // engine has already retried transient failures that happened
+                // before its first event, so only mid-stream failures reach
+                // the host un-retried. The mapper's opening events count as
+                // client actions, so the host recovers by resuming rather than
+                // re-sending (see `local_route::RESUME_UNSUPPORTED`).
                 vec![
                     client_actions(vec![Action::RollbackTransaction(
                         api::client_action::RollbackTransaction {},
