@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use settings::Setting as _;
 use warpui::{AppContext, SingletonEntity};
 
 use crate::auth::AuthStateProvider;
@@ -95,6 +96,7 @@ impl HeaderToolbarItemKind {
             return false;
         }
         match self {
+            Self::CodeReview => *TabSettings::as_ref(app).show_code_review_button.value(),
             Self::NotificationsMailbox => *AISettings::as_ref(app).show_agent_notifications,
             _ => true,
         }
