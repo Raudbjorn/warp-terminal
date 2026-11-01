@@ -601,6 +601,101 @@ async fn permanent_errors_are_not_retried() {
 }
 
 #[tokio::test]
+async fn an_exhausted_quota_is_not_retried() {
+    let mut server = Server::new_async().await;
+    let mock = responses_mock(&mut server)
+        .with_status(429)
+        .with_body(r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let results = run_with_policy(&server, fast_policy()).await;
+
+    mock.assert_async().await;
+    assert!(matches!(
+        &results[..],
+        [Err(LocalAgentError::ErrorStatus { status: 429, .. })]
+    ));
+}
+
+#[tokio::test]
+async fn a_rate_limit_is_retried() {
+    let mut server = Server::new_async().await;
+    let limited = responses_mock(&mut server)
+        .with_status(429)
+        .with_body(r#"{"error":{"message":"Rate limit reached","code":"rate_limit_exceeded"}}"#)
+        .expect(1)
+        .create_async()
+        .await;
+    let ok = responses_mock(&mut server)
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(text_response("ok"))
+        .expect(1)
+        .create_async()
+        .await;
+
+    let events = expect_ok(run_with_policy(&server, fast_policy()).await);
+
+    limited.assert_async().await;
+    ok.assert_async().await;
+    assert_eq!(events.last(), Some(&AgentEvent::Done));
+}
+
+/// Collects a turn on a bad config, bounded so a misbehaving retry loop
+/// fails the test instead of hanging it.
+async fn collect_misconfigured(
+    config: LocalEndpointConfig,
+) -> Vec<Result<AgentEvent, LocalAgentError>> {
+    timeout(PROMPT, collect(user_transcript(), vec![], config))
+        .await
+        .expect("a misconfigured request must fail promptly")
+}
+
+#[tokio::test]
+async fn an_unusable_base_url_is_a_permanent_error_that_says_so() {
+    for schema in [EndpointSchema::Responses, EndpointSchema::ChatCompletions] {
+        for base_url in ["api.openai.com/v1", ""] {
+            let config = LocalEndpointConfig {
+                schema,
+                ..config_for_url(base_url.to_string())
+            };
+
+            let results = collect_misconfigured(config).await;
+
+            assert!(
+                matches!(&results[..], [Err(LocalAgentError::Parse(message))]
+                    if message.contains("base URL") && message.contains("relative URL")),
+                "{schema:?} {base_url:?}: {results:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_unusable_api_key_is_a_permanent_error_that_leaks_neither_key_nor_url_query() {
+    for schema in [EndpointSchema::Responses, EndpointSchema::ChatCompletions] {
+        let config = LocalEndpointConfig {
+            schema,
+            api_key: "sk-secret\nsecond-line".to_string(),
+            ..config_for_url("http://127.0.0.1:9/v1?token=hunter2".to_string())
+        };
+
+        let results = collect_misconfigured(config).await;
+
+        let Some(Err(LocalAgentError::Parse(message))) = results.first() else {
+            panic!("{schema:?}: expected a Parse error, got {results:?}");
+        };
+        assert_eq!(results.len(), 1);
+        assert!(message.contains("API key"), "{message}");
+        for secret in ["sk-secret", "second-line", "hunter2"] {
+            assert!(!message.contains(secret), "{secret} leaked into {message}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn dropping_the_stream_during_retry_backoff_sends_no_further_request() {
     const BACKOFF: Duration = Duration::from_millis(500);
     let mut server = Server::new_async().await;

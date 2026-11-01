@@ -21,6 +21,9 @@ use crate::{AgentEvent, LocalAgentError, LocalEndpointConfig, ToolCallRequest, o
 /// end of turn rather than an error.
 const MAX_OUTPUT_TOKENS_REASON: &str = "max_output_tokens";
 
+/// How much of a detail-less failure event is echoed into the error text.
+const MAX_FAILURE_EXCERPT_CHARS: usize = 200;
+
 /// Separates the paragraphs of a multi-part reasoning summary.
 const SUMMARY_PART_SEPARATOR: &str = "\n\n";
 
@@ -454,6 +457,15 @@ fn non_empty_str<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
         .filter(|text| !text.is_empty())
 }
 
+/// The message for a failure event that carries none: a fixed sentence and a
+/// bounded excerpt of the event, which can embed the whole response.
+fn undescribed_failure(payload: &Value) -> String {
+    let raw = payload.to_string();
+    let excerpt: String = raw.chars().take(MAX_FAILURE_EXCERPT_CHARS).collect();
+    let ellipsis = if excerpt.len() < raw.len() { "..." } else { "" };
+    format!("the provider reported a failure without details: {excerpt}{ellipsis}")
+}
+
 /// Maps a `response.failed` / `error` event onto [`LocalAgentError`] the way
 /// the HTTP status mapping does for a rejected request. Codes that signal a
 /// transient provider problem become the matching retryable status.
@@ -468,7 +480,7 @@ fn failure_error(payload: &Value, config: &LocalEndpointConfig) -> LocalAgentErr
         .unwrap_or_default();
     let message = non_empty_str(error, "message")
         .map(str::to_string)
-        .unwrap_or_else(|| payload.to_string());
+        .unwrap_or_else(|| undescribed_failure(payload));
     if openai::looks_like_context_overflow(&format!("{code} {message}")) {
         return LocalAgentError::ContextWindowExceeded { message };
     }
