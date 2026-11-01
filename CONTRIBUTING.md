@@ -38,6 +38,10 @@ The project builds for Linux only. See the README for release bundles.
 3. `cargo clippy --workspace --all-targets --tests -- -D warnings`, and the same
    for `-p warp`
 4. `clang-format` on `crates/warpui/src` and `app/src`, and `wgslfmt` on `*.wgsl`
+5. `./script/lint_shellcheck` (ShellCheck on the bash bootstrap script; it prints
+   a message and passes if `shellcheck` is not installed)
+6. `cargo nextest run --no-fail-fast --workspace` (needs `cargo-nextest`)
+7. `cargo test --doc`
 
 This repository has no CI workflows, so these run only when you run them.
 `presubmit` does not currently pass on a clean `master`; the failures are
@@ -48,8 +52,9 @@ tracked in
 change does not add new failures, and say in the pull request which checks you
 ran.
 
-Also run the tests of the crates you touched, for example
-`cargo test -p node_runtime --features local_fs`.
+While you iterate, run only the tests of the crates you touched, for example
+`cargo test -p node_runtime --features local_fs`, instead of the whole
+workspace.
 
 ## Tests
 
