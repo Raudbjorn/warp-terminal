@@ -1,8 +1,12 @@
+use std::time::Duration;
+
 use ::conn::{ConnEntryKind, ConnStatus};
+use chrono::Utc;
 use warp_util::git::run_git_command;
+use warpui::r#async::Timer;
 use warpui::{App, EntityId, SingletonEntity};
 
-use super::{ConnModel, conn_status};
+use super::{ConnModel, MAX_TRANSCRIPT_BYTES, conn_status};
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::event::{
     CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventSource, CLIAgentEventType,
@@ -723,5 +727,238 @@ fn a_finished_turn_is_done() {
         send(app, view_id, stop("Renamed.", None));
 
         assert_eq!(status(app, view_id), Some(ConnStatus::Done));
+    });
+}
+
+/// A prompt that also reports where the transcript is, which dispatches a single read.
+fn prompt_with_transcript(text: &str, path: &std::path::Path) -> CLIAgentEvent {
+    event(
+        CLIAgentEventType::PromptSubmit,
+        CLIAgentEventPayload {
+            query: Some(text.to_owned()),
+            transcript_path: path.to_str().map(str::to_owned),
+            ..Default::default()
+        },
+    )
+}
+
+fn from_session(mut event: CLIAgentEvent, session_id: &str) -> CLIAgentEvent {
+    event.session_id = Some(session_id.to_owned());
+    event
+}
+
+/// A pane keeps its history after its agent exits, so a different agent started there must not
+/// be shown the previous conversation as its own.
+#[test]
+fn a_replacement_agent_does_not_inherit_the_previous_transcript() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, transcript_jsonl()).expect("write transcript");
+
+        send(
+            &mut app,
+            view_id,
+            prompt_with_transcript("wire the ADRs in", &path),
+        );
+        await_read(&mut app, view_id).await;
+        let watermark = Utc::now();
+        ConnModel::handle(&app).update(&mut app, |me, _| {
+            me.sessions
+                .get_mut(&view_id)
+                .expect("session recorded")
+                .watermark = Some(watermark);
+        });
+
+        send(
+            &mut app,
+            view_id,
+            from_session(prompt("a different conversation"), "session-2"),
+        );
+
+        ConnModel::handle(&app).read(&app, |me, _| {
+            let session = me.session(view_id).expect("session recorded");
+            assert_eq!(session.session_id.as_deref(), Some("session-2"));
+            assert!(
+                session.story().is_none(),
+                "the old story is not the new one's"
+            );
+            assert_eq!(
+                session.transcript_path, None,
+                "the old transcript is not the new one's"
+            );
+            assert_eq!(
+                session.prompts().collect::<Vec<_>>(),
+                vec!["a different conversation"]
+            );
+            assert_eq!(
+                session.watermark,
+                Some(watermark),
+                "what the reader has seen belongs to the pane"
+            );
+        });
+    });
+}
+
+/// The same session id is the same conversation resumed, which carries on.
+#[test]
+fn the_same_session_keeps_its_history() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, transcript_jsonl()).expect("write transcript");
+
+        send(
+            &mut app,
+            view_id,
+            prompt_with_transcript("wire the ADRs in", &path),
+        );
+        await_read(&mut app, view_id).await;
+        send(&mut app, view_id, prompt("now write the tests"));
+
+        ConnModel::handle(&app).read(&app, |me, _| {
+            let session = me.session(view_id).expect("session recorded");
+            assert!(session.story().is_some());
+            assert!(session.transcript_path.is_some());
+            assert_eq!(session.prompts().count(), 2);
+        });
+    });
+}
+
+/// A read dispatched for the previous agent can land after the new one has started. What it read
+/// is the previous agent's story.
+#[test]
+fn a_read_for_a_replaced_agent_is_not_adopted() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, transcript_jsonl()).expect("write transcript");
+
+        send(
+            &mut app,
+            view_id,
+            prompt_with_transcript("wire the ADRs in", &path),
+        );
+        let stale = ConnModel::handle(&app)
+            .read(&app, |me, _| me.read_in_flight(view_id))
+            .expect("the prompt reads");
+        send(
+            &mut app,
+            view_id,
+            from_session(prompt("a different conversation"), "session-2"),
+        );
+
+        let awaiting =
+            ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(stale));
+        awaiting.await;
+
+        ConnModel::handle(&app).read(&app, |me, _| {
+            let session = me.session(view_id).expect("session recorded");
+            assert!(session.story().is_none(), "the stale read was dropped");
+            assert_eq!(session.transcript_path, None);
+        });
+    });
+}
+
+/// A finished turn reads twice, at once and again after a grace period. The first landing must not
+/// make the pane look as though the second were not coming.
+#[test]
+fn the_first_read_to_land_does_not_clear_the_one_still_coming() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, transcript_jsonl()).expect("write transcript");
+
+        send(&mut app, view_id, prompt("wire the ADRs in"));
+        send(
+            &mut app,
+            view_id,
+            stop("ADRs were assumed...", path.to_str()),
+        );
+        let delayed = ConnModel::handle(&app)
+            .read(&app, |me, _| me.read_in_flight(view_id))
+            .expect("the stop event reads");
+
+        // Long enough for the immediate read to land, far short of the grace period.
+        Timer::after(Duration::from_millis(300)).await;
+
+        let (adopted, in_flight) = ConnModel::handle(&app).read(&app, |me, _| {
+            (
+                me.session(view_id).is_some_and(|s| s.story().is_some()),
+                me.read_in_flight(view_id),
+            )
+        });
+        if adopted {
+            assert_eq!(
+                in_flight,
+                Some(delayed),
+                "the immediate read landed and the delayed one is still tracked"
+            );
+        }
+        let awaiting =
+            ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(delayed));
+        awaiting.await;
+        let in_flight = ConnModel::handle(&app).read(&app, |me, _| me.read_in_flight(view_id));
+        assert_eq!(in_flight, None, "the last read to land clears the pane");
+    });
+}
+
+/// Reading a path that is not a regular file must neither hang nor grow without bound, and must
+/// leave the live history in place.
+async fn assert_unreadable_transcript_is_ignored(
+    app: &mut App,
+    view_id: EntityId,
+    path: &std::path::Path,
+) {
+    send(app, view_id, prompt_with_transcript("do the thing", path));
+    await_read(app, view_id).await;
+
+    ConnModel::handle(&*app).read(app, |me, _| {
+        let session = me.session(view_id).expect("session recorded");
+        assert!(session.story().is_none());
+        assert_eq!(session.entries().len(), 1, "the live prompt is still there");
+    });
+}
+
+#[test]
+fn a_directory_is_not_read_as_a_transcript() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_unreadable_transcript_is_ignored(&mut app, view_id, dir.path()).await;
+    });
+}
+
+/// `/dev/zero` exists and never ends, which is what a terminal naming it would be counting on.
+#[cfg(unix)]
+#[test]
+fn an_endless_device_is_not_read_as_a_transcript() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        assert_unreadable_transcript_is_ignored(
+            &mut app,
+            view_id,
+            std::path::Path::new("/dev/zero"),
+        )
+        .await;
+    });
+}
+
+#[test]
+fn a_transcript_over_the_size_limit_is_not_read() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        // Sparse, so this costs no disk and no time.
+        let file = std::fs::File::create(&path).expect("create transcript");
+        file.set_len(MAX_TRANSCRIPT_BYTES + 1).expect("extend");
+        drop(file);
+
+        assert_unreadable_transcript_is_ignored(&mut app, view_id, &path).await;
     });
 }

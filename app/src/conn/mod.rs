@@ -12,13 +12,14 @@ pub(crate) mod preview;
 mod project;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ::conn::seen::{SEEN_AFTER, advance_watermark};
 use ::conn::story::{ConnStory, parse_transcript};
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession, ConnStatus, is_harness_prompt, tidy_prompt};
 use chrono::{DateTime, TimeDelta, Utc};
+use tokio::io::AsyncReadExt as _;
 use warpui::r#async::{FutureId, Timer};
 use warpui::{Entity, EntityId, ModelContext, SingletonEntity, WindowId};
 
@@ -39,9 +40,15 @@ pub struct ConnModel {
     /// [`ConnModel::forget_pane`]. Per session the history is capped by
     /// `conn::MAX_ENTRIES`; pane count is what that call bounds.
     sessions: HashMap<EntityId, ConnSession>,
-    /// The transcript read currently in flight for each pane. Reading it is
+    /// The latest transcript read dispatched for each pane, until it lands. Reading it is
     /// how tests await the read before asserting on the story.
-    reads_in_flight: HashMap<EntityId, FutureId>,
+    reads_in_flight: HashMap<EntityId, InFlightRead>,
+    /// Numbers reads in dispatch order, so that a read finishing is only taken to mean its pane
+    /// has no read in flight if no later read has been dispatched since.
+    next_read_seq: u64,
+    /// How many times a different agent has taken over each pane. A read is only adopted by the
+    /// agent it was dispatched for, which this tells apart.
+    session_epochs: HashMap<EntityId, u64>,
     /// When a read was last dispatched for each pane, so a busy turn re-reads
     /// at a steady rate instead of once per tool call.
     last_read: HashMap<EntityId, DateTime<Utc>>,
@@ -53,6 +60,13 @@ pub struct ConnModel {
     resolving_projects: HashMap<String, FutureId>,
     /// The pane focused in the key window, if any.
     visit: Option<Visit>,
+}
+
+/// A transcript read that has been dispatched and has not landed yet.
+struct InFlightRead {
+    /// Position in dispatch order. See [`ConnModel::next_read_seq`].
+    seq: u64,
+    future_id: FutureId,
 }
 
 /// The reader's time in one pane of the key window.
@@ -80,6 +94,15 @@ const READ_INTERVAL: TimeDelta = TimeDelta::seconds(3);
 /// — leaving the panel showing an earlier line as the agent's last word, with
 /// no further event coming to correct it. One more read closes that window.
 const FLUSH_GRACE: Duration = Duration::from_millis(1500);
+
+/// The most of a transcript that is read into memory, in bytes.
+///
+/// A transcript is a whole-file parse, and the path it is read from arrives from the terminal,
+/// so a file with no end (`/dev/zero`) or one far larger than any real session must not be
+/// allowed to grow the process without bound. Real transcripts are a few megabytes, and tens of
+/// megabytes once a long session has pasted images into it. A transcript over the bound is
+/// skipped, and the live entries keep describing the session.
+const MAX_TRANSCRIPT_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Emitted whenever a pane's history changes.
 ///
@@ -204,7 +227,9 @@ impl ConnModel {
     /// asserting on the story.
     #[allow(dead_code)]
     pub fn read_in_flight(&self, terminal_view_id: EntityId) -> Option<FutureId> {
-        self.reads_in_flight.get(&terminal_view_id).copied()
+        self.reads_in_flight
+            .get(&terminal_view_id)
+            .map(|read| read.future_id)
     }
 
     fn handle_cli_session_event(
@@ -272,6 +297,7 @@ impl ConnModel {
     pub fn forget_pane(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
         self.reads_in_flight.remove(&terminal_view_id);
         self.last_read.remove(&terminal_view_id);
+        self.session_epochs.remove(&terminal_view_id);
         if self
             .visit
             .as_ref()
@@ -292,6 +318,9 @@ impl ConnModel {
         event: &CLIAgentEvent,
         ctx: &mut ModelContext<Self>,
     ) {
+        if self.replaces_session(terminal_view_id, event) {
+            self.reset_session(terminal_view_id, ctx);
+        }
         let session = self.sessions.entry(terminal_view_id).or_default();
 
         // Identity and location can arrive on any event, and the plugin only
@@ -362,6 +391,56 @@ impl ConnModel {
             self.resolve_project(cwd, ctx);
         }
         self.mark_seen(ctx);
+    }
+
+    /// Whether `event` comes from a different agent session than the one the pane has been
+    /// recording.
+    ///
+    /// A pane keeps its history after its agent exits, so a new agent started there finds the old
+    /// one's. The same session id is the same conversation resumed and carries on; a different one
+    /// is a new conversation, and showing it the old one's transcript as its own would be wrong. A
+    /// pane that has not yet learned an id is not replaced by learning one.
+    fn replaces_session(&self, terminal_view_id: EntityId, event: &CLIAgentEvent) -> bool {
+        let Some(incoming) = event.session_id.as_deref() else {
+            return false;
+        };
+        self.sessions
+            .get(&terminal_view_id)
+            .and_then(|session| session.session_id.as_deref())
+            .is_some_and(|known| known != incoming)
+    }
+
+    /// Starts a pane's history over for a new agent session, keeping what belongs to the pane
+    /// rather than to the session: the reader's watermark and the status.
+    ///
+    /// Reads dispatched for the previous session are not cancelled, only made unwelcome: they
+    /// carry the epoch they were dispatched in, and [`ConnModel::read_transcript`] drops what
+    /// arrives under an older one.
+    // `ConnSession` keeps its story and entries private, so a fresh one cannot be built with
+    // struct update syntax from here.
+    #[allow(clippy::field_reassign_with_default)]
+    fn reset_session(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        let mut fresh = ConnSession::default();
+        fresh.status = session.status;
+        fresh.watermark = session.watermark;
+        *session = fresh;
+
+        *self.session_epochs.entry(terminal_view_id).or_insert(0) += 1;
+        // The new session is owed a read of its own, whatever the old one was doing.
+        self.reads_in_flight.remove(&terminal_view_id);
+        self.last_read.remove(&terminal_view_id);
+        ctx.notify();
+        ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+    }
+
+    fn session_epoch(&self, terminal_view_id: EntityId) -> u64 {
+        self.session_epochs
+            .get(&terminal_view_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     #[cfg(test)]
@@ -438,8 +517,24 @@ impl ConnModel {
         ctx: &mut ModelContext<Self>,
     ) {
         self.last_read.insert(terminal_view_id, through);
+        let seq = self.next_read_seq;
+        self.next_read_seq += 1;
+        let epoch = self.session_epoch(terminal_view_id);
         let handle = ctx.spawn(read_story(locator, after), move |me, read, ctx| {
-            me.reads_in_flight.remove(&terminal_view_id);
+            // A finished turn dispatches two reads, and the one that lands first must not
+            // clear the tracking of the one still to come.
+            if me
+                .reads_in_flight
+                .get(&terminal_view_id)
+                .is_some_and(|in_flight| in_flight.seq == seq)
+            {
+                me.reads_in_flight.remove(&terminal_view_id);
+            }
+            // The agent this was read for has been replaced in the pane: the transcript is its,
+            // not the new one's.
+            if me.session_epoch(terminal_view_id) != epoch {
+                return;
+            }
             // A transcript that cannot be found or read is not a failure: the
             // live hook entries still describe the session, just less well.
             let Some((path, story)) = read else {
@@ -456,8 +551,13 @@ impl ConnModel {
                 me.mark_seen(ctx);
             }
         });
-        self.reads_in_flight
-            .insert(terminal_view_id, handle.future_id());
+        self.reads_in_flight.insert(
+            terminal_view_id,
+            InFlightRead {
+                seq,
+                future_id: handle.future_id(),
+            },
+        );
     }
 }
 
@@ -479,8 +579,64 @@ async fn read_story(
         Timer::after(after).await;
     }
     let path = locate_transcript(&locator).await?;
-    let jsonl = tokio::fs::read_to_string(&path).await.ok()?;
+    let jsonl = read_bounded(&path).await?;
     Some((path, parse_transcript(&jsonl)))
+}
+
+/// Whether `path` names a regular file, following links.
+async fn is_regular_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Reads a transcript, refusing anything that is not a regular file of at most
+/// [`MAX_TRANSCRIPT_BYTES`]. `None` for a refusal, which is logged: it is not the user's problem,
+/// but something named a path that is not a transcript.
+async fn read_bounded(path: &Path) -> Option<String> {
+    // Looked at before opening, because opening a FIFO waits for a writer that may never come.
+    if !is_regular_file(path).await {
+        log::warn!("Conn: not reading {path:?}, which is not a regular file");
+        return None;
+    }
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(err) => {
+            log::warn!("Conn: could not open transcript {path:?}: {err}");
+            return None;
+        }
+    };
+    // Looked at again on the file actually opened, since the path may have changed meanwhile.
+    let metadata = file.metadata().await.ok()?;
+    if !metadata.is_file() {
+        log::warn!("Conn: not reading {path:?}, which is not a regular file");
+        return None;
+    }
+    if metadata.len() > MAX_TRANSCRIPT_BYTES {
+        log::warn!(
+            "Conn: not reading transcript {path:?}: {} bytes is over the {MAX_TRANSCRIPT_BYTES} byte limit",
+            metadata.len()
+        );
+        return None;
+    }
+    // The length said above can be out of date or wrong for the file, so the read is bounded
+    // too. One byte past the limit is enough to tell that it was exceeded.
+    let mut bytes = Vec::new();
+    if let Err(err) = file
+        .take(MAX_TRANSCRIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+    {
+        log::warn!("Conn: could not read transcript {path:?}: {err}");
+        return None;
+    }
+    if bytes.len() as u64 > MAX_TRANSCRIPT_BYTES {
+        log::warn!(
+            "Conn: not reading transcript {path:?}: it grew past the {MAX_TRANSCRIPT_BYTES} byte limit"
+        );
+        return None;
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Finds a session's transcript.
@@ -493,7 +649,8 @@ async fn read_story(
 async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
     if let Some(path) = locator.path.as_deref() {
         let path = PathBuf::from(path);
-        if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+        // A path that is not a regular file is no transcript, so the search carries on.
+        if is_regular_file(&path).await {
             return Some(path);
         }
     }
@@ -504,7 +661,7 @@ async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
 
     if let Some(cwd) = locator.cwd.as_deref() {
         let derived = projects.join(mangle_project_dir(cwd)).join(&file_name);
-        if tokio::fs::try_exists(&derived).await.unwrap_or(false) {
+        if is_regular_file(&derived).await {
             return Some(derived);
         }
     }
@@ -514,7 +671,7 @@ async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
     let mut entries = tokio::fs::read_dir(&projects).await.ok()?;
     while let Ok(Some(entry)) = entries.next_entry().await {
         let candidate = entry.path().join(&file_name);
-        if tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+        if is_regular_file(&candidate).await {
             return Some(candidate);
         }
     }
