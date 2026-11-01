@@ -22,16 +22,21 @@ OpenRouter, or any gateway that speaks the OpenAI API), or
 [OpenCode](https://opencode.ai). Until an endpoint is configured, the terminal
 works normally but AI actions have nowhere to go.
 
-There are two separate AI paths, each with its own settings:
+There are three separate AI paths, each with its own settings:
 
 - **Natural-language commands, workflow metadata and command prediction:**
   **Settings → Local AI.** Set the base URL (e.g. `http://localhost:11434/v1`),
   an API key *if your server requires one*, and the model names. In this build
   the endpoint must be a loopback address (`localhost`, `127.0.0.1`, `::1`);
   LAN, Tailscale and public hosts are rejected.
-- **Warp Agent conversations:** **Settings → Agents → Agent Profiles**, section
-  *LOCAL INFERENCE*: set *OpenAI Base URL* and the API key. If the base URL is
-  left empty the agent sends requests to `https://api.openai.com/v1`.
+- **Warp Agent conversations:** **Settings → Agents → Warp Agent → Custom
+  Inference.** Add a custom endpoint that uses the OpenAI Chat Completions
+  schema and select one of its models. A request for any other model is
+  refused; it is never sent to Warp.
+- **Command autocomplete (off by default), model discovery and the *Test*
+  button:** **Settings → Agents → Agent Profiles**, section *LOCAL INFERENCE*.
+  These go through a bundled local service. If *OpenAI Base URL* is left empty
+  there, the service and the *Test* button use `https://api.openai.com/v1`.
 
 See [docs/local-ai.md](docs/local-ai.md) for every setting, the OpenCode
 provider, and exactly what the local-only network policy does and does not
