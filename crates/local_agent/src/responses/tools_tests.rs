@@ -333,3 +333,37 @@ fn a_tool_without_parameters_is_not_strict() {
         "additionalProperties": false,
     })));
 }
+
+/// An all-required, closed object schema of `width` string properties.
+fn strict_object(width: usize, nested: Option<Value>) -> Value {
+    let mut properties = serde_json::Map::new();
+    for index in 0..width {
+        properties.insert(format!("p{index}"), json!({ "type": "string" }));
+    }
+    if let Some(nested) = nested {
+        properties.insert("nested".to_string(), nested);
+    }
+    let required: Vec<_> = properties.keys().cloned().collect();
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+        "additionalProperties": false,
+    })
+}
+
+#[test]
+fn strict_is_off_beyond_the_size_ceilings() {
+    assert!(strict_of(strict_object(MAX_STRICT_PROPERTIES, None)));
+    assert!(!strict_of(strict_object(MAX_STRICT_PROPERTIES + 1, None)));
+
+    // Leaf properties count as a level too, so `MAX_STRICT_NESTING - 1`
+    // levels of objects is the deepest schema that still qualifies.
+    let objects_nested = |levels: usize| {
+        (1..levels).fold(strict_object(1, None), |inner, _| {
+            strict_object(1, Some(inner))
+        })
+    };
+    assert!(strict_of(objects_nested(MAX_STRICT_NESTING - 1)));
+    assert!(!strict_of(objects_nested(MAX_STRICT_NESTING)));
+}

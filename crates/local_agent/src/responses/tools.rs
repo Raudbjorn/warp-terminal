@@ -31,6 +31,12 @@ const STRICT_KEYWORDS: [&str; 8] = [
     "items",
 ];
 
+/// Strict-mode size ceilings. The API has raised its published limits over
+/// time; these are the older, smaller ones, so a big schema merely falls back
+/// to non-strict instead of being rejected.
+const MAX_STRICT_NESTING: usize = 5;
+const MAX_STRICT_PROPERTIES: usize = 100;
+
 /// Keywords from which a missing `type` can be inferred, per target type.
 const OBJECT_HINTS: [&str; 5] = [
     "properties",
@@ -227,15 +233,17 @@ fn any_value_union() -> Value {
 /// Whether a (normalized) schema already meets every strict-mode rule, so
 /// that `strict: true` cannot make the API reject the tool.
 fn is_strict_compatible(parameters: &Value) -> bool {
-    parameters
-        .as_object()
-        .is_some_and(|root| has_type(root, "object") && is_strict_node(root))
+    let mut properties_seen = 0;
+    parameters.as_object().is_some_and(|root| {
+        has_type(root, "object") && is_strict_node(root, 1, &mut properties_seen)
+    })
 }
 
-fn is_strict_node(node: &Map<String, Value>) -> bool {
-    if node
-        .keys()
-        .any(|key| !STRICT_KEYWORDS.contains(&key.as_str()))
+fn is_strict_node(node: &Map<String, Value>, depth: usize, properties_seen: &mut usize) -> bool {
+    if depth > MAX_STRICT_NESTING
+        || node
+            .keys()
+            .any(|key| !STRICT_KEYWORDS.contains(&key.as_str()))
     {
         return false;
     }
@@ -244,17 +252,21 @@ fn is_strict_node(node: &Map<String, Value>) -> bool {
         Some("array") => node
             .get("items")
             .and_then(Value::as_object)
-            .is_some_and(is_strict_node),
-        Some("object") => is_strict_object(node),
+            .is_some_and(|items| is_strict_node(items, depth + 1, properties_seen)),
+        Some("object") => is_strict_object(node, depth, properties_seen),
         _ => false,
     }
 }
 
-fn is_strict_object(node: &Map<String, Value>) -> bool {
+fn is_strict_object(node: &Map<String, Value>, depth: usize, properties_seen: &mut usize) -> bool {
     let Some(properties) = node.get("properties").and_then(Value::as_object) else {
         return false;
     };
     if node.get("additionalProperties") != Some(&Value::Bool(false)) {
+        return false;
+    }
+    *properties_seen += properties.len();
+    if *properties_seen > MAX_STRICT_PROPERTIES {
         return false;
     }
     let required = match node.get("required") {
@@ -266,9 +278,11 @@ fn is_strict_object(node: &Map<String, Value>) -> bool {
         && properties
             .keys()
             .all(|name| required.iter().any(|required| required == name))
-        && properties
-            .values()
-            .all(|property| property.as_object().is_some_and(is_strict_node))
+        && properties.values().all(|property| {
+            property
+                .as_object()
+                .is_some_and(|property| is_strict_node(property, depth + 1, properties_seen))
+        })
 }
 
 #[cfg(test)]
