@@ -14,6 +14,7 @@
 //!   reasoning items) inside the task tree and read them back when the
 //!   transcript is rebuilt — see [`PersistedReplayItem`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -290,7 +291,9 @@ fn plan_suggestion_turn(
             if let Some(command) = completed.executed_shell_command.as_ref() {
                 instruction.push_str(&format!(
                     "\nCommand: {}\nExit code: {}\nOutput:\n{}\n",
-                    command.command, command.exit_code, command.output
+                    command.command,
+                    command.exit_code,
+                    truncate_for_context(&command.output, "shell command output")
                 ));
             }
             for file in &completed.relevant_files {
@@ -299,7 +302,8 @@ fn plan_suggestion_turn(
                 {
                     instruction.push_str(&format!(
                         "\n=== {} ===\n{}\n",
-                        content.file_path, content.content
+                        content.file_path,
+                        truncate_for_context(&content.content, "file content")
                     ));
                 }
             }
@@ -356,13 +360,37 @@ fn render_passive_suggestion_trigger(result: &api::PassiveSuggestionResultType) 
         Trigger::ExecutedShellCommand(cmd) => Some(format!(
             "Context: this request follows a passive suggestion.\n\
              Triggered by shell command: {}\nExit code: {}\nOutput:\n{}",
-            cmd.command, cmd.exit_code, cmd.output
+            cmd.command,
+            cmd.exit_code,
+            truncate_for_context(&cmd.output, "shell command output")
         )),
         Trigger::AgentResponseCompleted(_) => Some(String::from(
             "Context: this request follows a passive suggestion.\n\
              Triggered after the agent completed its previous response.",
         )),
     }
+}
+
+/// Most characters of one command output or file content placed in the prompt
+/// as ambient context. A single huge block must not crowd out the rest of the
+/// prompt (or overflow the model's context window on its own).
+const MAX_CONTEXT_CHARS: usize = 20_000;
+
+/// Caps `text` at [`MAX_CONTEXT_CHARS`] characters, cutting on a character
+/// boundary and ending with a notice that names what was cut. The result,
+/// notice included, is at most [`MAX_CONTEXT_CHARS`] characters long.
+fn truncate_for_context<'a>(text: &'a str, what: &str) -> Cow<'a, str> {
+    // Every character is at least one byte, so short texts cannot overflow.
+    if text.len() <= MAX_CONTEXT_CHARS || text.char_indices().nth(MAX_CONTEXT_CHARS).is_none() {
+        return Cow::Borrowed(text);
+    }
+    let notice = format!("\n[truncated: {what} exceeded {MAX_CONTEXT_CHARS} characters]");
+    let kept_chars = MAX_CONTEXT_CHARS.saturating_sub(notice.chars().count());
+    let end = text
+        .char_indices()
+        .nth(kept_chars)
+        .map_or(text.len(), |(index, _)| index);
+    Cow::Owned(format!("{}{notice}", &text[..end]))
 }
 
 /// The request-level and message-level `GeneratePassiveSuggestions` triggers
@@ -2364,10 +2392,24 @@ pub(crate) fn generate_local_agent_output(
             }));
         }
     };
-    let mut mapper = EventMapper::new(&plan);
-    let initial_events = mapper.initial_events();
+    let mapper = EventMapper::new(&plan);
     let engine_events =
         local_agent::run_turn(plan.transcript, plan.tools.definitions(), route.endpoint);
+    response_stream(mapper, engine_events)
+}
+
+/// Chains the mapper's opening events with the mapped engine events. The
+/// returned stream owns the engine stream and spawns nothing, so dropping it
+/// (the client's cancellation path) drops the engine stream, which aborts the
+/// in-flight HTTP request.
+fn response_stream(
+    mut mapper: EventMapper,
+    engine_events: futures::stream::BoxStream<
+        'static,
+        Result<local_agent::AgentEvent, local_agent::LocalAgentError>,
+    >,
+) -> ResponseStream {
+    let initial_events = mapper.initial_events();
     let mapped_events =
         engine_events.flat_map(move |event| futures::stream::iter(mapper.on_event(event)));
     Box::pin(futures::stream::iter(initial_events).chain(mapped_events))

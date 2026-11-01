@@ -2297,6 +2297,212 @@ mod reasoning {
     }
 }
 
+mod context_sizing {
+    use super::*;
+
+    fn huge_output(chars: usize) -> String {
+        "你".repeat(chars)
+    }
+
+    #[test]
+    fn text_within_the_cap_is_untouched() {
+        let at_cap = "x".repeat(MAX_CONTEXT_CHARS);
+        let multibyte_at_cap = huge_output(MAX_CONTEXT_CHARS);
+
+        assert_eq!(truncate_for_context(&at_cap, "output"), at_cap.as_str());
+        assert!(matches!(
+            truncate_for_context(&multibyte_at_cap, "output"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn oversized_text_is_cut_on_a_character_boundary_and_flagged() {
+        let text = huge_output(MAX_CONTEXT_CHARS + 1);
+
+        let truncated = truncate_for_context(&text, "shell command output");
+
+        assert_eq!(truncated.chars().count(), MAX_CONTEXT_CHARS);
+        assert!(
+            truncated.ends_with("\n[truncated: shell command output exceeded 20000 characters]"),
+            "missing truncation notice"
+        );
+        assert!(truncated.starts_with('你'));
+    }
+
+    #[test]
+    fn passive_suggestion_trigger_output_is_capped() {
+        let req = request(
+            vec![],
+            api::request::input::Type::GeneratePassiveSuggestions(
+                api::request::input::GeneratePassiveSuggestions {
+                    attachments: vec![],
+                    trigger: Some(
+                        api::request::input::generate_passive_suggestions::Trigger::ShellCommandCompleted(
+                            api::request::input::generate_passive_suggestions::ShellCommandCompleted {
+                                executed_shell_command: Some(api::ExecutedShellCommand {
+                                    command: "cat big.log".to_string(),
+                                    output: huge_output(MAX_CONTEXT_CHARS * 3),
+                                    exit_code: 0,
+                                    ..Default::default()
+                                }),
+                                relevant_files: vec![],
+                            },
+                        ),
+                    ),
+                },
+            ),
+            "",
+        );
+
+        let plan = plan_turn(&req, &route()).expect("plan");
+
+        let Some(ChatMessage::User(instruction)) = plan.transcript.last() else {
+            panic!("expected the trigger as the last user message");
+        };
+        assert!(instruction.contains("cat big.log"));
+        assert!(instruction.contains("[truncated: shell command output exceeded"));
+        assert!(
+            instruction.chars().count() < MAX_CONTEXT_CHARS + 1_000,
+            "the prompt carries one bounded block, got {} chars",
+            instruction.chars().count()
+        );
+    }
+
+    #[test]
+    fn accepted_suggestion_trigger_output_is_capped() {
+        let input = api::request::input::user_inputs::user_input::Input::PassiveSuggestionResult(
+            api::request::input::user_inputs::PassiveSuggestionResultInput {
+                result: Some(api::PassiveSuggestionResultType {
+                    trigger: Some(
+                        api::passive_suggestion_result_type::Trigger::ExecutedShellCommand(
+                            api::ExecutedShellCommand {
+                                command: "cat big.log".to_string(),
+                                output: huge_output(MAX_CONTEXT_CHARS * 3),
+                                exit_code: 0,
+                                ..Default::default()
+                            },
+                        ),
+                    ),
+                    suggestion: Some(api::passive_suggestion_result_type::Suggestion::Prompt(
+                        api::passive_suggestion_result_type::Prompt {
+                            prompt: "Summarize it".to_string(),
+                        },
+                    )),
+                }),
+            },
+        );
+        let req = request(vec![], user_inputs(vec![input]), "");
+
+        let plan = plan_turn(&req, &route()).expect("plan");
+
+        let trigger = plan
+            .transcript
+            .iter()
+            .find_map(|message| match message {
+                ChatMessage::User(text) if text.contains("cat big.log") => Some(text),
+                _ => None,
+            })
+            .expect("trigger context");
+        assert!(trigger.contains("[truncated: shell command output exceeded"));
+        assert!(trigger.chars().count() < MAX_CONTEXT_CHARS + 1_000);
+    }
+}
+
+mod cancellation {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use futures::{FutureExt, StreamExt};
+
+    use super::*;
+
+    /// Flips a flag when dropped, standing in for the engine's HTTP
+    /// connection (which is closed when its stream is dropped).
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// An engine stream that never produces an event, like a model that is
+    /// still thinking.
+    fn stalled_engine(
+        flag: DropFlag,
+    ) -> futures::stream::BoxStream<'static, Result<AgentEvent, LocalAgentError>> {
+        Box::pin(async_stream::stream! {
+            let _connection = flag;
+            futures::future::pending::<()>().await;
+            yield Ok(AgentEvent::Done);
+        })
+    }
+
+    fn stalled_response_stream() -> (ResponseStream, Arc<AtomicBool>) {
+        let req = request(vec![], user_inputs(vec![user_query_input("hi")]), "");
+        let plan = plan_turn(&req, &route()).expect("plan");
+        let dropped = Arc::new(AtomicBool::new(false));
+        let stream = response_stream(
+            EventMapper::new(&plan),
+            stalled_engine(DropFlag(dropped.clone())),
+        );
+        (stream, dropped)
+    }
+
+    /// Reads every event that is available without waiting on the engine.
+    fn drain_ready(stream: &mut (impl futures::Stream<Item = Event> + Unpin)) -> usize {
+        let mut count = 0;
+        while let Some(Some(_)) = stream.next().now_or_never() {
+            count += 1;
+        }
+        count
+    }
+
+    #[test]
+    fn opening_events_do_not_wait_for_the_engine() {
+        let (mut stream, dropped) = stalled_response_stream();
+
+        // init, begin transaction, create task, input echoes.
+        assert_eq!(drain_ready(&mut stream), 4);
+        assert!(!dropped.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropping_the_response_stream_drops_the_engine_stream() {
+        let (mut stream, dropped) = stalled_response_stream();
+        drain_ready(&mut stream);
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "the engine stream must stay alive while the response stream is"
+        );
+
+        drop(stream);
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "dropping the response stream must drop the engine stream and with it the connection"
+        );
+    }
+
+    #[test]
+    fn cancelling_through_take_until_ends_the_stream_and_releases_the_engine() {
+        // Mirrors how `generate_multi_agent_output` wires cancellation.
+        let (response, dropped) = stalled_response_stream();
+        let (cancel, cancellation_rx) = futures::channel::oneshot::channel::<()>();
+        let mut stream = response.take_until(cancellation_rx);
+        drain_ready(&mut stream);
+
+        cancel.send(()).expect("cancellation receiver is alive");
+
+        assert!(
+            matches!(stream.next().now_or_never(), Some(None)),
+            "a cancelled stream must end without waiting for the engine"
+        );
+        drop(stream);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+}
+
 mod accepted_passive_suggestion {
     use super::*;
 
