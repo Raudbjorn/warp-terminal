@@ -6969,6 +6969,40 @@ fn conn_story_lines(turn: &ConnTurn, is_running: bool) -> Option<ConnStoryLines>
     })
 }
 
+/// The newest prompt the story does not yet cover, if there is one.
+///
+/// The story is re-read on a pace, so for a moment after a prompt is sent it
+/// still describes the turn before. A prompt in this state is the turn that is
+/// actually running.
+fn conn_live_prompt(session: &ConnSession) -> Option<&str> {
+    session
+        .in_flight()
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            ConnEntryKind::Prompt { text } => Some(text.as_str()),
+            _ => None,
+        })
+}
+
+/// What the card says about a session: its latest turn, unless a running
+/// session has been given a newer prompt that the story has not caught up to.
+///
+/// In that window the story's latest turn is the previous one, and its last
+/// step would be shown as what the pane is doing now. The new prompt is shown
+/// alone instead, which is a complete enough answer for a turn that has only
+/// just started.
+fn conn_session_story_lines(session: &ConnSession, is_running: bool) -> Option<ConnStoryLines> {
+    if is_running && let Some(text) = conn_live_prompt(session) {
+        let prompt = conn_preview::head(text, DETAIL_SIDECAR_PROMPT_CHARS);
+        return (!prompt.is_empty()).then_some(ConnStoryLines {
+            prompt,
+            progress: None,
+        });
+    }
+    conn_story_lines(session.story()?.latest_turn()?, is_running)
+}
+
 /// The story so far for a pane's CLI agent session: what was asked, and either
 /// what it is doing now or what it came back with.
 ///
@@ -6989,7 +7023,7 @@ fn render_conn_story_section(
         Some(CLIAgentSessionStatus::InProgress)
     );
     let session = ConnModel::as_ref(app).session(terminal_view.id())?;
-    let lines = conn_story_lines(session.story()?.latest_turn()?, is_running)?;
+    let lines = conn_session_story_lines(session, is_running)?;
 
     let mut section = Flex::column()
         .with_cross_axis_alignment(CrossAxisAlignment::Start)
@@ -7038,11 +7072,7 @@ fn conn_running_step(
         return None;
     }
     let session = session?;
-    if session
-        .in_flight()
-        .iter()
-        .any(|entry| matches!(entry.kind, ConnEntryKind::Prompt { .. }))
-    {
+    if conn_live_prompt(session).is_some() {
         return None;
     }
     let turn = session.story()?.latest_turn()?;

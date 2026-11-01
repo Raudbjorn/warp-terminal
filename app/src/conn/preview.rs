@@ -37,8 +37,10 @@ pub(crate) fn tail(text: &str, limit: usize) -> String {
         return text;
     }
     let tail: String = text.chars().skip(length - limit).collect();
-    // Start after the first break so the preview does not open mid-word.
-    let start = tail.find(char::is_whitespace).map_or(0, |index| index + 1);
+    // Start at the first break so the preview does not open mid-word. The break
+    // is cut at its own start rather than past it: whitespace is not always one
+    // byte (U+3000, U+00A0), and `trim_start` drops it whatever its width.
+    let start = tail.find(char::is_whitespace).unwrap_or(0);
     format!("…{}", tail[start..].trim_start())
 }
 
@@ -54,3 +56,7 @@ pub(crate) fn flatten(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" · ")
 }
+
+#[cfg(test)]
+#[path = "preview_tests.rs"]
+mod tests;

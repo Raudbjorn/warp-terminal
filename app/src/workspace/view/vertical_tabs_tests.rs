@@ -15,17 +15,17 @@ use super::{
     TerminalPrimaryLineData, TerminalPrimaryLineFont, VerticalTabsDetailTarget,
     VerticalTabsDetailTargetKind, VerticalTabsSummaryBranchEntry, VerticalTabsSummaryData,
     VerticalTabsSummaryPrimaryLabel, branch_label_display, coalesce_summary_branch_entries,
-    code_detail_kind_label, compact_branch_subtitle_display, conn_running_step, conn_story_lines,
-    detail_sidecar_width_and_bounds, detail_target_for_hovered_row, group_display_name,
-    group_name_highlight_indices, matched_group_ids, merge_group_name_matches,
-    non_terminal_search_text_fragments, pane_ids_for_display_granularity,
-    pane_search_text_fragments, preferred_agent_tab_titles, push_normalized_unique_summary_label,
-    resolve_compact_subtitle, search_fragments_contain_query, select_summary_pane_kind_icons,
-    should_keep_detail_sidecar_visible_for_mouse_position, should_show_tab_group_header,
-    shows_synced_inputs_indicator, sort_summary_primary_labels_status_first,
-    subtitle_options_for_primary, summary_overflow_count, summary_search_text_fragments,
-    tab_admitted_by_group_name, terminal_kind_badge_label, terminal_primary_line_data,
-    terminal_pull_request_badge_label, terminal_search_text_fragments,
+    code_detail_kind_label, compact_branch_subtitle_display, conn_running_step,
+    conn_session_story_lines, conn_story_lines, detail_sidecar_width_and_bounds,
+    detail_target_for_hovered_row, group_display_name, group_name_highlight_indices,
+    matched_group_ids, merge_group_name_matches, non_terminal_search_text_fragments,
+    pane_ids_for_display_granularity, pane_search_text_fragments, preferred_agent_tab_titles,
+    push_normalized_unique_summary_label, resolve_compact_subtitle, search_fragments_contain_query,
+    select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
+    should_show_tab_group_header, shows_synced_inputs_indicator,
+    sort_summary_primary_labels_status_first, subtitle_options_for_primary, summary_overflow_count,
+    summary_search_text_fragments, tab_admitted_by_group_name, terminal_kind_badge_label,
+    terminal_primary_line_data, terminal_pull_request_badge_label, terminal_search_text_fragments,
     terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
     vtab_diff_stats_text,
 };
@@ -1725,5 +1725,47 @@ fn a_long_answer_is_previewed_from_its_end() {
     assert!(
         body.starts_with('\u{2026}'),
         "a cut from the front is marked as one: {body}"
+    );
+}
+
+#[test]
+fn a_running_pane_with_a_prompt_the_story_lacks_shows_that_prompt_alone() {
+    let mut session = conn_session(conn_turn(
+        "elevate this repo",
+        &["Read README"],
+        Some("Start with A9."),
+    ));
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "now do A10".to_owned(),
+        },
+        Utc::now(),
+    ));
+
+    let lines =
+        conn_session_story_lines(&session, true).expect("a live prompt is enough to tell a story");
+
+    assert_eq!(lines.prompt, "now do A10");
+    assert_eq!(
+        lines.progress, None,
+        "the previous turn's step is not what the pane is doing now"
+    );
+}
+
+#[test]
+fn a_running_pane_whose_story_covers_its_prompt_is_told_by_the_story() {
+    let session = conn_session(conn_turn(
+        "elevate this repo",
+        &["Read README", "Check hygiene files"],
+        None,
+    ));
+
+    let lines =
+        conn_session_story_lines(&session, true).expect("a turn with a prompt tells a story");
+
+    assert_eq!(lines.prompt, "elevate this repo");
+    assert_eq!(
+        lines.progress,
+        Some(("now", "Check hygiene files".to_owned()))
     );
 }

@@ -10134,10 +10134,32 @@ impl Workspace {
             pane_group.right_panel_open = should_open;
             pane_group.is_right_panel_maximized
         });
-        if should_open {
-            self.right_panel_content = Some(RightPanelContent::CodeReview);
-        } else if self.right_panel_content == Some(RightPanelContent::CodeReview) {
-            self.right_panel_content = None;
+        // `right_panel_content` is what the active tab shows. An event from a
+        // tab in the background must not change it (that would swap the active
+        // tab's Conn panel for code review), so it only updates what the
+        // background tab's focused pane will show when it is switched to.
+        if panel_update_params.pane_group.id() == self.active_tab_pane_group().id() {
+            if should_open {
+                self.right_panel_content = Some(RightPanelContent::CodeReview);
+            } else if self.right_panel_content == Some(RightPanelContent::CodeReview) {
+                self.right_panel_content = None;
+            }
+        } else {
+            let background_pane = panel_update_params
+                .pane_group
+                .as_ref(ctx)
+                .focused_session_view(ctx)
+                .map(|terminal| terminal.id());
+            if let Some(pane) = background_pane {
+                if should_open {
+                    self.right_panel_by_pane
+                        .insert(pane, Some(RightPanelContent::CodeReview));
+                } else if self.right_panel_by_pane.get(&pane).copied()
+                    == Some(Some(RightPanelContent::CodeReview))
+                {
+                    self.right_panel_by_pane.insert(pane, None);
+                }
+            }
         }
 
         self.right_panel_view.update(ctx, |view, ctx| {
@@ -29123,6 +29145,16 @@ impl Workspace {
             pg.detach_panes_for_close(&working_directories_model, ctx);
         });
         self.pending_pane_group_transfer = false;
+        // Conn holds the active pane group weakly, and still points at the
+        // placeholder that was just dropped. Retarget it the way a tab switch
+        // does, or it reports on nothing until the next switch.
+        if self.active_tab_pane_group().id() == new_id {
+            let conn_active_pane_group = new_pane_group.clone();
+            self.conn_panel_view.update(ctx, |panel, ctx| {
+                panel.set_active_pane_group(conn_active_pane_group, ctx);
+            });
+            self.report_focus_to_conn(ctx);
+        }
         ctx.dispatch_global_action("workspace:save_app", ());
         ctx.notify();
     }
