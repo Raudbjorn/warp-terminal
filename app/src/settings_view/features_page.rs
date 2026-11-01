@@ -98,8 +98,9 @@ use crate::terminal::session_settings::{
     SessionSettingsChangedEvent, ShouldConfirmCloseSession,
 };
 use crate::terminal::settings::{
-    AsyncFindEnabled, MaximumGridSize, Osc52ClipboardAccess, Osc52ClipboardAccessSetting,
-    ShowTerminalZeroStateBlock, TerminalSettings, TerminalSettingsChangedEvent, UseAudibleBell,
+    AsyncFindEnabled, FileCaptureBlockPattern, FileCaptureOutputPattern, FileCaptureSessionPattern,
+    MaximumGridSize, Osc52ClipboardAccess, Osc52ClipboardAccessSetting, ShowTerminalZeroStateBlock,
+    TerminalSettings, TerminalSettingsChangedEvent, UseAudibleBell,
 };
 use crate::terminal::{BlockListSettings, PreserveInputFocusOnBlockSelection, SnackbarEnabled};
 use crate::undo_close::UndoCloseSettings;
@@ -831,6 +832,51 @@ pub enum FeaturesPageAction {
     TogglePreserveInputFocusOnBlockSelection,
     ToggleAgentInAppNotifications,
     MakeWarpDefaultTerminal,
+    SetFileCapturePattern(FileCapturePatternKind),
+}
+
+/// The three independently configurable file name patterns used by the
+/// "Save .../Stream ... to file..." commands.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum FileCapturePatternKind {
+    Output,
+    Block,
+    Session,
+}
+
+impl FileCapturePatternKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Output => "Output file name",
+            Self::Block => "Block file name",
+            Self::Session => "Session file name",
+        }
+    }
+
+    fn description(self) -> String {
+        match self {
+            Self::Output => format!(
+                "Used by \"Save output to file...\" and \"Stream output to file...\". \
+                 Available tokens: {FILE_CAPTURE_PATTERN_TOKENS}. Clearing the field restores the default."
+            ),
+            Self::Block => {
+                "Used by \"Save block to file...\" and \"Stream block to file...\", which also \
+                 record the command line."
+                    .to_string()
+            }
+            Self::Session => {
+                "Used by \"Save session to file...\" and \"Stream session to file...\".".to_string()
+            }
+        }
+    }
+
+    fn telemetry_name(self) -> &'static str {
+        match self {
+            Self::Output => "Output",
+            Self::Block => "Block",
+            Self::Session => "Session",
+        }
+    }
 }
 
 lazy_static! {
@@ -857,6 +903,11 @@ const NOTIFICATIONS_DOCS_URL: &str = "https://docs.warp.dev/terminal/more-featur
 const QUAKE_DROPDOWN_WIDTH: f32 = 130.;
 
 const MAX_BLOCK_SIZE_INPUT_BOX_WIDTH: f32 = 80.;
+
+const FILE_CAPTURE_PATTERN_INPUT_BOX_WIDTH: f32 = 260.;
+
+const FILE_CAPTURE_PATTERN_TOKENS: &str =
+    "{command}, {timestamp}, {finished-timestamp}, {session-or-command}";
 
 const MIN_MAX_GRID_SIZE: usize = 100;
 
@@ -1365,6 +1416,12 @@ impl FeaturesPageAction {
                 action: "ToggleAsyncFind".to_string(),
                 value: to_string(*TerminalSettings::as_ref(ctx).async_find_enabled),
             },
+            // The pattern itself can name a command or a directory, so only the
+            // kind of pattern is reported, never its value.
+            Self::SetFileCapturePattern(kind) => TelemetryEvent::FeaturesPageAction {
+                action: "SetFileCapturePattern".to_string(),
+                value: kind.telemetry_name().to_string(),
+            },
         }
     }
 }
@@ -1433,6 +1490,10 @@ pub struct FeaturesPageView {
 
     max_block_size_input_editor: ViewHandle<EditorView>,
     valid_max_block_size: bool,
+
+    file_capture_output_pattern_editor: ViewHandle<EditorView>,
+    file_capture_block_pattern_editor: ViewHandle<EditorView>,
+    file_capture_session_pattern_editor: ViewHandle<EditorView>,
 
     mouse_scroll_input_editor: ViewHandle<EditorView>,
     valid_mouse_scroll_multiplier: bool,
@@ -1973,6 +2034,7 @@ impl TypedActionView for FeaturesPageView {
                     report_if_error!(selection.word_char_allowlist.set_value_to_default(ctx));
                 });
             }
+            SetFileCapturePattern(kind) => self.set_file_capture_pattern(*kind, ctx),
             ToggleUseAudibleBell => {
                 TerminalSettings::handle(ctx).update(ctx, |terminal_settings, ctx| {
                     report_if_error!(
@@ -2371,6 +2433,27 @@ impl FeaturesPageView {
                         ctx,
                     );
                 }
+                let changed_pattern = match event {
+                    TerminalSettingsChangedEvent::FileCaptureOutputPattern { .. } => {
+                        Some(FileCapturePatternKind::Output)
+                    }
+                    TerminalSettingsChangedEvent::FileCaptureBlockPattern { .. } => {
+                        Some(FileCapturePatternKind::Block)
+                    }
+                    TerminalSettingsChangedEvent::FileCaptureSessionPattern { .. } => {
+                        Some(FileCapturePatternKind::Session)
+                    }
+                    _ => None,
+                };
+                if let Some(kind) = changed_pattern {
+                    let pattern = Self::file_capture_pattern(kind, ctx);
+                    me.file_capture_pattern_editor(kind)
+                        .update(ctx, |editor, ctx| {
+                            if editor.buffer_text(ctx) != pattern {
+                                editor.set_buffer_text(&pattern, ctx);
+                            }
+                        });
+                }
                 ctx.notify()
             },
         );
@@ -2620,6 +2703,29 @@ impl FeaturesPageView {
             me.handle_block_size_editor_event(event, ctx);
         });
 
+        let file_capture_pattern_editors = [
+            FileCapturePatternKind::Output,
+            FileCapturePatternKind::Block,
+            FileCapturePatternKind::Session,
+        ]
+        .map(|kind| {
+            let editor = ctx.add_typed_action_view(|ctx| {
+                EditorView::single_line(width_and_height_editor_options.clone(), ctx)
+            });
+            editor.update(ctx, |editor, ctx| {
+                editor.set_buffer_text(&Self::file_capture_pattern(kind, ctx), ctx);
+            });
+            ctx.subscribe_to_view(&editor, move |me, _, event, ctx| {
+                me.handle_file_capture_pattern_editor_event(kind, event, ctx);
+            });
+            editor
+        });
+        let [
+            file_capture_output_pattern_editor,
+            file_capture_block_pattern_editor,
+            file_capture_session_pattern_editor,
+        ] = file_capture_pattern_editors;
+
         let mouse_scroll_input_editor = ctx.add_typed_action_view(|ctx| {
             EditorView::single_line(width_and_height_editor_options.clone(), ctx)
         });
@@ -2733,6 +2839,10 @@ impl FeaturesPageView {
 
             max_block_size_input_editor: block_size_editor,
             valid_max_block_size: true,
+
+            file_capture_output_pattern_editor,
+            file_capture_block_pattern_editor,
+            file_capture_session_pattern_editor,
 
             word_boundary_editor,
             global_hotkey_dropdown,
@@ -2873,6 +2983,32 @@ impl FeaturesPageView {
                 .is_supported_on_current_platform()
         {
             session_widgets.push(Box::new(ConfirmCloseSharedSessionWidget::default()));
+        }
+
+        let terminal_settings = TerminalSettings::as_ref(ctx);
+        if terminal_settings
+            .file_capture_output_pattern
+            .is_supported_on_current_platform()
+        {
+            session_widgets.push(Box::new(FileCapturePatternWidget::new(
+                FileCapturePatternKind::Output,
+            )));
+        }
+        if terminal_settings
+            .file_capture_block_pattern
+            .is_supported_on_current_platform()
+        {
+            session_widgets.push(Box::new(FileCapturePatternWidget::new(
+                FileCapturePatternKind::Block,
+            )));
+        }
+        if terminal_settings
+            .file_capture_session_pattern
+            .is_supported_on_current_platform()
+        {
+            session_widgets.push(Box::new(FileCapturePatternWidget::new(
+                FileCapturePatternKind::Session,
+            )));
         }
 
         let mut keys_widgets: Vec<Box<dyn SettingsWidget<View = Self>>> = vec![];
@@ -3337,6 +3473,95 @@ impl FeaturesPageView {
                 );
             });
         }
+    }
+
+    fn file_capture_pattern(kind: FileCapturePatternKind, ctx: &AppContext) -> String {
+        let settings = TerminalSettings::as_ref(ctx);
+        match kind {
+            FileCapturePatternKind::Output => settings.file_capture_output_pattern.value(),
+            FileCapturePatternKind::Block => settings.file_capture_block_pattern.value(),
+            FileCapturePatternKind::Session => settings.file_capture_session_pattern.value(),
+        }
+        .clone()
+    }
+
+    fn file_capture_pattern_default(kind: FileCapturePatternKind) -> String {
+        match kind {
+            FileCapturePatternKind::Output => FileCaptureOutputPattern::default_value(),
+            FileCapturePatternKind::Block => FileCaptureBlockPattern::default_value(),
+            FileCapturePatternKind::Session => FileCaptureSessionPattern::default_value(),
+        }
+    }
+
+    fn file_capture_pattern_editor(&self, kind: FileCapturePatternKind) -> &ViewHandle<EditorView> {
+        match kind {
+            FileCapturePatternKind::Output => &self.file_capture_output_pattern_editor,
+            FileCapturePatternKind::Block => &self.file_capture_block_pattern_editor,
+            FileCapturePatternKind::Session => &self.file_capture_session_pattern_editor,
+        }
+    }
+
+    fn handle_file_capture_pattern_editor_event(
+        &mut self,
+        kind: FileCapturePatternKind,
+        event: &EditorEvent,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        match event {
+            EditorEvent::Enter | EditorEvent::Blurred => self.set_file_capture_pattern(kind, ctx),
+            EditorEvent::Escape => ctx.emit(FeaturesSettingsPageEvent::FocusModal),
+            _ => {}
+        }
+    }
+
+    fn set_file_capture_pattern(
+        &mut self,
+        kind: FileCapturePatternKind,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let editor = self.file_capture_pattern_editor(kind).clone();
+        let buffer_text = editor.read(ctx, |editor, ctx| editor.buffer_text(ctx));
+        // An empty pattern would expand to an empty file name, so treat clearing
+        // the field as a request for the default rather than as a value.
+        let new_pattern = match buffer_text.trim() {
+            "" => Self::file_capture_pattern_default(kind),
+            trimmed => trimmed.to_string(),
+        };
+
+        if new_pattern != buffer_text {
+            editor.update(ctx, |editor, ctx| {
+                editor.set_buffer_text(&new_pattern, ctx);
+            });
+        }
+
+        if Self::file_capture_pattern(kind, ctx) == new_pattern {
+            return;
+        }
+
+        // Each setting is its own type, so the three cases cannot share a binding.
+        TerminalSettings::handle(ctx).update(ctx, |settings, ctx| match kind {
+            FileCapturePatternKind::Output => {
+                report_if_error!(
+                    settings
+                        .file_capture_output_pattern
+                        .set_value(new_pattern, ctx)
+                );
+            }
+            FileCapturePatternKind::Block => {
+                report_if_error!(
+                    settings
+                        .file_capture_block_pattern
+                        .set_value(new_pattern, ctx)
+                );
+            }
+            FileCapturePatternKind::Session => {
+                report_if_error!(
+                    settings
+                        .file_capture_session_pattern
+                        .set_value(new_pattern, ctx)
+                );
+            }
+        });
     }
 
     fn handle_mouse_scroll_input_editor_event(
@@ -5150,6 +5375,83 @@ impl SettingsWidget for BlockLimitWidget {
             appearance,
             input_field,
             Some(block_maximum_rows_description()),
+        )
+    }
+}
+
+/// One row per file name pattern used by the "Save .../Stream ... to file..."
+/// commands.
+struct FileCapturePatternWidget {
+    kind: FileCapturePatternKind,
+}
+
+impl FileCapturePatternWidget {
+    fn new(kind: FileCapturePatternKind) -> Self {
+        Self { kind }
+    }
+}
+
+impl SettingsWidget for FileCapturePatternWidget {
+    type View = FeaturesPageView;
+
+    fn search_terms(&self) -> &str {
+        "save stream output block session file name pattern capture log"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let (storage_key, sync_to_cloud) = match self.kind {
+            FileCapturePatternKind::Output => (
+                FileCaptureOutputPattern::storage_key(),
+                FileCaptureOutputPattern::sync_to_cloud(),
+            ),
+            FileCapturePatternKind::Block => (
+                FileCaptureBlockPattern::storage_key(),
+                FileCaptureBlockPattern::sync_to_cloud(),
+            ),
+            FileCapturePatternKind::Session => (
+                FileCaptureSessionPattern::storage_key(),
+                FileCaptureSessionPattern::sync_to_cloud(),
+            ),
+        };
+
+        let input_field = appearance
+            .ui_builder()
+            .text_input(view.file_capture_pattern_editor(self.kind).clone())
+            .with_style(UiComponentStyles {
+                width: Some(FILE_CAPTURE_PATTERN_INPUT_BOX_WIDTH),
+                padding: Some(Coords {
+                    top: 4.,
+                    bottom: 4.,
+                    left: 6.,
+                    right: 6.,
+                }),
+                background: Some(appearance.theme().surface_2().into()),
+                ..Default::default()
+            })
+            .build()
+            .finish();
+
+        render_body_item::<FeaturesPageAction>(
+            self.kind.label().into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                storage_key,
+                sync_to_cloud,
+                &mut view
+                    .button_mouse_states
+                    .local_only_icon_tooltip_states
+                    .borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            input_field,
+            Some(self.kind.description()),
         )
     }
 }

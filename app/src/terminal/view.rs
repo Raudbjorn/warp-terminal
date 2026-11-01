@@ -418,6 +418,7 @@ use crate::terminal::event::{
     AfterBlockCompletedEvent, BlockType, BootstrappedEvent, RemoteServerSetupState, TerminalMode,
     UserBlockCompleted,
 };
+use crate::terminal::file_capture::{self, CaptureRequest, CaptureScope};
 use crate::terminal::find::{BlockGridMatch, BlockListMatch, TerminalFindModel};
 use crate::terminal::general_settings::GeneralSettings;
 use crate::terminal::grid_size_util::grid_cell_dimensions;
@@ -471,7 +472,6 @@ use crate::terminal::session_settings::{
     SessionSettings, SessionSettingsChangedEvent, ToolbarChipSelection,
 };
 use crate::terminal::settings::{TerminalSettings, TerminalSettingsChangedEvent};
-use crate::terminal::shared_session::manager::Manager;
 use crate::terminal::shared_session::role_change_modal::{
     RoleChangeCloseSource, RoleChangeOpenSource,
 };
@@ -548,7 +548,7 @@ use crate::util::repo_detection::{RepoDetectionSessionType, detect_possible_git_
 use crate::util::truncation::truncate_from_end;
 use crate::view_components::action_button::{ActionButton, ButtonSize, KeystrokeSource};
 use crate::view_components::find::{Event as FindEvent, Find, FindDirection, FindWithinBlockState};
-use crate::view_components::{DismissibleToast, ToastFlavor};
+use crate::view_components::{DismissibleToast, ToastFlavor, ToastLink};
 use crate::workflows::WorkflowSelectionSource;
 use crate::workflows::workflow::Workflow;
 use crate::workspace::sync_inputs::SyncedInputState;
@@ -1400,6 +1400,18 @@ pub enum ContextMenuAction {
     OpenShareBlockModal {
         block_index: BlockIndex,
     },
+    /// Write the selected block(s) output to a file and close it.
+    SaveOutputToFile,
+    /// Write the selected block(s) output to a file and keep appending while the
+    /// command runs. Falls back to [`Self::SaveOutputToFile`] once it has ended.
+    StreamOutputToFile,
+    /// As above, but including each block's command line.
+    SaveBlockToFile,
+    StreamBlockToFile,
+    /// Write every block in the session, including whatever the running command
+    /// has produced so far.
+    SaveSessionToFile,
+    StreamSessionToFile,
     FindWithinBlock,
     ToggleBookmark,
     ScrollToBottomOfBlock,
@@ -1535,6 +1547,12 @@ impl fmt::Debug for ContextMenuAction {
             OpenShareBlockModal { block_index } => {
                 write!(f, "OpenShareModal {{ block_index: {block_index} }}")
             }
+            SaveOutputToFile => f.write_str("SaveOutputToFile"),
+            StreamOutputToFile => f.write_str("StreamOutputToFile"),
+            SaveBlockToFile => f.write_str("SaveBlockToFile"),
+            StreamBlockToFile => f.write_str("StreamBlockToFile"),
+            SaveSessionToFile => f.write_str("SaveSessionToFile"),
+            StreamSessionToFile => f.write_str("StreamSessionToFile"),
             FindWithinBlock => f.write_str("FindWithinBlock"),
             ScrollToBottomOfBlock => f.write_str("ScrollToBottomOfBlock"),
             ScrollToTopOfBlock => f.write_str("ScrollToTopOfBlock"),
@@ -2518,6 +2536,15 @@ struct LocalSessionCanonicalPwdCache {
     canonical: CanonicalizedPath,
 }
 
+#[cfg(feature = "local_fs")]
+struct ActiveFileCapture {
+    request: CaptureRequest,
+    block_id: BlockId,
+    // Session tails include transient background blocks after the last finalized command.
+    session_prefix_block_id: Option<BlockId>,
+    stream: file_capture::FileStream,
+}
+
 pub struct TerminalView {
     pub model: Arc<FairMutex<TerminalModel>>,
     view_handle: WeakViewHandle<Self>,
@@ -2987,6 +3014,17 @@ pub struct TerminalView {
 
     /// Per-session PTY recorder for writing PTY bytes to a file.
     pty_recorder: ModelHandle<PtyRecorder>,
+    /// Tab name for the capture currently being started, handed down from the
+    /// tab menu. `None` for captures started from the block context menu.
+    pending_capture_session_name: Option<String>,
+    /// Open `Stream … to file...` capture following one block. Closed when that
+    /// block finishes.
+    #[cfg(feature = "local_fs")]
+    block_capture_stream: Option<ActiveFileCapture>,
+    /// Open `Stream session to file...` capture. Follows the active block and
+    /// crosses block boundaries; lives until the session ends.
+    #[cfg(feature = "local_fs")]
+    session_capture_stream: Option<ActiveFileCapture>,
 
     /// When viewer-driven sizing is active on the sharer, this stores the
     /// viewer's last reported (rows, cols).
@@ -4544,6 +4582,11 @@ impl TerminalView {
             pending_cloud_mode_start_callback: None,
             pending_cloud_mode_start_abort_handle: None,
             ephemeral_message_model,
+            pending_capture_session_name: None,
+            #[cfg(feature = "local_fs")]
+            block_capture_stream: None,
+            #[cfg(feature = "local_fs")]
+            session_capture_stream: None,
             pty_recorder: ctx
                 .add_model(|ctx| PtyRecorder::new(inactive_pty_reads_rx, window_id, ctx)),
             active_viewer_driven_size: None,
@@ -10238,6 +10281,11 @@ impl TerminalView {
     /// This function is invoked every time there is some form of view event
     /// such as a state change or terminal wakeup to update the view context.
     fn handle_terminal_wakeup(&mut self, _: (), ctx: &mut ViewContext<Self>) {
+        // Wakeup is the only "output may have changed" tick available, so open
+        // file captures re-render and diff here. See `file_capture`.
+        #[cfg(feature = "local_fs")]
+        self.pump_file_captures(ctx);
+
         // If find bar is active, we update the matches for the last/active block or the alt screen.
         if self.find_model.as_ref(ctx).is_find_bar_open() {
             self.find_model.update(ctx, |find_model, ctx| {
@@ -12639,6 +12687,12 @@ impl TerminalView {
                 }
             }
             ModelEvent::Exit { reason } => {
+                #[cfg(feature = "local_fs")]
+                {
+                    self.pump_file_captures(ctx);
+                    self.block_capture_stream = None;
+                    self.session_capture_stream = None;
+                }
                 if !self.manual_pty_shutdown_requested
                     && let Some((conversation_id, command)) =
                         self.maybe_send_agent_exited_shell_telemetry(ctx)
@@ -12688,6 +12742,8 @@ impl TerminalView {
                 }
             }
             ModelEvent::BlockCompleted(block_completed_event) => {
+                #[cfg(feature = "local_fs")]
+                self.on_block_completed_for_captures(block_completed_event.block_id, ctx);
                 record_trace_event!("command_execution:block_completed");
                 end_trace_after_next!("window:redraw:end");
                 let block_completed_event_clone = block_completed_event.clone();
@@ -17931,13 +17987,6 @@ impl TerminalView {
                 };
 
                 let is_single_selection = self.selected_blocks.is_singleton();
-                let is_active_block_selected = self
-                    .selected_blocks
-                    .is_selected(model.block_list().active_block_index());
-                let is_active_block_running = model
-                    .block_list()
-                    .active_block()
-                    .is_active_and_long_running();
 
                 let copy_commands_str = if is_single_selection {
                     "Copy command"
@@ -17961,10 +18010,6 @@ impl TerminalView {
                     "Scroll to bottom of blocks"
                 };
 
-                // currently, we don't support share for multi selections
-                let is_share_disabled =
-                    !is_single_selection || (is_active_block_selected && is_active_block_running);
-
                 let is_ask_ai_disabled = !is_single_selection;
 
                 let is_copy_commands_disabled =
@@ -17972,13 +18017,39 @@ impl TerminalView {
                 let is_copy_both_disabled =
                     is_copy_commands_disabled && tail_block.output_to_string().trim().is_empty();
 
-                let share_block_label = if FeatureFlag::CreatingSharedSessions.is_enabled()
-                    && ContextFlag::CreateSharedSession.is_enabled()
-                {
-                    "Share block..."
-                } else {
-                    "Share..."
-                };
+                let (save_output_label, stream_output_label, save_block_label, stream_block_label) =
+                    if is_single_selection {
+                        (
+                            "Save output to file...",
+                            "Stream output to file...",
+                            "Save block to file...",
+                            "Stream block to file...",
+                        )
+                    } else {
+                        (
+                            "Save outputs to file...",
+                            "Stream outputs to file...",
+                            "Save blocks to file...",
+                            "Stream blocks to file...",
+                        )
+                    };
+
+                // Any target block still running enables the streaming items.
+                let sort_direction = InputModeSettings::as_ref(ctx)
+                    .input_mode
+                    .value()
+                    .block_sort_direction();
+                let has_running_target = self
+                    .selected_blocks
+                    .sorted_ranges(sort_direction)
+                    .into_iter()
+                    .flat_map(|range| range.range(None))
+                    .any(|index| {
+                        model
+                            .block_list()
+                            .block_at(index)
+                            .is_some_and(|block| block.is_executing())
+                    });
 
                 // Only right-click sources offer general terminal actions like "Paste";
                 // the overflow-button and keybinding menus are scoped to the selected block(s).
@@ -18056,39 +18127,72 @@ impl TerminalView {
                     items.push(self.paste_menu_item(ctx));
                 }
 
-                items.push(MenuItem::Separator);
-                items.push(
-                    MenuItemFields::new(share_block_label)
-                        .with_on_select_action(TerminalAction::ContextMenu(
-                            ContextMenuAction::OpenShareBlockModal {
-                                block_index: tail_block_index,
-                            },
-                        ))
-                        .with_key_shortcut_label(keybinding_name_to_display_string(
-                            "terminal:open_share_block_modal",
-                            ctx,
-                        ))
-                        .with_disabled(is_share_disabled)
-                        .into_item(),
-                );
+                if cfg!(feature = "local_fs") {
+                    items.push(MenuItem::Separator);
+                    items.push(
+                        MenuItemFields::new(save_output_label)
+                            .with_on_select_action(TerminalAction::ContextMenu(
+                                ContextMenuAction::SaveOutputToFile,
+                            ))
+                            .with_key_shortcut_label(keybinding_name_to_display_string(
+                                "terminal:save_output_to_file",
+                                ctx,
+                            ))
+                            .with_disabled(is_copy_both_disabled)
+                            .into_item(),
+                    );
 
-                if FeatureFlag::CreatingSharedSessions.is_enabled()
-                    && ContextFlag::CreateSharedSession.is_enabled()
-                {
-                    // Sharing a session from a context menu is disabled for multi block selections, restored blocks, and viewers.
-                    let is_share_session_disabled = !is_single_selection
-                        || model
-                            .block_list()
-                            .block_at(tail_block_index)
-                            .is_none_or(|b| b.is_restored());
+                    // Streaming only makes sense while something is still producing
+                    // output, so these appear only then.
+                    if has_running_target {
+                        items.push(
+                            MenuItemFields::new(stream_output_label)
+                                .with_on_select_action(TerminalAction::ContextMenu(
+                                    ContextMenuAction::StreamOutputToFile,
+                                ))
+                                .with_key_shortcut_label(keybinding_name_to_display_string(
+                                    "terminal:stream_output_to_file",
+                                    ctx,
+                                ))
+                                .into_item(),
+                        );
+                    }
 
-                    let has_session_link = Manager::as_ref(ctx)
-                        .has_session_link(&ctx.view_id(), model.shared_session_status());
-                    items.extend(self.session_sharing_context_menu_items(
-                        &model,
-                        is_share_session_disabled,
-                        has_session_link,
-                    ));
+                    items.push(
+                        MenuItemFields::new(save_block_label)
+                            .with_on_select_action(TerminalAction::ContextMenu(
+                                ContextMenuAction::SaveBlockToFile,
+                            ))
+                            .with_disabled(is_copy_both_disabled)
+                            .into_item(),
+                    );
+                    if has_running_target {
+                        items.push(
+                            MenuItemFields::new(stream_block_label)
+                                .with_on_select_action(TerminalAction::ContextMenu(
+                                    ContextMenuAction::StreamBlockToFile,
+                                ))
+                                .into_item(),
+                        );
+                    }
+
+                    // Session scope is meaningless against a multi-selection.
+                    if is_single_selection {
+                        items.push(
+                            MenuItemFields::new("Save session to file...")
+                                .with_on_select_action(TerminalAction::ContextMenu(
+                                    ContextMenuAction::SaveSessionToFile,
+                                ))
+                                .into_item(),
+                        );
+                        items.push(
+                            MenuItemFields::new("Stream session to file...")
+                                .with_on_select_action(TerminalAction::ContextMenu(
+                                    ContextMenuAction::StreamSessionToFile,
+                                ))
+                                .into_item(),
+                        );
+                    }
                 }
 
                 if WarpDriveSettings::is_warp_drive_enabled(ctx) {
@@ -18252,20 +18356,13 @@ impl TerminalView {
                 None,
                 true,
             ) => {
-                // If selection is empty, only show non-block related options
+                // If selection is empty, only show non-block related options.
                 let mut items = Vec::new();
 
-                if FeatureFlag::CreatingSharedSessions.is_enabled()
-                    && ContextFlag::CreateSharedSession.is_enabled()
-                {
-                    let has_session_link = Manager::as_ref(ctx)
-                        .has_session_link(&ctx.view_id(), model.shared_session_status());
-                    items.extend(self.session_sharing_context_menu_items(
-                        &model,
-                        false,
-                        has_session_link,
-                    ));
-                }
+                // Session capture is the one thing that still makes sense with
+                // nothing selected -- including on a brand-new session, where
+                // streaming can be armed before the first command is even run.
+                items.extend(self.session_capture_context_menu_items(&model));
 
                 items
             }
@@ -18745,13 +18842,7 @@ impl TerminalView {
                 .into_item(),
         );
 
-        if FeatureFlag::CreatingSharedSessions.is_enabled()
-            && ContextFlag::CreateSharedSession.is_enabled()
-        {
-            let has_session_link = Manager::as_ref(ctx)
-                .has_session_link(&ctx.view_id(), model.shared_session_status());
-            items.extend(self.session_sharing_context_menu_items(&model, false, has_session_link));
-        }
+        items.extend(self.session_capture_context_menu_items(&model));
 
         // Section 2: AI Command Search, Ask Warp AI
         items.extend([
@@ -18988,17 +19079,8 @@ impl TerminalView {
             }
         }
 
-        if FeatureFlag::CreatingSharedSessions.is_enabled()
-            && ContextFlag::CreateSharedSession.is_enabled()
-        {
-            let has_session_link = Manager::as_ref(ctx)
-                .has_session_link(&ctx.view_id(), model.shared_session_status());
-            menu_items.extend(self.session_sharing_context_menu_items(
-                &model,
-                false,
-                has_session_link,
-            ));
-        }
+        menu_items.extend(self.session_capture_context_menu_items(&model));
+
         let current_shell = model.shell_launch_state().available_shell();
         let mut pane_context_menu_items = self.pane_context_menu_items(current_shell, ctx);
         if !menu_items.is_empty() && !pane_context_menu_items.is_empty() {
@@ -20201,6 +20283,18 @@ impl TerminalView {
         // current state.
         self.redetermine_global_focus(ctx);
 
+        #[cfg(feature = "local_fs")]
+        {
+            self.pump_file_captures(ctx);
+            if self.block_capture_stream.take().is_some()
+                | self.session_capture_stream.take().is_some()
+            {
+                self.show_error_toast(
+                    "File capture stopped because command history was cleared.".to_string(),
+                    ctx,
+                );
+            }
+        }
         self.model.lock().clear_screen(ClearMode::ResetAndClear);
         self.find_model.update(ctx, |find_model, ctx| {
             find_model.clear_matches(ctx);
@@ -22454,41 +22548,13 @@ impl TerminalView {
         block_index: BlockIndex,
         ctx: &mut ViewContext<Self>,
     ) {
-        if AuthStateProvider::as_ref(ctx)
-            .get()
-            .is_anonymous_or_logged_out()
-        {
-            AuthManager::handle(ctx).update(ctx, |auth_manager, ctx| {
-                auth_manager.attempt_login_gated_feature(
-                    "Share Block",
-                    AuthViewVariant::ShareRequirementCloseable,
-                    ctx,
-                )
-            });
-            return;
-        }
-
-        send_telemetry_from_ctx!(
-            TelemetryEvent::ContextMenuOpenShareModal(self.selected_blocks.cardinality()),
-            ctx
-        );
-        self.tips_completed.update(ctx, |tips, ctx| {
-            mark_feature_used_and_write_to_user_defaults(
-                Tip::Hint(TipHint::BlockAction),
-                tips,
-                ctx,
-            );
-            ctx.notify();
-        });
-        ctx.emit(Event::ShareModalOpened(block_index));
-        self.close_context_menu(ctx, true);
-        ctx.notify();
+        self.selected_blocks = SelectedBlocks::default();
+        self.selected_blocks.toggle(block_index, None, None);
+        self.capture_to_file(CaptureRequest::block_full(false), ctx);
     }
 
     fn open_share_block_modal(&mut self, ctx: &mut ViewContext<Self>) {
-        if let Some(selected_index) = self.selected_blocks.tail() {
-            self.context_menu_open_share_block_modal(selected_index, ctx);
-        }
+        self.capture_to_file(CaptureRequest::block_full(false), ctx);
     }
 
     fn context_menu_copy_blocks(&mut self, ctx: &mut ViewContext<Self>) {
@@ -22547,6 +22613,497 @@ impl TerminalView {
                 {
                     action(block);
                 }
+            }
+        }
+    }
+
+    /// Freeze block targets before the picker opens; commands may finish while it is open.
+    fn capture_block_ids(&self, ctx: &AppContext) -> Vec<BlockId> {
+        if self.selected_blocks.is_empty() {
+            let model = self.model.lock();
+            return model
+                .block_list()
+                .blocks()
+                .iter()
+                .rev()
+                .find(|block| {
+                    !block.is_empty(model.block_list().transcript_scope())
+                        && !Self::capture_block_text(block, CaptureRequest::block_full(false))
+                            .is_empty()
+                })
+                .map(|block| vec![*block.id()])
+                .unwrap_or_default();
+        }
+        let direction = InputModeSettings::as_ref(ctx)
+            .input_mode
+            .value()
+            .block_sort_direction();
+        let mut indices: Vec<_> = self
+            .selected_blocks
+            .sorted_ranges(direction)
+            .into_iter()
+            .flat_map(|range| range.range(None))
+            .collect();
+        indices.sort_unstable();
+        let model = self.model.lock();
+        indices
+            .into_iter()
+            .filter_map(|index| model.block_list().block_at(index).map(|block| *block.id()))
+            .collect()
+    }
+
+    /// Shared handler for all six `Save …/Stream … to file...` commands.
+    ///
+    /// Builds the text, suggests a filename from the scope's pattern, and hands
+    /// off to the native save dialog. A streaming request that finds nothing
+    /// running — including a command that ended while the dialog was open —
+    /// simply writes and closes rather than erroring.
+    #[cfg(feature = "local_fs")]
+    fn capture_to_file(&mut self, request: CaptureRequest, ctx: &mut ViewContext<Self>) {
+        use warpui::platform::SaveFilePickerConfiguration;
+
+        let indices = self.capture_block_ids(ctx);
+        let filename = self.capture_filename(request, ctx);
+        let mut config = SaveFilePickerConfiguration::new().with_default_filename(filename);
+        if let Some(pwd) = self.pwd() {
+            config = config.with_default_directory(PathBuf::from(pwd));
+        }
+
+        // Deliberately nothing is captured here. The dialog can stay open for
+        // seconds while the command keeps producing output, so both the initial
+        // contents and the tail are taken together in the callback below. Taking
+        // the contents now and the tail later silently dropped everything
+        // emitted in between: the tail claimed that text was already written, so
+        // the first update found no delta and it never reached the file.
+        ctx.open_save_file_picker(
+            move |path_opt: Option<String>, me: &mut Self, ctx: &mut ViewContext<Self>| {
+                let Some(path) = path_opt else {
+                    return;
+                };
+                me.finish_capture(PathBuf::from(path), request, &indices, ctx);
+            },
+            config,
+        );
+    }
+
+    #[cfg(not(feature = "local_fs"))]
+    fn capture_to_file(&mut self, _request: CaptureRequest, _ctx: &mut ViewContext<Self>) {}
+
+    /// Session capture items for any context menu that used to offer
+    /// "Share session...".
+    ///
+    /// Three menus reach this -- the empty block list, the input area, and the
+    /// selected-text menu -- and they previously each inlined their own call to
+    /// `session_sharing_context_menu_items`. Sharing one builder keeps them from
+    /// drifting apart as this fork evolves.
+    ///
+    /// Saving needs something to save; streaming can always be armed, including
+    /// on a session that has not run anything yet.
+    fn session_capture_context_menu_items(
+        &self,
+        model: &TerminalModel,
+    ) -> Vec<MenuItem<TerminalAction>> {
+        if !cfg!(feature = "local_fs") {
+            return Vec::new();
+        }
+        let mut items = Vec::new();
+        if Self::session_has_content(model) {
+            items.push(
+                MenuItemFields::new("Save session to file...")
+                    .with_on_select_action(TerminalAction::ContextMenu(
+                        ContextMenuAction::SaveSessionToFile,
+                    ))
+                    .into_item(),
+            );
+        }
+        items.push(
+            MenuItemFields::new("Stream session to file...")
+                .with_on_select_action(TerminalAction::ContextMenu(
+                    ContextMenuAction::StreamSessionToFile,
+                ))
+                .into_item(),
+        );
+        items
+    }
+
+    /// Public wrapper over [`Self::session_has_content`] for the tab menu, which
+    /// only has a `ViewHandle<TerminalView>` and cannot lock the model itself.
+    pub fn session_has_captured_content(&self) -> bool {
+        Self::session_has_content(&self.model.lock())
+    }
+
+    /// Whether the session has produced anything worth saving.
+    ///
+    /// A new session still holds the bootstrap block, so a bare `blocks()`
+    /// emptiness check would wrongly report content.
+    fn session_has_content(model: &TerminalModel) -> bool {
+        model.block_list().blocks().iter().any(|block| {
+            (block.bootstrap_stage().is_done() || block.is_restored())
+                && !Self::capture_block_text(block, CaptureRequest::session(false)).is_empty()
+        })
+    }
+
+    /// Whether a block's command is worth naming a file after.
+    ///
+    /// Block 0 of every session is Warp's own shell bootstrap -- a dot-source of
+    /// `pwsh.ps1` -- which produced suggested names like
+    /// `PS_._C_..._build_portable_pwsh.ps1_...`. `BootstrapStage::is_done()` is
+    /// true only for `PostBootstrapPrecmd`, so it rejects that block along with
+    /// the `.rc`/`$PROFILE` execution blocks.
+    ///
+    /// Mirrors the filter in `TerminalView::last_completed_command_text`
+    /// (`view/tab_metadata.rs`), minus its `finished()` requirement: a session
+    /// can be named after a command that is still running.
+    fn is_nameable_command(block: &Block) -> bool {
+        if block.is_background() || block.is_static() {
+            return false;
+        }
+        if !(block.bootstrap_stage().is_done() || block.is_restored()) {
+            return false;
+        }
+        let command = block.command_to_string();
+        let command = command.trim();
+        !command.is_empty() && !command.starts_with("cd ")
+    }
+
+    /// Expands the pattern configured for this scope into a suggested filename.
+    fn capture_filename(&mut self, request: CaptureRequest, ctx: &mut ViewContext<Self>) -> String {
+        let settings = TerminalSettings::as_ref(ctx);
+        let pattern = match request.scope {
+            CaptureScope::BlockOutput => settings.file_capture_output_pattern.value().clone(),
+            CaptureScope::BlockFull => settings.file_capture_block_pattern.value().clone(),
+            CaptureScope::Session => settings.file_capture_session_pattern.value().clone(),
+        };
+
+        let indices = self.capture_block_ids(ctx);
+        let model = self.model.lock();
+        let block_list = model.block_list();
+
+        // `{command}` uses the first target block, `{finished-timestamp}` the
+        // last, so a multi-selection spans from its first command to its last
+        // completion.
+        let (first, last) = if request.is_session() {
+            let blocks = block_list.blocks();
+            (
+                blocks
+                    .iter()
+                    .find(|b| Self::is_nameable_command(b))
+                    .or_else(|| blocks.first()),
+                blocks.last(),
+            )
+        } else {
+            (
+                indices.first().and_then(|id| block_list.block_with_id(id)),
+                indices.last().and_then(|id| block_list.block_with_id(id)),
+            )
+        };
+
+        let tokens = file_capture::PatternTokens {
+            command: first.map(|b| b.command_to_string()),
+            finished: last.and_then(|b| b.completed_ts().copied()),
+            session_name: request
+                .is_session()
+                .then(|| self.pending_capture_session_name.take())
+                .flatten(),
+        };
+        drop(model);
+
+        file_capture::expand_pattern(&pattern, &tokens)
+    }
+
+    /// Brings any open capture up to date with the block it is following.
+    #[cfg(feature = "local_fs")]
+    fn pump_file_captures(&mut self, ctx: &mut ViewContext<Self>) {
+        for is_session in [false, true] {
+            let Some(capture) = self.capture_stream(is_session) else {
+                continue;
+            };
+            let rendered = {
+                let model = self.model.lock();
+                let blocks = model.block_list();
+                if is_session {
+                    Self::capture_session_tail_start(blocks, capture.session_prefix_block_id).map(
+                        |start| {
+                            Self::capture_blocks_text(&blocks.blocks()[start..], capture.request)
+                        },
+                    )
+                } else {
+                    blocks
+                        .block_with_id(&capture.block_id)
+                        .map(|block| Self::capture_block_text(block, capture.request))
+                }
+            };
+            let Some(rendered) = rendered else {
+                *self.capture_stream_slot(is_session) = None;
+                self.show_error_toast(
+                    "File capture stopped because its command history was cleared.".to_string(),
+                    ctx,
+                );
+                continue;
+            };
+            if let Some(capture) = self.capture_stream_slot(is_session).as_mut()
+                && let Err(err) = capture.stream.update_tail(&rendered)
+            {
+                report_error!(anyhow::Error::new(err).context("Failed to append to capture file"));
+                *self.capture_stream_slot(is_session) = None;
+                self.show_error_toast("Could not continue saving command output.".to_string(), ctx);
+            }
+        }
+    }
+
+    /// Closes a completed block capture and advances a session capture by stable block identity.
+    #[cfg(feature = "local_fs")]
+    fn on_block_completed_for_captures(
+        &mut self,
+        completed_id: BlockId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        for is_session in [false, true] {
+            let Some(capture) = self.capture_stream(is_session) else {
+                continue;
+            };
+            let completed = {
+                let model = self.model.lock();
+                let blocks = model.block_list();
+                blocks.block_with_id(&completed_id).and_then(|block| {
+                    if is_session {
+                        let start = Self::capture_session_tail_start(
+                            blocks,
+                            capture.session_prefix_block_id,
+                        )?;
+                        let end = usize::from(block.index());
+                        // Background output can later become the command grid during typeahead repair.
+                        if block.is_background() || end < start {
+                            return None;
+                        }
+                        Some((
+                            Self::capture_blocks_text(
+                                &blocks.blocks()[start..=end],
+                                capture.request,
+                            ),
+                            Some((completed_id, end + 1)),
+                        ))
+                    } else if *block.id() == capture.block_id {
+                        Some((Self::capture_block_text(block, capture.request), None))
+                    } else {
+                        None
+                    }
+                })
+            };
+            let Some((rendered, next)) = completed else {
+                continue;
+            };
+            let mut capture = self.capture_stream_slot(is_session).take().unwrap();
+            let result = if is_session {
+                if let Some((id, index)) = next {
+                    capture.session_prefix_block_id = Some(id);
+                    capture
+                        .stream
+                        .advance_to(&rendered, index, file_capture::BLOCK_SEPARATOR)
+                } else {
+                    capture.stream.update_tail(&rendered)
+                }
+            } else {
+                capture.stream.update_tail(&rendered)
+            };
+            if let Err(err) = result {
+                report_error!(
+                    anyhow::Error::new(err).context("Failed to finish command output capture")
+                );
+                self.show_error_toast("Could not finish saving command output.".to_string(), ctx);
+            } else if is_session && next.is_some() {
+                self.session_capture_stream = Some(capture);
+            }
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn capture_stream(&self, is_session: bool) -> Option<&ActiveFileCapture> {
+        if is_session {
+            self.session_capture_stream.as_ref()
+        } else {
+            self.block_capture_stream.as_ref()
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn capture_stream_slot(&mut self, is_session: bool) -> &mut Option<ActiveFileCapture> {
+        if is_session {
+            &mut self.session_capture_stream
+        } else {
+            &mut self.block_capture_stream
+        }
+    }
+
+    fn capture_session_tail_start(blocks: &BlockList, prefix: Option<BlockId>) -> Option<usize> {
+        match prefix {
+            Some(id) => blocks
+                .block_index_for_id(&id)
+                .map(|index| usize::from(index) + 1),
+            None => Some(0),
+        }
+    }
+
+    fn capture_blocks_text(blocks: &[Block], request: CaptureRequest) -> String {
+        blocks
+            .iter()
+            .map(|block| Self::capture_block_text(block, request))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(file_capture::BLOCK_SEPARATOR)
+    }
+
+    /// A single block rendered the way this request writes it.
+    fn capture_block_text(block: &Block, request: CaptureRequest) -> String {
+        // An idle prompt is not command output, even if it already has a cwd prompt.
+        if block.command_to_string().trim().is_empty()
+            && block.output_with_secrets_unobfuscated().trim().is_empty()
+        {
+            return String::new();
+        }
+        match request.scope {
+            CaptureScope::BlockOutput => block.output_with_secrets_unobfuscated(),
+            CaptureScope::BlockFull | CaptureScope::Session => {
+                block.command_and_output_with_secrets_unobfuscated()
+            }
+        }
+    }
+
+    /// Entry point for the tab right-click menu.
+    ///
+    /// `TerminalView` cannot reach its own `PaneGroup`, so the tab name is
+    /// passed down from the workspace layer rather than looked up here.
+    pub fn capture_session_to_file(
+        &mut self,
+        session_name: Option<String>,
+        keep_open: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.pending_capture_session_name = session_name;
+        self.capture_to_file(CaptureRequest::session(keep_open), ctx);
+    }
+
+    /// Confirmation toast with an "Open" link, mirroring [`PtyRecorder`].
+    #[cfg(feature = "local_fs")]
+    fn show_capture_toast(&self, path: &Path, ctx: &mut ViewContext<Self>) {
+        let display_path = warp_core::paths::home_relative_path(path);
+        let window_id = ctx.window_id();
+        let path = path.to_owned();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            let toast = DismissibleToast::default(format!("Saved to {display_path}")).with_link(
+                ToastLink::new("Open".to_string())
+                    .with_onclick_action(WorkspaceAction::OpenInExplorer { path }),
+            );
+            toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+        });
+    }
+
+    /// Writes the capture, keeping the handle open for a streaming request whose
+    /// target is still running.
+    #[cfg(feature = "local_fs")]
+    fn finish_capture(
+        &mut self,
+        path: PathBuf,
+        request: CaptureRequest,
+        indices: &[BlockId],
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.pump_file_captures(ctx);
+        // Snapshot contents and the tail under the same lock, in chronological order.
+        let (contents, tail, session_prefix_block_id) = {
+            let model = self.model.lock();
+            let blocks = model.block_list();
+            let targets: Vec<_> = if request.is_session() {
+                blocks.blocks().iter().collect()
+            } else {
+                indices
+                    .iter()
+                    .filter_map(|id| blocks.block_with_id(id))
+                    .collect()
+            };
+            if !request.is_session() && (targets.is_empty() || targets.len() != indices.len()) {
+                drop(model);
+                self.show_error_toast(
+                    "The selected command history is no longer available.".to_string(),
+                    ctx,
+                );
+                return;
+            }
+            let tail_block = request
+                .keep_open
+                .then(|| {
+                    if request.is_session() {
+                        Some(blocks.active_block())
+                    } else {
+                        targets.last().copied().filter(|block| block.is_executing())
+                    }
+                })
+                .flatten();
+            let mut contents = targets
+                .iter()
+                .map(|block| Self::capture_block_text(block, request))
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join(file_capture::BLOCK_SEPARATOR);
+            let session_prefix_block_id = request
+                .is_session()
+                .then(|| {
+                    blocks
+                        .blocks()
+                        .iter()
+                        .rev()
+                        .find(|block| block.finished() && !block.is_background())
+                        .map(|block| *block.id())
+                })
+                .flatten();
+            let tail = tail_block.map(|block| {
+                (
+                    *block.id(),
+                    usize::from(block.index()),
+                    if request.is_session() {
+                        let start =
+                            Self::capture_session_tail_start(blocks, session_prefix_block_id)
+                                .unwrap();
+                        Self::capture_blocks_text(&blocks.blocks()[start..], request)
+                    } else {
+                        Self::capture_block_text(block, request)
+                    },
+                )
+            });
+            if tail.as_ref().is_some_and(|(_, _, text)| text.is_empty()) && !contents.is_empty() {
+                contents.push_str(file_capture::BLOCK_SEPARATOR);
+            }
+            (contents, tail, session_prefix_block_id)
+        };
+
+        let Some((block_id, index, tail)) = tail else {
+            if let Err(err) = file_capture::write_snapshot(&path, &contents) {
+                report_error!(anyhow::Error::new(err).context("Failed to write capture file"));
+                self.show_error_toast("Could not save command output.".to_string(), ctx);
+            } else {
+                self.show_capture_toast(&path, ctx);
+            }
+            return;
+        };
+
+        match file_capture::FileStream::create(&path, &contents, Some((index, tail))) {
+            Ok(stream) => {
+                let capture = ActiveFileCapture {
+                    request,
+                    block_id,
+                    session_prefix_block_id,
+                    stream,
+                };
+                if request.is_session() {
+                    self.session_capture_stream = Some(capture);
+                } else {
+                    self.block_capture_stream = Some(capture);
+                }
+                self.show_capture_toast(&path, ctx);
+            }
+            Err(err) => {
+                report_error!(anyhow::Error::new(err).context("Failed to open capture file"));
+                self.show_error_toast("Could not start saving command output.".to_string(), ctx);
             }
         }
     }
@@ -26298,6 +26855,12 @@ impl TerminalView {
             OpenShareBlockModal { block_index } => {
                 self.context_menu_open_share_block_modal(*block_index, ctx)
             }
+            SaveOutputToFile => self.capture_to_file(CaptureRequest::block_output(false), ctx),
+            StreamOutputToFile => self.capture_to_file(CaptureRequest::block_output(true), ctx),
+            SaveBlockToFile => self.capture_to_file(CaptureRequest::block_full(false), ctx),
+            StreamBlockToFile => self.capture_to_file(CaptureRequest::block_full(true), ctx),
+            SaveSessionToFile => self.capture_to_file(CaptureRequest::session(false), ctx),
+            StreamSessionToFile => self.capture_to_file(CaptureRequest::session(true), ctx),
             FindWithinBlock => self.find_within_block(ctx),
             ScrollToBottomOfBlock => self.scroll_to_bottom_of_bottommost_selected_block(ctx),
             ScrollToTopOfBlock => self.scroll_to_top_of_topmost_selected_block(ctx),
@@ -27845,6 +28408,10 @@ impl TypedActionView for TerminalView {
                     Empty
                 }
             }
+            // Nothing to announce at dispatch: these open a save dialog, and the
+            // confirmation toast reports the result once the file is written.
+            SaveOutputToFile | StreamOutputToFile | SaveBlockToFile | StreamBlockToFile
+            | SaveSessionToFile | StreamSessionToFile => Empty,
             SelectAllBlocks => Custom(AccessibilityContent::new_without_help(
                 format!(
                     "Selected all {} blocks.",
@@ -28264,6 +28831,12 @@ impl TypedActionView for TerminalView {
             Paste => self.paste(false, ctx),
             Copy => self.copy(ctx),
             CopyOutputs => self.copy_outputs(ctx),
+            SaveOutputToFile => self.capture_to_file(CaptureRequest::block_output(false), ctx),
+            StreamOutputToFile => self.capture_to_file(CaptureRequest::block_output(true), ctx),
+            SaveBlockToFile => self.capture_to_file(CaptureRequest::block_full(false), ctx),
+            StreamBlockToFile => self.capture_to_file(CaptureRequest::block_full(true), ctx),
+            SaveSessionToFile => self.capture_to_file(CaptureRequest::session(false), ctx),
+            StreamSessionToFile => self.capture_to_file(CaptureRequest::session(true), ctx),
             CopyCommands => self.copy_commands(ctx),
             CopyGitBranch => {
                 let prompt_position = match self.selected_blocks.tail() {

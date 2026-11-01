@@ -459,6 +459,14 @@ pub enum WorkspaceAction {
     CopySharedSessionLinkFromTab {
         tab_index: usize,
     },
+    /// Capture a tab's session to a file from its right-click menu. Resolved by
+    /// tab index without activating the tab, so saving does not yank focus.
+    SaveSessionToFileFromTab {
+        tab_index: usize,
+    },
+    StreamSessionToFileFromTab {
+        tab_index: usize,
+    },
     OpenSharedSessionQrCode {
         session_id: SessionId,
     },
@@ -1145,6 +1153,8 @@ impl WorkspaceAction {
             | StopSharingSessionFromTabMenu { .. }
             | StopSharingAllSessionsInTab { .. }
             | CopySharedSessionLinkFromTab { .. }
+            | SaveSessionToFileFromTab { .. }
+            | StreamSessionToFileFromTab { .. }
             | OpenSharedSessionQrCode { .. }
             | ReopenClosedSession
             | FocusLeftPanel

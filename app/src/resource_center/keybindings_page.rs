@@ -19,8 +19,8 @@ use super::section_views::{
     SECTION_HEADER_FONT_SIZE, SECTION_SPACING,
 };
 use super::utils::{
-    BLOCKS_KEYBINDINGS, FUNDAMENTALS_KEYBINDINGS, INPUT_EDITOR_KEYBINDINGS, TERMINAL_KEYBINDINGS,
-    get_additional_keybindings,
+    BLOCKS_KEYBINDINGS, FILE_CAPTURE_KEYBINDINGS, FUNDAMENTALS_KEYBINDINGS,
+    INPUT_EDITOR_KEYBINDINGS, TERMINAL_KEYBINDINGS, get_additional_keybindings,
 };
 use crate::appearance::Appearance;
 use crate::command_palette::PRIORITIZED_KEYBINDINGS;
@@ -138,7 +138,11 @@ impl KeybindingsView {
             .filter_map(|lens| CommandBinding::from_lens(lens, ctx))
             .chain(get_additional_keybindings())
             .filter(|a| {
-                a.trigger.is_some()
+                // Unbound commands are normally noise here, but the four file
+                // captures without a default keystroke have no other home: this
+                // panel is where you find them, and the subheader points at the
+                // settings page to give them a key.
+                (a.trigger.is_some() || FILE_CAPTURE_KEYBINDINGS.contains(&a.name.as_str()))
                     && !a
                         .description
                         .in_context(DescriptionContext::Default)

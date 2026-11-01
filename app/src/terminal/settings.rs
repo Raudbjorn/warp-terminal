@@ -130,6 +130,39 @@ impl AltScreenPaddingMode {
 }
 
 define_settings_group!(TerminalSettings, settings: [
+    // Filename patterns for the "Save .../Stream ... to file..." commands.
+    // Machine-local, so never synced. Tokens: {command}, {timestamp},
+    // {finished-timestamp}, {session-or-command}.
+    file_capture_output_pattern: FileCaptureOutputPattern {
+        type: String,
+        default: "{command}_{timestamp}.log".to_string(),
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "terminal.file_capture.output_pattern",
+        description: "Filename pattern used when saving or streaming block output to a file.",
+    },
+    file_capture_block_pattern: FileCaptureBlockPattern {
+        type: String,
+        default: "{command}_{timestamp}.log".to_string(),
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "terminal.file_capture.block_pattern",
+        description: "Filename pattern used when saving or streaming whole blocks to a file.",
+    },
+    file_capture_session_pattern: FileCaptureSessionPattern {
+        type: String,
+        default: "{session-or-command}_{timestamp}.log".to_string(),
+        supported_platforms: SupportedPlatforms::DESKTOP,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "terminal.file_capture.session_pattern",
+        description: "Filename pattern used when saving or streaming the whole session to a file.",
+    },
     use_audible_bell: UseAudibleBell {
         type: bool,
         default: false,
