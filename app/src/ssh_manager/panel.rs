@@ -577,7 +577,9 @@ impl SshProfilesPanelView {
         profile_id: Uuid,
         ctx: &mut ViewContext<Self>,
     ) -> Result<(), String> {
-        let profiles = Self::profiles(ctx);
+        let profiles = config_file::load_profiles().map_err(|err| {
+            format!("Could not read ~/.ssh/config before deleting the profile: {err:#}")
+        })?;
         let Some(profile) = profiles
             .iter()
             .find(|profile| profile.id == profile_id)
@@ -602,25 +604,10 @@ impl SshProfilesPanelView {
             ));
         }
 
-        for mut other in profiles.into_iter().filter(|other| {
-            other.id != profile_id
-                && warp_owned_ids.contains(&other.id)
-                && other
-                    .jump_hosts
-                    .iter()
-                    .any(|jump_host| jump_host_points_at(jump_host, &profile))
-        }) {
-            other
-                .jump_hosts
-                .retain(|jump_host| !jump_host_points_at(jump_host, &profile));
-            if let Err(err) = config_file::upsert_profile(&other) {
-                log::error!("Failed to drop jump host from ~/.ssh/config: {err:#}");
-                self.sync_profiles(ctx);
-                return Err(format!(
-                    "Could not remove \"{}\" from jump host \"{}\": {err:#}",
-                    profile.name, other.name
-                ));
-            }
+        if has_jump_references(&profile, &profiles) {
+            return Err(
+                "Remove this host from saved jump-host routes before deleting it.".to_string(),
+            );
         }
 
         if let Err(err) = self.remove_profile_password(&profile, ctx) {
@@ -1676,16 +1663,21 @@ pub(super) fn jump_host_points_at(jump_host: &SshJumpHost, profile: &SshHostProf
     }
 }
 
+fn has_jump_references(profile: &SshHostProfile, profiles: &[SshHostProfile]) -> bool {
+    profiles.iter().any(|other| {
+        other.id != profile.id
+            && other
+                .jump_hosts
+                .iter()
+                .any(|jump| jump.source_profile_id == Some(profile.id) || jump.host == profile.name)
+    })
+}
+
 fn rename_breaks_jump_route(profile: &SshHostProfile, profiles: &[SshHostProfile]) -> bool {
     profiles
         .iter()
-        .any(|old| old.id == profile.id && old.name != profile.name)
-        && profiles.iter().any(|other| {
-            other
-                .jump_hosts
-                .iter()
-                .any(|jump| jump.source_profile_id == Some(profile.id))
-        })
+        .find(|old| old.id == profile.id)
+        .is_some_and(|old| old.name != profile.name && has_jump_references(old, profiles))
 }
 
 #[cfg(test)]
@@ -1715,5 +1707,31 @@ mod tests {
             &[jump.clone(), destination]
         ));
         assert!(!rename_breaks_jump_route(&renamed, &[jump]));
+    }
+    #[test]
+    fn referenced_hosts_cannot_be_deleted_by_id_or_alias() {
+        let jump = SshHostProfile::new("bastion".into(), "gateway.example".into());
+        let mut destination = SshHostProfile::new("work".into(), "work.example".into());
+        for source_profile_id in [Some(jump.id), None] {
+            destination.jump_hosts = vec![SshJumpHost {
+                source_profile_id,
+                host: if source_profile_id.is_some() {
+                    "old-alias".into()
+                } else {
+                    jump.name.clone()
+                },
+                user: Some("other".into()),
+                port: 2222,
+                port_is_explicit: true,
+                identity_file: None,
+            }];
+            let profiles = vec![jump.clone(), destination.clone()];
+            assert!(has_jump_references(&jump, &profiles));
+            let mut renamed = jump.clone();
+            renamed.name = "new-name".into();
+            assert!(rename_breaks_jump_route(&renamed, &profiles));
+        }
+        destination.jump_hosts.clear();
+        assert!(!has_jump_references(&jump, &[jump.clone(), destination]));
     }
 }

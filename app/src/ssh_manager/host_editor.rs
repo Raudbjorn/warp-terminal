@@ -917,7 +917,7 @@ impl View for SshProfileDeleteModalView {
             .with_child(
                 Text::new(
                     format!(
-                        "\"{name}\" will be removed from ~/.ssh/config and its stored password will be deleted. This cannot be undone."
+                        "\"{name}\" will be removed from ~/.ssh/config and its stored password will be deleted. Remove its saved jump-host references first. This cannot be undone."
                     ),
                     appearance.ui_font_family(),
                     12.,
