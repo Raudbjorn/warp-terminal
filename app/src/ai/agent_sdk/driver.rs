@@ -4454,7 +4454,9 @@ impl AgentDriver {
                 }
                 CLIAgentSessionsModelEvent::Started { .. }
                 | CLIAgentSessionsModelEvent::InputSessionChanged { .. }
-                | CLIAgentSessionsModelEvent::Ended { .. } => {}
+                | CLIAgentSessionsModelEvent::Ended { .. }
+                // Conn consumes RawEvent; the harness only needs status transitions.
+                | CLIAgentSessionsModelEvent::RawEvent { .. } => {}
             });
     }
     /// Drives the harness exit signal from the status of the driver's bound native conversation,

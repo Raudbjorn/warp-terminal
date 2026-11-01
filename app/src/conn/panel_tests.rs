@@ -1,0 +1,604 @@
+//! Tests for the panel's row addressing, which is the part that decides what
+//! a returning reader actually sees. Rendering needs a window; deciding which
+//! row is at which index does not.
+
+use ::conn::story::{ConnStep, ConnStory, ConnTurn};
+use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
+use chrono::{DateTime, TimeZone, Utc};
+
+use super::{ConnRow, PREVIEW_CHARS, row_at, row_count, scroll_target, truncate};
+
+fn at(seconds: i64) -> DateTime<Utc> {
+    Utc.timestamp_opt(seconds, 0).single().expect("valid time")
+}
+
+fn step(description: &str, runs: usize) -> ConnStep {
+    ConnStep {
+        description: description.to_owned(),
+        runs,
+    }
+}
+
+fn turn(started: i64, prompt: &str, steps: Vec<ConnStep>, outcome: Option<&str>) -> ConnTurn {
+    ConnTurn {
+        started_at: at(started),
+        ended_at: Some(at(started + 60)),
+        prompt: prompt.to_owned(),
+        steps,
+        outcome: outcome.map(str::to_owned),
+    }
+}
+
+/// `describe` collapses a row to something comparable, so a test can assert on
+/// the shape of a whole chapter rather than one row at a time.
+fn describe(session: &ConnSession) -> Vec<String> {
+    describe_with_divider(session, None)
+}
+
+fn describe_with_divider(session: &ConnSession, divider: Option<DateTime<Utc>>) -> Vec<String> {
+    (0..row_count(session, divider))
+        .map(|index| match row_at(session, divider, index) {
+            Some(ConnRow::Turn { prompt, .. }) => format!("you: {prompt}"),
+            Some(ConnRow::Step { description, runs }) => format!("did: {description} ×{runs}"),
+            Some(ConnRow::Outcome { text, .. }) => format!("said: {text}"),
+            Some(ConnRow::Live(entry)) => format!("live: {:?}", entry.kind),
+            Some(ConnRow::NoTranscript) => "no transcript".to_owned(),
+            Some(ConnRow::SinceYouLooked) => "since you looked".to_owned(),
+            None => "missing".to_owned(),
+        })
+        .collect()
+}
+
+#[test]
+fn a_chapter_is_a_prompt_then_its_steps_then_its_outcome() {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![turn(
+                0,
+                "wire the ADRs in",
+                vec![
+                    step("Explore the docs layout", 1),
+                    step("Add ADR settings", 3),
+                ],
+                Some("ADRs were assumed but never wired in."),
+            )],
+        },
+        at(100),
+    );
+
+    assert_eq!(
+        describe(&session),
+        vec![
+            "you: wire the ADRs in",
+            "did: Explore the docs layout ×1",
+            "did: Add ADR settings ×3",
+            "said: ADRs were assumed but never wired in.",
+        ]
+    );
+}
+
+#[test]
+fn chapters_read_in_the_order_they_happened() {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![
+                turn(
+                    0,
+                    "first ask",
+                    vec![step("first work", 1)],
+                    Some("first done"),
+                ),
+                turn(200, "second ask", vec![], Some("second done")),
+            ],
+        },
+        at(300),
+    );
+
+    assert_eq!(
+        describe(&session),
+        vec![
+            "you: first ask",
+            "did: first work ×1",
+            "said: first done",
+            "you: second ask",
+            "said: second done",
+        ]
+    );
+}
+
+/// The turn in flight has no transcript account yet, so it shows as live hook
+/// events after the chapters that do.
+#[test]
+fn the_turn_in_flight_follows_the_chapters_already_told() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "the told turn".to_owned(),
+        },
+        at(10),
+    ));
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![turn(10, "the told turn", vec![], Some("told"))],
+        },
+        at(100),
+    );
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "the new ask".to_owned(),
+        },
+        at(200),
+    ));
+    session.push(ConnEntry::new(
+        ConnEntryKind::QuestionAsked {
+            summary: Some("which layer?".to_owned()),
+        },
+        at(210),
+    ));
+
+    let rows = describe(&session);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(&rows[..2], ["you: the told turn", "said: told"]);
+    assert!(
+        rows[2].starts_with("live: Prompt"),
+        "the new instruction is live, not told: {}",
+        rows[2]
+    );
+    assert!(rows[3].starts_with("live: QuestionAsked"), "{}", rows[3]);
+}
+
+/// A turn that has not finished contributes no outcome row, so the panel does
+/// not show an empty "said".
+#[test]
+fn an_unfinished_chapter_has_no_outcome_row() {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![turn(
+                0,
+                "start something long",
+                vec![step("Kick it off", 1)],
+                None,
+            )],
+        },
+        at(100),
+    );
+
+    assert_eq!(
+        describe(&session),
+        vec!["you: start something long", "did: Kick it off ×1"]
+    );
+}
+
+#[test]
+fn a_session_with_nothing_in_it_has_no_rows() {
+    let session = ConnSession::default();
+    assert_eq!(row_count(&session, None), 0);
+    assert!(row_at(&session, None, 0).is_none());
+}
+
+/// The list asks for indices it has already allocated, and the story can
+/// shrink between the two, so an index past the end has to be absent rather
+/// than a panic.
+#[test]
+fn an_index_past_the_end_is_no_row() {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![turn(0, "go", vec![], Some("done"))],
+        },
+        at(100),
+    );
+
+    assert_eq!(row_count(&session, None), 2);
+    assert!(row_at(&session, None, 2).is_none());
+    assert!(row_at(&session, None, 99).is_none());
+}
+
+#[test]
+fn a_long_prompt_is_cut_with_a_mark() {
+    let long = "a".repeat(PREVIEW_CHARS + 50);
+    let cut = truncate(&long);
+    assert_eq!(cut.chars().count(), PREVIEW_CHARS + 1);
+    assert!(cut.ends_with('…'));
+}
+
+/// Truncating by bytes would split a multi-byte character and panic.
+#[test]
+fn truncation_counts_characters_not_bytes() {
+    let long = "é".repeat(PREVIEW_CHARS + 10);
+    let cut = truncate(&long);
+    assert_eq!(cut.chars().count(), PREVIEW_CHARS + 1);
+}
+
+/// For a tool with no `command` or `file_path`, the plugin serialises the
+/// whole tool input into the summary. Eighty characters of JSON in the panel
+/// says less than the tool's name on its own.
+#[test]
+fn a_permission_summary_drops_a_raw_json_preview() {
+    assert_eq!(
+        super::drop_json_tail(
+            r#"Wants to run AskUserQuestion: {"questions":[{"question":"FORMAT.md:12 already"#
+        ),
+        "Wants to run AskUserQuestion"
+    );
+}
+
+/// A real command is the most useful thing the permission row can carry, so
+/// only JSON is cut.
+#[test]
+fn a_permission_summary_keeps_a_real_command() {
+    assert_eq!(
+        super::drop_json_tail("Wants to run Bash: rm -rf node_modules"),
+        "Wants to run Bash: rm -rf node_modules"
+    );
+}
+
+/// Hook events alone are a visibly worse panel: a tool's name with nothing
+/// about what it did. Saying so beats letting someone conclude the feature is
+/// broken.
+#[test]
+fn a_session_with_no_transcript_says_so() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "do the thing".to_owned(),
+        },
+        at(10),
+    ));
+
+    assert!(matches!(
+        row_at(&session, None, 0),
+        Some(ConnRow::NoTranscript)
+    ));
+    assert_eq!(
+        row_count(&session, None),
+        2,
+        "the notice sits above the events"
+    );
+}
+
+/// Once there is a story the notice goes away, rather than sitting above every
+/// session forever.
+#[test]
+fn a_session_with_a_story_shows_no_notice() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "do the thing".to_owned(),
+        },
+        at(10),
+    ));
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![turn(10, "do the thing", vec![], Some("done"))],
+        },
+        at(100),
+    );
+
+    assert!(matches!(
+        row_at(&session, None, 0),
+        Some(ConnRow::Turn { .. })
+    ));
+}
+
+/// An empty session shows its empty state, not a complaint about transcripts.
+#[test]
+fn a_session_with_no_events_shows_no_notice() {
+    let session = ConnSession::default();
+    assert_eq!(row_count(&session, None), 0);
+}
+
+/// Hook tool entries coalesce into one row whose time keeps moving, so it
+/// always sits after the story boundary — restating as `Bash ×18` the same
+/// work the chapter above already names one call at a time.
+#[test]
+fn tool_noise_drops_out_once_the_story_tells_it() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "do the work".to_owned(),
+        },
+        at(10),
+    ));
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![turn(
+                10,
+                "do the work",
+                vec![step("Read the docs", 3)],
+                None,
+            )],
+        },
+        at(20),
+    );
+    session.push(ConnEntry::new(
+        ConnEntryKind::ToolCompleted {
+            tool_name: Some("Bash".to_owned()),
+            target: None,
+            runs: 18,
+        },
+        at(30),
+    ));
+
+    assert_eq!(
+        describe(&session),
+        vec!["you: do the work", "did: Read the docs ×3"],
+        "the chapter tells the work; the hook row would only repeat it"
+    );
+}
+
+/// A permission request is the session waiting on you, which is the most
+/// important thing the panel can report and is not something the story says.
+#[test]
+fn a_permission_request_survives_beside_the_story() {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![turn(10, "do the work", vec![], Some("done"))],
+        },
+        at(20),
+    );
+    session.push(ConnEntry::new(
+        ConnEntryKind::PermissionRequested {
+            summary: Some("Wants to run Bash: rm -rf build".to_owned()),
+            tool_name: Some("Bash".to_owned()),
+            target: Some("rm -rf build".to_owned()),
+        },
+        at(30),
+    ));
+
+    let rows = describe(&session);
+    assert_eq!(
+        rows.len(),
+        3,
+        "the chapter, its outcome, then what it waits on"
+    );
+    assert!(
+        rows[2].starts_with("live: PermissionRequested"),
+        "{}",
+        rows[2]
+    );
+}
+
+/// With no story, the hook entries are all there is and none are dropped.
+#[test]
+fn tool_rows_stay_when_there_is_no_story() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::ToolCompleted {
+            tool_name: Some("Bash".to_owned()),
+            target: None,
+            runs: 4,
+        },
+        at(30),
+    ));
+
+    let rows = describe(&session);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("live: ToolCompleted"))
+    );
+}
+
+/// An answer opens with orientation and closes with the conclusion and
+/// whatever decision it is waiting on. Coming back to a pane, the close is the
+/// part worth reading.
+#[test]
+fn a_long_answer_previews_its_conclusion_not_its_opening() {
+    let answer = format!(
+        "Read the repo and both reference repos. Here's what I found.\n\n{}\n\nWant me to start? \
+         I'd do A1-A3 in one pass, then A6.",
+        "F1 — no LICENSE, which disqualifies the repo. ".repeat(20)
+    );
+
+    let preview = super::tail_preview(&answer);
+    assert!(
+        preview.ends_with("I'd do A1-A3 in one pass, then A6."),
+        "the conclusion has to survive: {preview}"
+    );
+    assert!(
+        !preview.contains("Here's what I found"),
+        "the opening is the part you can infer from your own prompt"
+    );
+    assert!(preview.starts_with('…'), "the cut is marked: {preview}");
+}
+
+/// A short answer is its own conclusion and is shown whole.
+#[test]
+fn a_short_answer_is_not_cut() {
+    assert_eq!(
+        super::tail_preview("Four commits, working tree clean."),
+        "Four commits, working tree clean."
+    );
+}
+
+/// The panel draws plain text, so a stray `##` reads as noise rather than as
+/// structure.
+#[test]
+fn heading_markers_are_not_shown() {
+    assert_eq!(
+        super::tail_preview("## What I found\n\nNeither repo gets it from CI."),
+        "What I found · Neither repo gets it from CI."
+    );
+}
+
+/// A prompt cut mid-word reads as a rendering bug rather than as an excerpt.
+#[test]
+fn a_cut_prompt_ends_on_a_word() {
+    let prompt = format!(
+        "{} and have all the hygiene factors",
+        "x".repeat(PREVIEW_CHARS - 10)
+    );
+
+    let cut = truncate(&prompt);
+    let kept = cut.trim_end_matches('…');
+    assert!(prompt.starts_with(kept), "the preview is a prefix: {cut}");
+    assert!(
+        prompt[kept.len()..].starts_with(char::is_whitespace),
+        "the cut lands between words, not inside one: {cut}"
+    );
+}
+
+/// With no word boundary within reach, cutting mid-word beats returning
+/// nothing.
+#[test]
+fn an_unbroken_prompt_is_cut_where_it_must_be() {
+    let prompt = "x".repeat(PREVIEW_CHARS + 50);
+    let cut = truncate(&prompt);
+    assert_eq!(cut.chars().count(), PREVIEW_CHARS + 1);
+}
+
+/// Only the answer being read is shown whole; marking an earlier one as latest would unfold
+/// every chapter.
+#[test]
+fn only_the_last_turns_outcome_is_the_latest() {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![
+                turn(0, "first", vec![], Some("## Plan\n\n- one")),
+                turn(100, "second", vec![], Some("Done.")),
+            ],
+        },
+        at(200),
+    );
+
+    let latest: Vec<bool> = (0..row_count(&session, None))
+        .filter_map(|index| match row_at(&session, None, index) {
+            Some(ConnRow::Outcome { latest, .. }) => Some(latest),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(latest, vec![false, true]);
+}
+
+fn three_answered_turns() -> ConnSession {
+    let mut session = ConnSession::default();
+    session.adopt_story(
+        ConnStory {
+            title: None,
+            plan_file: None,
+            turns: vec![
+                turn(0, "first", vec![], Some("first done")),
+                turn(100, "second", vec![step("work", 1)], Some("second done")),
+                turn(200, "third", vec![], Some("third done")),
+            ],
+        },
+        at(300),
+    );
+    session
+}
+
+#[test]
+fn the_divider_opens_the_first_unseen_turn() {
+    let session = three_answered_turns();
+
+    assert_eq!(
+        describe_with_divider(&session, Some(at(100))),
+        vec![
+            "you: first",
+            "said: first done",
+            "since you looked",
+            "you: second",
+            "did: work ×1",
+            "said: second done",
+            "you: third",
+            "said: third done",
+        ]
+    );
+}
+
+#[test]
+fn a_story_with_nothing_unseen_has_no_divider() {
+    let session = three_answered_turns();
+
+    assert!(
+        !describe(&session)
+            .iter()
+            .any(|row| row == "since you looked")
+    );
+}
+
+/// The reader comes back to what they missed, not to the end of it.
+#[test]
+fn the_story_opens_at_the_divider_when_turns_are_unseen() {
+    let session = three_answered_turns();
+
+    assert_eq!(scroll_target(&session, Some(at(100))), Some(2));
+}
+
+#[test]
+fn the_story_opens_at_its_tail_when_nothing_is_unseen() {
+    let session = three_answered_turns();
+
+    assert_eq!(scroll_target(&session, None), Some(6));
+}
+
+#[test]
+fn an_empty_story_has_nowhere_to_open() {
+    assert_eq!(scroll_target(&ConnSession::default(), None), None);
+}
+
+mod mode {
+    use warpui::EntityId;
+
+    use super::super::{ModeChoice, PanelMode, panel_mode};
+
+    #[test]
+    fn a_pane_with_a_session_shows_its_story() {
+        let pane = EntityId::new();
+        assert_eq!(panel_mode(Some(pane), true, None), PanelMode::ThisPane);
+    }
+
+    #[test]
+    fn a_pane_without_a_session_shows_the_overview() {
+        assert_eq!(
+            panel_mode(Some(EntityId::new()), false, None),
+            PanelMode::All
+        );
+        assert_eq!(panel_mode(None, false, None), PanelMode::All);
+    }
+
+    #[test]
+    fn a_manual_choice_holds_while_focus_stays() {
+        let pane = EntityId::new();
+        let choice = ModeChoice {
+            pane: Some(pane),
+            mode: PanelMode::All,
+        };
+        assert_eq!(panel_mode(Some(pane), true, Some(choice)), PanelMode::All);
+    }
+
+    #[test]
+    fn a_manual_choice_lapses_when_focus_moves() {
+        let choice = ModeChoice {
+            pane: Some(EntityId::new()),
+            mode: PanelMode::All,
+        };
+        assert_eq!(
+            panel_mode(Some(EntityId::new()), true, Some(choice)),
+            PanelMode::ThisPane
+        );
+    }
+}

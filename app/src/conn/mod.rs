@@ -1,0 +1,764 @@
+//! Conn's in-process session history.
+//!
+//! [`ConnModel`] listens to [`CLIAgentSessionsModel`] and accumulates the
+//! per-session history that model discards, keyed by the pane the session runs
+//! in. It is strictly a reader: it holds no writable handle to a session, a
+//! terminal or a PTY, and it sits downstream of the terminal parser, so by the
+//! time an event arrives the agent's hook has already returned. Conn cannot
+//! delay, alter or block a session.
+
+pub mod panel;
+pub(crate) mod preview;
+mod project;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use ::conn::seen::{SEEN_AFTER, advance_watermark};
+use ::conn::story::{ConnStory, parse_transcript};
+use ::conn::{ConnEntry, ConnEntryKind, ConnSession, ConnStatus, is_harness_prompt, tidy_prompt};
+use chrono::{DateTime, TimeDelta, Utc};
+use tokio::io::AsyncReadExt as _;
+use warpui::r#async::{FutureId, Timer};
+use warpui::{Entity, EntityId, ModelContext, SingletonEntity, WindowId};
+
+use crate::terminal::cli_agent_sessions::event::{CLIAgentEvent, CLIAgentEventType};
+use crate::terminal::cli_agent_sessions::{
+    CLIAgentSessionStatus, CLIAgentSessionsModel, CLIAgentSessionsModelEvent,
+};
+
+/// Per-pane session history.
+#[derive(Default)]
+pub struct ConnModel {
+    /// Keyed by the terminal view the session runs in. This is a
+    /// process-lifetime id, so it is deliberately not a persistence key; a
+    /// durable store should key on the terminal's session UUID instead.
+    ///
+    /// A session's history outlives the agent that made it, because reading it
+    /// afterwards is the point, and is discarded with the pane by
+    /// [`ConnModel::forget_pane`]. Per session the history is capped by
+    /// `conn::MAX_ENTRIES`; pane count is what that call bounds.
+    sessions: HashMap<EntityId, ConnSession>,
+    /// The latest transcript read dispatched for each pane, until it lands. Reading it is
+    /// how tests await the read before asserting on the story.
+    reads_in_flight: HashMap<EntityId, InFlightRead>,
+    /// Numbers reads in dispatch order, so that a read finishing is only taken to mean its pane
+    /// has no read in flight if no later read has been dispatched since.
+    next_read_seq: u64,
+    /// How many times a different agent has taken over each pane. A read is only adopted by the
+    /// agent it was dispatched for, which this tells apart.
+    session_epochs: HashMap<EntityId, u64>,
+    /// When a read was last dispatched for each pane, so a busy turn re-reads
+    /// at a steady rate instead of once per tool call.
+    last_read: HashMap<EntityId, DateTime<Utc>>,
+    /// Project names by working directory. Resolving one runs git, so each directory is resolved
+    /// once per process.
+    /// `None` when the directory names nothing, which leaves the plugin's name in place.
+    projects: HashMap<String, Option<String>>,
+    /// Project resolutions in flight, by working directory.
+    resolving_projects: HashMap<String, FutureId>,
+    /// The pane focused in the key window, if any.
+    visit: Option<Visit>,
+}
+
+/// A transcript read that has been dispatched and has not landed yet.
+struct InFlightRead {
+    /// Position in dispatch order. See [`ConnModel::next_read_seq`].
+    seq: u64,
+    future_id: FutureId,
+}
+
+/// The reader's time in one pane of the key window.
+struct Visit {
+    window: WindowId,
+    pane: EntityId,
+    since: DateTime<Utc>,
+    /// Where the "since you looked" divider sits for this visit: the start of the first turn
+    /// unseen on arrival. Held, so the divider stays put while the reader catches up.
+    divider: Option<DateTime<Utc>>,
+}
+
+/// How often the transcript is re-read while a turn is running.
+///
+/// A turn can run for many minutes, and that is exactly when someone walks
+/// away and comes back, so the account of it cannot wait for the turn to
+/// finish. Re-reading is a whole-file parse — tens of milliseconds on a
+/// background thread — so it is paced rather than done per tool call.
+const READ_INTERVAL: TimeDelta = TimeDelta::seconds(3);
+
+/// How long to wait before re-reading a finished turn.
+///
+/// Claude Code writes the transcript asynchronously, so the read triggered by
+/// the stop event can land before the turn's closing message reaches the file
+/// — leaving the panel showing an earlier line as the agent's last word, with
+/// no further event coming to correct it. One more read closes that window.
+const FLUSH_GRACE: Duration = Duration::from_millis(1500);
+
+/// The most of a transcript that is read into memory, in bytes.
+///
+/// A transcript is a whole-file parse, and the path it is read from arrives from the terminal,
+/// so a file with no end (`/dev/zero`) or one far larger than any real session must not be
+/// allowed to grow the process without bound. Real transcripts are a few megabytes, and tens of
+/// megabytes once a long session has pasted images into it. A transcript over the bound is
+/// skipped, and the live entries keep describing the session.
+const MAX_TRANSCRIPT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Emitted whenever a pane's history changes.
+///
+/// The docked panel only needs a repaint and gets one from `notify`, but the
+/// tab list draws every pane in the window and only some of them belong to
+/// this workspace, so it needs to know which pane moved.
+pub enum ConnModelEvent {
+    SessionUpdated { terminal_view_id: EntityId },
+}
+
+impl Entity for ConnModel {
+    type Event = ConnModelEvent;
+}
+
+impl SingletonEntity for ConnModel {}
+
+impl ConnModel {
+    pub fn new(ctx: &mut ModelContext<Self>) -> Self {
+        let cli_sessions_model = CLIAgentSessionsModel::handle(ctx);
+        ctx.subscribe_to_model(&cli_sessions_model, |me, _, event, ctx| {
+            me.handle_cli_session_event(event, ctx);
+        });
+
+        Self::default()
+    }
+
+    pub fn session(&self, terminal_view_id: EntityId) -> Option<&ConnSession> {
+        self.sessions.get(&terminal_view_id)
+    }
+
+    /// The terminal views that have a session.
+    pub fn panes(&self) -> impl Iterator<Item = EntityId> + '_ {
+        self.sessions.keys().copied()
+    }
+
+    /// Where a pane's "since you looked" divider sits: at the start of the first unseen turn.
+    pub fn divider(&self, terminal_view_id: EntityId) -> Option<DateTime<Utc>> {
+        match &self.visit {
+            Some(visit) if visit.pane == terminal_view_id => visit.divider,
+            _ => self.divider_now(terminal_view_id),
+        }
+    }
+
+    /// When the reader started looking at a pane, while they still are.
+    pub fn visit_since(&self, terminal_view_id: EntityId) -> Option<DateTime<Utc>> {
+        self.visit
+            .as_ref()
+            .filter(|visit| visit.pane == terminal_view_id)
+            .map(|visit| visit.since)
+    }
+
+    /// Records the pane focused in `window`, which is the key window. `None` when no terminal
+    /// pane is focused there.
+    pub fn key_window_focused(
+        &mut self,
+        window: WindowId,
+        pane: Option<EntityId>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.visit.as_ref().map(|visit| (visit.window, visit.pane)) == pane.map(|p| (window, p))
+        {
+            return;
+        }
+        self.visit = pane.map(|pane| Visit {
+            window,
+            pane,
+            since: Utc::now(),
+            divider: self.divider_now(pane),
+        });
+        ctx.notify();
+        if self.visit.is_some() {
+            // The timer's clock is monotonic and the seen rule's is the wall clock, so the
+            // margin keeps the check from landing a hair short of the threshold.
+            let after = (SEEN_AFTER + TimeDelta::milliseconds(100))
+                .to_std()
+                .expect("a positive duration");
+            ctx.spawn(Timer::after(after), |me, _, ctx| me.mark_seen(ctx));
+        }
+    }
+
+    /// `window` stopped being the key window.
+    pub fn window_resigned_key(&mut self, window: WindowId, ctx: &mut ModelContext<Self>) {
+        if self
+            .visit
+            .as_ref()
+            .is_some_and(|visit| visit.window == window)
+        {
+            self.visit = None;
+            ctx.notify();
+        }
+    }
+
+    fn divider_now(&self, terminal_view_id: EntityId) -> Option<DateTime<Utc>> {
+        self.session(terminal_view_id)?
+            .first_unseen_turn()
+            .map(|turn| turn.started_at)
+    }
+
+    /// Advances the visited pane's watermark once the seen rule allows it.
+    fn mark_seen(&mut self, ctx: &mut ModelContext<Self>) {
+        let Some(visit) = &self.visit else {
+            return;
+        };
+        let terminal_view_id = visit.pane;
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        let watermark = advance_watermark(
+            session.watermark,
+            session.latest_activity(),
+            visit.since,
+            Utc::now(),
+        );
+        if watermark != session.watermark {
+            session.watermark = watermark;
+            ctx.notify();
+            ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+        }
+    }
+
+    /// The transcript read in flight for a pane, if any. Tests await it before
+    /// asserting on the story.
+    #[allow(dead_code)]
+    pub fn read_in_flight(&self, terminal_view_id: EntityId) -> Option<FutureId> {
+        self.reads_in_flight
+            .get(&terminal_view_id)
+            .map(|read| read.future_id)
+    }
+
+    fn handle_cli_session_event(
+        &mut self,
+        event: &CLIAgentSessionsModelEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        match event {
+            CLIAgentSessionsModelEvent::RawEvent {
+                terminal_view_id,
+                event,
+            } => self.record(*terminal_view_id, event, ctx),
+            CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                status,
+                ..
+            } => self.set_status(*terminal_view_id, conn_status(status), ctx),
+            // A pane's history outlives the session that produced it: the
+            // point of Conn is to still be readable after a session ends.
+            // Only the pane going away discards it, which the workspace
+            // reports separately.
+            CLIAgentSessionsModelEvent::Ended {
+                terminal_view_id, ..
+            } => self.set_status(*terminal_view_id, ConnStatus::Ended, ctx),
+            // A pane running an agent has a session even before its first hook event. The agent
+            // waits at its prompt until asked something, which Warp reports as in progress.
+            CLIAgentSessionsModelEvent::Started {
+                terminal_view_id, ..
+            } => {
+                self.sessions.entry(*terminal_view_id).or_default();
+                self.set_status(*terminal_view_id, ConnStatus::Done, ctx);
+            }
+            CLIAgentSessionsModelEvent::InputSessionChanged { .. }
+            | CLIAgentSessionsModelEvent::SessionUpdated { .. } => {}
+        }
+    }
+
+    fn set_status(
+        &mut self,
+        terminal_view_id: EntityId,
+        status: ConnStatus,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        if session.status == status {
+            return;
+        }
+        session.status = status;
+        ctx.notify();
+        ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+    }
+
+    /// Discards a pane's history, on the pane being closed for good.
+    ///
+    /// Not when its agent exits: a finished session is exactly the one worth
+    /// reading, and its pane is still there to read it in. Warp removes the
+    /// `CLIAgentSession` at both moments, which is why this is wired to the
+    /// pane's own close rather than to that model's `Ended` event.
+    ///
+    /// A transcript read already in flight for this pane is left to land and
+    /// find nothing, which is what its callback does with a pane it cannot
+    /// find. Forgetting the id is enough; there is nothing to cancel.
+    pub fn forget_pane(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        self.reads_in_flight.remove(&terminal_view_id);
+        self.last_read.remove(&terminal_view_id);
+        self.session_epochs.remove(&terminal_view_id);
+        if self
+            .visit
+            .as_ref()
+            .is_some_and(|visit| visit.pane == terminal_view_id)
+        {
+            self.visit = None;
+        }
+        if self.sessions.remove(&terminal_view_id).is_some() {
+            // No `ConnModelEvent`: it names a pane that no longer exists, and
+            // the panel it would reach repaints from this `notify` anyway.
+            ctx.notify();
+        }
+    }
+
+    fn record(
+        &mut self,
+        terminal_view_id: EntityId,
+        event: &CLIAgentEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        if self.replaces_session(terminal_view_id, event) {
+            self.reset_session(terminal_view_id, ctx);
+        }
+        let session = self.sessions.entry(terminal_view_id).or_default();
+
+        // Identity and location can arrive on any event, and the plugin only
+        // sets them when it knows them, so never overwrite a known value with
+        // `None`.
+        if event.session_id.is_some() {
+            session.session_id = event.session_id.clone();
+        }
+        if event.cwd.is_some() {
+            session.cwd = event.cwd.clone();
+        }
+        // The plugin names the project after the working directory, which splits one repository
+        // into several projects. Its name stands in until the repository's own is known.
+        let resolved = session
+            .cwd
+            .as_deref()
+            .and_then(|cwd| self.projects.get(cwd));
+        if let Some(Some(project)) = resolved {
+            session.project = Some(project.clone());
+        } else if event.project.is_some() {
+            session.project = event.project.clone();
+        }
+        let unresolved_cwd = session.cwd.clone().filter(|_| resolved.is_none());
+
+        // The plugin only sends the path on `stop`, so it is kept once known.
+        if let Some(path) = event.payload.transcript_path.as_deref() {
+            session.transcript_path = Some(path.to_owned());
+        }
+
+        let at = Utc::now();
+        if let Some(kind) = entry_kind(event) {
+            session.push(ConnEntry::new(kind, at));
+            ctx.notify();
+            ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+        }
+
+        let locator = TranscriptLocator {
+            path: session.transcript_path.clone(),
+            cwd: session.cwd.clone(),
+            session_id: session.session_id.clone(),
+        };
+        let finished = matches!(
+            event.event,
+            CLIAgentEventType::Stop | CLIAgentEventType::StopFailure
+        );
+        // The session now waits on the user and sends nothing more until they answer, so this
+        // is the last event that can bring the story up to date, plan included.
+        let waiting = matches!(
+            event.event,
+            CLIAgentEventType::PermissionRequest
+                | CLIAgentEventType::QuestionAsked
+                | CLIAgentEventType::NeedsInput
+        );
+        // The story covers what led up to the request. The request itself is told only by its
+        // live entry, so the boundary stops just short of it.
+        let through = if waiting {
+            at - TimeDelta::milliseconds(1)
+        } else {
+            at
+        };
+        if self.should_read(terminal_view_id, event, at) {
+            self.read_transcript(terminal_view_id, locator.clone(), through, None, ctx);
+        }
+        if finished || waiting {
+            self.read_transcript(terminal_view_id, locator, through, Some(FLUSH_GRACE), ctx);
+        }
+        if let Some(cwd) = unresolved_cwd {
+            self.resolve_project(cwd, ctx);
+        }
+        self.mark_seen(ctx);
+    }
+
+    /// Whether `event` comes from a different agent session than the one the pane has been
+    /// recording.
+    ///
+    /// A pane keeps its history after its agent exits, so a new agent started there finds the old
+    /// one's. The same session id is the same conversation resumed and carries on; a different one
+    /// is a new conversation, and showing it the old one's transcript as its own would be wrong. A
+    /// pane that has not yet learned an id is not replaced by learning one.
+    fn replaces_session(&self, terminal_view_id: EntityId, event: &CLIAgentEvent) -> bool {
+        let Some(incoming) = event.session_id.as_deref() else {
+            return false;
+        };
+        self.sessions
+            .get(&terminal_view_id)
+            .and_then(|session| session.session_id.as_deref())
+            .is_some_and(|known| known != incoming)
+    }
+
+    /// Starts a pane's history over for a new agent session, keeping what belongs to the pane
+    /// rather than to the session: the reader's watermark and the status.
+    ///
+    /// Reads dispatched for the previous session are not cancelled, only made unwelcome: they
+    /// carry the epoch they were dispatched in, and [`ConnModel::read_transcript`] drops what
+    /// arrives under an older one.
+    // `ConnSession` keeps its story and entries private, so a fresh one cannot be built with
+    // struct update syntax from here.
+    #[allow(clippy::field_reassign_with_default)]
+    fn reset_session(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        let Some(session) = self.sessions.get_mut(&terminal_view_id) else {
+            return;
+        };
+        let mut fresh = ConnSession::default();
+        fresh.status = session.status;
+        fresh.watermark = session.watermark;
+        *session = fresh;
+
+        *self.session_epochs.entry(terminal_view_id).or_insert(0) += 1;
+        // The new session is owed a read of its own, whatever the old one was doing.
+        self.reads_in_flight.remove(&terminal_view_id);
+        self.last_read.remove(&terminal_view_id);
+        ctx.notify();
+        ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+    }
+
+    fn session_epoch(&self, terminal_view_id: EntityId) -> u64 {
+        self.session_epochs
+            .get(&terminal_view_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub fn project_resolution_in_flight(&self, cwd: &str) -> Option<FutureId> {
+        self.resolving_projects.get(cwd).copied()
+    }
+
+    fn resolve_project(&mut self, cwd: String, ctx: &mut ModelContext<Self>) {
+        if self.resolving_projects.contains_key(&cwd) {
+            return;
+        }
+        let path = PathBuf::from(&cwd);
+        let key = cwd.clone();
+        let handle = ctx.spawn(
+            async move { project::resolve_project(&path).await },
+            move |me, project, ctx| {
+                me.resolving_projects.remove(&cwd);
+                if let Some(project) = &project {
+                    for (terminal_view_id, session) in &mut me.sessions {
+                        if session.cwd.as_deref() == Some(cwd.as_str())
+                            && session.project.as_ref() != Some(project)
+                        {
+                            session.project = Some(project.clone());
+                            ctx.emit(ConnModelEvent::SessionUpdated {
+                                terminal_view_id: *terminal_view_id,
+                            });
+                        }
+                    }
+                    ctx.notify();
+                }
+                me.projects.insert(cwd, project);
+            },
+        );
+        self.resolving_projects.insert(key, handle.future_id());
+    }
+
+    /// Whether this event should trigger a transcript read.
+    ///
+    /// A finished turn always reads: it is the turn boundary and the last
+    /// chance to record the closing message. Anything else reads at most once
+    /// per [`READ_INTERVAL`], and never while a read is already running,
+    /// because a long turn emits events continuously.
+    fn should_read(
+        &self,
+        terminal_view_id: EntityId,
+        event: &CLIAgentEvent,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if matches!(
+            event.event,
+            CLIAgentEventType::Stop | CLIAgentEventType::StopFailure
+        ) {
+            return true;
+        }
+        if self.reads_in_flight.contains_key(&terminal_view_id) {
+            return false;
+        }
+        self.last_read
+            .get(&terminal_view_id)
+            .is_none_or(|last| now - *last >= READ_INTERVAL)
+    }
+
+    /// Reads and parses the transcript off the main thread.
+    ///
+    /// The parse is tens of milliseconds on a long session and grows with it,
+    /// so it must never run on the thread that draws frames. Locating the file
+    /// touches the filesystem too, so that happens in the same place.
+    fn read_transcript(
+        &mut self,
+        terminal_view_id: EntityId,
+        locator: TranscriptLocator,
+        through: DateTime<Utc>,
+        after: Option<Duration>,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        self.last_read.insert(terminal_view_id, through);
+        let seq = self.next_read_seq;
+        self.next_read_seq += 1;
+        let epoch = self.session_epoch(terminal_view_id);
+        let handle = ctx.spawn(read_story(locator, after), move |me, read, ctx| {
+            // A finished turn dispatches two reads, and the one that lands first must not
+            // clear the tracking of the one still to come.
+            if me
+                .reads_in_flight
+                .get(&terminal_view_id)
+                .is_some_and(|in_flight| in_flight.seq == seq)
+            {
+                me.reads_in_flight.remove(&terminal_view_id);
+            }
+            // The agent this was read for has been replaced in the pane: the transcript is its,
+            // not the new one's.
+            if me.session_epoch(terminal_view_id) != epoch {
+                return;
+            }
+            // A transcript that cannot be found or read is not a failure: the
+            // live hook entries still describe the session, just less well.
+            let Some((path, story)) = read else {
+                return;
+            };
+            let Some(session) = me.sessions.get_mut(&terminal_view_id) else {
+                return;
+            };
+            // Remember where it was found so the next read skips the search.
+            session.transcript_path = Some(path.to_string_lossy().into_owned());
+            if session.adopt_story(story, through) {
+                ctx.notify();
+                ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+                me.mark_seen(ctx);
+            }
+        });
+        self.reads_in_flight.insert(
+            terminal_view_id,
+            InFlightRead {
+                seq,
+                future_id: handle.future_id(),
+            },
+        );
+    }
+}
+
+/// What is known about where a session's transcript lives.
+#[derive(Clone)]
+struct TranscriptLocator {
+    /// A path the plugin reported, which is authoritative when present.
+    path: Option<String>,
+    cwd: Option<String>,
+    session_id: Option<String>,
+}
+
+/// Runs on a background thread. Returns the file it read and the story in it.
+async fn read_story(
+    locator: TranscriptLocator,
+    after: Option<Duration>,
+) -> Option<(PathBuf, ConnStory)> {
+    if let Some(after) = after {
+        Timer::after(after).await;
+    }
+    let path = locate_transcript(&locator).await?;
+    let jsonl = read_bounded(&path).await?;
+    Some((path, parse_transcript(&jsonl)))
+}
+
+/// Whether `path` names a regular file, following links.
+async fn is_regular_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file())
+}
+
+/// Reads a transcript, refusing anything that is not a regular file of at most
+/// [`MAX_TRANSCRIPT_BYTES`]. `None` for a refusal, which is logged: it is not the user's problem,
+/// but something named a path that is not a transcript.
+async fn read_bounded(path: &Path) -> Option<String> {
+    // Looked at before opening, because opening a FIFO waits for a writer that may never come.
+    if !is_regular_file(path).await {
+        log::warn!("Conn: not reading {path:?}, which is not a regular file");
+        return None;
+    }
+    let file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(err) => {
+            log::warn!("Conn: could not open transcript {path:?}: {err}");
+            return None;
+        }
+    };
+    // Looked at again on the file actually opened, since the path may have changed meanwhile.
+    let metadata = file.metadata().await.ok()?;
+    if !metadata.is_file() {
+        log::warn!("Conn: not reading {path:?}, which is not a regular file");
+        return None;
+    }
+    if metadata.len() > MAX_TRANSCRIPT_BYTES {
+        log::warn!(
+            "Conn: not reading transcript {path:?}: {} bytes is over the {MAX_TRANSCRIPT_BYTES} byte limit",
+            metadata.len()
+        );
+        return None;
+    }
+    // The length said above can be out of date or wrong for the file, so the read is bounded
+    // too. One byte past the limit is enough to tell that it was exceeded.
+    let mut bytes = Vec::new();
+    if let Err(err) = file
+        .take(MAX_TRANSCRIPT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await
+    {
+        log::warn!("Conn: could not read transcript {path:?}: {err}");
+        return None;
+    }
+    if bytes.len() as u64 > MAX_TRANSCRIPT_BYTES {
+        log::warn!(
+            "Conn: not reading transcript {path:?}: it grew past the {MAX_TRANSCRIPT_BYTES} byte limit"
+        );
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Finds a session's transcript.
+///
+/// The plugin reports the path on `stop` only, so the first turn of a session
+/// — which can be the longest, and is the one most worth reading while it is
+/// still running — would otherwise have no account at all until it ended.
+/// Claude Code writes transcripts to a known place, so the path is derived
+/// until the plugin confirms one.
+async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
+    if let Some(path) = locator.path.as_deref() {
+        let path = PathBuf::from(path);
+        // A path that is not a regular file is no transcript, so the search carries on.
+        if is_regular_file(&path).await {
+            return Some(path);
+        }
+    }
+
+    let session_id = locator.session_id.as_deref()?;
+    let file_name = format!("{session_id}.jsonl");
+    let projects = claude_projects_dir()?;
+
+    if let Some(cwd) = locator.cwd.as_deref() {
+        let derived = projects.join(mangle_project_dir(cwd)).join(&file_name);
+        if is_regular_file(&derived).await {
+            return Some(derived);
+        }
+    }
+
+    // The directory name is a guess; the session id is not. When the guess is
+    // wrong, look for the file itself rather than give up on the session.
+    let mut entries = tokio::fs::read_dir(&projects).await.ok()?;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let candidate = entry.path().join(&file_name);
+        if is_regular_file(&candidate).await {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn claude_projects_dir() -> Option<PathBuf> {
+    let root = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::home_dir()?.join(".claude"),
+    };
+    Some(root.join("projects"))
+}
+
+/// Claude Code names a project directory after the working directory it ran
+/// in, with the path separators flattened.
+fn mangle_project_dir(cwd: &str) -> String {
+    cwd.replace(['/', '.'], "-")
+}
+
+fn conn_status(status: &CLIAgentSessionStatus) -> ConnStatus {
+    match status {
+        CLIAgentSessionStatus::InProgress => ConnStatus::Working,
+        CLIAgentSessionStatus::Blocked { .. } => ConnStatus::NeedsYou,
+        CLIAgentSessionStatus::Success | CLIAgentSessionStatus::Cancelled => ConnStatus::Done,
+        CLIAgentSessionStatus::Failed { .. } => ConnStatus::Failed,
+    }
+}
+
+/// Translates a plugin event into a history entry, or `None` for events that
+/// carry no history.
+fn entry_kind(event: &CLIAgentEvent) -> Option<ConnEntryKind> {
+    let payload = &event.payload;
+    match &event.event {
+        // A session beginning tells a returning reader nothing they can act
+        // on, and it pushed the first real prompt down the panel.
+        CLIAgentEventType::SessionStart => None,
+        // A prompt with no text tells the reader nothing, and an empty line in
+        // the spine is worse than no line.
+        // A background task notification reaches this hook the same way a typed
+        // instruction does, and would otherwise open a chapter nobody asked
+        // for.
+        CLIAgentEventType::PromptSubmit => payload
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty() && !is_harness_prompt(query))
+            .map(|query| ConnEntryKind::Prompt {
+                text: tidy_prompt(query),
+            }),
+        CLIAgentEventType::PermissionRequest => Some(ConnEntryKind::PermissionRequested {
+            summary: payload.summary.clone(),
+            tool_name: payload.tool_name.clone(),
+            target: payload.tool_input_preview.clone(),
+        }),
+        CLIAgentEventType::PermissionReplied => Some(ConnEntryKind::PermissionResolved),
+        // An agent that reports it needs input is waiting on the user the same
+        // way one that asks a question is, so the history tells it the same way.
+        CLIAgentEventType::QuestionAsked | CLIAgentEventType::NeedsInput => {
+            Some(ConnEntryKind::QuestionAsked {
+                summary: payload.summary.clone(),
+            })
+        }
+        CLIAgentEventType::ToolComplete => Some(ConnEntryKind::ToolCompleted {
+            tool_name: payload.tool_name.clone(),
+            // Always `None` with the current Warp plugin, which sends no
+            // `tool_input` for a completed call. Kept because a plugin we
+            // control could fill it in.
+            target: payload.tool_input_preview.clone(),
+            runs: 1,
+        }),
+        CLIAgentEventType::Stop => Some(ConnEntryKind::Responded {
+            text: payload.response.clone(),
+        }),
+        CLIAgentEventType::StopFailure => Some(ConnEntryKind::Failed {
+            error_type: payload.error_type.clone(),
+            message: payload.response.clone(),
+        }),
+        // The agent sitting at its prompt is already implied by the turn that
+        // preceded it, so it would only pad the history.
+        CLIAgentEventType::IdlePrompt => None,
+        // A newer plugin than this build understands. Dropping it keeps
+        // unknown events out of the history rather than guessing at them.
+        CLIAgentEventType::Unknown(_) => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

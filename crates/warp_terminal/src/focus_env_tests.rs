@@ -28,3 +28,34 @@ fn focus_env_vars_point_at_session_deeplink() {
         )))
     );
 }
+
+/// Launching Warp from inside a Claude Code session used to make every
+/// terminal in it a child of that session, which turns transcript saving off.
+/// The markers describe whatever started Warp, never the shells Warp starts.
+#[test]
+fn launcher_agent_markers_are_dropped_but_user_config_is_kept() {
+    // SAFETY: this test owns the variables it sets and runs before any thread
+    // it spawns; nextest gives each test its own process.
+    unsafe {
+        std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
+        std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("CLAUDE_PID", "123");
+        std::env::set_var("CLAUDE_CONFIG_DIR", "/somewhere/.claude");
+        std::env::set_var("CLAUDE_CODE_USE_BEDROCK", "1");
+        super::clear_launcher_agent_env();
+    }
+
+    assert!(std::env::var_os("CLAUDE_CODE_CHILD_SESSION").is_none());
+    assert!(std::env::var_os("CLAUDECODE").is_none());
+    assert!(std::env::var_os("CLAUDE_PID").is_none());
+    assert_eq!(
+        std::env::var_os("CLAUDE_CONFIG_DIR"),
+        Some("/somewhere/.claude".into()),
+        "the user's own configuration is not a session marker"
+    );
+    assert_eq!(
+        std::env::var_os("CLAUDE_CODE_USE_BEDROCK"),
+        Some("1".into()),
+        "a CLAUDE_CODE_ variable is not a session marker unless it is one of the named ones"
+    );
+}

@@ -284,6 +284,8 @@ pub enum PaneGroupAction {
     Remove(PaneId),
     RemoveActive,
     Activate(PaneId, ActivationReason),
+    /// Any click inside a pane, including one its content handles itself.
+    Clicked,
     ResizeMove(Vector2F),
     StartResizing(DraggedBorder),
     ResetPaneSizes(EntityId),
@@ -595,6 +597,8 @@ pub enum Event {
         space: Space,
     },
     PaneFocused,
+    /// A pane was clicked, whether or not that moved focus.
+    PaneClicked,
     DroppedOnTabBar {
         origin: ActionOrigin,
         pane_id: PaneId,
@@ -2284,6 +2288,17 @@ impl PaneGroup {
     pub fn contains_terminal_view(&self, terminal_view_id: EntityId, ctx: &AppContext) -> bool {
         self.panes_of::<TerminalPane>()
             .any(|pane| pane.terminal_view(ctx).id() == terminal_view_id)
+    }
+
+    /// The terminal panes still open in this group, with their terminal view ids. A pane hidden
+    /// pending close is left out.
+    pub fn open_terminal_panes<'a>(
+        &'a self,
+        ctx: &'a AppContext,
+    ) -> impl Iterator<Item = (PaneId, EntityId)> + 'a {
+        self.panes_of::<TerminalPane>()
+            .filter(|pane| !self.is_pane_hidden_for_close(pane.id()))
+            .map(move |pane| (pane.id(), pane.terminal_view(ctx).id()))
     }
 
     /// Returns the [`PaneId`] of the terminal pane whose persistent UUID matches
@@ -8253,6 +8268,7 @@ impl TypedActionView for PaneGroup {
             Remove(view_id) => self.close_pane_with_confirmation(*view_id, ctx),
             RemoveActive => self.close_active_pane_with_confirmation(ctx),
             Activate(view_id, reason) => self.focus_pane_on_mouse_event(*view_id, *reason, ctx),
+            Clicked => ctx.emit(Event::PaneClicked),
             ResizeMove(position) => self.maybe_resize_pane(*position, ctx),
             StartResizing(border) => self.start_resizing(*border, ctx),
             ResetPaneSizes(border_id) => self.reset_pane_sizes(*border_id, ctx),

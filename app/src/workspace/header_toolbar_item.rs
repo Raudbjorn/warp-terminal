@@ -31,6 +31,7 @@ pub enum HeaderToolbarItemKind {
     ToolsPanel,
     AgentManagement,
     CodeReview,
+    Conn,
     NotificationsMailbox,
 }
 
@@ -41,6 +42,7 @@ impl HeaderToolbarItemKind {
             Self::ToolsPanel => "Tools Panel",
             Self::AgentManagement => "Agent Management",
             Self::CodeReview => "Code Review",
+            Self::Conn => "Conn",
             Self::NotificationsMailbox => "Notifications",
         }
     }
@@ -51,6 +53,7 @@ impl HeaderToolbarItemKind {
             Self::ToolsPanel => Icon::Tool2,
             Self::AgentManagement => Icon::Grid,
             Self::CodeReview => Icon::Diff,
+            Self::Conn => Icon::ClockRewind,
             Self::NotificationsMailbox => Icon::Inbox,
         }
     }
@@ -79,6 +82,7 @@ impl HeaderToolbarItemKind {
                     && !is_web_anonymous_user
             }
             Self::CodeReview => cfg!(feature = "local_fs"),
+            Self::Conn => true,
             Self::NotificationsMailbox => {
                 !ChannelState::is_local_only() && FeatureFlag::HOANotifications.is_enabled()
             }
@@ -101,7 +105,10 @@ impl HeaderToolbarItemKind {
     /// Whether this item opens a side panel (as opposed to replacing the content
     /// area or opening a popover).
     pub fn is_panel(&self) -> bool {
-        matches!(self, Self::TabsPanel | Self::ToolsPanel | Self::CodeReview)
+        matches!(
+            self,
+            Self::TabsPanel | Self::ToolsPanel | Self::CodeReview | Self::Conn
+        )
     }
 
     pub fn default_left() -> Vec<Self> {
@@ -109,7 +116,7 @@ impl HeaderToolbarItemKind {
     }
 
     pub fn default_right() -> Vec<Self> {
-        vec![Self::CodeReview, Self::NotificationsMailbox]
+        vec![Self::CodeReview, Self::Conn, Self::NotificationsMailbox]
     }
 
     /// All toolbar item variants (availability filtering is done at the call site).
@@ -119,6 +126,7 @@ impl HeaderToolbarItemKind {
             Self::ToolsPanel,
             Self::AgentManagement,
             Self::CodeReview,
+            Self::Conn,
             Self::NotificationsMailbox,
         ]
     }

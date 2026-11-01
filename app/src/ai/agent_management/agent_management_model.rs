@@ -137,9 +137,11 @@ impl AgentNotificationsModel {
                     ctx,
                 );
             }
+            // Conn consumes RawEvent; notifications only track lifecycle and status.
             CLIAgentSessionsModelEvent::Started { .. }
             | CLIAgentSessionsModelEvent::InputSessionChanged { .. }
-            | CLIAgentSessionsModelEvent::SessionUpdated { .. } => {}
+            | CLIAgentSessionsModelEvent::SessionUpdated { .. }
+            | CLIAgentSessionsModelEvent::RawEvent { .. } => {}
             CLIAgentSessionsModelEvent::StatusChanged {
                 terminal_view_id,
                 agent,

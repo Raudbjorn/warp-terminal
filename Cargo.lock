@@ -3227,6 +3227,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "conn"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "console"
 version = "0.15.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15177,6 +15186,7 @@ dependencies = [
  "command-corrections",
  "computer_use",
  "concat-idents",
+ "conn",
  "console_error_panic_hook",
  "content_inspector",
  "core-foundation 0.10.1",

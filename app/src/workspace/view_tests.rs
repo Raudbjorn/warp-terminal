@@ -163,6 +163,9 @@ pub(crate) fn initialize_app_with_team_client(app: &mut App, team_client: Arc<dy
     app.add_singleton_model(crate::ai::blocklist::QueuedQueryModel::new);
     app.add_singleton_model(|ctx| OrchestrationPillBarModel::new(Default::default(), ctx));
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // ConnPanelView reads this on construction, so a harness that builds a
+    // Workspace needs it registered as production does.
+    app.add_singleton_model(crate::conn::ConnModel::new);
     // The blocklist controller created during terminal bootstrap subscribes to
     // OrchestrationEventService and OrchestrationEventStreamer unconditionally,
     // so both singletons must be registered before bootstrap.
@@ -821,7 +824,7 @@ fn test_tools_panel_does_not_suppress_vertical_tab_bar_traffic_light_padding() {
             right: vec![
                 HeaderToolbarItemKind::TabsPanel,
                 HeaderToolbarItemKind::ToolsPanel,
-                HeaderToolbarItemKind::CodeReview,
+                HeaderToolbarItemKind::Conn,
                 HeaderToolbarItemKind::NotificationsMailbox,
             ],
         },
@@ -832,7 +835,7 @@ fn test_tools_panel_does_not_suppress_vertical_tab_bar_traffic_light_padding() {
                 HeaderToolbarItemKind::AgentManagement,
             ],
             right: vec![
-                HeaderToolbarItemKind::CodeReview,
+                HeaderToolbarItemKind::Conn,
                 HeaderToolbarItemKind::NotificationsMailbox,
             ],
         },
@@ -5920,6 +5923,85 @@ fn test_tab_group_rename_blur_does_not_commit_unfinished_name() {
                 workspace.tab_groups[&group_id].name, None,
                 "a rename interrupted by the terminal stealing focus must not be committed"
             );
+        });
+    });
+}
+
+#[test]
+fn test_right_panel_content_is_remembered_per_terminal_pane() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            assert_eq!(workspace.right_panel_content, Some(RightPanelContent::Conn));
+            // Close Conn for the first tab's pane.
+            workspace.toggle_conn_panel(ctx);
+
+            workspace.add_terminal_tab(false, ctx);
+            workspace.activate_tab(1, ctx);
+            assert_eq!(
+                workspace.right_panel_content, None,
+                "a pane with no remembered content keeps what is showing"
+            );
+            workspace.toggle_conn_panel(ctx);
+
+            workspace.activate_tab(0, ctx);
+            assert_eq!(workspace.right_panel_content, None);
+
+            workspace.activate_tab(1, ctx);
+            assert_eq!(workspace.right_panel_content, Some(RightPanelContent::Conn));
+        });
+    });
+}
+
+#[test]
+fn test_right_panel_content_follows_focus_between_split_panes() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        let (first, second) = workspace.update(&mut app, |workspace, ctx| {
+            let pane_group = workspace.get_pane_group_view(0).unwrap().clone();
+            let first = pane_group.read(ctx, |panes, _| panes.pane_id_by_index(0).unwrap());
+            pane_group.update(ctx, |panes, ctx| {
+                panes.handle_action(&PaneGroupAction::Add(Direction::Right), ctx);
+            });
+            let second = pane_group.read(ctx, |panes, _| panes.pane_id_by_index(1).unwrap());
+            (first, second)
+        });
+
+        // The new pane has focus. Close Conn for it; the first pane is left with Conn.
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.toggle_conn_panel(ctx);
+            workspace.toggle_conn_panel(ctx);
+            workspace.toggle_conn_panel(ctx);
+            assert_eq!(workspace.right_panel_content, None);
+        });
+        let focus = |app: &mut App, pane| {
+            workspace.update(app, |workspace, ctx| {
+                let pane_group = workspace.get_pane_group_view(0).unwrap().clone();
+                pane_group.update(ctx, |panes, ctx| panes.focus_pane_by_id(pane, ctx));
+            });
+        };
+
+        focus(&mut app, first);
+        workspace.update(&mut app, |workspace, ctx| {
+            assert_eq!(
+                workspace.right_panel_content, None,
+                "the first pane has no remembered content yet"
+            );
+            workspace.toggle_conn_panel(ctx);
+        });
+
+        focus(&mut app, second);
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(workspace.right_panel_content, None);
+        });
+
+        focus(&mut app, first);
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(workspace.right_panel_content, Some(RightPanelContent::Conn));
         });
     });
 }

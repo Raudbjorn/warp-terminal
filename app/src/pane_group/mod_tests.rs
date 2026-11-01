@@ -190,6 +190,9 @@ fn initialize_app_with_history(app: &mut App, conversations: Vec<AgentConversati
         )
     });
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // Subscribes to `CLIAgentSessionsModel` on construction, so it is
+    // registered after it, and closing a pane reads it.
+    app.add_singleton_model(crate::conn::ConnModel::new);
     app.add_singleton_model(OrchestrationEventService::new);
     app.add_singleton_model(LocalAgentTaskSyncModel::new);
     app.add_singleton_model(

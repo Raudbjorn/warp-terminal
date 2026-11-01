@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use ::conn::story::ConnTurn;
+use ::conn::{ConnEntryKind, ConnSession};
 use languages::language_by_local_filename;
 use pathfinder_color::ColorU;
 use pathfinder_geometry::rect::RectF;
@@ -45,6 +47,7 @@ use crate::cloud_object::CloudObjectLookup as _;
 use crate::cloud_object::model::generic_string_model::StringModel;
 use crate::code::editor::{add_color, remove_color};
 use crate::code::icon_from_file_path;
+use crate::conn::{ConnModel, preview as conn_preview};
 use crate::context_chips::display_chip::GitLineChanges;
 use crate::context_chips::github_pr_display_text_from_url;
 use crate::drive::DriveObjectType;
@@ -59,7 +62,7 @@ use crate::tab::{
     SelectedTabColor, TAB_INDICATOR_SYNCED_COLOR, TabData, reveals_tab_shortcut_hints,
     tab_activate_binding_name, tab_position_id,
 };
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
+use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModel};
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::view::TerminalViewState;
 use crate::terminal::{CLIAgent, TerminalView};
@@ -4662,6 +4665,9 @@ fn render_terminal_row_content(
         .with_cross_axis_alignment(CrossAxisAlignment::Start);
     content.add_child(first_line_element);
     content.add_child(Container::new(second_line).with_margin_top(2.).finish());
+    if let Some(step_line) = render_conn_step_line(terminal_view, 12., appearance, app) {
+        content.add_child(Container::new(step_line).with_margin_top(2.).finish());
+    }
     content.add_child(
         Container::new(render_terminal_metadata_line(
             terminal_view,
@@ -6868,6 +6874,261 @@ fn render_detail_wrapping_text(
     text.finish()
 }
 
+/// How much of a prompt the hover card shows. Tighter than the docked panel's
+/// budget: the card is 320px wide and is read at a glance.
+const DETAIL_SIDECAR_PROMPT_CHARS: usize = 180;
+
+/// How much of an answer or a step the hover card shows. Looser than the
+/// prompt, because the prompt is yours and the answer is what you came back
+/// for.
+const DETAIL_SIDECAR_BODY_CHARS: usize = 220;
+
+/// A line of the story with its speaker, laid out so the bodies of successive
+/// lines align under one another.
+fn render_detail_story_line(
+    label: &str,
+    body: String,
+    body_color: WarpThemeFill,
+    label_color: WarpThemeFill,
+    appearance: &Appearance,
+) -> Box<dyn Element> {
+    const LABEL_WIDTH: f32 = 26.;
+    Flex::row()
+        .with_main_axis_size(MainAxisSize::Max)
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_spacing(6.)
+        .with_child(
+            ConstrainedBox::new(
+                Text::new_inline(label.to_owned(), appearance.ui_font_family(), 10.)
+                    .with_color(label_color.into())
+                    .finish(),
+            )
+            .with_width(LABEL_WIDTH)
+            .finish(),
+        )
+        .with_child(
+            Shrinkable::new(
+                1.,
+                render_detail_wrapping_text(body, 12., body_color, None, appearance),
+            )
+            .finish(),
+        )
+        .finish()
+}
+
+/// The lines the hover card shows for one turn.
+struct ConnStoryLines {
+    prompt: String,
+    /// What has come of the instruction so far, and what to call it. `None`
+    /// for a turn that has only just started, where the instruction alone is
+    /// a complete enough answer.
+    progress: Option<(&'static str, String)>,
+}
+
+/// Decides what the card says about a turn.
+///
+/// A finished turn is told by its closing message. A running one is told by
+/// what it is doing, which is its latest step, or — before it has taken one —
+/// whatever it said on its way into the work.
+///
+/// Running is the hooks' answer rather than the story's. A turn's `outcome` is
+/// only the latest thing the agent has said, and reading it as a conclusion
+/// puts "I'll look at the repo first" under `said` for the ten minutes that
+/// follow.
+fn conn_story_lines(turn: &ConnTurn, is_running: bool) -> Option<ConnStoryLines> {
+    let prompt = conn_preview::head(&turn.prompt, DETAIL_SIDECAR_PROMPT_CHARS);
+    if prompt.is_empty() {
+        return None;
+    }
+    let latest_step = || {
+        turn.steps.last().map(|step| {
+            (
+                "now",
+                conn_preview::head(&step.description, DETAIL_SIDECAR_BODY_CHARS),
+            )
+        })
+    };
+    let progress = if is_running {
+        latest_step().or_else(|| {
+            turn.outcome
+                .as_ref()
+                .map(|said| ("now", conn_preview::head(said, DETAIL_SIDECAR_BODY_CHARS)))
+        })
+    } else {
+        match &turn.outcome {
+            Some(outcome) => Some((
+                "said",
+                conn_preview::tail(outcome, DETAIL_SIDECAR_BODY_CHARS),
+            )),
+            None => latest_step(),
+        }
+    };
+    Some(ConnStoryLines {
+        prompt,
+        progress: progress.filter(|(_, body)| !body.is_empty()),
+    })
+}
+
+/// The newest prompt the story does not yet cover, if there is one.
+///
+/// The story is re-read on a pace, so for a moment after a prompt is sent it
+/// still describes the turn before. A prompt in this state is the turn that is
+/// actually running.
+fn conn_live_prompt(session: &ConnSession) -> Option<&str> {
+    session
+        .in_flight()
+        .iter()
+        .rev()
+        .find_map(|entry| match &entry.kind {
+            ConnEntryKind::Prompt { text } => Some(text.as_str()),
+            _ => None,
+        })
+}
+
+/// What the card says about a session: its latest turn, unless a running
+/// session has been given a newer prompt that the story has not caught up to.
+///
+/// In that window the story's latest turn is the previous one, and its last
+/// step would be shown as what the pane is doing now. The new prompt is shown
+/// alone instead, which is a complete enough answer for a turn that has only
+/// just started.
+fn conn_session_story_lines(session: &ConnSession, is_running: bool) -> Option<ConnStoryLines> {
+    if is_running && let Some(text) = conn_live_prompt(session) {
+        let prompt = conn_preview::head(text, DETAIL_SIDECAR_PROMPT_CHARS);
+        return (!prompt.is_empty()).then_some(ConnStoryLines {
+            prompt,
+            progress: None,
+        });
+    }
+    conn_story_lines(session.story()?.latest_turn()?, is_running)
+}
+
+/// The story so far for a pane's CLI agent session: what was asked, and either
+/// what it is doing now or what it came back with.
+///
+/// This is the tab list's share of Conn. The docked panel tells the whole story
+/// for the pane you are looking at; the card answers the single question you
+/// have about a pane you are not looking at, which is whether it is still on
+/// the thing you wanted.
+fn render_conn_story_section(
+    terminal_view: &TerminalView,
+    text_colors: &DetailSidecarTextColors,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    let is_running = matches!(
+        CLIAgentSessionsModel::as_ref(app)
+            .session(terminal_view.id())
+            .map(|session| &session.status),
+        Some(CLIAgentSessionStatus::InProgress)
+    );
+    let session = ConnModel::as_ref(app).session(terminal_view.id())?;
+    let lines = conn_session_story_lines(session, is_running)?;
+
+    let mut section = Flex::column()
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_spacing(DETAIL_SIDECAR_SECTION_GAP);
+    section.add_child(render_detail_story_line(
+        "you",
+        lines.prompt,
+        text_colors.main,
+        text_colors.disabled,
+        appearance,
+    ));
+    if let Some((label, body)) = lines.progress {
+        section.add_child(render_detail_story_line(
+            label,
+            body,
+            text_colors.sub,
+            text_colors.disabled,
+            appearance,
+        ));
+    }
+    Some(section.finish())
+}
+
+/// How much of a step a pane row shows.
+///
+/// Far tighter than the hover card's budget. The row is one clipped line in a
+/// sidebar that starts at 250px, so the clip does the real work and this only
+/// keeps a runaway description from being built at all.
+const ROW_STEP_CHARS: usize = 100;
+
+/// What a pane is doing right this second, or `None` if it is not mid-turn.
+///
+/// Whether a turn is running is the hooks' answer, not the story's. A turn's
+/// `outcome` is only the latest thing the agent has said, and it says plenty
+/// on the way past — "I'll look at the repo first" is an outcome the moment
+/// it is written, with ten minutes of work still to come.
+///
+/// What the story can be wrong about is which turn it describes: it is re-read
+/// on a pace, so a prompt it does not yet cover means its last step belongs to
+/// the turn before this one.
+fn conn_running_step(
+    status: Option<&CLIAgentSessionStatus>,
+    session: Option<&ConnSession>,
+) -> Option<String> {
+    if !matches!(status?, CLIAgentSessionStatus::InProgress) {
+        return None;
+    }
+    let session = session?;
+    if conn_live_prompt(session).is_some() {
+        return None;
+    }
+    let turn = session.story()?.latest_turn()?;
+    let step = conn_preview::head(&turn.steps.last()?.description, ROW_STEP_CHARS);
+    (!step.is_empty()).then_some(step)
+}
+
+/// The row's share of Conn: the step a running pane is on.
+///
+/// Only a running pane gets this line, so a list of eight panes does not grow
+/// eight rows taller for the sake of the one you are waiting on. The icon and
+/// its colour come from the same place as the hover card's status pill, so the
+/// two surfaces say "in progress" the same way.
+fn render_conn_step_line(
+    terminal_view: &TerminalView,
+    font_size: f32,
+    appearance: &Appearance,
+    app: &AppContext,
+) -> Option<Box<dyn Element>> {
+    let step = conn_running_step(
+        CLIAgentSessionsModel::as_ref(app)
+            .session(terminal_view.id())
+            .map(|session| &session.status),
+        ConnModel::as_ref(app).session(terminal_view.id()),
+    )?;
+
+    let theme = appearance.theme();
+    let (icon, icon_color) =
+        ConversationStatus::InProgress.status_icon_and_color(theme, StatusColorStyle::Standard);
+    Some(
+        Flex::row()
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(4.)
+            .with_child(
+                ConstrainedBox::new(
+                    icon.to_warpui_icon(WarpThemeFill::Solid(icon_color))
+                        .finish(),
+                )
+                .with_width(font_size - 2.)
+                .with_height(font_size - 2.)
+                .finish(),
+            )
+            .with_child(
+                Shrinkable::new(
+                    1.,
+                    Text::new_inline(step, appearance.ui_font_family(), font_size)
+                        .with_clip(ClipConfig::ellipsis())
+                        .with_color(theme.sub_text_color(theme.background()).into())
+                        .finish(),
+                )
+                .finish(),
+            )
+            .finish(),
+    )
+}
+
 fn render_terminal_detail_primary_line(
     primary_line: &TerminalPrimaryLineData,
     color: WarpThemeFill,
@@ -6996,6 +7257,9 @@ fn render_terminal_detail_section(
         text_colors.sub,
         appearance,
     ));
+    if let Some(story) = render_conn_story_section(terminal_view, &text_colors, appearance, app) {
+        section.add_child(story);
+    }
 
     let mut metadata_row = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
@@ -7536,9 +7800,21 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
         theme,
     );
 
+    // The step line only exists while the pane's agent is mid-turn, so a row
+    // grows by one line exactly when it has something new to say.
+    let step_element = match &props.typed {
+        TypedPane::Terminal(terminal_pane) => render_conn_step_line(
+            terminal_pane.terminal_view(app).as_ref(app),
+            10.,
+            appearance,
+            app,
+        ),
+        _ => None,
+    };
+
     // Assemble text column: title + optional subtitle
     // Top-align the icon when there are two lines of content; center for single-line rows.
-    let icon_alignment = if subtitle_element.is_some() {
+    let icon_alignment = if subtitle_element.is_some() || step_element.is_some() {
         CrossAxisAlignment::Start
     } else {
         CrossAxisAlignment::Center
@@ -7552,6 +7828,10 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
 
     if let Some(subtitle) = subtitle_element {
         text_col.add_child(subtitle);
+    }
+
+    if let Some(step) = step_element {
+        text_col.add_child(step);
     }
 
     let content = Flex::row()

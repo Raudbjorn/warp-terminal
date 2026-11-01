@@ -20,6 +20,7 @@ mod coding_entrypoints;
 mod coding_panel_enablement_state;
 mod command_palette;
 mod completer;
+mod conn;
 #[allow(dead_code)]
 mod context_chips;
 #[cfg(enable_crash_recovery)]
@@ -813,6 +814,11 @@ pub fn run() -> Result<()> {
     if let Some(locale) = detect_system_ui_locale() {
         warpui::set_ui_locale(locale);
     }
+
+    // SAFETY: nothing in this process has started a thread yet. This has to
+    // happen before anything spawns a shell, and before anything reads the
+    // environment concurrently.
+    unsafe { warp_terminal::focus_env::clear_launcher_agent_env() };
 
     // Perform any necessary platform-specific initialization.
     platform::init();
@@ -2328,6 +2334,8 @@ pub(crate) fn initialize_app(
     // loads metadata.
     ctx.add_singleton_model(|_| RestoredAgentConversations::new());
     ctx.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // Must follow CLIAgentSessionsModel: ConnModel subscribes to it on construction.
+    ctx.add_singleton_model(conn::ConnModel::new);
     // ActiveAgentViewsModel is used to track active agent conversations and notify listeners when they change.
     ctx.add_singleton_model(|_| ActiveAgentViewsModel::new());
     ctx.add_singleton_model(AgentNotificationsModel::new);

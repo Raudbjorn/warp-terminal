@@ -383,6 +383,8 @@ pub enum WorkspaceAction {
     OpenWarpDrive,
     /// Toggles the right panel. This happens as an explicit action from the user.
     ToggleRightPanel,
+    /// Toggles the Conn panel. This happens as an explicit action from the user.
+    ToggleConnPanel,
     /// Opens the code review panel (right panel) without toggling. If already open,
     /// switches to the target pane's repo. Used by vertical tabs diff stats chip.
     OpenCodeReviewPanel(PaneViewLocator),
@@ -484,6 +486,10 @@ pub enum WorkspaceAction {
     },
     /// Open a local file with the system's default application.
     OpenFilePath {
+        path: PathBuf,
+    },
+    /// Open an agent session's plan file, rendered, in a pane beside the session.
+    OpenConnPlan {
         path: PathBuf,
     },
     TerminateApp,
@@ -1100,6 +1106,7 @@ impl WorkspaceAction {
             | OpenWarpDrive
             | ClosePanel
             | ToggleRightPanel
+            | ToggleConnPanel
             | OpenCodeReviewPanel(..)
             | ToggleVerticalTabsSettingsPopup
             | SetVerticalTabsDisplayGranularity(_)
@@ -1164,6 +1171,7 @@ impl WorkspaceAction {
             | OpenFilePath { .. }
             | ViewObjectInWarpDrive(_)
             | OpenObjectSharingSettings { .. }
+            | OpenConnPlan { .. }
             | TerminateApp
             | SignInAnonymousWebUser
             | TabHoverWidthStart { .. }

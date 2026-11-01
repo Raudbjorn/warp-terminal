@@ -266,6 +266,8 @@ use crate::code_review::GlobalCodeReviewModel;
 use crate::code_review::diff_state::DiffStateModel;
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
+use crate::conn::panel::ConnPanelView;
+use crate::conn::{ConnModel, ConnModelEvent};
 use crate::context_chips::ChipRuntimeCapabilities;
 use crate::default_terminal::DefaultTerminal;
 use crate::drive::export::ExportManager;
@@ -1051,6 +1053,12 @@ enum TabBarSlot {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RightPanelContent {
+    CodeReview,
+    Conn,
+}
+
 pub struct Workspace {
     window_id: WindowId,
     pub(crate) tabs: Vec<TabData>,
@@ -1209,6 +1217,14 @@ pub struct Workspace {
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
     right_panel_view: ViewHandle<RightPanelView>,
+    conn_panel_view: ViewHandle<ConnPanelView>,
+    /// What the right panel shows, shared by every tab so switching tabs changes the panel's
+    /// content but not the layout. Code review's open state also lives on each pane group, which
+    /// `reconcile_right_panel_for_active_tab` keeps in line with this.
+    right_panel_content: Option<RightPanelContent>,
+    /// The right panel content each terminal pane was last left with, keyed by terminal view and
+    /// restored when that pane takes focus. A pane with no entry keeps whatever is showing.
+    right_panel_by_pane: HashMap<EntityId, Option<RightPanelContent>>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
     agent_management_view: ViewHandle<AgentManagementView>,
     notification_mailbox_view: Option<ViewHandle<NotificationMailboxView>>,
@@ -3318,6 +3334,8 @@ impl Workspace {
             me.handle_right_panel_event(event.clone(), ctx);
         });
 
+        let conn_panel_view = ctx.add_typed_action_view(ConnPanelView::new);
+
         // Get persisted filters from window snapshot if restoring.
         let agent_management_filters = match workspace_setting {
             NewWorkspaceSource::Restored {
@@ -3392,6 +3410,10 @@ impl Workspace {
         );
         ctx.subscribe_to_model(&CLIAgentSessionsModel::handle(ctx), |me, _, event, ctx| {
             me.handle_cli_agent_sessions_event(event, ctx);
+        });
+
+        ctx.subscribe_to_model(&ConnModel::handle(ctx), |me, _, event, ctx| {
+            me.handle_conn_event(event, ctx);
         });
 
         ctx.subscribe_to_model(
@@ -3725,6 +3747,9 @@ impl Workspace {
             left_panel_view,
             left_panel_views,
             right_panel_view,
+            conn_panel_view,
+            right_panel_content: Some(RightPanelContent::Conn),
+            right_panel_by_pane: HashMap::new(),
             working_directories_model,
             shown_staging_banner_count: 0,
 
@@ -3980,6 +4005,35 @@ impl Workspace {
                 | CLIAgentSessionsModelEvent::SessionUpdated { .. }
         ) && self.workspace_contains_terminal_view(event.terminal_view_id(), ctx)
         {
+            ctx.notify();
+        }
+    }
+
+    /// Tells Conn which pane the reader is looking at, while this window is the key window.
+    fn report_focus_to_conn(&self, ctx: &mut ViewContext<Self>) {
+        if WindowManager::as_ref(ctx).active_window() != Some(self.window_id) {
+            return;
+        }
+        let window_id = self.window_id;
+        let pane = self
+            .active_tab_pane_group()
+            .as_ref(ctx)
+            .focused_session_view(ctx)
+            .map(|terminal| terminal.id());
+        ConnModel::handle(ctx).update(ctx, |conn, ctx| {
+            conn.key_window_focused(window_id, pane, ctx);
+        });
+    }
+
+    /// Redraws the tab list when a pane's Conn history moves.
+    ///
+    /// A pane row carries the step its agent is on, and that comes from the
+    /// transcript rather than from the hooks, so it changes at moments no
+    /// `CLIAgentSessionsModelEvent` marks. Scoped to this window's panes, as
+    /// the model records every pane in the app.
+    fn handle_conn_event(&mut self, event: &ConnModelEvent, ctx: &mut ViewContext<Self>) {
+        let ConnModelEvent::SessionUpdated { terminal_view_id } = event;
+        if self.workspace_contains_terminal_view(*terminal_view_id, ctx) {
             ctx.notify();
         }
     }
@@ -4594,6 +4648,7 @@ impl Workspace {
             pg.right_panel_open = true;
             pg.is_right_panel_maximized = right_panel_snapshot.is_maximized;
         });
+        self.right_panel_content = Some(RightPanelContent::CodeReview);
 
         let resizable = ResizableData::handle(ctx);
         if let Some(modal_sizes) = resizable.as_ref(ctx).get_all_handles(self.window_id)
@@ -4605,6 +4660,9 @@ impl Workspace {
         self.right_panel_view.update(ctx, |rp, ctx| {
             rp.set_active_pane_group(pane_group.clone(), &self.working_directories_model, ctx);
             rp.set_maximized(right_panel_snapshot.is_maximized, ctx);
+        });
+        self.conn_panel_view.update(ctx, |panel, ctx| {
+            panel.set_active_pane_group(pane_group.clone(), ctx);
         });
 
         ctx.notify();
@@ -5761,6 +5819,61 @@ impl Workspace {
         }
     }
 
+    fn reconcile_right_panel_for_active_tab(&mut self, ctx: &mut ViewContext<Self>) {
+        let pane_group = self.active_tab_pane_group().clone();
+        let code_review_open = pane_group.as_ref(ctx).right_panel_open;
+        let code_review_wanted = self.right_panel_content == Some(RightPanelContent::CodeReview);
+        if code_review_wanted && !code_review_open {
+            self.toggle_right_panel(&pane_group, ctx);
+        } else if !code_review_wanted && code_review_open {
+            self.close_right_panel(&pane_group, ctx);
+        }
+    }
+
+    fn toggle_conn_panel(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.right_panel_content == Some(RightPanelContent::Conn) {
+            self.right_panel_content = None;
+        } else {
+            let pane_group = self.active_tab_pane_group().clone();
+            if pane_group.as_ref(ctx).right_panel_open {
+                self.close_right_panel(&pane_group, ctx);
+            }
+            self.right_panel_content = Some(RightPanelContent::Conn);
+        }
+        self.remember_right_panel_for_focused_pane(ctx);
+        ctx.notify();
+    }
+
+    fn focused_terminal_id(&self, ctx: &AppContext) -> Option<EntityId> {
+        self.active_tab_pane_group()
+            .as_ref(ctx)
+            .focused_session_view(ctx)
+            .map(|terminal| terminal.id())
+    }
+
+    fn remember_right_panel_for_focused_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        if let Some(pane) = self.focused_terminal_id(ctx) {
+            self.right_panel_by_pane
+                .insert(pane, self.right_panel_content);
+        }
+    }
+
+    /// Shows the right panel content the focused terminal pane was last left with.
+    fn restore_right_panel_for_focused_pane(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(wanted) = self
+            .focused_terminal_id(ctx)
+            .and_then(|pane| self.right_panel_by_pane.get(&pane).copied())
+        else {
+            return;
+        };
+        if wanted == self.right_panel_content {
+            return;
+        }
+        self.right_panel_content = wanted;
+        self.reconcile_right_panel_for_active_tab(ctx);
+        ctx.notify();
+    }
+
     /// Change the active tab index. This must be used instead of setting `self.active_tab_index`
     /// directly, as it updates related state.
     pub(crate) fn set_active_tab_index(&mut self, index: usize, ctx: &mut ViewContext<Self>) {
@@ -5814,6 +5927,17 @@ impl Workspace {
                 ctx,
             );
         });
+        // Conn follows the active tab's pane group, so it has to be retargeted
+        // wherever the right panel is, or it keeps reporting on a stale tab.
+        // It holds the group weakly, so this is about showing the right pane,
+        // not about keeping a closed tab's terminals alive.
+        let conn_active_pane_group = self.active_tab_pane_group().clone();
+        self.conn_panel_view.update(ctx, |panel, ctx| {
+            panel.set_active_pane_group(conn_active_pane_group, ctx);
+        });
+        self.report_focus_to_conn(ctx);
+        self.restore_right_panel_for_focused_pane(ctx);
+        self.reconcile_right_panel_for_active_tab(ctx);
 
         let pane_group = self.active_tab_pane_group();
         let focused_terminal_view_id = self
@@ -10010,6 +10134,33 @@ impl Workspace {
             pane_group.right_panel_open = should_open;
             pane_group.is_right_panel_maximized
         });
+        // `right_panel_content` is what the active tab shows. An event from a
+        // tab in the background must not change it (that would swap the active
+        // tab's Conn panel for code review), so it only updates what the
+        // background tab's focused pane will show when it is switched to.
+        if panel_update_params.pane_group.id() == self.active_tab_pane_group().id() {
+            if should_open {
+                self.right_panel_content = Some(RightPanelContent::CodeReview);
+            } else if self.right_panel_content == Some(RightPanelContent::CodeReview) {
+                self.right_panel_content = None;
+            }
+        } else {
+            let background_pane = panel_update_params
+                .pane_group
+                .as_ref(ctx)
+                .focused_session_view(ctx)
+                .map(|terminal| terminal.id());
+            if let Some(pane) = background_pane {
+                if should_open {
+                    self.right_panel_by_pane
+                        .insert(pane, Some(RightPanelContent::CodeReview));
+                } else if self.right_panel_by_pane.get(&pane).copied()
+                    == Some(Some(RightPanelContent::CodeReview))
+                {
+                    self.right_panel_by_pane.insert(pane, None);
+                }
+            }
+        }
 
         self.right_panel_view.update(ctx, |view, ctx| {
             view.set_maximized(new_is_maximized, ctx);
@@ -10062,6 +10213,7 @@ impl Workspace {
             self.focus_active_tab(ctx);
         }
 
+        self.remember_right_panel_for_focused_pane(ctx);
         ctx.notify();
     }
 
@@ -16852,6 +17004,13 @@ impl Workspace {
             // If focused pane contains an object, then set selected state in WD to that object
             pane_group::Event::PaneFocused => {
                 self.current_workspace_state.close_all_modals();
+                if pane_group.id() == self.active_tab_pane_group().id() {
+                    self.restore_right_panel_for_focused_pane(ctx);
+                    // The Conn panel decides what to show from the focused pane at render time,
+                    // and a click into a pane changes nothing else it observes.
+                    self.conn_panel_view.update(ctx, |_, ctx| ctx.notify());
+                    self.report_focus_to_conn(ctx);
+                }
 
                 // Re-evaluate which region is focused and update pane dimming accordingly.
                 self.update_pane_dimming_for_current_focus_region(ctx);
@@ -16973,6 +17132,12 @@ impl Workspace {
                     ambient_agent_task_id,
                     ctx,
                 );
+            }
+            pane_group::Event::PaneClicked => {
+                if pane_group.id() == self.active_tab_pane_group().id() {
+                    self.conn_panel_view
+                        .update(ctx, |panel, ctx| panel.follow_focused_pane(ctx));
+                }
             }
             pane_group::Event::RepoChanged => {
                 self.refresh_working_directories_for_pane_group(&pane_group, ctx);
@@ -19506,6 +19671,17 @@ impl Workspace {
                     // This ensures dimming updates properly when the app gains/loses focus
                     ctx.notify();
                 }
+
+                if did_window_change_focus {
+                    if current.active_window == Some(self.window_id) {
+                        self.report_focus_to_conn(ctx);
+                    } else {
+                        let window_id = self.window_id;
+                        ConnModel::handle(ctx).update(ctx, |conn, ctx| {
+                            conn.window_resigned_key(window_id, ctx);
+                        });
+                    }
+                }
             }
         };
     }
@@ -21107,6 +21283,30 @@ impl Workspace {
             })
     }
 
+    fn render_conn_panel_button(&self, appearance: &Appearance) -> Box<dyn Element> {
+        SavePosition::new(
+            Container::new(
+                Align::new(
+                    self.render_tab_bar_icon_button(
+                        appearance,
+                        icons::Icon::ClockRewind,
+                        &self.mouse_states.conn_panel_icon,
+                        WorkspaceAction::ToggleConnPanel,
+                        "Conn".to_string(),
+                        None,
+                        self.right_panel_content == Some(RightPanelContent::Conn),
+                        false,
+                    )
+                    .finish(),
+                )
+                .finish(),
+            )
+            .finish(),
+            "workspace:toggle_conn_panel",
+        )
+        .finish()
+    }
+
     fn render_right_panel_button(
         &self,
         appearance: &Appearance,
@@ -21766,6 +21966,7 @@ impl Workspace {
                 self.render_agent_management_view_button(appearance, ctx)
             }
             HeaderToolbarItemKind::CodeReview => self.render_right_panel_button(appearance, ctx),
+            HeaderToolbarItemKind::Conn => self.render_conn_panel_button(appearance),
             HeaderToolbarItemKind::NotificationsMailbox => {
                 self.render_notifications_mailbox_button(appearance, ctx)
             }
@@ -23400,6 +23601,12 @@ impl Workspace {
                     return None;
                 }
                 Some(ChildView::new(&self.right_panel_view).finish())
+            }
+            HeaderToolbarItemKind::Conn => {
+                if self.right_panel_content != Some(RightPanelContent::Conn) {
+                    return None;
+                }
+                Some(ChildView::new(&self.conn_panel_view).finish())
             }
             HeaderToolbarItemKind::AgentManagement
             | HeaderToolbarItemKind::NotificationsMailbox => None,
@@ -25287,6 +25494,7 @@ impl TypedActionView for Workspace {
                 let pane_group_handle = self.active_tab_pane_group().clone();
                 self.toggle_right_panel(&pane_group_handle, ctx);
             }
+            ToggleConnPanel => self.toggle_conn_panel(ctx),
             #[cfg(feature = "local_fs")]
             OpenCodeReviewPanel(locator) => {
                 let pane_group_handle = self
@@ -25556,6 +25764,19 @@ impl TypedActionView for Workspace {
             }
             OpenFilePath { path } => {
                 ctx.open_file_path(path);
+            }
+            OpenConnPlan { path } => {
+                self.open_file_with_target(
+                    path.clone(),
+                    FileTarget::MarkdownViewer(EditorLayout::SplitPane),
+                    None,
+                    CodeSource::Link {
+                        path: path.clone(),
+                        range_start: None,
+                        range_end: None,
+                    },
+                    ctx,
+                );
             }
             NewTabInAgentMode {
                 entrypoint,
@@ -26046,9 +26267,13 @@ impl TypedActionView for Workspace {
                 if !self.focus_terminal_view_locally(*terminal_view_id, ctx) {
                     self.focus_terminal_view_in_other_window(*terminal_view_id, ctx);
                 }
+                self.conn_panel_view
+                    .update(ctx, |panel, ctx| panel.follow_focused_pane(ctx));
             }
             FocusPane(locator) => {
                 self.focus_pane(*locator, ctx);
+                self.conn_panel_view
+                    .update(ctx, |panel, ctx| panel.follow_focused_pane(ctx));
             }
             StartNewConversation { terminal_view_id } => {
                 Self::set_pending_query_state_for_terminal_view(
@@ -28920,6 +29145,16 @@ impl Workspace {
             pg.detach_panes_for_close(&working_directories_model, ctx);
         });
         self.pending_pane_group_transfer = false;
+        // Conn holds the active pane group weakly, and still points at the
+        // placeholder that was just dropped. Retarget it the way a tab switch
+        // does, or it reports on nothing until the next switch.
+        if self.active_tab_pane_group().id() == new_id {
+            let conn_active_pane_group = new_pane_group.clone();
+            self.conn_panel_view.update(ctx, |panel, ctx| {
+                panel.set_active_pane_group(conn_active_pane_group, ctx);
+            });
+            self.report_focus_to_conn(ctx);
+        }
         ctx.dispatch_global_action("workspace:save_app", ());
         ctx.notify();
     }
