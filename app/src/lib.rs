@@ -135,6 +135,7 @@ pub mod root_view;
 pub mod search;
 pub mod settings;
 pub mod settings_view;
+mod ssh_manager;
 pub mod tab_configs;
 pub mod terminal;
 pub mod themes;

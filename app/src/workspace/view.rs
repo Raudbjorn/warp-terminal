@@ -20,6 +20,7 @@ pub(crate) mod orchestration_launch_modal;
 mod plugin_markdown_modal;
 mod plugin_palette_modal;
 pub(crate) mod right_panel;
+mod ssh_manager;
 mod startup_directory;
 mod tab_grouping;
 #[cfg(test)]
@@ -542,6 +543,7 @@ use crate::workspace::view::orchestration_launch_modal::{
 use crate::workspace::view::plugin_markdown_modal::PluginMarkdownModal;
 use crate::workspace::view::plugin_palette_modal::{PluginPaletteEvent, PluginPaletteModal};
 use crate::workspace::view::right_panel::{RightPanelEvent, RightPanelView};
+use crate::workspace::view::ssh_manager::SshManagerWorkspaceState;
 use crate::workspace::{ForkFromExchange, ForkedConversationDestination};
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_workspaces::{ResolvedTeamScope, UserWorkspaces};
@@ -1208,6 +1210,7 @@ pub struct Workspace {
     vertical_tabs_panel: VerticalTabsPanelState,
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
+    ssh_manager: SshManagerWorkspaceState,
     right_panel_view: ViewHandle<RightPanelView>,
     working_directories_model: ModelHandle<pane_group::WorkingDirectoriesModel>,
     agent_management_view: ViewHandle<AgentManagementView>,
@@ -3311,6 +3314,8 @@ impl Workspace {
             me.handle_left_panel_event(event, ctx);
         });
 
+        let ssh_manager = SshManagerWorkspaceState::new(ctx);
+
         let right_panel_view = ctx.add_typed_action_view(|ctx| {
             RightPanelView::new(working_directories_model.clone(), ctx)
         });
@@ -3724,6 +3729,7 @@ impl Workspace {
             vertical_tabs_panel: Default::default(),
             left_panel_view,
             left_panel_views,
+            ssh_manager,
             right_panel_view,
             working_directories_model,
             shown_staging_banner_count: 0,
@@ -7327,6 +7333,7 @@ impl Workspace {
             );
         }
 
+        menu_items.extend(self.ssh_new_session_menu_items(ctx));
         menu_items.push(MenuItem::Separator);
         menu_items.push(
             MenuItemFields::new("Reopen closed session")
@@ -15153,6 +15160,7 @@ impl Workspace {
 
     /// Close all overlays in this workspace and the active pane group.
     fn close_all_overlays(&mut self, ctx: &mut ViewContext<Self>) {
+        self.close_ssh_launcher(ctx);
         self.current_workspace_state.close_all_modals();
         self.close_tab_bar_overflow_menu(ctx);
         self.close_all_chip_menus(ctx);
@@ -21762,6 +21770,7 @@ impl Workspace {
                     self.render_left_toggle_button(appearance, ctx)
                 }
             }
+            HeaderToolbarItemKind::SshProfiles => self.render_ssh_profiles_button(appearance, ctx),
             HeaderToolbarItemKind::AgentManagement => {
                 self.render_agent_management_view_button(appearance, ctx)
             }
@@ -23245,6 +23254,20 @@ impl Workspace {
             }
         }
 
+        // A failed settings write must not make an explicitly opened SSH panel invisible.
+        if !hide_vertical_tabs
+            && !TabSettings::as_ref(app)
+                .header_toolbar_chip_selection
+                .contains_item(&HeaderToolbarItemKind::SshProfiles)
+        {
+            Self::add_panel_with_separator(
+                &mut panels_view,
+                &mut prev_panel_added,
+                self.render_ssh_profiles_panel(),
+                app,
+            );
+        }
+
         // Theme chooser (workspace-level, not configurable).
         // Uses wrap_in_panel_surface which adds margin for its own visual separation,
         // so we add a separator before it only if a config panel is to its left, then
@@ -23392,6 +23415,7 @@ impl Workspace {
                 }
                 Some(ChildView::new(&self.left_panel_view).finish())
             }
+            HeaderToolbarItemKind::SshProfiles => self.render_ssh_profiles_panel(),
             HeaderToolbarItemKind::CodeReview => {
                 if !pane_group.right_panel_open {
                     return None;
@@ -25342,6 +25366,7 @@ impl TypedActionView for Workspace {
                     self.toggle_vertical_tabs_panel(ctx);
                 }
             }
+            SshManager(action) => self.handle_ssh_manager_action(action, ctx),
             ToggleNotificationMailbox { select_first } => {
                 if FeatureFlag::HOANotifications.is_enabled()
                     && *AISettings::as_ref(ctx).show_agent_notifications
@@ -25544,7 +25569,9 @@ impl TypedActionView for Workspace {
                 }
             }
             ClosePanel => {
-                if self.left_panel_view.is_self_or_child_focused(ctx) {
+                if self.ssh_profiles_panel_is_focused(ctx) {
+                    self.toggle_ssh_profiles_panel(ctx);
+                } else if self.left_panel_view.is_self_or_child_focused(ctx) {
                     self.close_left_panel(ctx);
                 } else if self.right_panel_view.is_self_or_child_focused(ctx) {
                     let pane_group_handle = self.active_tab_pane_group().clone();
@@ -27957,6 +27984,10 @@ impl View for Workspace {
 
         if self.current_workspace_state.is_header_toolbar_editor_open {
             stack.add_child(ChildView::new(&self.header_toolbar_editor_modal).finish());
+        }
+
+        if let Some(modal) = self.render_ssh_profiles_modal(app) {
+            stack.add_child(modal);
         }
 
         if self

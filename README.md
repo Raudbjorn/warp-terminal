@@ -46,6 +46,47 @@ See [docs/local-ai.md](docs/local-ai.md) for every setting, the OpenCode
 provider, and exactly what the local-only network policy does and does not
 cover.
 
+### SSH profiles
+
+Open **Connect to SSH host** with **Ctrl+Shift+H** (macOS: **Cmd+Shift+H**), or
+choose **Toggle SSH profiles panel** from the command palette. The SSH Profiles
+panel lets you add and edit hosts, identity files, jump hosts, and tags; pin hosts;
+and open saved or recent connections. The launcher also accepts
+`user@host:port` for a quick connection. Existing toolbar customizations are
+preserved when opening the panel.
+
+Profiles are read from `~/.ssh/config`. Saving a profile updates its host stanza,
+preserves unrecognized directives, and keeps a backup at `~/.ssh/config.warp.bak`.
+Hand-written stanzas are imported for use and editing; only Warp-managed stanzas
+can be deleted from the panel. Pattern and multi-alias stanzas stay in the file
+but are not listed as editable profiles. Leave the hostname or port blank to
+inherit SSH configuration. Additional IdentityFile entries survive unrelated
+edits; change multi-key lists directly in the config file. Remove references to a
+saved jump host before renaming or deleting it. Profile metadata and recent-host history stay local.
+Password authentication uses SSH's normal terminal prompt; identity files and
+SSH-agent authentication are supported. Automatic saved-password release is
+unavailable because the shell-launched connection cannot securely bind a helper
+request to the exact SSH process. Previously stored passwords can be cleared in
+the editor but are never read by the manager.
+
+Remote-tab reopening uses the original connection's control socket and refuses
+restoration if effective SSH settings have changed since launch. It accepts at
+most eight terminal panes per restoration and limits remote stdout to 4 MiB and
+stderr to 16 KiB while reading. A missing control socket causes an error rather
+than a new connection. SSH config saves recheck the file before replacing it,
+though external editors that ignore Warp's lock can still race the final rename.
+
+The manager is adapted from [Changroro/warp](https://github.com/Changroro/warp),
+with its implementation in `app/src/ssh_manager/` and small integration modules in
+`app/src/terminal/view/ssh_manager.rs` and
+`app/src/workspace/view/ssh_manager.rs`. The source snapshot is
+[`f25058b7`](https://github.com/Changroro/warp/commit/f25058b7d3bbae94bc5a3b6f051d6edf50b74251);
+remote-session reopening and the workspace adapter use
+[`92b8e4cf`](https://github.com/Changroro/warp/commit/92b8e4cf)
+to keep this integration independent of the sibling's session archive and agent
+logo features. The pre-existing `warp_ssh_manager` database crate is unchanged;
+this UI uses SSH config profiles and does not migrate that crate's database rows.
+
 ## Building and running this fork
 
 The build is driven by the scripts in [`script/`](script). This fork builds as

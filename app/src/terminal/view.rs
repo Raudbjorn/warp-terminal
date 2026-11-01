@@ -13,6 +13,7 @@ pub(crate) mod queued_prompts_panel;
 #[cfg(test)]
 #[path = "view/queued_prompts_tests.rs"]
 mod queued_prompts_tests;
+mod ssh_manager;
 use ai::agent::action::InsertReviewComment;
 pub use load_ai_conversation::ConversationRestorationInNewPaneType;
 // TODO(advait): if we align on prompt suggestions banner in Input, move code out of inline_banner mod.
@@ -131,6 +132,7 @@ pub(crate) use shared_session::cloud_conversation_continuation::{
 };
 use shared_session::{SharedSessionAdapter, Viewer};
 use ssh_file_upload::{FileUpload, FileUploadEvent};
+use ssh_manager::SshProfileSessionState;
 use sum_tree::SeekBias;
 use use_agent_footer::UseAgentToolbar;
 use uuid::Uuid;
@@ -2836,6 +2838,7 @@ pub struct TerminalView {
     find_model: ModelHandle<TerminalFindModel>,
 
     warpify_state: WarpifyState,
+    ssh_profile: SshProfileSessionState,
 
     /// The keystroke bound to canceling a command.
     ///
@@ -4491,6 +4494,7 @@ impl TerminalView {
             input_hoverable_handle: Default::default(),
             find_model,
             warpify_state: Default::default(),
+            ssh_profile: Default::default(),
             cancel_command_keystroke: keybinding_name_to_keystroke(CANCEL_COMMAND_KEYBINDING, ctx),
             is_file_drop_target: false,
             is_ssh_file_uploader: false,
@@ -12891,6 +12895,10 @@ impl TerminalView {
                 let command_is_denylisted = warpify_settings
                     .is_denylisted_subshell_command(command)
                     || warpify_settings.is_denylisted_subshell_command(warpify_command);
+                let is_ssh_profile_command_with_warpify_disabled =
+                    self.handle_ssh_manager_block_started(block_id, command, warpify_command, ctx);
+                let command_is_denylisted =
+                    command_is_denylisted || is_ssh_profile_command_with_warpify_disabled;
                 // Never warpify or surface warpification for agent-requested commands.
                 let has_ai_metadata = self
                     .model
@@ -13526,6 +13534,7 @@ impl TerminalView {
                 self.handle_control_master_error(ctx);
             }
             ModelEvent::BlockMetadataReceived(block_metadata_received_event) => {
+                self.handle_ssh_manager_precmd(&block_metadata_received_event.block_metadata, ctx);
                 self.apply_block_metadata_update(
                     &block_metadata_received_event.block_metadata,
                     block_metadata_received_event.is_after_in_band_command,
@@ -17611,6 +17620,13 @@ impl TerminalView {
             TerminalView::middle_click_paste_content(shell_family, ctx)
         } else {
             let clipboard_content = ctx.clipboard().read();
+
+            if !is_cli_agent_paste
+                && !should_paste_in_input
+                && self.paste_image_over_ssh(&clipboard_content, ctx)
+            {
+                return;
+            }
 
             if is_cli_agent_paste && clipboard_content.has_image_data() {
                 if !cfg!(windows) {
@@ -29816,6 +29832,7 @@ impl View for TerminalView {
         } else {
             element
         };
+        let final_element = self.wrap_with_ssh_session_bar(final_element, app);
 
         // Wrap with conversation details panel on the right if open.
         // On WASM, the panel is rendered in the wasm_view instead.
