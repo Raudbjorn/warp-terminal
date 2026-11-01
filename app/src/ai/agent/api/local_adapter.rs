@@ -81,6 +81,15 @@ fn turn_identity(request: &api::Request) -> TurnIdentity {
     }
 }
 
+/// The tool kinds the client declared it can execute (`ToolType` tags).
+fn supported_tools(request: &api::Request) -> &[i32] {
+    request
+        .settings
+        .as_ref()
+        .map(|settings| settings.supported_tools.as_slice())
+        .unwrap_or_default()
+}
+
 fn request_tasks(request: &api::Request) -> &[api::Task] {
     request
         .task_context
@@ -128,7 +137,7 @@ fn plan_agent_turn(
         is_first_turn,
     } = turn_identity(request);
 
-    let tools = ToolRegistry::new(request.mcp_context.as_ref());
+    let tools = ToolRegistry::new(request.mcp_context.as_ref(), supported_tools(request));
 
     let environment = environment_from_context(input.context.as_ref());
     let mut transcript = vec![local_agent::ChatMessage::System(
@@ -670,6 +679,9 @@ fn convert_input_tool_result(
             Some(MessageResult::ReadMcpResource(result.clone()))
         }
         InputResult::CallMcpTool(result) => Some(MessageResult::CallMcpTool(result.clone())),
+        InputResult::AskUserQuestion(result) => {
+            Some(MessageResult::AskUserQuestion(result.clone()))
+        }
         other => {
             log::warn!("local agent loop: dropping unsupported tool call result {other:?}");
             None
@@ -684,6 +696,21 @@ const GREP: &str = "grep";
 const FILE_GLOB: &str = "file_glob";
 const READ_MCP_RESOURCE: &str = "read_mcp_resource";
 const SUGGEST_PROMPT: &str = "suggest_prompt";
+const ASK_USER_QUESTION: &str = "ask_user_question";
+
+/// `ask_user_question` question kinds, as the model spells them.
+const SINGLE_SELECT: &str = "single_select";
+const MULTI_SELECT: &str = "multi_select";
+
+/// Wire value for "no recommended option" in `AskUserQuestion.MultipleChoice`.
+const NO_RECOMMENDED_OPTION: i32 = -1;
+
+/// Longest function name OpenAI-compatible servers accept.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+
+/// Number of hex digits of the identity hash appended to a colliding MCP tool
+/// name.
+const TOOL_NAME_HASH_HEX_DIGITS: usize = 8;
 
 /// Builtin tool definitions plus the per-request MCP projection (mangled
 /// OpenAI tool names mapped back to `(server_id, tool_name)`).
@@ -694,6 +721,10 @@ pub(crate) struct ToolRegistry {
     /// Passive suggestion turns are one-shot and read-only: the model gets
     /// only the `suggest_prompt` tool.
     suggestion_only: bool,
+    /// The client declared `ask_user_question` in `settings.supported_tools`.
+    /// Unlike the core tools it is opt-in: the client lists it only when the
+    /// user's settings allow the agent to ask questions.
+    ask_user_question: bool,
 }
 
 #[derive(Clone)]
@@ -706,25 +737,34 @@ struct McpToolBinding {
 }
 
 impl ToolRegistry {
-    fn new(mcp_context: Option<&api::request::McpContext>) -> Self {
+    fn new(mcp_context: Option<&api::request::McpContext>, supported_tools: &[i32]) -> Self {
         let mut mcp_tools = HashMap::new();
         for server in mcp_context
             .map(|context| context.servers.as_slice())
             .unwrap_or_default()
         {
             for tool in &server.tools {
-                let name = mangle_mcp_tool_name(&server.name, &tool.name);
-                let parameters = tool
-                    .input_schema
-                    .as_ref()
-                    .map(prost_struct_to_json)
-                    .unwrap_or_else(|| json!({ "type": "object" }));
-                // Preserve the first binding for a given mangled name and
-                // warn on subsequent collisions; routing to the wrong MCP
-                // target silently is worse than skipping the second one.
-                if mcp_tools.contains_key(&name) {
-                    log::warn!("local agent loop: duplicate MCP tool name {name}");
+                if mcp_tools.values().any(|binding: &McpToolBinding| {
+                    binding.server_id == server.id && binding.tool_name == tool.name
+                }) {
+                    log::warn!(
+                        "local agent loop: ignoring MCP tool {} listed twice for server {}",
+                        tool.name,
+                        server.id
+                    );
                     continue;
+                }
+                let mut name = mangle_mcp_tool_name(&server.name, &tool.name);
+                // Distinct tools can mangle to the same name (same display
+                // name on two servers, a long server name truncating the tool
+                // part, non-ASCII names). Keep both reachable instead of
+                // dropping one.
+                if mcp_tools.contains_key(&name) {
+                    name = disambiguate_mcp_tool_name(&name, &server.id, &tool.name);
+                    if mcp_tools.contains_key(&name) {
+                        log::warn!("local agent loop: duplicate MCP tool name {name}");
+                        continue;
+                    }
                 }
                 mcp_tools.insert(
                     name,
@@ -732,8 +772,11 @@ impl ToolRegistry {
                         server_identity: server.identity.clone(),
                         server_id: server.id.clone(),
                         tool_name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters,
+                        description: mcp_tool_description(&server.name, tool),
+                        parameters: normalize_mcp_input_schema(
+                            tool.input_schema.as_ref().map(prost_struct_to_json),
+                            &tool.name,
+                        ),
                     },
                 );
             }
@@ -741,6 +784,7 @@ impl ToolRegistry {
         Self {
             mcp_tools,
             suggestion_only: false,
+            ask_user_question: supported_tools.contains(&(api::ToolType::AskUserQuestion as i32)),
         }
     }
 
@@ -748,6 +792,7 @@ impl ToolRegistry {
         Self {
             mcp_tools: HashMap::new(),
             suggestion_only: true,
+            ask_user_question: false,
         }
     }
 
@@ -756,6 +801,9 @@ impl ToolRegistry {
             return vec![suggest_prompt_definition()];
         }
         let mut definitions = builtin_definitions();
+        if self.ask_user_question {
+            definitions.push(ask_user_question_definition());
+        }
         let mut mcp_names: Vec<&String> = self.mcp_tools.keys().collect();
         mcp_names.sort();
         for name in mcp_names {
@@ -795,7 +843,11 @@ impl ToolRegistry {
                 Tool::RunShellCommand(api::message::tool_call::RunShellCommand {
                     command: args.command,
                     is_read_only: args.is_read_only,
-                    is_risky: args.is_risky,
+                    // A model that omits the flag must not silently classify
+                    // a mutating command as safe: anything not declared
+                    // read-only is treated as risky.
+                    is_risky: args.is_risky.unwrap_or(!args.is_read_only),
+                    uses_pager: args.uses_pager,
                     // v1 has no long-running command support: every command
                     // runs to completion before its result comes back.
                     wait_until_complete_value: Some(
@@ -870,7 +922,9 @@ impl ToolRegistry {
                 Tool::FileGlobV2(api::message::tool_call::FileGlobV2 {
                     patterns: args.patterns,
                     search_dir: args.search_dir,
-                    ..Default::default()
+                    max_matches: args.max_matches,
+                    max_depth: args.max_depth,
+                    min_depth: args.min_depth,
                 })
             }
             READ_MCP_RESOURCE => {
@@ -884,6 +938,10 @@ impl ToolRegistry {
                         .and_then(|binding| binding.server_identity.clone()),
                     server_id: args.server_id,
                 })
+            }
+            ASK_USER_QUESTION if self.ask_user_question => {
+                let args: AskUserQuestionArgs = parse_args(call)?;
+                Tool::AskUserQuestion(ask_user_question_from_args(args)?)
             }
             SUGGEST_PROMPT => {
                 let args: SuggestPromptArgs = parse_args(call)?;
@@ -939,6 +997,7 @@ impl ToolRegistry {
                     "command": shell.command,
                     "is_read_only": shell.is_read_only,
                     "is_risky": shell.is_risky,
+                    "uses_pager": shell.uses_pager,
                 }),
             ),
             Tool::ReadFiles(read) => (
@@ -984,7 +1043,17 @@ impl ToolRegistry {
             ),
             Tool::FileGlobV2(glob) => (
                 FILE_GLOB.to_string(),
-                json!({ "patterns": glob.patterns, "search_dir": glob.search_dir }),
+                json!({
+                    "patterns": glob.patterns,
+                    "search_dir": glob.search_dir,
+                    "max_matches": glob.max_matches,
+                    "max_depth": glob.max_depth,
+                    "min_depth": glob.min_depth,
+                }),
+            ),
+            Tool::AskUserQuestion(ask) => (
+                ASK_USER_QUESTION.to_string(),
+                ask_user_question_arguments(ask),
             ),
             Tool::ReadMcpResource(read) => (
                 READ_MCP_RESOURCE.to_string(),
@@ -1040,7 +1109,9 @@ struct RunShellCommandArgs {
     #[serde(default)]
     is_read_only: bool,
     #[serde(default)]
-    is_risky: bool,
+    is_risky: Option<bool>,
+    #[serde(default)]
+    uses_pager: bool,
 }
 
 #[derive(Deserialize)]
@@ -1099,6 +1170,29 @@ struct FileGlobArgs {
     patterns: Vec<String>,
     #[serde(default)]
     search_dir: String,
+    /// Zero means unlimited, as on the wire.
+    #[serde(default)]
+    max_matches: i32,
+    #[serde(default)]
+    max_depth: i32,
+    #[serde(default)]
+    min_depth: i32,
+}
+
+#[derive(Deserialize)]
+struct AskUserQuestionArgs {
+    questions: Vec<QuestionArg>,
+}
+
+#[derive(Deserialize)]
+struct QuestionArg {
+    question: String,
+    options: Vec<String>,
+    #[serde(default)]
+    recommended_option_index: Option<i32>,
+    /// [`SINGLE_SELECT`] or [`MULTI_SELECT`]; anything else reads as single.
+    #[serde(default, rename = "type")]
+    question_type: String,
 }
 
 #[derive(Deserialize)]
@@ -1145,13 +1239,130 @@ fn suggest_prompt_definition() -> local_agent::ToolDefinition {
     }
 }
 
+/// Offered only when the client lists `AskUserQuestion` in
+/// `settings.supported_tools`. Questions are numbered `q1`, `q2`, ... in the
+/// order given; answers come back keyed by those ids.
+fn ask_user_question_definition() -> local_agent::ToolDefinition {
+    local_agent::ToolDefinition {
+        name: ASK_USER_QUESTION.to_string(),
+        description: "Asks the user one or more multiple-choice clarifying questions and \
+                      returns their answers. Only ask when the task cannot proceed without the \
+                      answer; if the task is clear, just proceed. Questions are numbered q1, \
+                      q2, ... in the order given, and the answers refer to those ids. The user \
+                      can always type their own answer instead of picking an option."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "The questions to present, in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The question text.",
+                            },
+                            "options": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "The selectable options (at least 2). Do not include an \"Other\" option.",
+                            },
+                            "recommended_option_index": {
+                                "type": "integer",
+                                "description": "Zero-based index into options of the recommended choice. Single-select only; omit when there is no recommendation.",
+                            },
+                            "type": {
+                                "type": "string",
+                                "enum": [SINGLE_SELECT, MULTI_SELECT],
+                                "description": "Whether the user picks exactly one option (single_select) or may pick several (multi_select).",
+                            },
+                        },
+                        "required": ["question", "options", "type"],
+                    },
+                },
+            },
+            "required": ["questions"],
+        }),
+    }
+}
+
+fn ask_user_question_from_args(
+    args: AskUserQuestionArgs,
+) -> Result<api::AskUserQuestion, AdapterError> {
+    if args.questions.is_empty() {
+        return Err(AdapterError::BadToolArguments {
+            tool: ASK_USER_QUESTION.to_string(),
+            message: "at least one question is required".to_string(),
+        });
+    }
+    let questions = args
+        .questions
+        .into_iter()
+        .enumerate()
+        .map(|(index, question)| {
+            let is_multiselect = question.question_type == MULTI_SELECT;
+            let recommended_option_index = question
+                .recommended_option_index
+                .filter(|_| !is_multiselect)
+                .unwrap_or(NO_RECOMMENDED_OPTION);
+            api::ask_user_question::Question {
+                question_id: format!("q{}", index + 1),
+                question: question.question,
+                question_type: Some(
+                    api::ask_user_question::question::QuestionType::MultipleChoice(
+                        api::ask_user_question::MultipleChoice {
+                            options: question
+                                .options
+                                .into_iter()
+                                .map(|label| api::ask_user_question::Option { label })
+                                .collect(),
+                            recommended_option_index,
+                            is_multiselect,
+                            supports_other: true,
+                        },
+                    ),
+                ),
+            }
+        })
+        .collect();
+    Ok(api::AskUserQuestion { questions })
+}
+
+/// The reverse of [`ask_user_question_from_args`], for history rebuilds.
+fn ask_user_question_arguments(ask: &api::AskUserQuestion) -> serde_json::Value {
+    let questions: Vec<serde_json::Value> = ask
+        .questions
+        .iter()
+        .filter_map(|question| {
+            let api::ask_user_question::question::QuestionType::MultipleChoice(choice) =
+                question.question_type.as_ref()?;
+            let mut value = json!({
+                "question": question.question,
+                "options": choice.options.iter().map(|option| option.label.clone()).collect::<Vec<_>>(),
+                "type": if choice.is_multiselect { MULTI_SELECT } else { SINGLE_SELECT },
+            });
+            if let Ok(index) = usize::try_from(choice.recommended_option_index) {
+                value["recommended_option_index"] = json!(index);
+            }
+            Some(value)
+        })
+        .collect();
+    json!({ "questions": questions })
+}
+
 fn builtin_definitions() -> Vec<local_agent::ToolDefinition> {
     vec![
         local_agent::ToolDefinition {
             name: RUN_SHELL_COMMAND.to_string(),
             description: "Executes a shell command in the user's terminal and returns its \
                           output and exit code. The command runs to completion before the \
-                          result is returned; there is no interactive input."
+                          result is returned; there is no interactive input. Prefer \
+                          non-paginated forms of commands (for example `git --no-pager log`) \
+                          and the dedicated file tools over `cat`, `grep` and `find`. The \
+                          user may edit the command before it runs; if the result shows a \
+                          different command, treat that one as the source of truth."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1162,14 +1373,18 @@ fn builtin_definitions() -> Vec<local_agent::ToolDefinition> {
                     },
                     "is_read_only": {
                         "type": "boolean",
-                        "description": "True if the command only reads state and has no side effects.",
+                        "description": "True if the command only reads state and has no side effects. If unsure, return false.",
                     },
                     "is_risky": {
                         "type": "boolean",
-                        "description": "True if the command could have destructive or hard-to-reverse effects.",
+                        "description": "True if the command could have destructive or hard-to-reverse effects: deleting or overwriting data, handling secrets unsafely, running unknown code, or needing root. If unsure, return true.",
+                    },
+                    "uses_pager": {
+                        "type": "boolean",
+                        "description": "True if the command might open a pager (git log, git diff, less, man, ...). Set it for any version-control command that can paginate, or the command hangs waiting for input. If unsure, return true.",
                     },
                 },
-                "required": ["command"],
+                "required": ["command", "is_read_only", "is_risky", "uses_pager"],
             }),
         },
         local_agent::ToolDefinition {
@@ -1288,6 +1503,18 @@ fn builtin_definitions() -> Vec<local_agent::ToolDefinition> {
                         "type": "string",
                         "description": "Directory to search in. Defaults to the working directory.",
                     },
+                    "max_matches": {
+                        "type": "integer",
+                        "description": "Maximum number of matches to return. 0 or omitted means unlimited; set it when searching large trees.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum directory depth to search; 1 matches only the direct children of search_dir. 0 or omitted means unlimited.",
+                    },
+                    "min_depth": {
+                        "type": "integer",
+                        "description": "Minimum directory depth to match; 2 skips the direct children of search_dir. 0 or omitted means no minimum.",
+                    },
                 },
                 "required": ["patterns"],
             }),
@@ -1311,7 +1538,7 @@ fn builtin_definitions() -> Vec<local_agent::ToolDefinition> {
 }
 
 /// Mangles an MCP server/tool pair into a name OpenAI-compatible servers
-/// accept (`[a-zA-Z0-9_-]`, at most 64 characters).
+/// accept (`[a-zA-Z0-9_-]`, at most [`MAX_TOOL_NAME_CHARS`] characters).
 fn mangle_mcp_tool_name(server: &str, tool: &str) -> String {
     let sanitize = |value: &str| {
         value
@@ -1326,8 +1553,72 @@ fn mangle_mcp_tool_name(server: &str, tool: &str) -> String {
             .collect::<String>()
     };
     let mut name = format!("mcp__{}__{}", sanitize(server), sanitize(tool));
-    name.truncate(64);
+    name.truncate(MAX_TOOL_NAME_CHARS);
     name
+}
+
+/// Derives a second name for a tool whose mangled `name` is already taken by
+/// another tool, by appending a hash of the tool's real identity. The mangled
+/// name is pure ASCII, so truncating it by byte is safe.
+fn disambiguate_mcp_tool_name(name: &str, server_id: &str, tool: &str) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    (server_id, tool).hash(&mut hasher);
+    let digits = format!("{:016x}", hasher.finish());
+    let suffix = format!("_{}", &digits[..TOOL_NAME_HASH_HEX_DIGITS]);
+    let mut base = name.to_string();
+    base.truncate(MAX_TOOL_NAME_CHARS - suffix.len());
+    base + &suffix
+}
+
+/// The description shown to the model; servers sometimes leave it empty.
+fn mcp_tool_description(server: &str, tool: &api::request::mcp_context::McpTool) -> String {
+    if tool.description.is_empty() {
+        format!(
+            "Calls the `{}` tool of the `{}` MCP server.",
+            tool.name, server
+        )
+    } else {
+        tool.description.clone()
+    }
+}
+
+/// Makes an MCP tool's input schema usable as function `parameters`.
+/// OpenAI-compatible endpoints require a JSON-schema object whose root is
+/// `type: "object"` with a `properties` map; servers regularly omit one or
+/// both, or ship a `$schema` marker. A root that is not an object schema at
+/// all cannot describe named arguments, so the tool is exposed without any.
+/// `$ref`/`$defs` and the rest of the schema pass through untouched.
+fn normalize_mcp_input_schema(schema: Option<serde_json::Value>, tool: &str) -> serde_json::Value {
+    use serde_json::Value;
+
+    let mut schema = match schema {
+        Some(Value::Object(schema)) => schema,
+        Some(other) => {
+            log::warn!("local agent loop: MCP tool {tool} has a non-object input schema: {other}");
+            serde_json::Map::new()
+        }
+        None => serde_json::Map::new(),
+    };
+    schema.remove("$schema");
+    let describes_an_object = match schema.get("type") {
+        None => true,
+        Some(Value::String(kind)) => kind == "object",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+        Some(_) => false,
+    };
+    if !describes_an_object {
+        log::warn!(
+            "local agent loop: MCP tool {tool} does not take an object; exposing it without arguments"
+        );
+        schema.clear();
+    }
+    schema.insert("type".to_string(), json!("object"));
+    if !matches!(schema.get("properties"), Some(Value::Object(_))) {
+        schema.insert("properties".to_string(), json!({}));
+    }
+    Value::Object(schema)
 }
 
 /// Renders a proto tool call result into the plain-text content of a
@@ -1458,20 +1749,7 @@ pub(crate) fn render_tool_result_text(result: &api::message::ToolCallResult) -> 
             Some(api::read_mcp_resource_result::Result::Success(success)) => success
                 .contents
                 .iter()
-                .map(|content| match content.content_type.as_ref() {
-                    Some(api::mcp_resource_content::ContentType::Text(text)) => {
-                        format!("=== {} ===\n{}", content.uri, text.content)
-                    }
-                    Some(api::mcp_resource_content::ContentType::Binary(binary)) => {
-                        format!(
-                            "=== {} ===\n(binary content, {} bytes, {})",
-                            content.uri,
-                            binary.data.len(),
-                            binary.mime_type
-                        )
-                    }
-                    None => format!("=== {} ===\n(empty)", content.uri),
-                })
+                .map(render_mcp_resource_content)
                 .collect::<Vec<_>>()
                 .join("\n\n"),
             Some(api::read_mcp_resource_result::Result::Error(error)) => {
@@ -1483,12 +1761,22 @@ pub(crate) fn render_tool_result_text(result: &api::message::ToolCallResult) -> 
             Some(api::call_mcp_tool_result::Result::Success(success)) => success
                 .results
                 .iter()
-                .map(|entry| match entry.result.as_ref() {
-                    Some(api::call_mcp_tool_result::success::result::Result::Text(text)) => {
-                        text.text.clone()
+                .map(|entry| {
+                    use api::call_mcp_tool_result::success::result::Result as McpContent;
+                    match entry.result.as_ref() {
+                        Some(McpContent::Text(text)) => text.text.clone(),
+                        // The payload is base64 image data: describe it, never
+                        // dump it into the prompt.
+                        Some(McpContent::Image(image)) => format!(
+                            "(image content, {} bytes, {})",
+                            image.data.len(),
+                            image.mime_type
+                        ),
+                        Some(McpContent::Resource(resource)) => {
+                            render_mcp_resource_content(resource)
+                        }
+                        None => "(empty MCP content)".to_string(),
                     }
-                    Some(other) => format!("(non-text MCP content: {other:?})"),
-                    None => "(empty MCP content)".to_string(),
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1497,6 +1785,7 @@ pub(crate) fn render_tool_result_text(result: &api::message::ToolCallResult) -> 
             }
             None => "(no result)".to_string(),
         },
+        Result::AskUserQuestion(ask) => render_ask_user_question_result(ask),
         Result::Cancel(()) => "The user canceled this tool call.".to_string(),
         other => {
             // The local loop never issues the remaining tools; render a debug
@@ -1510,15 +1799,28 @@ fn render_shell_result(shell: &api::RunShellCommandResult) -> String {
     match shell.result.as_ref() {
         Some(api::run_shell_command_result::Result::CommandFinished(finished)) => {
             format!(
-                "Exit code: {}\n\nOutput:\n{}",
-                finished.exit_code, finished.output
+                "{}Exit code: {}\n\nOutput:\n{}",
+                render_executed_command(shell),
+                finished.exit_code,
+                finished.output
             )
         }
         Some(api::run_shell_command_result::Result::PermissionDenied(_)) => {
             "The user denied permission to run this command.".to_string()
         }
         Some(api::run_shell_command_result::Result::LongRunningCommandSnapshot(snapshot)) => {
-            format!("The command is still running. Latest output snapshot:\n{snapshot:?}")
+            let screen = if snapshot.is_alt_screen_active {
+                " It is showing a full-screen program (alternate screen)."
+            } else {
+                ""
+            };
+            format!(
+                "{}The command is still running (command id {}) and did not finish while the \
+                 terminal was being watched.{screen} Output so far:\n{}",
+                render_executed_command(shell),
+                snapshot.command_id,
+                snapshot.output
+            )
         }
         Some(api::run_shell_command_result::Result::TerminalBusy(busy)) => {
             format!(
@@ -1532,6 +1834,60 @@ fn render_shell_result(shell: &api::RunShellCommandResult) -> String {
             shell.exit_code, shell.output
         ),
     }
+}
+
+/// The command line that actually ran, when the client reports it. It can
+/// differ from the tool call's when the user edited the command before running
+/// it, which the model must be able to see.
+fn render_executed_command(shell: &api::RunShellCommandResult) -> String {
+    if shell.command.is_empty() {
+        return String::new();
+    }
+    format!("Command run: {}\n", shell.command)
+}
+
+fn render_mcp_resource_content(content: &api::McpResourceContent) -> String {
+    match content.content_type.as_ref() {
+        Some(api::mcp_resource_content::ContentType::Text(text)) => {
+            format!("=== {} ===\n{}", content.uri, text.content)
+        }
+        Some(api::mcp_resource_content::ContentType::Binary(binary)) => {
+            format!(
+                "=== {} ===\n(binary content, {} bytes, {})",
+                content.uri,
+                binary.data.len(),
+                binary.mime_type
+            )
+        }
+        None => format!("=== {} ===\n(empty)", content.uri),
+    }
+}
+
+/// Renders the answers as JSON so the model sees which option the user picked
+/// for which question; a summary such as "completed" would hide the answer.
+fn render_ask_user_question_result(result: &api::AskUserQuestionResult) -> String {
+    use api::ask_user_question_result::Result as AskResult;
+    use api::ask_user_question_result::answer_item::Answer;
+
+    let value = match result.result.as_ref() {
+        Some(AskResult::Success(success)) => json!({
+            "status": "success",
+            "answers": success.answers.iter().map(|item| match item.answer.as_ref() {
+                Some(Answer::MultipleChoice(choice)) => json!({
+                    "question_id": item.question_id,
+                    "selected_options": choice.selected_options,
+                    "other_text": choice.other_text,
+                }),
+                Some(Answer::Skipped(())) | None => json!({
+                    "question_id": item.question_id,
+                    "skipped": true,
+                }),
+            }).collect::<Vec<_>>(),
+        }),
+        Some(AskResult::Error(error)) => json!({ "status": "error", "message": error.message }),
+        None => json!({ "status": "error", "message": "no result" }),
+    };
+    value.to_string()
 }
 
 fn render_file_content(content: &api::FileContent) -> String {
@@ -1570,6 +1926,22 @@ fn json_value_to_prost(value: &serde_json::Value) -> prost_types::Value {
     prost_types::Value { kind: Some(kind) }
 }
 
+/// Largest magnitude below which every integer is exactly representable as an
+/// `f64` (2^53).
+const MAX_EXACT_F64_INTEGER: f64 = 9_007_199_254_740_992.0;
+
+/// `prost_types::Value` stores every number as `f64`. Give integral values
+/// back as integers so schemas and replayed tool arguments read `10`, not
+/// `10.0`.
+fn json_number(number: f64) -> serde_json::Value {
+    if number.fract() == 0.0 && number.abs() <= MAX_EXACT_F64_INTEGER {
+        return serde_json::Value::from(number as i64);
+    }
+    serde_json::Number::from_f64(number)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn prost_struct_to_json(value: &prost_types::Struct) -> serde_json::Value {
     serde_json::Value::Object(
         value
@@ -1585,9 +1957,7 @@ fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
     match value.kind.as_ref() {
         None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
         Some(Kind::BoolValue(value)) => serde_json::Value::Bool(*value),
-        Some(Kind::NumberValue(number)) => serde_json::Number::from_f64(*number)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+        Some(Kind::NumberValue(number)) => json_number(*number),
         Some(Kind::StringValue(value)) => serde_json::Value::String(value.clone()),
         Some(Kind::ListValue(values)) => {
             serde_json::Value::Array(values.values.iter().map(prost_value_to_json).collect())
