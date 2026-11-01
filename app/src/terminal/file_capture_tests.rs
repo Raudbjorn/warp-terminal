@@ -95,6 +95,23 @@ fn expand_pattern_leaves_unknown_tokens_visible() {
 }
 
 #[test]
+fn expand_pattern_does_not_expand_tokens_in_substituted_values() {
+    let tokens = PatternTokens {
+        command: Some("echo {timestamp} {session-or-command}".to_owned()),
+        session_name: Some("tab {command} {finished-timestamp}".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(
+        expand_pattern("{command}_{session-or-command}.log", &tokens),
+        "echo_{timestamp}_{session-or-command}_tab_{command}_{finished-timestamp}.log"
+    );
+    assert_eq!(
+        expand_pattern("íslenska_{unknown}_{command}_{", &tokens),
+        "íslenska_{unknown}_echo_{timestamp}_{session-or-command}_{"
+    );
+}
+
+#[test]
 fn update_tail_appends_when_output_only_grows() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("capture.log");
@@ -251,4 +268,212 @@ fn active_capture_rejects_other_writers_before_truncating() {
     stream.finish();
     write_snapshot(&alias, "after closing").unwrap();
     assert_eq!(read(&path), "after closing");
+}
+
+#[test]
+fn update_and_commit_keeps_already_written_later_output() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("session.log");
+    let mut stream =
+        FileStream::create(&path, "one\ntwo\ntail", Some((0, "one\ntwo\ntail".into()))).unwrap();
+    stream.update_and_commit("one\ntwo\ntail", 4).unwrap();
+    assert_eq!(read(&path), "one\ntwo\ntail");
+    stream.update_and_commit("two\ntail final", 4).unwrap();
+    assert_eq!(read(&path), "one\ntwo\ntail final");
+}
+
+fn wait_for_capture_close(path: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let file = OpenOptions::new().write(true).open(path).unwrap();
+        if file.try_lock().is_ok() {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "capture did not close"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+#[serial_test::serial(file_capture)]
+fn async_capture_drains_final_snapshot_after_stalled_write_without_view_callback() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("session.log");
+    let stream = futures_lite::future::block_on(
+        AsyncFileStream::create(
+            path.clone(),
+            "one\ntail".into(),
+            Some((0, "one\ntail".into())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let finish = stream.finish_handle();
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let operation = stream.run(move |stream| {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        stream.update_and_commit("one\ntail", 4)
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    // A final render is relative to the prefix the ordered in-flight write commits.
+    let finished = finish.queue("tail final".into(), 0);
+    release_tx.send(()).unwrap();
+    let (stream, result) = futures_lite::future::block_on(operation);
+    result.unwrap();
+    futures_lite::future::block_on(finished).unwrap().unwrap();
+    assert_eq!(read(&path), "one\ntail final");
+    drop(stream);
+    wait_for_capture_close(&path);
+}
+
+#[test]
+#[serial_test::serial(file_capture)]
+fn async_capture_drop_drains_late_final_snapshot_and_releases_lock() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("session.log");
+    let stream = futures_lite::future::block_on(
+        AsyncFileStream::create(path.clone(), "initial".into(), Some((0, "initial".into())))
+            .unwrap(),
+    )
+    .unwrap();
+    let finish = stream.finish_handle();
+    let finished = finish.queue("final".into(), 0);
+    drop(stream);
+    futures_lite::future::block_on(finished).unwrap().unwrap();
+    wait_for_capture_close(&path);
+    assert_eq!(read(&path), "final");
+}
+
+#[test]
+#[serial_test::serial(file_capture)]
+fn async_capture_propagates_open_and_update_errors() {
+    let directory = TempDir::new().unwrap();
+    let invalid = directory.path().join("missing").join("capture");
+    assert!(
+        futures_lite::future::block_on(
+            AsyncFileStream::create(invalid, String::new(), None).unwrap()
+        )
+        .is_err()
+    );
+    let path = directory.path().join("session.log");
+    let stream = futures_lite::future::block_on(
+        AsyncFileStream::create(path.clone(), "initial".into(), Some((0, "initial".into())))
+            .unwrap(),
+    )
+    .unwrap();
+    let (stream, result) = futures_lite::future::block_on(
+        stream.run(|_| Err(Error::new(ErrorKind::WriteZero, "injected write failure"))),
+    );
+    assert_eq!(result.unwrap_err().kind(), ErrorKind::WriteZero);
+    drop(stream);
+    wait_for_capture_close(&path);
+}
+
+#[test]
+#[serial_test::serial(file_capture)]
+fn async_capture_caps_owners_including_stalled_operations_and_releases_permits() {
+    let directory = TempDir::new().unwrap();
+    // Other serial tests may have just queued off-thread close jobs.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while ACTIVE_CAPTURES.load(Ordering::Acquire) != 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let mut owners = Vec::new();
+    for index in 0..MAX_ACTIVE_CAPTURES {
+        owners.push(
+            futures_lite::future::block_on(
+                AsyncFileStream::create(
+                    directory.path().join(index.to_string()),
+                    String::new(),
+                    Some((0, String::new())),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+    }
+    let result = AsyncFileStream::create(directory.path().join("overflow"), String::new(), None);
+    assert!(matches!(result, Err(error) if error.kind() == ErrorKind::WouldBlock));
+    assert!(!directory.path().join("overflow").exists());
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let operation = owners.pop().unwrap().run(move |_| {
+        started_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        Ok(())
+    });
+    started_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    // Dropping the awaiter must not free a permit while its syscall/job still runs.
+    drop(operation);
+    assert_eq!(ACTIVE_CAPTURES.load(Ordering::Acquire), MAX_ACTIVE_CAPTURES);
+    release_tx.send(()).unwrap();
+    drop(owners);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while ACTIVE_CAPTURES.load(Ordering::Acquire) != 0 {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[test]
+#[serial_test::serial(file_capture)]
+fn async_capture_rejects_late_final_snapshot_after_failed_commit() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("session.log");
+    let stream = futures_lite::future::block_on(
+        AsyncFileStream::create(
+            path.clone(),
+            "one\ntail".into(),
+            Some((0, "one\ntail".into())),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let finish = stream.finish_handle();
+    let (stream, result) = futures_lite::future::block_on(
+        stream.run(|_| Err(Error::other("injected failure before prefix commit"))),
+    );
+    assert!(result.is_err());
+    // The UI had advanced its logical prefix when scheduling the failed write.
+    // A final tail relative to that prefix must never be applied at the old file offset.
+    let finished = finish.queue("tail final".into(), 0);
+    assert!(futures_lite::future::block_on(finished).unwrap().is_err());
+    drop(stream);
+    wait_for_capture_close(&path);
+    assert_eq!(read(&path), "one\ntail");
+}
+
+#[test]
+#[serial_test::serial(file_capture)]
+fn async_capture_final_write_error_reaches_completion_receiver() {
+    let directory = TempDir::new().unwrap();
+    let path = directory.path().join("session.log");
+    let stream = futures_lite::future::block_on(
+        AsyncFileStream::create(path.clone(), "initial".into(), Some((0, "initial".into())))
+            .unwrap(),
+    )
+    .unwrap();
+    let finish = stream.finish_handle();
+    // Reject an invalid UTF-8 prefix before touching the existing file.
+    let finished = finish.queue("é".into(), 1);
+    drop(stream);
+    assert_eq!(
+        futures_lite::future::block_on(finished)
+            .unwrap()
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    wait_for_capture_close(&path);
+    assert_eq!(read(&path), "initial");
 }

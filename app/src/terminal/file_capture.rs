@@ -30,6 +30,8 @@ use std::io::{Error, ErrorKind, Result as IoResult, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Local};
 
@@ -174,11 +176,30 @@ pub fn expand_pattern(pattern: &str, tokens: &PatternTokens) -> String {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or(command);
 
-    pattern
-        .replace("{command}", &sanitize_token(command))
-        .replace("{timestamp}", &timestamp)
-        .replace("{finished-timestamp}", &finished)
-        .replace("{session-or-command}", &sanitize_token(session_or_command))
+    let replacements = [
+        ("{command}", sanitize_token(command)),
+        ("{timestamp}", timestamp),
+        ("{finished-timestamp}", finished),
+        ("{session-or-command}", sanitize_token(session_or_command)),
+    ];
+    let mut expanded = String::with_capacity(pattern.len());
+    let mut remaining = pattern;
+    while let Some(open) = remaining.find('{') {
+        expanded.push_str(&remaining[..open]);
+        remaining = &remaining[open..];
+        if let Some((token, value)) = replacements
+            .iter()
+            .find(|(token, _)| remaining.starts_with(token))
+        {
+            expanded.push_str(value);
+            remaining = &remaining[token.len()..];
+        } else {
+            expanded.push('{');
+            remaining = &remaining[1..];
+        }
+    }
+    expanded.push_str(remaining);
+    expanded
 }
 
 /// A capture file, optionally still being appended to.
@@ -261,6 +282,20 @@ impl FileStream {
         Ok(())
     }
 
+    /// Commit a rendered prefix without temporarily truncating its already-rendered suffix.
+    pub fn update_and_commit(&mut self, rendered: &str, committed_bytes: usize) -> IoResult<()> {
+        if !rendered.is_char_boundary(committed_bytes) {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "invalid capture prefix boundary",
+            ));
+        }
+        self.update_tail(rendered)?;
+        self.tail_offset += committed_bytes as u64;
+        self.tail_text.drain(..committed_bytes);
+        Ok(())
+    }
+
     /// Finalises the current block and starts tailing another.
     ///
     /// Used by session streams when a block completes: `final_render` is written
@@ -284,6 +319,153 @@ impl FileStream {
     /// Closes the already-flushed file, returning its path for the confirmation toast.
     pub fn finish(self) -> PathBuf {
         self.path
+    }
+}
+
+// Slots include blocked opens, active files, and deferred closes.
+const MAX_ACTIVE_CAPTURES: usize = 8;
+static ACTIVE_CAPTURES: AtomicUsize = AtomicUsize::new(0);
+
+struct CapturePermit;
+
+impl CapturePermit {
+    fn acquire() -> IoResult<Self> {
+        ACTIVE_CAPTURES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_ACTIVE_CAPTURES).then_some(active + 1)
+            })
+            .map(|_| Self)
+            .map_err(|_| Error::new(ErrorKind::WouldBlock, "too many active file captures"))
+    }
+}
+
+impl Drop for CapturePermit {
+    fn drop(&mut self) {
+        ACTIVE_CAPTURES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Files and permits remain owned by blocking jobs until the syscall and close finish.
+pub struct AsyncFileStream {
+    inner: Option<(FileStream, CapturePermit)>,
+    finish: CaptureFinish,
+}
+
+/// A bounded final snapshot that survives destruction of the terminal view.
+#[derive(Clone, Default)]
+pub struct CaptureFinish(Arc<Mutex<FinishState>>);
+
+#[derive(Default)]
+struct FinishState {
+    failed: bool,
+    pending: Option<(
+        String,
+        usize,
+        futures::channel::oneshot::Sender<IoResult<()>>,
+    )>,
+}
+
+impl CaptureFinish {
+    pub fn queue(
+        &self,
+        rendered: String,
+        committed_bytes: usize,
+    ) -> futures::channel::oneshot::Receiver<IoResult<()>> {
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        let mut state = self.0.lock().unwrap();
+        if state.failed {
+            let _ = sender.send(Err(Error::other("capture previously failed")));
+        } else {
+            state.pending = Some((rendered, committed_bytes, sender));
+        }
+        receiver
+    }
+
+    fn fail(&self) {
+        let mut state = self.0.lock().unwrap();
+        state.failed = true;
+        if let Some((_, _, sender)) = state.pending.take() {
+            let _ = sender.send(Err(Error::other("capture previously failed")));
+        }
+    }
+
+    fn drain(&self, stream: &mut FileStream) -> IoResult<()> {
+        let pending = self.0.lock().unwrap().pending.take();
+        if let Some((rendered, committed_bytes, sender)) = pending {
+            let result = stream.update_and_commit(&rendered, committed_bytes);
+            if result.is_err() {
+                self.fail();
+            }
+            let notification = result
+                .as_ref()
+                .copied()
+                .map_err(|error| Error::new(error.kind(), error.to_string()));
+            let _ = sender.send(notification);
+            return result;
+        }
+        Ok(())
+    }
+}
+
+impl AsyncFileStream {
+    pub fn create(
+        path: PathBuf,
+        initial: String,
+        tail: Option<(usize, String)>,
+    ) -> IoResult<impl std::future::Future<Output = IoResult<Self>> + Send> {
+        let permit = CapturePermit::acquire()?;
+        Ok(blocking::unblock(move || {
+            let stream = FileStream::create(&path, &initial, tail).inspect_err(|error| {
+                log::error!("Failed to open command output capture: {error}");
+            })?;
+            Ok(Self {
+                inner: Some((stream, permit)),
+                finish: CaptureFinish::default(),
+            })
+        }))
+    }
+
+    pub fn finish_handle(&self) -> CaptureFinish {
+        self.finish.clone()
+    }
+
+    pub fn update(
+        self,
+        rendered: String,
+        committed_bytes: usize,
+    ) -> impl std::future::Future<Output = (Self, IoResult<()>)> + Send {
+        self.run(move |stream| stream.update_and_commit(&rendered, committed_bytes))
+    }
+
+    fn run(
+        mut self,
+        operation: impl FnOnce(&mut FileStream) -> IoResult<()> + Send + 'static,
+    ) -> impl std::future::Future<Output = (Self, IoResult<()>)> + Send {
+        blocking::unblock(move || {
+            let result = operation(&mut self.inner.as_mut().unwrap().0)
+                .and_then(|()| self.finish.drain(&mut self.inner.as_mut().unwrap().0));
+            if let Err(error) = &result {
+                log::error!("Failed to write command output capture: {error}");
+                // Do not apply later offsets after a partially failed write.
+                self.finish.fail();
+            }
+            (self, result)
+        })
+    }
+}
+
+impl Drop for AsyncFileStream {
+    fn drop(&mut self) {
+        if let Some(mut inner) = self.inner.take() {
+            let finish = self.finish.clone();
+            blocking::unblock(move || {
+                if let Err(error) = finish.drain(&mut inner.0) {
+                    log::error!("Failed to finish command output capture: {error}");
+                }
+                drop(inner);
+            })
+            .detach();
+        }
     }
 }
 

@@ -362,7 +362,7 @@ pub fn custom_tag_to_keystroke(custom: CustomTag) -> Option<Keystroke> {
         CustomAction::SelectBlockAbove => Keystroke::parse("cmdorctrl-up").ok(),
         CustomAction::SelectBlockBelow => Keystroke::parse("cmdorctrl-down").ok(),
         // The legacy native-menu action now saves terminal output locally.
-        CustomAction::CreateBlockPermalink => Keystroke::parse(cmd_or_ctrl_shift("s")).ok(),
+        CustomAction::CreateBlockPermalink => Keystroke::parse("cmdorctrl-shift-S").ok(),
         CustomAction::ToggleBookmarkBlock => Keystroke::parse(cmd_or_ctrl_shift("b")).ok(),
         CustomAction::CopyBlockOutput => Keystroke::parse("cmdorctrl-alt-shift-C").ok(),
         // Set this to mac-only. On Linux this conflicts with the general binding to copy.

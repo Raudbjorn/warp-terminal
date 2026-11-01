@@ -619,7 +619,7 @@ pub fn init(app: &mut AppContext) {
             TerminalAction::StreamOutputToFile,
         )
         .with_enabled(|| cfg!(feature = "local_fs"))
-        .with_key_binding("ctrl-alt-shift-s")
+        .with_key_binding("ctrl-alt-shift-S")
         .with_context_predicate(id!("Terminal")),
         EditableBinding::new(
             "terminal:save_block_to_file",

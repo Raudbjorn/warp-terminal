@@ -58,6 +58,12 @@ Live capture mirrors the terminal's retained output: if the active command excee
 the configured grid limit, older lines can also disappear from its captured tail.
 Use shell redirection or a PTY recording when a complete byte log is required.
 
+File operations run in the background. The app allows up to eight open or pending
+file captures at a time; a stalled destination retains its place until its I/O finishes.
+Closing a pane or clearing its history drains the last available snapshot. If the
+file is still opening, capture stops with an incomplete-snapshot warning. Abrupt
+application termination can leave the final write incomplete.
+
 All six actions are listed in the Resource Center's **Terminal** shortcuts and
 can be assigned keys in **Settings → Keyboard Shortcuts**. Filename patterns live
 under **Settings → Features → Session** and are stored locally:
@@ -69,7 +75,9 @@ under **Settings → Features → Session** and are stored locally:
 | `terminal.file_capture.session_pattern` | `{session-or-command}_{timestamp}.log` |
 
 Patterns support `{command}`, `{timestamp}`, `{finished-timestamp}` and
-`{session-or-command}` (a custom tab name, falling back to the first command).
+`{session-or-command}`. For session captures, `{session-or-command}` uses the
+custom tab name from any capture entry point, falling back to the first command.
+For output and block captures, it uses the target command.
 Clearing a settings field restores its default. The pattern suggests a filename;
 the save dialog lets you change it.
 

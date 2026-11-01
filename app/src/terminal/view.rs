@@ -2542,7 +2542,18 @@ struct ActiveFileCapture {
     block_id: BlockId,
     // Session tails include transient background blocks after the last finalized command.
     session_prefix_block_id: Option<BlockId>,
-    stream: file_capture::FileStream,
+    id: Uuid,
+    stream: Option<file_capture::AsyncFileStream>,
+    dirty: bool,
+    finish: file_capture::CaptureFinish,
+}
+
+#[cfg(feature = "local_fs")]
+struct CaptureUpdate {
+    rendered: String,
+    committed_bytes: usize,
+    prefix: Option<BlockId>,
+    close: bool,
 }
 
 pub struct TerminalView {
@@ -3017,6 +3028,10 @@ pub struct TerminalView {
     /// Tab name for the capture currently being started, handed down from the
     /// tab menu. `None` for captures started from the block context menu.
     pending_capture_session_name: Option<String>,
+    #[cfg(feature = "local_fs")]
+    capture_open_ids: [Option<Uuid>; 2],
+    #[cfg(feature = "local_fs")]
+    capture_tasks: HashMap<Uuid, SpawnedFutureHandle>,
     /// Open `Stream … to file...` capture following one block. Closed when that
     /// block finishes.
     #[cfg(feature = "local_fs")]
@@ -4583,6 +4598,10 @@ impl TerminalView {
             pending_cloud_mode_start_abort_handle: None,
             ephemeral_message_model,
             pending_capture_session_name: None,
+            #[cfg(feature = "local_fs")]
+            capture_open_ids: [None, None],
+            #[cfg(feature = "local_fs")]
+            capture_tasks: HashMap::new(),
             #[cfg(feature = "local_fs")]
             block_capture_stream: None,
             #[cfg(feature = "local_fs")]
@@ -9198,6 +9217,8 @@ impl TerminalView {
     /// Shuts down the pty and event loop, terminating the shell process.
     /// Also marks this view as manually shut down for telemetry attribution.
     pub fn shutdown_pty(&mut self, ctx: &mut ViewContext<Self>) {
+        #[cfg(feature = "local_fs")]
+        self.stop_file_captures(ctx);
         self.manual_pty_shutdown_requested = true;
         ctx.emit(Event::ShutdownPty);
     }
@@ -12689,9 +12710,7 @@ impl TerminalView {
             ModelEvent::Exit { reason } => {
                 #[cfg(feature = "local_fs")]
                 {
-                    self.pump_file_captures(ctx);
-                    self.block_capture_stream = None;
-                    self.session_capture_stream = None;
+                    self.stop_file_captures(ctx);
                 }
                 if !self.manual_pty_shutdown_requested
                     && let Some((conversation_id, command)) =
@@ -20285,10 +20304,10 @@ impl TerminalView {
 
         #[cfg(feature = "local_fs")]
         {
-            self.pump_file_captures(ctx);
-            if self.block_capture_stream.take().is_some()
-                | self.session_capture_stream.take().is_some()
-            {
+            let had_capture =
+                self.block_capture_stream.is_some() || self.session_capture_stream.is_some();
+            self.stop_file_captures(ctx);
+            if had_capture {
                 self.show_error_toast(
                     "File capture stopped because command history was cleared.".to_string(),
                     ctx,
@@ -22627,7 +22646,9 @@ impl TerminalView {
                 .iter()
                 .rev()
                 .find(|block| {
-                    !block.is_empty(model.block_list().transcript_scope())
+                    !block.is_background()
+                        && !block.is_static()
+                        && !block.is_empty(model.block_list().transcript_scope())
                         && !Self::capture_block_text(block, CaptureRequest::block_full(false))
                             .is_empty()
                 })
@@ -22648,7 +22669,13 @@ impl TerminalView {
         let model = self.model.lock();
         indices
             .into_iter()
-            .filter_map(|index| model.block_list().block_at(index).map(|block| *block.id()))
+            .filter_map(|index| {
+                model
+                    .block_list()
+                    .block_at(index)
+                    .filter(|block| !block.is_empty(model.block_list().transcript_scope()))
+                    .map(|block| *block.id())
+            })
             .collect()
     }
 
@@ -22775,6 +22802,29 @@ impl TerminalView {
             CaptureScope::Session => settings.file_capture_session_pattern.value().clone(),
         };
 
+        let session_name = if request.is_session() {
+            self.pending_capture_session_name.take().or_else(|| {
+                WorkspaceRegistry::as_ref(ctx)
+                    .get(self.window_id, ctx)
+                    .and_then(|workspace| {
+                        workspace.as_ref(ctx).tab_views().find_map(|group| {
+                            let group = group.as_ref(ctx);
+                            group
+                                .visible_pane_ids()
+                                .into_iter()
+                                .any(|pane_id| {
+                                    group
+                                        .terminal_view_from_pane_id(pane_id, ctx)
+                                        .is_some_and(|terminal| terminal.id() == ctx.view_id())
+                                })
+                                .then(|| group.custom_title(ctx))
+                                .flatten()
+                        })
+                    })
+            })
+        } else {
+            None
+        };
         let indices = self.capture_block_ids(ctx);
         let model = self.model.lock();
         let block_list = model.block_list();
@@ -22801,120 +22851,219 @@ impl TerminalView {
         let tokens = file_capture::PatternTokens {
             command: first.map(|b| b.command_to_string()),
             finished: last.and_then(|b| b.completed_ts().copied()),
-            session_name: request
-                .is_session()
-                .then(|| self.pending_capture_session_name.take())
-                .flatten(),
+            session_name,
         };
         drop(model);
 
         file_capture::expand_pattern(&pattern, &tokens)
     }
 
-    /// Brings any open capture up to date with the block it is following.
+    /// One IO operation per capture; busy wakeups coalesce into a single subsequent snapshot.
     #[cfg(feature = "local_fs")]
     fn pump_file_captures(&mut self, ctx: &mut ViewContext<Self>) {
+        let updates = {
+            let model = self.model.lock();
+            let mut cache = HashMap::new();
+            [false, true]
+                .into_iter()
+                .filter_map(|is_session| {
+                    let capture = self.capture_stream(is_session)?;
+                    capture.stream.as_ref()?;
+                    Some((
+                        is_session,
+                        Self::capture_update_cached(model.block_list(), capture, &mut cache),
+                    ))
+                })
+                .collect::<Vec<_>>()
+        };
         for is_session in [false, true] {
-            let Some(capture) = self.capture_stream(is_session) else {
-                continue;
-            };
-            let rendered = {
-                let model = self.model.lock();
-                let blocks = model.block_list();
-                if is_session {
-                    Self::capture_session_tail_start(blocks, capture.session_prefix_block_id).map(
-                        |start| {
-                            Self::capture_blocks_text(&blocks.blocks()[start..], capture.request)
-                        },
-                    )
-                } else {
-                    blocks
-                        .block_with_id(&capture.block_id)
-                        .map(|block| Self::capture_block_text(block, capture.request))
-                }
-            };
-            let Some(rendered) = rendered else {
-                *self.capture_stream_slot(is_session) = None;
-                self.show_error_toast(
-                    "File capture stopped because its command history was cleared.".to_string(),
-                    ctx,
-                );
-                continue;
-            };
-            if let Some(capture) = self.capture_stream_slot(is_session).as_mut()
-                && let Err(err) = capture.stream.update_tail(&rendered)
-            {
-                report_error!(anyhow::Error::new(err).context("Failed to append to capture file"));
-                *self.capture_stream_slot(is_session) = None;
-                self.show_error_toast("Could not continue saving command output.".to_string(), ctx);
+            if let Some(capture) = self.capture_stream_slot(is_session).as_mut() {
+                capture.dirty = true;
             }
+        }
+        for (is_session, update) in updates {
+            self.write_capture_update_prepared(is_session, update, ctx);
         }
     }
 
-    /// Closes a completed block capture and advances a session capture by stable block identity.
+    #[cfg(feature = "local_fs")]
+    fn capture_update(&self, capture: &ActiveFileCapture) -> Option<CaptureUpdate> {
+        let model = self.model.lock();
+        Self::capture_update_cached(model.block_list(), capture, &mut HashMap::new())
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn capture_update_cached(
+        blocks: &BlockList,
+        capture: &ActiveFileCapture,
+        cache: &mut HashMap<BlockId, (String, String)>,
+    ) -> Option<CaptureUpdate> {
+        if capture.request.is_session() {
+            let start = Self::capture_session_tail_start(blocks, capture.session_prefix_block_id)?;
+            let last_completed = blocks.blocks()[start..]
+                .iter()
+                .rposition(|block| block.finished() && !block.is_background())
+                .map(|offset| start + offset);
+            let render = |block: &Block, cache: &mut HashMap<BlockId, (String, String)>| {
+                Self::capture_block_text_cached(block, capture.request, cache)
+            };
+            let join = |blocks: &[Block], cache: &mut HashMap<BlockId, (String, String)>| {
+                blocks
+                    .iter()
+                    .map(|block| render(block, cache))
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(file_capture::BLOCK_SEPARATOR)
+            };
+            let (rendered, committed_bytes, prefix) = match last_completed {
+                Some(end) => {
+                    let mut committed = join(&blocks.blocks()[start..=end], cache);
+                    if !committed.is_empty() {
+                        committed.push_str(file_capture::BLOCK_SEPARATOR);
+                    }
+                    let committed_bytes = committed.len();
+                    committed.push_str(&join(&blocks.blocks()[end + 1..], cache));
+                    (committed, committed_bytes, Some(*blocks.blocks()[end].id()))
+                }
+                None => (
+                    join(&blocks.blocks()[start..], cache),
+                    0,
+                    capture.session_prefix_block_id,
+                ),
+            };
+            Some(CaptureUpdate {
+                rendered,
+                committed_bytes,
+                prefix,
+                close: false,
+            })
+        } else {
+            let block = blocks.block_with_id(&capture.block_id)?;
+            Some(CaptureUpdate {
+                rendered: Self::capture_block_text_cached(block, capture.request, cache),
+                committed_bytes: 0,
+                prefix: None,
+                close: block.finished(),
+            })
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn write_capture_update(&mut self, is_session: bool, ctx: &mut ViewContext<Self>) {
+        let update = self.capture_stream(is_session).and_then(|capture| {
+            capture.stream.as_ref()?;
+            self.capture_update(capture)
+        });
+        self.write_capture_update_prepared(is_session, update, ctx);
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn write_capture_update_prepared(
+        &mut self,
+        is_session: bool,
+        update: Option<CaptureUpdate>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(mut capture) = self.capture_stream_slot(is_session).take() else {
+            return;
+        };
+        let Some(stream) = capture.stream.take() else {
+            *self.capture_stream_slot(is_session) = Some(capture);
+            return;
+        };
+        let Some(update) = update else {
+            self.show_error_toast(
+                "File capture stopped because its command history was cleared.".to_string(),
+                ctx,
+            );
+            return;
+        };
+        let id = capture.id;
+        capture.dirty = false;
+        // Pending snapshots must use the offset this ordered write will establish.
+        // A failed write drops the capture, so this logical advance cannot be reused on failure.
+        capture.session_prefix_block_id = update.prefix;
+        *self.capture_stream_slot(is_session) = Some(capture);
+        let task_id = Uuid::new_v4();
+        let task = ctx.spawn(
+            stream.update(update.rendered, update.committed_bytes),
+            move |me, (stream, result), ctx| {
+                me.capture_tasks.remove(&task_id);
+                let is_current = me
+                    .capture_stream(is_session)
+                    .is_some_and(|capture| capture.id == id);
+                if let Err(error) = result {
+                    if is_current {
+                        *me.capture_stream_slot(is_session) = None;
+                    }
+                    report_error!(
+                        anyhow::Error::new(error).context("Failed to write command output capture")
+                    );
+                    me.show_error_toast(
+                        "Could not continue saving command output.".to_string(),
+                        ctx,
+                    );
+                    return;
+                }
+                if !is_current {
+                    return;
+                }
+                let capture = me.capture_stream_slot(is_session).as_mut().unwrap();
+                if update.close {
+                    *me.capture_stream_slot(is_session) = None;
+                    return;
+                }
+                capture.stream = Some(stream);
+                if capture.dirty {
+                    me.write_capture_update(is_session, ctx);
+                }
+            },
+        );
+        self.capture_tasks.insert(task_id, task);
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn stop_file_captures(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.capture_open_ids.iter().any(Option::is_some) {
+            self.show_error_toast(
+                "A file capture was stopped before opening finished; its initial snapshot may be incomplete.".to_string(), ctx);
+        }
+        self.capture_open_ids = [None, None];
+        for is_session in [false, true] {
+            let Some(capture) = self.capture_stream_slot(is_session).take() else {
+                continue;
+            };
+            if let Some(update) = self.capture_update(&capture) {
+                // The writer owns this slot too: an in-flight write or off-thread close
+                // drains it even if the view disappears before its callback runs.
+                let finished = capture
+                    .finish
+                    .queue(update.rendered, update.committed_bytes);
+                let task_id = Uuid::new_v4();
+                let task = ctx.spawn(finished, move |me, result, ctx| {
+                    me.capture_tasks.remove(&task_id);
+                    if !matches!(result, Ok(Ok(()))) {
+                        me.show_error_toast(
+                            "Could not finish saving command output.".to_string(),
+                            ctx,
+                        );
+                    }
+                });
+                self.capture_tasks.insert(task_id, task);
+            }
+            // Dropping an idle writer schedules off-thread drain/close. Busy writers
+            // remain owned by their already-running operation until it completes.
+        }
+    }
+
     #[cfg(feature = "local_fs")]
     fn on_block_completed_for_captures(
         &mut self,
-        completed_id: BlockId,
+        _completed_id: BlockId,
         ctx: &mut ViewContext<Self>,
     ) {
-        for is_session in [false, true] {
-            let Some(capture) = self.capture_stream(is_session) else {
-                continue;
-            };
-            let completed = {
-                let model = self.model.lock();
-                let blocks = model.block_list();
-                blocks.block_with_id(&completed_id).and_then(|block| {
-                    if is_session {
-                        let start = Self::capture_session_tail_start(
-                            blocks,
-                            capture.session_prefix_block_id,
-                        )?;
-                        let end = usize::from(block.index());
-                        // Background output can later become the command grid during typeahead repair.
-                        if block.is_background() || end < start {
-                            return None;
-                        }
-                        Some((
-                            Self::capture_blocks_text(
-                                &blocks.blocks()[start..=end],
-                                capture.request,
-                            ),
-                            Some((completed_id, end + 1)),
-                        ))
-                    } else if *block.id() == capture.block_id {
-                        Some((Self::capture_block_text(block, capture.request), None))
-                    } else {
-                        None
-                    }
-                })
-            };
-            let Some((rendered, next)) = completed else {
-                continue;
-            };
-            let mut capture = self.capture_stream_slot(is_session).take().unwrap();
-            let result = if is_session {
-                if let Some((id, index)) = next {
-                    capture.session_prefix_block_id = Some(id);
-                    capture
-                        .stream
-                        .advance_to(&rendered, index, file_capture::BLOCK_SEPARATOR)
-                } else {
-                    capture.stream.update_tail(&rendered)
-                }
-            } else {
-                capture.stream.update_tail(&rendered)
-            };
-            if let Err(err) = result {
-                report_error!(
-                    anyhow::Error::new(err).context("Failed to finish command output capture")
-                );
-                self.show_error_toast("Could not finish saving command output.".to_string(), ctx);
-            } else if is_session && next.is_some() {
-                self.session_capture_stream = Some(capture);
-            }
-        }
+        // Snapshot the whole mutable suffix, including text after this completion event.
+        self.pump_file_captures(ctx);
     }
 
     #[cfg(feature = "local_fs")]
@@ -22955,24 +23104,43 @@ impl TerminalView {
 
     /// A single block rendered the way this request writes it.
     fn capture_block_text(block: &Block, request: CaptureRequest) -> String {
-        // An idle prompt is not command output, even if it already has a cwd prompt.
-        if block.command_to_string().trim().is_empty()
-            && block.output_with_secrets_unobfuscated().trim().is_empty()
-        {
+        let output = block.output_with_secrets_unobfuscated();
+        let command = block.command_with_secrets_unobfuscated(false);
+        if command.trim().is_empty() && output.trim().is_empty() {
             return String::new();
         }
         match request.scope {
-            CaptureScope::BlockOutput => block.output_with_secrets_unobfuscated(),
+            CaptureScope::BlockOutput => output,
             CaptureScope::BlockFull | CaptureScope::Session => {
-                block.command_and_output_with_secrets_unobfuscated()
+                format!("{}\n{}", block.command_line_with_pwd(), output)
             }
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn capture_block_text_cached(
+        block: &Block,
+        request: CaptureRequest,
+        cache: &mut HashMap<BlockId, (String, String)>,
+    ) -> String {
+        let (output, full) = cache.entry(*block.id()).or_insert_with(|| {
+            let output = block.output_with_secrets_unobfuscated();
+            let command = block.command_with_secrets_unobfuscated(false);
+            if output.trim().is_empty() && command.trim().is_empty() {
+                return (String::new(), String::new());
+            }
+            let full = format!("{}\n{}", block.command_line_with_pwd(), output);
+            (output, full)
+        });
+        match request.scope {
+            CaptureScope::BlockOutput => output.clone(),
+            CaptureScope::BlockFull | CaptureScope::Session => full.clone(),
         }
     }
 
     /// Entry point for the tab right-click menu.
     ///
-    /// `TerminalView` cannot reach its own `PaneGroup`, so the tab name is
-    /// passed down from the workspace layer rather than looked up here.
+    /// The tab menu supplies its title directly; other entry points resolve the owning tab.
     pub fn capture_session_to_file(
         &mut self,
         session_name: Option<String>,
@@ -23076,36 +23244,78 @@ impl TerminalView {
             (contents, tail, session_prefix_block_id)
         };
 
-        let Some((block_id, index, tail)) = tail else {
-            if let Err(err) = file_capture::write_snapshot(&path, &contents) {
-                report_error!(anyhow::Error::new(err).context("Failed to write capture file"));
-                self.show_error_toast("Could not save command output.".to_string(), ctx);
-            } else {
-                self.show_capture_toast(&path, ctx);
+        let id = Uuid::new_v4();
+        let is_session = request.is_session();
+        let task = match file_capture::AsyncFileStream::create(
+            path.clone(),
+            contents,
+            tail.as_ref().map(|(_, index, text)| (*index, text.clone())),
+        ) {
+            Ok(task) => task,
+            Err(error) => {
+                report_error!(anyhow::Error::new(error).context("Failed to start file capture"));
+                self.show_error_toast(
+                    "Too many active file captures. Close a captured pane and retry.".to_string(),
+                    ctx,
+                );
+                return;
             }
-            return;
         };
-
-        match file_capture::FileStream::create(&path, &contents, Some((index, tail))) {
-            Ok(stream) => {
-                let capture = ActiveFileCapture {
-                    request,
-                    block_id,
-                    session_prefix_block_id,
-                    stream,
-                };
-                if request.is_session() {
-                    self.session_capture_stream = Some(capture);
-                } else {
-                    self.block_capture_stream = Some(capture);
-                }
-                self.show_capture_toast(&path, ctx);
-            }
-            Err(err) => {
-                report_error!(anyhow::Error::new(err).context("Failed to open capture file"));
-                self.show_error_toast("Could not start saving command output.".to_string(), ctx);
-            }
+        if tail.is_some() {
+            self.capture_open_ids[usize::from(is_session)] = Some(id);
         }
+        let task_id = Uuid::new_v4();
+        let task = ctx.spawn(task, move |me, result, ctx| {
+            me.capture_tasks.remove(&task_id);
+            match result {
+                Ok(stream) => {
+                    if let Some((block_id, _, _)) = tail {
+                        if me.capture_open_ids[usize::from(is_session)] != Some(id) {
+                            return;
+                        }
+                        me.capture_open_ids[usize::from(is_session)] = None;
+                        if let Some(previous) = me.capture_stream_slot(is_session).take()
+                            && let Some(update) = me.capture_update(&previous)
+                        {
+                            let finished = previous
+                                .finish
+                                .queue(update.rendered, update.committed_bytes);
+                            let finish_id = Uuid::new_v4();
+                            let task = ctx.spawn(finished, move |me, result, ctx| {
+                                me.capture_tasks.remove(&finish_id);
+                                if !matches!(result, Ok(Ok(()))) {
+                                    me.show_error_toast(
+                                        "Could not finish the previous command output capture."
+                                            .to_string(),
+                                        ctx,
+                                    );
+                                }
+                            });
+                            me.capture_tasks.insert(finish_id, task);
+                        }
+                        *me.capture_stream_slot(is_session) = Some(ActiveFileCapture {
+                            request,
+                            block_id,
+                            session_prefix_block_id,
+                            id,
+                            finish: stream.finish_handle(),
+                            stream: Some(stream),
+                            dirty: true,
+                        });
+                        me.write_capture_update(is_session, ctx);
+                    }
+                    me.show_capture_toast(&path, ctx);
+                }
+                Err(error) => {
+                    if me.capture_open_ids[usize::from(is_session)] == Some(id) {
+                        me.capture_open_ids[usize::from(is_session)] = None;
+                    }
+                    report_error!(anyhow::Error::new(error).context("Failed to open capture file"));
+                    me.show_error_toast("Could not save command output.".to_string(), ctx);
+                }
+            }
+        });
+        self.capture_tasks.insert(task_id, task);
     }
 
     fn copy_blocks(&mut self, entity: BlockEntity, ctx: &mut ViewContext<Self>) {
@@ -30795,6 +31005,32 @@ impl MenuPositioningProvider for TerminalViewMenuPositioningProvider {
 
 impl Drop for TerminalView {
     fn drop(&mut self) {
+        #[cfg(feature = "local_fs")]
+        if self.block_capture_stream.is_some() || self.session_capture_stream.is_some() {
+            if let Some(model) = self.model.try_lock() {
+                let mut cache = HashMap::new();
+                for capture in [&self.block_capture_stream, &self.session_capture_stream]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(update) =
+                        Self::capture_update_cached(model.block_list(), capture, &mut cache)
+                    {
+                        // The writer outlives the view and reports any final write error to the log.
+                        drop(
+                            capture
+                                .finish
+                                .queue(update.rendered, update.committed_bytes),
+                        );
+                    }
+                }
+            } else {
+                log::error!(
+                    "Could not snapshot command output during terminal teardown: model is busy"
+                );
+            }
+        }
+
         if let Some((is_bootstrapped, pending_shell, has_pending_ssh_session)) =
             self.model.try_lock().map(|model| {
                 (

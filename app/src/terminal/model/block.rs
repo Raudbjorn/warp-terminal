@@ -2280,7 +2280,7 @@ impl Block {
     /// the case for restored blocks and for anything that ran before the first
     /// precmd.
     pub fn command_line_with_pwd(&self) -> String {
-        let command = self.command_to_string();
+        let command = self.command_with_secrets_unobfuscated(false);
         let Some(pwd) = self.user_friendly_pwd() else {
             return command;
         };
