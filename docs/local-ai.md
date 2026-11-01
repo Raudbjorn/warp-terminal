@@ -1,9 +1,11 @@
 # Local AI
 
-This fork's OSS build never talks to Warp's servers. AI features work only
-against endpoints you configure yourself. There are **two separate AI code
-paths** with separate settings, and the network rules differ between them, so
-read the first two sections before configuring anything.
+This fork's OSS build never talks to Warp's servers. Single-shot AI features
+work only against endpoints you configure. The Warp Agent uses the *OpenAI Base
+URL* from its profile, and an empty value sends prompts to
+`https://api.openai.com/v1`. There are **two separate AI code paths** with
+separate settings, and the network rules differ between them, so read the first
+two sections before configuring anything.
 
 Everything below was read from the source on `master`. Where behavior is
 known to be incomplete, the text says so and links the tracking issue.
