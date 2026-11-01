@@ -33,6 +33,9 @@ const PRIVATE_RANGES: [(IpAddr, u8); 7] = [
     (IpAddr::V6(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0)), 10),
 ];
 
+/// Length in bits of the `::ffff:0:0/96` prefix that IPv4-mapped IPv6 addresses share.
+const IPV4_MAPPED_PREFIX_BITS: u8 = 96;
+
 static ALLOWED_PRIVATE_HOSTS: RwLock<Vec<PrivateNetwork>> = RwLock::new(Vec::new());
 
 /// A single allowed entry: an IP address (a /32 or /128) or a CIDR range inside a private range.
@@ -55,7 +58,8 @@ pub enum PrivateHostsError {
 }
 
 impl PrivateNetwork {
-    /// Parses `10.0.0.5`, `192.168.1.0/24`, `fd00::/8` or `[fd00::1]`.
+    /// Parses `10.0.0.5`, `192.168.1.0/24`, `fd00::/8`, `[fd00::1]` or an IPv4-mapped form such as
+    /// `::ffff:10.0.0.5`.
     pub fn parse(entry: &str) -> Result<Self, PrivateHostsError> {
         let invalid = || PrivateHostsError::Invalid(entry.to_owned());
         let trimmed = entry.trim();
@@ -76,6 +80,19 @@ impl PrivateNetwork {
         if prefix_len > max_len {
             return Err(invalid());
         }
+
+        // `::ffff:192.168.1.0/120` is the IPv4 range `192.168.1.0/24`. `contains` compares mapped
+        // addresses as IPv4, so entries are stored that way too. A prefix shorter than the mapped
+        // block also covers non-IPv4 addresses, so it is not a private range.
+        let normalized = normalize(addr);
+        let (addr, prefix_len) = if normalized.is_ipv4() && addr.is_ipv6() {
+            let Some(prefix_len) = prefix_len.checked_sub(IPV4_MAPPED_PREFIX_BITS) else {
+                return Err(PrivateHostsError::NotPrivate(entry.trim().to_owned()));
+            };
+            (normalized, prefix_len)
+        } else {
+            (addr, prefix_len)
+        };
 
         let network = Self {
             addr: mask(addr, prefix_len),

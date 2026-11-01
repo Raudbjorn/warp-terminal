@@ -56,6 +56,47 @@ fn parses_addresses_and_ranges_inside_private_space() {
 }
 
 #[test]
+fn ipv4_mapped_entries_are_stored_as_ipv4() {
+    for (entry, shown) in [
+        ("::ffff:192.168.1.50", "192.168.1.50"),
+        ("[::ffff:10.0.0.5]", "10.0.0.5"),
+        // The prefix counts bits of the 128-bit address: /120 is the IPv4 /24.
+        ("::ffff:192.168.1.0/120", "192.168.1.0/24"),
+        ("::ffff:10.0.0.5/128", "10.0.0.5"),
+        ("::ffff:10.1.2.3/104", "10.0.0.0/8"),
+    ] {
+        assert_eq!(
+            PrivateNetwork::parse(entry).unwrap().to_string(),
+            shown,
+            "entry: {entry:?}"
+        );
+    }
+
+    let mapped = PrivateNetwork::parse("::ffff:192.168.1.50").unwrap();
+    assert_eq!(mapped, PrivateNetwork::parse("192.168.1.50").unwrap());
+    assert!(mapped.contains("192.168.1.50".parse().unwrap()));
+    assert!(mapped.contains("::ffff:192.168.1.50".parse().unwrap()));
+    assert!(!mapped.contains("192.168.1.51".parse().unwrap()));
+
+    // Mapped addresses outside private space stay rejected, and so does a prefix that reaches
+    // past the mapped block into other IPv6 space.
+    for entry in [
+        "::ffff:8.8.8.8",
+        "::ffff:127.0.0.1",
+        "::ffff:10.0.0.0/95",
+        "::ffff:0:0/0",
+    ] {
+        assert!(
+            matches!(
+                PrivateNetwork::parse(entry),
+                Err(PrivateHostsError::NotPrivate(_))
+            ),
+            "entry: {entry:?}"
+        );
+    }
+}
+
+#[test]
 fn rejects_entries_that_are_not_ip_literals_or_ranges() {
     for entry in [
         "",
