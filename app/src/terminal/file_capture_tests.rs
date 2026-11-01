@@ -30,6 +30,37 @@ fn sanitize_token_falls_back_when_nothing_survives() {
 }
 
 #[test]
+fn sanitize_token_limits_utf8_bytes_at_character_boundaries() {
+    assert_eq!(sanitize_token(&"a".repeat(65)), "a".repeat(64));
+    assert_eq!(sanitize_token(&"😀".repeat(64)), "😀".repeat(16));
+    // 64 is not a character boundary for three-byte characters or mixed widths.
+    assert_eq!(sanitize_token(&"界".repeat(22)), "界".repeat(21));
+    assert_eq!(
+        sanitize_token(&format!("{}😀z", "a".repeat(62))),
+        "a".repeat(62)
+    );
+    assert_eq!(
+        sanitize_token(&format!("{}😀z", "a".repeat(60))),
+        format!("{}😀", "a".repeat(60))
+    );
+}
+
+#[test]
+fn default_session_filename_with_multibyte_name_fits_filesystem_component() {
+    let tokens = PatternTokens {
+        session_name: Some("😀".repeat(64)),
+        ..Default::default()
+    };
+    let name = expand_pattern("{session-or-command}_{timestamp}.log", &tokens);
+    assert!(name.starts_with(&format!("{}_", "😀".repeat(16))));
+    assert!(name.ends_with(".log"));
+    assert!(name.len() <= 255, "filename has {} UTF-8 bytes", name.len());
+
+    let directory = TempDir::new().unwrap();
+    write_snapshot(&directory.path().join(name), "captured output").unwrap();
+}
+
+#[test]
 fn expand_pattern_keeps_the_extension_dot() {
     // Sanitising the finished string instead of each token would eat this dot.
     let tokens = PatternTokens {

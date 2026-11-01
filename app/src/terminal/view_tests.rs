@@ -11480,3 +11480,116 @@ fn file_capture_superseded_open_callback_cannot_replace_new_capture() {
         assert_eq!(std::fs::read_to_string(&second).unwrap(), "output newest");
     });
 }
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn file_capture_menu_actions_restore_focus_and_preserve_selected_targets() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window, terminal) = add_window_with_id_and_terminal(&mut app, None);
+        terminal.update(&mut app, |view, _| {
+            bootstrap_with_long_running_block(view);
+            let index = view.model.lock().block_list().active_block_index();
+            view.selected_blocks.reset_to_single(index);
+        });
+        for action in [
+            ContextMenuAction::SaveOutputToFile,
+            ContextMenuAction::StreamOutputToFile,
+            ContextMenuAction::SaveBlockToFile,
+            ContextMenuAction::StreamBlockToFile,
+            ContextMenuAction::SaveSessionToFile,
+            ContextMenuAction::StreamSessionToFile,
+        ] {
+            let menu_id = terminal.update(&mut app, |view, ctx| {
+                view.context_menu_state = Some(ContextMenuState {
+                    menu_type: ContextMenuType::Prompt {
+                        position: vec2f(0., 0.),
+                    },
+                });
+                ctx.focus(&view.context_menu);
+                view.context_menu.id()
+            });
+            assert_eq!(app.focused_view_id(window), Some(menu_id));
+            terminal.update(&mut app, |view, ctx| {
+                let targets = view.capture_block_ids(ctx);
+                view.context_menu_action(&action, ctx);
+                assert!(!view.is_context_menu_open());
+                assert_eq!(view.capture_block_ids(ctx), targets);
+            });
+            // The test picker is inert; focus must already have left the dismissed menu.
+            assert_ne!(app.focused_view_id(window), Some(menu_id));
+        }
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn file_capture_cached_output_reuses_output_and_only_builds_requested_header() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, _| {
+            bootstrap_with_long_running_block(view);
+            let model = view.model.lock();
+            let block = model.block_list().active_block();
+            let mut cache = HashMap::new();
+            let mut output = String::new();
+            TerminalView::append_capture_block_text_cached(
+                block,
+                CaptureRequest::block_output(true),
+                &mut cache,
+                &mut output,
+                false,
+            );
+            assert_eq!(
+                output,
+                TerminalView::capture_block_text(block, CaptureRequest::block_output(true))
+            );
+            let cached = cache.get(block.id()).unwrap();
+            assert!(cached.header.is_none());
+            let output_allocation = cached.output.as_ptr();
+            let mut full = String::new();
+            TerminalView::append_capture_block_text_cached(
+                block,
+                CaptureRequest::session(true),
+                &mut cache,
+                &mut full,
+                false,
+            );
+            assert_eq!(
+                full,
+                TerminalView::capture_block_text(block, CaptureRequest::session(true))
+            );
+            let cached = cache.get(block.id()).unwrap();
+            assert!(cached.header.is_some());
+            // Overlapping scopes reuse the same rendered output allocation, storing only
+            // the additional command header instead of another full copy of the output.
+            assert_eq!(cached.output.as_ptr(), output_allocation);
+            assert_eq!(cache.len(), 1);
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn file_capture_unnamed_tab_does_not_reread_borrowed_workspace() {
+    App::test((), |mut app| async move {
+        initialize_workspace_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            assert!(
+                workspace
+                    .active_tab_pane_group()
+                    .as_ref(ctx)
+                    .custom_title(ctx)
+                    .is_none()
+            );
+            // This nested route owns a mutable workspace borrow. The terminal must use
+            // the explicitly supplied unnamed title rather than resolve the workspace again.
+            workspace.handle_action(
+                &WorkspaceAction::StreamSessionToFileFromTab { tab_index: 0 },
+                ctx,
+            );
+        });
+    });
+}

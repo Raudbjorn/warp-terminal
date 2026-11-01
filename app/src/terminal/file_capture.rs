@@ -115,7 +115,7 @@ pub struct PatternTokens {
 /// Applied per token rather than to the finished string: sanitising afterwards
 /// would also strip the dot in `.log`.
 fn sanitize_token(raw: &str) -> String {
-    const MAX_TOKEN_LEN: usize = 64;
+    const MAX_TOKEN_BYTES: usize = 64;
 
     let cleaned: String = raw
         .trim()
@@ -145,7 +145,12 @@ fn sanitize_token(raw: &str) -> String {
     }
 
     let trimmed = out.trim_matches(|c| c == '_' || c == '.');
-    let mut result: String = trimmed.chars().take(MAX_TOKEN_LEN).collect();
+    // Filesystem component limits count bytes; preserve whole UTF-8 characters.
+    let mut end = trimmed.len().min(MAX_TOKEN_BYTES);
+    while !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut result = trimmed[..end].to_owned();
     if result.is_empty() {
         result.push_str("untitled");
     }

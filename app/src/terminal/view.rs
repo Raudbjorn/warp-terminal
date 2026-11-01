@@ -2549,6 +2549,14 @@ struct ActiveFileCapture {
 }
 
 #[cfg(feature = "local_fs")]
+struct CaptureBlockText {
+    output: String,
+    // Built only when a full-block/session capture actually requests the header.
+    header: Option<String>,
+    is_empty: bool,
+}
+
+#[cfg(feature = "local_fs")]
 struct CaptureUpdate {
     rendered: String,
     committed_bytes: usize,
@@ -3025,9 +3033,9 @@ pub struct TerminalView {
 
     /// Per-session PTY recorder for writing PTY bytes to a file.
     pty_recorder: ModelHandle<PtyRecorder>,
-    /// Tab name for the capture currently being started, handed down from the
-    /// tab menu. `None` for captures started from the block context menu.
-    pending_capture_session_name: Option<String>,
+    /// The tab menu supplies its optional title, including an explicitly unnamed tab.
+    /// `None` means a direct terminal action must resolve its containing tab.
+    pending_capture_session_name: Option<Option<String>>,
     #[cfg(feature = "local_fs")]
     capture_open_ids: [Option<Uuid>; 2],
     #[cfg(feature = "local_fs")]
@@ -22681,7 +22689,7 @@ impl TerminalView {
 
     /// Shared handler for all six `Save …/Stream … to file...` commands.
     ///
-    /// Builds the text, suggests a filename from the scope's pattern, and hands
+    /// Resolves the targets, suggests a filename from the scope's pattern, and hands
     /// off to the native save dialog. A streaming request that finds nothing
     /// running — including a command that ended while the dialog was open —
     /// simply writes and closes rather than erroring.
@@ -22691,6 +22699,9 @@ impl TerminalView {
 
         let indices = self.capture_block_ids(ctx);
         let filename = self.capture_filename(request, ctx);
+        // Resolve targets before returning focus from the menu; keep their stable IDs
+        // while the native picker is open, including when it is later cancelled.
+        self.close_context_menu(ctx, true);
         let mut config = SaveFilePickerConfiguration::new().with_default_filename(filename);
         if let Some(pwd) = self.pwd() {
             config = config.with_default_directory(PathBuf::from(pwd));
@@ -22803,7 +22814,7 @@ impl TerminalView {
         };
 
         let session_name = if request.is_session() {
-            self.pending_capture_session_name.take().or_else(|| {
+            self.pending_capture_session_name.take().unwrap_or_else(|| {
                 WorkspaceRegistry::as_ref(ctx)
                     .get(self.window_id, ctx)
                     .and_then(|workspace| {
@@ -22864,6 +22875,10 @@ impl TerminalView {
         let updates = {
             let model = self.model.lock();
             let mut cache = HashMap::new();
+            let share_output = self
+                .session_capture_stream
+                .as_ref()
+                .is_some_and(|capture| capture.stream.is_some());
             [false, true]
                 .into_iter()
                 .filter_map(|is_session| {
@@ -22871,7 +22886,11 @@ impl TerminalView {
                     capture.stream.as_ref()?;
                     Some((
                         is_session,
-                        Self::capture_update_cached(model.block_list(), capture, &mut cache),
+                        if !is_session && !share_output {
+                            Self::capture_block_update(model.block_list(), capture)
+                        } else {
+                            Self::capture_update_cached(model.block_list(), capture, &mut cache)
+                        },
                     ))
                 })
                 .collect::<Vec<_>>()
@@ -22889,14 +22908,32 @@ impl TerminalView {
     #[cfg(feature = "local_fs")]
     fn capture_update(&self, capture: &ActiveFileCapture) -> Option<CaptureUpdate> {
         let model = self.model.lock();
-        Self::capture_update_cached(model.block_list(), capture, &mut HashMap::new())
+        if capture.request.is_session() {
+            Self::capture_update_cached(model.block_list(), capture, &mut HashMap::new())
+        } else {
+            Self::capture_block_update(model.block_list(), capture)
+        }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn capture_block_update(
+        blocks: &BlockList,
+        capture: &ActiveFileCapture,
+    ) -> Option<CaptureUpdate> {
+        let block = blocks.block_with_id(&capture.block_id)?;
+        Some(CaptureUpdate {
+            rendered: Self::capture_block_text(block, capture.request),
+            committed_bytes: 0,
+            prefix: None,
+            close: block.finished(),
+        })
     }
 
     #[cfg(feature = "local_fs")]
     fn capture_update_cached(
         blocks: &BlockList,
         capture: &ActiveFileCapture,
-        cache: &mut HashMap<BlockId, (String, String)>,
+        cache: &mut HashMap<BlockId, CaptureBlockText>,
     ) -> Option<CaptureUpdate> {
         if capture.request.is_session() {
             let start = Self::capture_session_tail_start(blocks, capture.session_prefix_block_id)?;
@@ -22904,32 +22941,36 @@ impl TerminalView {
                 .iter()
                 .rposition(|block| block.finished() && !block.is_background())
                 .map(|offset| start + offset);
-            let render = |block: &Block, cache: &mut HashMap<BlockId, (String, String)>| {
-                Self::capture_block_text_cached(block, capture.request, cache)
-            };
-            let join = |blocks: &[Block], cache: &mut HashMap<BlockId, (String, String)>| {
-                blocks
-                    .iter()
-                    .map(|block| render(block, cache))
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join(file_capture::BLOCK_SEPARATOR)
-            };
-            let (rendered, committed_bytes, prefix) = match last_completed {
+            let mut rendered = String::new();
+            let (committed_bytes, prefix) = match last_completed {
                 Some(end) => {
-                    let mut committed = join(&blocks.blocks()[start..=end], cache);
-                    if !committed.is_empty() {
-                        committed.push_str(file_capture::BLOCK_SEPARATOR);
+                    Self::append_capture_blocks_text_cached(
+                        &blocks.blocks()[start..=end],
+                        capture.request,
+                        cache,
+                        &mut rendered,
+                    );
+                    if !rendered.is_empty() {
+                        rendered.push_str(file_capture::BLOCK_SEPARATOR);
                     }
-                    let committed_bytes = committed.len();
-                    committed.push_str(&join(&blocks.blocks()[end + 1..], cache));
-                    (committed, committed_bytes, Some(*blocks.blocks()[end].id()))
+                    let committed_bytes = rendered.len();
+                    Self::append_capture_blocks_text_cached(
+                        &blocks.blocks()[end + 1..],
+                        capture.request,
+                        cache,
+                        &mut rendered,
+                    );
+                    (committed_bytes, Some(*blocks.blocks()[end].id()))
                 }
-                None => (
-                    join(&blocks.blocks()[start..], cache),
-                    0,
-                    capture.session_prefix_block_id,
-                ),
+                None => {
+                    Self::append_capture_blocks_text_cached(
+                        &blocks.blocks()[start..],
+                        capture.request,
+                        cache,
+                        &mut rendered,
+                    );
+                    (0, capture.session_prefix_block_id)
+                }
             };
             Some(CaptureUpdate {
                 rendered,
@@ -22939,8 +22980,16 @@ impl TerminalView {
             })
         } else {
             let block = blocks.block_with_id(&capture.block_id)?;
+            let mut rendered = String::new();
+            Self::append_capture_block_text_cached(
+                block,
+                capture.request,
+                cache,
+                &mut rendered,
+                false,
+            );
             Some(CaptureUpdate {
-                rendered: Self::capture_block_text_cached(block, capture.request, cache),
+                rendered,
                 committed_bytes: 0,
                 prefix: None,
                 close: block.finished(),
@@ -23093,20 +23142,15 @@ impl TerminalView {
         }
     }
 
-    fn capture_blocks_text(blocks: &[Block], request: CaptureRequest) -> String {
-        blocks
-            .iter()
-            .map(|block| Self::capture_block_text(block, request))
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join(file_capture::BLOCK_SEPARATOR)
-    }
-
     /// A single block rendered the way this request writes it.
     fn capture_block_text(block: &Block, request: CaptureRequest) -> String {
         let output = block.output_with_secrets_unobfuscated();
-        let command = block.command_with_secrets_unobfuscated(false);
-        if command.trim().is_empty() && output.trim().is_empty() {
+        if output.trim().is_empty()
+            && block
+                .command_with_secrets_unobfuscated(false)
+                .trim()
+                .is_empty()
+        {
             return String::new();
         }
         match request.scope {
@@ -23117,24 +23161,76 @@ impl TerminalView {
         }
     }
 
+    /// Append borrowed cache contents directly into the final write buffer. The cache
+    /// retains output once; it never materializes another full block string.
     #[cfg(feature = "local_fs")]
-    fn capture_block_text_cached(
+    fn append_capture_block_text_cached(
         block: &Block,
         request: CaptureRequest,
-        cache: &mut HashMap<BlockId, (String, String)>,
-    ) -> String {
-        let (output, full) = cache.entry(*block.id()).or_insert_with(|| {
+        cache: &mut HashMap<BlockId, CaptureBlockText>,
+        destination: &mut String,
+        separator: bool,
+    ) -> bool {
+        let text = cache.entry(*block.id()).or_insert_with(|| {
             let output = block.output_with_secrets_unobfuscated();
-            let command = block.command_with_secrets_unobfuscated(false);
-            if output.trim().is_empty() && command.trim().is_empty() {
-                return (String::new(), String::new());
+            let is_empty = output.trim().is_empty()
+                && block
+                    .command_with_secrets_unobfuscated(false)
+                    .trim()
+                    .is_empty();
+            CaptureBlockText {
+                output,
+                header: None,
+                is_empty,
             }
-            let full = format!("{}\n{}", block.command_line_with_pwd(), output);
-            (output, full)
         });
-        match request.scope {
-            CaptureScope::BlockOutput => output.clone(),
-            CaptureScope::BlockFull | CaptureScope::Session => full.clone(),
+        if text.is_empty || (request.scope == CaptureScope::BlockOutput && text.output.is_empty()) {
+            return false;
+        }
+        let header = match request.scope {
+            CaptureScope::BlockOutput => None,
+            CaptureScope::BlockFull | CaptureScope::Session => Some(
+                text.header
+                    .get_or_insert_with(|| block.command_line_with_pwd())
+                    .as_str(),
+            ),
+        };
+        destination.reserve(
+            text.output.len()
+                + header.map_or(0, |header| header.len() + 1)
+                + if separator {
+                    file_capture::BLOCK_SEPARATOR.len()
+                } else {
+                    0
+                },
+        );
+        if separator {
+            destination.push_str(file_capture::BLOCK_SEPARATOR);
+        }
+        if let Some(header) = header {
+            destination.push_str(header);
+            destination.push('\n');
+        }
+        destination.push_str(&text.output);
+        true
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn append_capture_blocks_text_cached<'a>(
+        blocks: impl IntoIterator<Item = &'a Block>,
+        request: CaptureRequest,
+        cache: &mut HashMap<BlockId, CaptureBlockText>,
+        destination: &mut String,
+    ) {
+        let mut separator = false;
+        for block in blocks {
+            separator |= Self::append_capture_block_text_cached(
+                block,
+                request,
+                cache,
+                destination,
+                separator,
+            );
         }
     }
 
@@ -23147,7 +23243,7 @@ impl TerminalView {
         keep_open: bool,
         ctx: &mut ViewContext<Self>,
     ) {
-        self.pending_capture_session_name = session_name;
+        self.pending_capture_session_name = Some(session_name);
         self.capture_to_file(CaptureRequest::session(keep_open), ctx);
     }
 
@@ -23207,12 +23303,21 @@ impl TerminalView {
                     }
                 })
                 .flatten();
-            let mut contents = targets
-                .iter()
-                .map(|block| Self::capture_block_text(block, request))
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join(file_capture::BLOCK_SEPARATOR);
+            let mut cache = HashMap::new();
+            let single_block = !request.is_session() && targets.len() == 1;
+            let mut contents = if single_block {
+                // No overlapping consumer: move output directly into the snapshot.
+                Self::capture_block_text(targets[0], request)
+            } else {
+                let mut contents = String::new();
+                Self::append_capture_blocks_text_cached(
+                    targets.iter().copied(),
+                    request,
+                    &mut cache,
+                    &mut contents,
+                );
+                contents
+            };
             let session_prefix_block_id = request
                 .is_session()
                 .then(|| {
@@ -23225,18 +23330,29 @@ impl TerminalView {
                 })
                 .flatten();
             let tail = tail_block.map(|block| {
-                (
-                    *block.id(),
-                    usize::from(block.index()),
-                    if request.is_session() {
-                        let start =
-                            Self::capture_session_tail_start(blocks, session_prefix_block_id)
-                                .unwrap();
-                        Self::capture_blocks_text(&blocks.blocks()[start..], request)
-                    } else {
-                        Self::capture_block_text(block, request)
-                    },
-                )
+                let mut rendered = String::new();
+                if single_block {
+                    // Initial contents and the worker's mutable-tail state both need ownership.
+                    rendered = contents.clone();
+                } else if request.is_session() {
+                    let start =
+                        Self::capture_session_tail_start(blocks, session_prefix_block_id).unwrap();
+                    Self::append_capture_blocks_text_cached(
+                        &blocks.blocks()[start..],
+                        request,
+                        &mut cache,
+                        &mut rendered,
+                    );
+                } else {
+                    Self::append_capture_block_text_cached(
+                        block,
+                        request,
+                        &mut cache,
+                        &mut rendered,
+                        false,
+                    );
+                }
+                (*block.id(), usize::from(block.index()), rendered)
             });
             if tail.as_ref().is_some_and(|(_, _, text)| text.is_empty()) && !contents.is_empty() {
                 contents.push_str(file_capture::BLOCK_SEPARATOR);
@@ -23246,11 +23362,11 @@ impl TerminalView {
 
         let id = Uuid::new_v4();
         let is_session = request.is_session();
-        let task = match file_capture::AsyncFileStream::create(
-            path.clone(),
-            contents,
-            tail.as_ref().map(|(_, index, text)| (*index, text.clone())),
-        ) {
+        let (tail_block_id, file_tail) = match tail {
+            Some((block_id, index, text)) => (Some(block_id), Some((index, text))),
+            None => (None, None),
+        };
+        let task = match file_capture::AsyncFileStream::create(path.clone(), contents, file_tail) {
             Ok(task) => task,
             Err(error) => {
                 report_error!(anyhow::Error::new(error).context("Failed to start file capture"));
@@ -23261,7 +23377,7 @@ impl TerminalView {
                 return;
             }
         };
-        if tail.is_some() {
+        if tail_block_id.is_some() {
             self.capture_open_ids[usize::from(is_session)] = Some(id);
         }
         let task_id = Uuid::new_v4();
@@ -23269,7 +23385,7 @@ impl TerminalView {
             me.capture_tasks.remove(&task_id);
             match result {
                 Ok(stream) => {
-                    if let Some((block_id, _, _)) = tail {
+                    if let Some(block_id) = tail_block_id {
                         if me.capture_open_ids[usize::from(is_session)] != Some(id) {
                             return;
                         }

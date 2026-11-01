@@ -78,6 +78,8 @@ Patterns support `{command}`, `{timestamp}`, `{finished-timestamp}` and
 `{session-or-command}`. For session captures, `{session-or-command}` uses the
 custom tab name from any capture entry point, falling back to the first command.
 For output and block captures, it uses the target command.
+Command and tab-name tokens are sanitized and limited to 64 UTF-8 bytes without
+splitting characters. Custom pattern text can still make a filename too long.
 Clearing a settings field restores its default. The pattern suggests a filename;
 the save dialog lets you change it.
 
