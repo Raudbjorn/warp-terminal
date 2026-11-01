@@ -122,6 +122,9 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "ok": true,
             "version": SERVICE_VERSION,
             "configHash": state.config.local_config_hash,
+            // Lets a client that did not start this service check that it enforces the same
+            // network policy as the client.
+            "networkPolicy": network_policy::PolicyReport::current(),
         })),
     )
 }

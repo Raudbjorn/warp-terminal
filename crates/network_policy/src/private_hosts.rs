@@ -12,6 +12,7 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::RwLock;
 
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::ServicesMode;
@@ -111,6 +112,13 @@ impl PrivateNetwork {
         same_family(&self.addr, &ip) && mask(ip, self.prefix_len) == self.addr
     }
 
+    /// Whether every address in this entry is also in `outer`.
+    fn is_within(&self, outer: &PrivateNetwork) -> bool {
+        same_family(&self.addr, &outer.addr)
+            && outer.prefix_len <= self.prefix_len
+            && mask(self.addr, outer.prefix_len) == outer.addr
+    }
+
     fn is_within_private_range(&self) -> bool {
         PRIVATE_RANGES.iter().any(|(range_addr, range_len)| {
             same_family(&self.addr, range_addr)
@@ -172,19 +180,97 @@ pub(crate) fn is_allowed_private_url(url: &Url) -> bool {
 /// The environment a child process needs to enforce the same policy as this process. Pass it to
 /// the child's `Command` and call [`init_from_env`] at the start of the child's `main`.
 pub fn env_for_child() -> Vec<(&'static str, String)> {
-    let mode = match crate::services_mode() {
+    let report = PolicyReport::current();
+    let mode = match report.services_mode {
         ServicesMode::LocalOnly => "local_only",
         ServicesMode::Online => "online",
     };
-    let hosts = allowed_private_hosts()
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(",");
     vec![
         (ENV_SERVICES_MODE, mode.to_owned()),
-        (ENV_ALLOWED_PRIVATE_HOSTS, hosts),
+        (
+            ENV_ALLOWED_PRIVATE_HOSTS,
+            report.allowed_private_hosts.join(","),
+        ),
     ]
+}
+
+/// The policy a process enforces, as a service reports it on its health endpoint so that a client
+/// that did not start the service can tell whether it enforces the same policy.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyReport {
+    pub services_mode: ServicesMode,
+    /// Allowed private hosts in the form [`PrivateNetwork`] displays and parses.
+    pub allowed_private_hosts: Vec<String>,
+}
+
+impl PolicyReport {
+    pub fn current() -> Self {
+        Self {
+            services_mode: crate::services_mode(),
+            allowed_private_hosts: allowed_private_hosts()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        }
+    }
+}
+
+/// Why a running service does not enforce the same policy as this process.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PolicyMismatch {
+    #[error("it does not report its network policy")]
+    NotReported,
+    #[error("it is not in local-only mode, so it can reach hosts this app cannot")]
+    NotLocalOnly,
+    #[error("it reports an invalid list of allowed private hosts: {0}")]
+    InvalidHosts(#[from] PrivateHostsError),
+    #[error("it allows private hosts [{service}] but this app allows [{app}]")]
+    HostsDiffer { service: String, app: String },
+}
+
+/// Checks that a service this process did not start enforces the same policy as this process.
+/// A process that is not in local-only mode has no policy to enforce, so anything matches. A
+/// service that allows more private hosts than this process lets requests through that this
+/// process would refuse, and one that allows fewer refuses requests this process permits, so every
+/// entry of either list must lie inside an entry of the other. Order and redundant entries do not
+/// matter; a range written as several smaller ones is reported as different.
+pub fn check_service_policy(reported: Option<&PolicyReport>) -> Result<(), PolicyMismatch> {
+    check_policy(crate::services_mode(), &allowed_private_hosts(), reported)
+}
+
+fn check_policy(
+    mode: ServicesMode,
+    hosts: &[PrivateNetwork],
+    reported: Option<&PolicyReport>,
+) -> Result<(), PolicyMismatch> {
+    if mode != ServicesMode::LocalOnly {
+        return Ok(());
+    }
+    let reported = reported.ok_or(PolicyMismatch::NotReported)?;
+    if reported.services_mode != ServicesMode::LocalOnly {
+        return Err(PolicyMismatch::NotLocalOnly);
+    }
+    let service_hosts = parse_allowed_private_hosts(&reported.allowed_private_hosts.join(","))?;
+    let covers = |outer: &[PrivateNetwork], inner: &[PrivateNetwork]| {
+        inner
+            .iter()
+            .all(|network| outer.iter().any(|outer| network.is_within(outer)))
+    };
+    if covers(hosts, &service_hosts) && covers(&service_hosts, hosts) {
+        return Ok(());
+    }
+    let describe = |networks: &[PrivateNetwork]| {
+        networks
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Err(PolicyMismatch::HostsDiffer {
+        service: describe(&service_hosts),
+        app: describe(hosts),
+    })
 }
 
 /// Applies the policy passed down by a parent through [`env_for_child`]. An absent

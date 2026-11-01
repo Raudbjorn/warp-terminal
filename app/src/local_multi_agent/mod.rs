@@ -403,6 +403,9 @@ pub enum LocalMultiAgentManagerEvent {
 struct LocalMultiAgentHealthResponse {
     ok: bool,
     version: Option<String>,
+    /// Absent from services that predate the policy report.
+    #[serde(default, rename = "networkPolicy")]
+    network_policy: Option<network_policy::PolicyReport>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -892,8 +895,11 @@ async fn start_service(
     let root_url = config.root_url()?;
     let config_hash = config.config_hash();
 
-    match health_check(root_url.clone()).await {
-        Ok(()) => {
+    match fetch_health(root_url.clone()).await {
+        Ok(health) => {
+            // This process cannot change the policy of a service it did not start (and so cannot
+            // restart it with a new allow-list), so it only reuses one that already matches.
+            ensure_service_policy_matches(&root_url, &health)?;
             log::info!("Reusing existing healthy local multi-agent service at {root_url}");
             return Ok(StartServiceResult {
                 child: None,
@@ -973,7 +979,26 @@ fn policy_client() -> Result<reqwest::Client> {
         .context("Failed to build HTTP client")
 }
 
+fn ensure_service_policy_matches(
+    root_url: &Url,
+    health: &LocalMultiAgentHealthResponse,
+) -> Result<()> {
+    network_policy::check_service_policy(health.network_policy.as_ref()).map_err(|mismatch| {
+        anyhow!(
+            "A local multi-agent service is already running at {root_url}, but {mismatch}. Start \
+             it with {mode}=local_only and {hosts} set to the allowed private hosts from \
+             Settings, or stop it so Warp can start its own.",
+            mode = network_policy::ENV_SERVICES_MODE,
+            hosts = network_policy::ENV_ALLOWED_PRIVATE_HOSTS,
+        )
+    })
+}
+
 async fn health_check(root_url: Url) -> Result<()> {
+    fetch_health(root_url).await.map(|_| ())
+}
+
+async fn fetch_health(root_url: Url) -> Result<LocalMultiAgentHealthResponse> {
     let url = root_url
         .join("/health")
         .context("Failed to build local health URL")?;
@@ -997,7 +1022,7 @@ async fn health_check(root_url: Url) -> Result<()> {
             .as_deref()
             .is_some_and(|version| !version.is_empty())
     {
-        Ok(())
+        Ok(health)
     } else {
         bail!("health response did not identify a Warp local service")
     }

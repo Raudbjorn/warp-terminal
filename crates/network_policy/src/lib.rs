@@ -6,9 +6,9 @@ use url::Url;
 mod private_hosts;
 
 pub use private_hosts::{
-    ENV_ALLOWED_PRIVATE_HOSTS, ENV_SERVICES_MODE, PrivateHostsError, PrivateNetwork,
-    allowed_private_hosts, env_for_child, init_from_env, parse_allowed_private_hosts,
-    set_allowed_private_hosts,
+    ENV_ALLOWED_PRIVATE_HOSTS, ENV_SERVICES_MODE, PolicyMismatch, PolicyReport, PrivateHostsError,
+    PrivateNetwork, allowed_private_hosts, check_service_policy, env_for_child, init_from_env,
+    parse_allowed_private_hosts, set_allowed_private_hosts,
 };
 
 static SERVICES_MODE: AtomicU8 = AtomicU8::new(ServicesMode::Online as u8);

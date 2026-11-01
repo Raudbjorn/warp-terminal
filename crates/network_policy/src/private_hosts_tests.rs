@@ -235,6 +235,122 @@ fn child_environment_parses_mode_and_hosts() {
     assert!(parse_env(Some("local_only"), "10.0.0.1, 8.8.8.8").is_err());
 }
 
+fn report(mode: ServicesMode, hosts: &[&str]) -> PolicyReport {
+    PolicyReport {
+        services_mode: mode,
+        allowed_private_hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+    }
+}
+
+fn networks(input: &str) -> Vec<PrivateNetwork> {
+    parse_allowed_private_hosts(input).unwrap()
+}
+
+#[test]
+fn a_service_with_the_same_policy_is_accepted() {
+    let hosts = networks("10.77.0.0/16, 100.100.0.7");
+    let same = report(ServicesMode::LocalOnly, &["100.100.0.7", "10.77.0.0/16"]);
+    assert_eq!(
+        check_policy(ServicesMode::LocalOnly, &hosts, Some(&same)),
+        Ok(())
+    );
+
+    // Order and redundant narrower entries do not matter.
+    let redundant = report(
+        ServicesMode::LocalOnly,
+        &["10.77.5.0/24", "100.100.0.7", "10.77.0.0/16"],
+    );
+    assert_eq!(
+        check_policy(ServicesMode::LocalOnly, &hosts, Some(&redundant)),
+        Ok(())
+    );
+
+    let empty = report(ServicesMode::LocalOnly, &[]);
+    assert_eq!(
+        check_policy(ServicesMode::LocalOnly, &[], Some(&empty)),
+        Ok(())
+    );
+}
+
+#[test]
+fn a_service_that_enforces_a_different_policy_is_refused() {
+    let hosts = networks("10.77.0.0/16");
+
+    assert_eq!(
+        check_policy(ServicesMode::LocalOnly, &hosts, None),
+        Err(PolicyMismatch::NotReported)
+    );
+    assert_eq!(
+        check_policy(
+            ServicesMode::LocalOnly,
+            &hosts,
+            Some(&report(ServicesMode::Online, &["10.77.0.0/16"]))
+        ),
+        Err(PolicyMismatch::NotLocalOnly)
+    );
+
+    // More hosts than this process allows lets requests through that it would refuse (here, a
+    // host that was just removed from the list); fewer refuses requests it permits.
+    for (service, shown) in [
+        (
+            &["10.77.0.0/16", "100.100.0.7"][..],
+            "10.77.0.0/16, 100.100.0.7",
+        ),
+        (&["10.0.0.0/8"][..], "10.0.0.0/8"),
+        (&["10.77.1.0/24"][..], "10.77.1.0/24"),
+        (&[][..], ""),
+    ] {
+        assert_eq!(
+            check_policy(
+                ServicesMode::LocalOnly,
+                &hosts,
+                Some(&report(ServicesMode::LocalOnly, service))
+            ),
+            Err(PolicyMismatch::HostsDiffer {
+                service: shown.to_owned(),
+                app: "10.77.0.0/16".to_owned(),
+            }),
+            "service hosts: {service:?}"
+        );
+    }
+
+    assert!(matches!(
+        check_policy(
+            ServicesMode::LocalOnly,
+            &hosts,
+            Some(&report(ServicesMode::LocalOnly, &["8.8.8.8"]))
+        ),
+        Err(PolicyMismatch::InvalidHosts(_))
+    ));
+}
+
+#[test]
+fn there_is_nothing_to_check_when_this_process_is_not_local_only() {
+    assert_eq!(check_policy(ServicesMode::Online, &[], None), Ok(()));
+    assert_eq!(
+        check_policy(
+            ServicesMode::Online,
+            &[],
+            Some(&report(ServicesMode::LocalOnly, &["10.77.0.0/16"]))
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn the_policy_report_round_trips_through_json() {
+    let report = report(ServicesMode::LocalOnly, &["10.77.0.0/16"]);
+    let json = serde_json::to_value(&report).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({ "servicesMode": "local_only", "allowedPrivateHosts": ["10.77.0.0/16"] })
+    );
+    assert_eq!(
+        serde_json::from_value::<PolicyReport>(json).unwrap(),
+        report
+    );
+}
+
 #[test]
 fn denial_in_chain_finds_a_denial_behind_other_errors() {
     #[derive(Debug, thiserror::Error)]
