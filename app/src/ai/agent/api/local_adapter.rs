@@ -9,14 +9,19 @@
 //! - turn the engine's [`local_agent::AgentEvent`] stream into the
 //!   `ResponseEvent` sequence the existing client machinery consumes
 //!   (StreamInit, transactions, CreateTask/AddMessagesToTask/
-//!   AppendToMessageContent, Finished).
+//!   AppendToMessageContent, Finished),
+//! - persist the provider items the next request must replay (Responses
+//!   reasoning items) inside the task tree and read them back when the
+//!   transcript is rebuilt — see [`PersistedReplayItem`].
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use uuid::Uuid;
 use warp_multi_agent_api as api;
@@ -77,6 +82,15 @@ fn turn_identity(request: &api::Request) -> TurnIdentity {
     }
 }
 
+/// The tool kinds the client declared it can execute (`ToolType` tags).
+fn supported_tools(request: &api::Request) -> &[i32] {
+    request
+        .settings
+        .as_ref()
+        .map(|settings| settings.supported_tools.as_slice())
+        .unwrap_or_default()
+}
+
 fn request_tasks(request: &api::Request) -> &[api::Task] {
     request
         .task_context
@@ -124,18 +138,13 @@ fn plan_agent_turn(
         is_first_turn,
     } = turn_identity(request);
 
-    let tools = ToolRegistry::new(request.mcp_context.as_ref());
+    let tools = ToolRegistry::new(request.mcp_context.as_ref(), supported_tools(request));
 
     let environment = environment_from_context(input.context.as_ref());
     let mut transcript = vec![local_agent::ChatMessage::System(
         local_agent::build_system_prompt(&environment),
     )];
-    let mut known_call_ids = Vec::new();
-    for task in tasks {
-        for message in &task.messages {
-            append_history_message(&mut transcript, &mut known_call_ids, message, &tools);
-        }
-    }
+    let known_call_ids = append_task_history(&mut transcript, tasks, &tools, &route.config_key);
 
     let mut input_echo_messages = Vec::new();
     for user_input in user_inputs {
@@ -271,12 +280,7 @@ fn plan_suggestion_turn(
     let mut transcript = vec![local_agent::ChatMessage::System(
         local_agent::build_suggestion_system_prompt(&environment),
     )];
-    let mut known_call_ids = Vec::new();
-    for task in tasks {
-        for message in &task.messages {
-            append_history_message(&mut transcript, &mut known_call_ids, message, &tools);
-        }
-    }
+    append_task_history(&mut transcript, tasks, &tools, &route.config_key);
 
     let instruction = match trigger {
         Trigger::ShellCommandCompleted(completed) => {
@@ -287,7 +291,9 @@ fn plan_suggestion_turn(
             if let Some(command) = completed.executed_shell_command.as_ref() {
                 instruction.push_str(&format!(
                     "\nCommand: {}\nExit code: {}\nOutput:\n{}\n",
-                    command.command, command.exit_code, command.output
+                    command.command,
+                    command.exit_code,
+                    truncate_for_context(&command.output, "shell command output")
                 ));
             }
             for file in &completed.relevant_files {
@@ -296,7 +302,8 @@ fn plan_suggestion_turn(
                 {
                     instruction.push_str(&format!(
                         "\n=== {} ===\n{}\n",
-                        content.file_path, content.content
+                        content.file_path,
+                        truncate_for_context(&content.content, "file content")
                     ));
                 }
             }
@@ -353,13 +360,37 @@ fn render_passive_suggestion_trigger(result: &api::PassiveSuggestionResultType) 
         Trigger::ExecutedShellCommand(cmd) => Some(format!(
             "Context: this request follows a passive suggestion.\n\
              Triggered by shell command: {}\nExit code: {}\nOutput:\n{}",
-            cmd.command, cmd.exit_code, cmd.output
+            cmd.command,
+            cmd.exit_code,
+            truncate_for_context(&cmd.output, "shell command output")
         )),
         Trigger::AgentResponseCompleted(_) => Some(String::from(
             "Context: this request follows a passive suggestion.\n\
              Triggered after the agent completed its previous response.",
         )),
     }
+}
+
+/// Most characters of one command output or file content placed in the prompt
+/// as ambient context. A single huge block must not crowd out the rest of the
+/// prompt (or overflow the model's context window on its own).
+const MAX_CONTEXT_CHARS: usize = 20_000;
+
+/// Caps `text` at [`MAX_CONTEXT_CHARS`] characters, cutting on a character
+/// boundary and ending with a notice that names what was cut. The result,
+/// notice included, is at most [`MAX_CONTEXT_CHARS`] characters long.
+fn truncate_for_context<'a>(text: &'a str, what: &str) -> Cow<'a, str> {
+    // Every character is at least one byte, so short texts cannot overflow.
+    if text.len() <= MAX_CONTEXT_CHARS || text.char_indices().nth(MAX_CONTEXT_CHARS).is_none() {
+        return Cow::Borrowed(text);
+    }
+    let notice = format!("\n[truncated: {what} exceeded {MAX_CONTEXT_CHARS} characters]");
+    let kept_chars = MAX_CONTEXT_CHARS.saturating_sub(notice.chars().count());
+    let end = text
+        .char_indices()
+        .nth(kept_chars)
+        .map_or(text.len(), |(index, _)| index);
+    Cow::Owned(format!("{}{notice}", &text[..end]))
 }
 
 /// The request-level and message-level `GeneratePassiveSuggestions` triggers
@@ -399,19 +430,91 @@ fn new_task_message(task_id: &str, content: api::message::Message) -> api::Messa
     }
 }
 
+fn reasoning_message(
+    task_id: &str,
+    reasoning: String,
+    finished_duration: Option<prost_types::Duration>,
+    server_message_data: String,
+) -> api::Message {
+    api::Message {
+        server_message_data,
+        ..new_task_message(
+            task_id,
+            api::message::Message::AgentReasoning(api::message::AgentReasoning {
+                reasoning,
+                finished_duration,
+            }),
+        )
+    }
+}
+
+/// Transcript-building state carried across task-tree messages.
+struct HistoryState<'a> {
+    tools: &'a ToolRegistry,
+    /// Custom model serving this turn; only replay items it produced are
+    /// handed back to the engine.
+    config_key: &'a str,
+    /// Ids of the tool calls already in the transcript, so results are only
+    /// emitted for calls the provider has seen.
+    known_call_ids: Vec<String>,
+    /// Replay items read since the last assistant message; the next assistant
+    /// message adopts them so they precede its text and tool calls.
+    pending_replay_items: Vec<serde_json::Value>,
+}
+
+impl HistoryState<'_> {
+    /// Replay items that were never followed by an assistant message (the
+    /// stream ended after reasoning) must not leak into a later turn: a
+    /// reasoning item without a following output item is rejected by the
+    /// Responses API.
+    fn discard_dangling_replay_items(&mut self) {
+        if !self.pending_replay_items.is_empty() {
+            log::debug!(
+                "local agent loop: dropping {} replay item(s) with no following assistant message",
+                self.pending_replay_items.len()
+            );
+            self.pending_replay_items.clear();
+        }
+    }
+}
+
+/// Appends every task's messages to the transcript and returns the ids of the
+/// tool calls they contain.
+fn append_task_history(
+    transcript: &mut Vec<local_agent::ChatMessage>,
+    tasks: &[api::Task],
+    tools: &ToolRegistry,
+    config_key: &str,
+) -> Vec<String> {
+    let mut state = HistoryState {
+        tools,
+        config_key,
+        known_call_ids: Vec::new(),
+        pending_replay_items: Vec::new(),
+    };
+    for task in tasks {
+        for message in &task.messages {
+            append_history_message(transcript, &mut state, message);
+        }
+    }
+    state.discard_dangling_replay_items();
+    state.known_call_ids
+}
+
 /// Appends one task-tree message to the transcript. Messages the local loop
-/// does not understand (reasoning, todos, server events, ...) are skipped;
-/// tool calls of kinds the registry cannot express are skipped together with
+/// does not understand (todos, server events, ...) are skipped; reasoning
+/// messages contribute only the replay item they carry, never their text.
+/// Tool calls of kinds the registry cannot express are skipped together with
 /// their results so the transcript never references an undefined call id.
 fn append_history_message(
     transcript: &mut Vec<local_agent::ChatMessage>,
-    known_call_ids: &mut Vec<String>,
+    state: &mut HistoryState<'_>,
     message: &api::Message,
-    tools: &ToolRegistry,
 ) {
     use api::message::Message;
     match message.message.as_ref() {
         Some(Message::UserQuery(query)) => {
+            state.discard_dangling_replay_items();
             transcript.push(local_agent::ChatMessage::User(query.query.clone()));
         }
         Some(Message::AgentOutput(output)) => {
@@ -419,36 +522,47 @@ fn append_history_message(
                 transcript.push(local_agent::ChatMessage::Assistant {
                     text: output.text.clone(),
                     tool_calls: vec![],
-                    replay_items: vec![],
+                    replay_items: std::mem::take(&mut state.pending_replay_items),
                 });
             }
         }
+        Some(Message::AgentReasoning(_)) => {
+            if let Some(item) = decode_replay_item(message, state.config_key) {
+                state.pending_replay_items.push(item);
+            }
+        }
         Some(Message::ToolCall(tool_call)) => {
-            let Some(request) = tools.to_request_tool_call(tool_call) else {
+            let Some(request) = state.tools.to_request_tool_call(tool_call) else {
                 log::warn!(
                     "local agent loop: dropping unsupported historic tool call {}",
                     tool_call.tool_call_id
                 );
                 return;
             };
-            known_call_ids.push(request.id.clone());
+            state.known_call_ids.push(request.id.clone());
+            let replay_items = std::mem::take(&mut state.pending_replay_items);
             // Parallel calls and text from the same LLM turn must live in
             // one assistant message, or strict OpenAI-compatible servers
             // reject the tool results that follow.
-            if let Some(local_agent::ChatMessage::Assistant { tool_calls, .. }) =
-                transcript.last_mut()
+            if let Some(local_agent::ChatMessage::Assistant {
+                tool_calls,
+                replay_items: assistant_replay_items,
+                ..
+            }) = transcript.last_mut()
             {
                 tool_calls.push(request);
+                assistant_replay_items.extend(replay_items);
             } else {
                 transcript.push(local_agent::ChatMessage::Assistant {
                     text: String::new(),
                     tool_calls: vec![request],
-                    replay_items: vec![],
+                    replay_items,
                 });
             }
         }
         Some(Message::ToolCallResult(result)) => {
-            if !known_call_ids.contains(&result.tool_call_id) {
+            state.discard_dangling_replay_items();
+            if !state.known_call_ids.contains(&result.tool_call_id) {
                 return;
             }
             transcript.push(local_agent::ChatMessage::Tool {
@@ -456,10 +570,67 @@ fn append_history_message(
                 content: render_tool_result_text(result),
             });
         }
-        // Reasoning, model markers, todos, server events, etc. carry no
-        // information the next LLM call needs.
+        // Model markers, todos, server events, etc. carry no information the
+        // next LLM call needs.
         _ => {}
     }
+}
+
+/// `server_message_data` payload of an `AgentReasoning` message that carries a
+/// provider replay item (a Responses `reasoning` item with
+/// `encrypted_content`). The proto defines that field as an opaque payload the
+/// client round-trips untouched, so it survives conversation persistence,
+/// restore and forks without any change to the proto. The envelope keeps
+/// foreign payloads (server-routed turns of the same conversation) from being
+/// mistaken for ours: they fail to deserialize and are ignored.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedReplayItem {
+    /// `config_key` of the custom model that produced the item. Encrypted
+    /// reasoning is only valid for the model that emitted it, so items are
+    /// replayed only to that same model.
+    config_key: String,
+    local_agent_replay_item: serde_json::Value,
+}
+
+fn encode_replay_item(
+    config_key: &str,
+    item: serde_json::Value,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&PersistedReplayItem {
+        config_key: config_key.to_string(),
+        local_agent_replay_item: item,
+    })
+}
+
+/// Reads the replay item an `AgentReasoning` message carries, if it was
+/// produced by `config_key`'s model.
+fn decode_replay_item(message: &api::Message, config_key: &str) -> Option<serde_json::Value> {
+    if message.server_message_data.is_empty() {
+        return None;
+    }
+    let Ok(persisted) = serde_json::from_str::<PersistedReplayItem>(&message.server_message_data)
+    else {
+        log::debug!(
+            "local agent loop: ignoring foreign server_message_data on reasoning message {}",
+            message.id
+        );
+        return None;
+    };
+    if persisted.config_key != config_key {
+        log::debug!(
+            "local agent loop: skipping replay item from model {} (serving {config_key})",
+            persisted.config_key
+        );
+        return None;
+    }
+    if !persisted.local_agent_replay_item.is_object() {
+        log::warn!(
+            "local agent loop: ignoring malformed replay item on reasoning message {}",
+            message.id
+        );
+        return None;
+    }
+    Some(persisted.local_agent_replay_item)
 }
 
 fn environment_from_context(context: Option<&api::InputContext>) -> local_agent::EnvironmentInfo {
@@ -536,6 +707,9 @@ fn convert_input_tool_result(
             Some(MessageResult::ReadMcpResource(result.clone()))
         }
         InputResult::CallMcpTool(result) => Some(MessageResult::CallMcpTool(result.clone())),
+        InputResult::AskUserQuestion(result) => {
+            Some(MessageResult::AskUserQuestion(result.clone()))
+        }
         other => {
             log::warn!("local agent loop: dropping unsupported tool call result {other:?}");
             None
@@ -550,6 +724,21 @@ const GREP: &str = "grep";
 const FILE_GLOB: &str = "file_glob";
 const READ_MCP_RESOURCE: &str = "read_mcp_resource";
 const SUGGEST_PROMPT: &str = "suggest_prompt";
+const ASK_USER_QUESTION: &str = "ask_user_question";
+
+/// `ask_user_question` question kinds, as the model spells them.
+const SINGLE_SELECT: &str = "single_select";
+const MULTI_SELECT: &str = "multi_select";
+
+/// Wire value for "no recommended option" in `AskUserQuestion.MultipleChoice`.
+const NO_RECOMMENDED_OPTION: i32 = -1;
+
+/// Longest function name OpenAI-compatible servers accept.
+const MAX_TOOL_NAME_CHARS: usize = 64;
+
+/// Number of hex digits of the identity hash appended to a colliding MCP tool
+/// name.
+const TOOL_NAME_HASH_HEX_DIGITS: usize = 8;
 
 /// Builtin tool definitions plus the per-request MCP projection (mangled
 /// OpenAI tool names mapped back to `(server_id, tool_name)`).
@@ -560,6 +749,10 @@ pub(crate) struct ToolRegistry {
     /// Passive suggestion turns are one-shot and read-only: the model gets
     /// only the `suggest_prompt` tool.
     suggestion_only: bool,
+    /// The client declared `ask_user_question` in `settings.supported_tools`.
+    /// Unlike the core tools it is opt-in: the client lists it only when the
+    /// user's settings allow the agent to ask questions.
+    ask_user_question: bool,
 }
 
 #[derive(Clone)]
@@ -572,25 +765,34 @@ struct McpToolBinding {
 }
 
 impl ToolRegistry {
-    fn new(mcp_context: Option<&api::request::McpContext>) -> Self {
+    fn new(mcp_context: Option<&api::request::McpContext>, supported_tools: &[i32]) -> Self {
         let mut mcp_tools = HashMap::new();
         for server in mcp_context
             .map(|context| context.servers.as_slice())
             .unwrap_or_default()
         {
             for tool in &server.tools {
-                let name = mangle_mcp_tool_name(&server.name, &tool.name);
-                let parameters = tool
-                    .input_schema
-                    .as_ref()
-                    .map(prost_struct_to_json)
-                    .unwrap_or_else(|| json!({ "type": "object" }));
-                // Preserve the first binding for a given mangled name and
-                // warn on subsequent collisions; routing to the wrong MCP
-                // target silently is worse than skipping the second one.
-                if mcp_tools.contains_key(&name) {
-                    log::warn!("local agent loop: duplicate MCP tool name {name}");
+                if mcp_tools.values().any(|binding: &McpToolBinding| {
+                    binding.server_id == server.id && binding.tool_name == tool.name
+                }) {
+                    log::warn!(
+                        "local agent loop: ignoring MCP tool {} listed twice for server {}",
+                        tool.name,
+                        server.id
+                    );
                     continue;
+                }
+                let mut name = mangle_mcp_tool_name(&server.name, &tool.name);
+                // Distinct tools can mangle to the same name (same display
+                // name on two servers, a long server name truncating the tool
+                // part, non-ASCII names). Keep both reachable instead of
+                // dropping one.
+                if mcp_tools.contains_key(&name) {
+                    name = disambiguate_mcp_tool_name(&name, &server.id, &tool.name);
+                    if mcp_tools.contains_key(&name) {
+                        log::warn!("local agent loop: duplicate MCP tool name {name}");
+                        continue;
+                    }
                 }
                 mcp_tools.insert(
                     name,
@@ -598,8 +800,11 @@ impl ToolRegistry {
                         server_identity: server.identity.clone(),
                         server_id: server.id.clone(),
                         tool_name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters,
+                        description: mcp_tool_description(&server.name, tool),
+                        parameters: normalize_mcp_input_schema(
+                            tool.input_schema.as_ref().map(prost_struct_to_json),
+                            &tool.name,
+                        ),
                     },
                 );
             }
@@ -607,6 +812,7 @@ impl ToolRegistry {
         Self {
             mcp_tools,
             suggestion_only: false,
+            ask_user_question: supported_tools.contains(&(api::ToolType::AskUserQuestion as i32)),
         }
     }
 
@@ -614,6 +820,7 @@ impl ToolRegistry {
         Self {
             mcp_tools: HashMap::new(),
             suggestion_only: true,
+            ask_user_question: false,
         }
     }
 
@@ -622,6 +829,9 @@ impl ToolRegistry {
             return vec![suggest_prompt_definition()];
         }
         let mut definitions = builtin_definitions();
+        if self.ask_user_question {
+            definitions.push(ask_user_question_definition());
+        }
         let mut mcp_names: Vec<&String> = self.mcp_tools.keys().collect();
         mcp_names.sort();
         for name in mcp_names {
@@ -661,7 +871,11 @@ impl ToolRegistry {
                 Tool::RunShellCommand(api::message::tool_call::RunShellCommand {
                     command: args.command,
                     is_read_only: args.is_read_only,
-                    is_risky: args.is_risky,
+                    // A model that omits the flag must not silently classify
+                    // a mutating command as safe: anything not declared
+                    // read-only is treated as risky.
+                    is_risky: args.is_risky.unwrap_or(!args.is_read_only),
+                    uses_pager: args.uses_pager,
                     // v1 has no long-running command support: every command
                     // runs to completion before its result comes back.
                     wait_until_complete_value: Some(
@@ -736,7 +950,9 @@ impl ToolRegistry {
                 Tool::FileGlobV2(api::message::tool_call::FileGlobV2 {
                     patterns: args.patterns,
                     search_dir: args.search_dir,
-                    ..Default::default()
+                    max_matches: args.max_matches,
+                    max_depth: args.max_depth,
+                    min_depth: args.min_depth,
                 })
             }
             READ_MCP_RESOURCE => {
@@ -750,6 +966,10 @@ impl ToolRegistry {
                         .and_then(|binding| binding.server_identity.clone()),
                     server_id: args.server_id,
                 })
+            }
+            ASK_USER_QUESTION if self.ask_user_question => {
+                let args: AskUserQuestionArgs = parse_args(call)?;
+                Tool::AskUserQuestion(ask_user_question_from_args(args)?)
             }
             SUGGEST_PROMPT => {
                 let args: SuggestPromptArgs = parse_args(call)?;
@@ -805,6 +1025,7 @@ impl ToolRegistry {
                     "command": shell.command,
                     "is_read_only": shell.is_read_only,
                     "is_risky": shell.is_risky,
+                    "uses_pager": shell.uses_pager,
                 }),
             ),
             Tool::ReadFiles(read) => (
@@ -850,7 +1071,17 @@ impl ToolRegistry {
             ),
             Tool::FileGlobV2(glob) => (
                 FILE_GLOB.to_string(),
-                json!({ "patterns": glob.patterns, "search_dir": glob.search_dir }),
+                json!({
+                    "patterns": glob.patterns,
+                    "search_dir": glob.search_dir,
+                    "max_matches": glob.max_matches,
+                    "max_depth": glob.max_depth,
+                    "min_depth": glob.min_depth,
+                }),
+            ),
+            Tool::AskUserQuestion(ask) => (
+                ASK_USER_QUESTION.to_string(),
+                ask_user_question_arguments(ask),
             ),
             Tool::ReadMcpResource(read) => (
                 READ_MCP_RESOURCE.to_string(),
@@ -906,7 +1137,9 @@ struct RunShellCommandArgs {
     #[serde(default)]
     is_read_only: bool,
     #[serde(default)]
-    is_risky: bool,
+    is_risky: Option<bool>,
+    #[serde(default)]
+    uses_pager: bool,
 }
 
 #[derive(Deserialize)]
@@ -965,6 +1198,29 @@ struct FileGlobArgs {
     patterns: Vec<String>,
     #[serde(default)]
     search_dir: String,
+    /// Zero means unlimited, as on the wire.
+    #[serde(default)]
+    max_matches: i32,
+    #[serde(default)]
+    max_depth: i32,
+    #[serde(default)]
+    min_depth: i32,
+}
+
+#[derive(Deserialize)]
+struct AskUserQuestionArgs {
+    questions: Vec<QuestionArg>,
+}
+
+#[derive(Deserialize)]
+struct QuestionArg {
+    question: String,
+    options: Vec<String>,
+    #[serde(default)]
+    recommended_option_index: Option<i32>,
+    /// [`SINGLE_SELECT`] or [`MULTI_SELECT`]; anything else reads as single.
+    #[serde(default, rename = "type")]
+    question_type: String,
 }
 
 #[derive(Deserialize)]
@@ -1011,13 +1267,130 @@ fn suggest_prompt_definition() -> local_agent::ToolDefinition {
     }
 }
 
+/// Offered only when the client lists `AskUserQuestion` in
+/// `settings.supported_tools`. Questions are numbered `q1`, `q2`, ... in the
+/// order given; answers come back keyed by those ids.
+fn ask_user_question_definition() -> local_agent::ToolDefinition {
+    local_agent::ToolDefinition {
+        name: ASK_USER_QUESTION.to_string(),
+        description: "Asks the user one or more multiple-choice clarifying questions and \
+                      returns their answers. Only ask when the task cannot proceed without the \
+                      answer; if the task is clear, just proceed. Questions are numbered q1, \
+                      q2, ... in the order given, and the answers refer to those ids. The user \
+                      can always type their own answer instead of picking an option."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "The questions to present, in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The question text.",
+                            },
+                            "options": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "The selectable options (at least 2). Do not include an \"Other\" option.",
+                            },
+                            "recommended_option_index": {
+                                "type": "integer",
+                                "description": "Zero-based index into options of the recommended choice. Single-select only; omit when there is no recommendation.",
+                            },
+                            "type": {
+                                "type": "string",
+                                "enum": [SINGLE_SELECT, MULTI_SELECT],
+                                "description": "Whether the user picks exactly one option (single_select) or may pick several (multi_select).",
+                            },
+                        },
+                        "required": ["question", "options", "type"],
+                    },
+                },
+            },
+            "required": ["questions"],
+        }),
+    }
+}
+
+fn ask_user_question_from_args(
+    args: AskUserQuestionArgs,
+) -> Result<api::AskUserQuestion, AdapterError> {
+    if args.questions.is_empty() {
+        return Err(AdapterError::BadToolArguments {
+            tool: ASK_USER_QUESTION.to_string(),
+            message: "at least one question is required".to_string(),
+        });
+    }
+    let questions = args
+        .questions
+        .into_iter()
+        .enumerate()
+        .map(|(index, question)| {
+            let is_multiselect = question.question_type == MULTI_SELECT;
+            let recommended_option_index = question
+                .recommended_option_index
+                .filter(|_| !is_multiselect)
+                .unwrap_or(NO_RECOMMENDED_OPTION);
+            api::ask_user_question::Question {
+                question_id: format!("q{}", index + 1),
+                question: question.question,
+                question_type: Some(
+                    api::ask_user_question::question::QuestionType::MultipleChoice(
+                        api::ask_user_question::MultipleChoice {
+                            options: question
+                                .options
+                                .into_iter()
+                                .map(|label| api::ask_user_question::Option { label })
+                                .collect(),
+                            recommended_option_index,
+                            is_multiselect,
+                            supports_other: true,
+                        },
+                    ),
+                ),
+            }
+        })
+        .collect();
+    Ok(api::AskUserQuestion { questions })
+}
+
+/// The reverse of [`ask_user_question_from_args`], for history rebuilds.
+fn ask_user_question_arguments(ask: &api::AskUserQuestion) -> serde_json::Value {
+    let questions: Vec<serde_json::Value> = ask
+        .questions
+        .iter()
+        .filter_map(|question| {
+            let api::ask_user_question::question::QuestionType::MultipleChoice(choice) =
+                question.question_type.as_ref()?;
+            let mut value = json!({
+                "question": question.question,
+                "options": choice.options.iter().map(|option| option.label.clone()).collect::<Vec<_>>(),
+                "type": if choice.is_multiselect { MULTI_SELECT } else { SINGLE_SELECT },
+            });
+            if let Ok(index) = usize::try_from(choice.recommended_option_index) {
+                value["recommended_option_index"] = json!(index);
+            }
+            Some(value)
+        })
+        .collect();
+    json!({ "questions": questions })
+}
+
 fn builtin_definitions() -> Vec<local_agent::ToolDefinition> {
     vec![
         local_agent::ToolDefinition {
             name: RUN_SHELL_COMMAND.to_string(),
             description: "Executes a shell command in the user's terminal and returns its \
                           output and exit code. The command runs to completion before the \
-                          result is returned; there is no interactive input."
+                          result is returned; there is no interactive input. Prefer \
+                          non-paginated forms of commands (for example `git --no-pager log`) \
+                          and the dedicated file tools over `cat`, `grep` and `find`. The \
+                          user may edit the command before it runs; if the result shows a \
+                          different command, treat that one as the source of truth."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -1028,14 +1401,18 @@ fn builtin_definitions() -> Vec<local_agent::ToolDefinition> {
                     },
                     "is_read_only": {
                         "type": "boolean",
-                        "description": "True if the command only reads state and has no side effects.",
+                        "description": "True if the command only reads state and has no side effects. If unsure, return false.",
                     },
                     "is_risky": {
                         "type": "boolean",
-                        "description": "True if the command could have destructive or hard-to-reverse effects.",
+                        "description": "True if the command could have destructive or hard-to-reverse effects: deleting or overwriting data, handling secrets unsafely, running unknown code, or needing root. If unsure, return true.",
+                    },
+                    "uses_pager": {
+                        "type": "boolean",
+                        "description": "True if the command might open a pager (git log, git diff, less, man, ...). Set it for any version-control command that can paginate, or the command hangs waiting for input. If unsure, return true.",
                     },
                 },
-                "required": ["command"],
+                "required": ["command", "is_read_only", "is_risky", "uses_pager"],
             }),
         },
         local_agent::ToolDefinition {
@@ -1154,6 +1531,18 @@ fn builtin_definitions() -> Vec<local_agent::ToolDefinition> {
                         "type": "string",
                         "description": "Directory to search in. Defaults to the working directory.",
                     },
+                    "max_matches": {
+                        "type": "integer",
+                        "description": "Maximum number of matches to return. 0 or omitted means unlimited; set it when searching large trees.",
+                    },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Maximum directory depth to search; 1 matches only the direct children of search_dir. 0 or omitted means unlimited.",
+                    },
+                    "min_depth": {
+                        "type": "integer",
+                        "description": "Minimum directory depth to match; 2 skips the direct children of search_dir. 0 or omitted means no minimum.",
+                    },
                 },
                 "required": ["patterns"],
             }),
@@ -1177,7 +1566,7 @@ fn builtin_definitions() -> Vec<local_agent::ToolDefinition> {
 }
 
 /// Mangles an MCP server/tool pair into a name OpenAI-compatible servers
-/// accept (`[a-zA-Z0-9_-]`, at most 64 characters).
+/// accept (`[a-zA-Z0-9_-]`, at most [`MAX_TOOL_NAME_CHARS`] characters).
 fn mangle_mcp_tool_name(server: &str, tool: &str) -> String {
     let sanitize = |value: &str| {
         value
@@ -1192,8 +1581,72 @@ fn mangle_mcp_tool_name(server: &str, tool: &str) -> String {
             .collect::<String>()
     };
     let mut name = format!("mcp__{}__{}", sanitize(server), sanitize(tool));
-    name.truncate(64);
+    name.truncate(MAX_TOOL_NAME_CHARS);
     name
+}
+
+/// Derives a second name for a tool whose mangled `name` is already taken by
+/// another tool, by appending a hash of the tool's real identity. The mangled
+/// name is pure ASCII, so truncating it by byte is safe.
+fn disambiguate_mcp_tool_name(name: &str, server_id: &str, tool: &str) -> String {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    (server_id, tool).hash(&mut hasher);
+    let digits = format!("{:016x}", hasher.finish());
+    let suffix = format!("_{}", &digits[..TOOL_NAME_HASH_HEX_DIGITS]);
+    let mut base = name.to_string();
+    base.truncate(MAX_TOOL_NAME_CHARS - suffix.len());
+    base + &suffix
+}
+
+/// The description shown to the model; servers sometimes leave it empty.
+fn mcp_tool_description(server: &str, tool: &api::request::mcp_context::McpTool) -> String {
+    if tool.description.is_empty() {
+        format!(
+            "Calls the `{}` tool of the `{}` MCP server.",
+            tool.name, server
+        )
+    } else {
+        tool.description.clone()
+    }
+}
+
+/// Makes an MCP tool's input schema usable as function `parameters`.
+/// OpenAI-compatible endpoints require a JSON-schema object whose root is
+/// `type: "object"` with a `properties` map; servers regularly omit one or
+/// both, or ship a `$schema` marker. A root that is not an object schema at
+/// all cannot describe named arguments, so the tool is exposed without any.
+/// `$ref`/`$defs` and the rest of the schema pass through untouched.
+fn normalize_mcp_input_schema(schema: Option<serde_json::Value>, tool: &str) -> serde_json::Value {
+    use serde_json::Value;
+
+    let mut schema = match schema {
+        Some(Value::Object(schema)) => schema,
+        Some(other) => {
+            log::warn!("local agent loop: MCP tool {tool} has a non-object input schema: {other}");
+            serde_json::Map::new()
+        }
+        None => serde_json::Map::new(),
+    };
+    schema.remove("$schema");
+    let describes_an_object = match schema.get("type") {
+        None => true,
+        Some(Value::String(kind)) => kind == "object",
+        Some(Value::Array(kinds)) => kinds.iter().any(|kind| kind == "object"),
+        Some(_) => false,
+    };
+    if !describes_an_object {
+        log::warn!(
+            "local agent loop: MCP tool {tool} does not take an object; exposing it without arguments"
+        );
+        schema.clear();
+    }
+    schema.insert("type".to_string(), json!("object"));
+    if !matches!(schema.get("properties"), Some(Value::Object(_))) {
+        schema.insert("properties".to_string(), json!({}));
+    }
+    Value::Object(schema)
 }
 
 /// Renders a proto tool call result into the plain-text content of a
@@ -1324,20 +1777,7 @@ pub(crate) fn render_tool_result_text(result: &api::message::ToolCallResult) -> 
             Some(api::read_mcp_resource_result::Result::Success(success)) => success
                 .contents
                 .iter()
-                .map(|content| match content.content_type.as_ref() {
-                    Some(api::mcp_resource_content::ContentType::Text(text)) => {
-                        format!("=== {} ===\n{}", content.uri, text.content)
-                    }
-                    Some(api::mcp_resource_content::ContentType::Binary(binary)) => {
-                        format!(
-                            "=== {} ===\n(binary content, {} bytes, {})",
-                            content.uri,
-                            binary.data.len(),
-                            binary.mime_type
-                        )
-                    }
-                    None => format!("=== {} ===\n(empty)", content.uri),
-                })
+                .map(render_mcp_resource_content)
                 .collect::<Vec<_>>()
                 .join("\n\n"),
             Some(api::read_mcp_resource_result::Result::Error(error)) => {
@@ -1349,12 +1789,22 @@ pub(crate) fn render_tool_result_text(result: &api::message::ToolCallResult) -> 
             Some(api::call_mcp_tool_result::Result::Success(success)) => success
                 .results
                 .iter()
-                .map(|entry| match entry.result.as_ref() {
-                    Some(api::call_mcp_tool_result::success::result::Result::Text(text)) => {
-                        text.text.clone()
+                .map(|entry| {
+                    use api::call_mcp_tool_result::success::result::Result as McpContent;
+                    match entry.result.as_ref() {
+                        Some(McpContent::Text(text)) => text.text.clone(),
+                        // The payload is base64 image data: describe it, never
+                        // dump it into the prompt.
+                        Some(McpContent::Image(image)) => format!(
+                            "(image content, {} bytes, {})",
+                            image.data.len(),
+                            image.mime_type
+                        ),
+                        Some(McpContent::Resource(resource)) => {
+                            render_mcp_resource_content(resource)
+                        }
+                        None => "(empty MCP content)".to_string(),
                     }
-                    Some(other) => format!("(non-text MCP content: {other:?})"),
-                    None => "(empty MCP content)".to_string(),
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
@@ -1363,6 +1813,7 @@ pub(crate) fn render_tool_result_text(result: &api::message::ToolCallResult) -> 
             }
             None => "(no result)".to_string(),
         },
+        Result::AskUserQuestion(ask) => render_ask_user_question_result(ask),
         Result::Cancel(()) => "The user canceled this tool call.".to_string(),
         other => {
             // The local loop never issues the remaining tools; render a debug
@@ -1376,15 +1827,28 @@ fn render_shell_result(shell: &api::RunShellCommandResult) -> String {
     match shell.result.as_ref() {
         Some(api::run_shell_command_result::Result::CommandFinished(finished)) => {
             format!(
-                "Exit code: {}\n\nOutput:\n{}",
-                finished.exit_code, finished.output
+                "{}Exit code: {}\n\nOutput:\n{}",
+                render_executed_command(shell),
+                finished.exit_code,
+                finished.output
             )
         }
         Some(api::run_shell_command_result::Result::PermissionDenied(_)) => {
             "The user denied permission to run this command.".to_string()
         }
         Some(api::run_shell_command_result::Result::LongRunningCommandSnapshot(snapshot)) => {
-            format!("The command is still running. Latest output snapshot:\n{snapshot:?}")
+            let screen = if snapshot.is_alt_screen_active {
+                " It is showing a full-screen program (alternate screen)."
+            } else {
+                ""
+            };
+            format!(
+                "{}The command is still running (command id {}) and did not finish while the \
+                 terminal was being watched.{screen} Output so far:\n{}",
+                render_executed_command(shell),
+                snapshot.command_id,
+                snapshot.output
+            )
         }
         Some(api::run_shell_command_result::Result::TerminalBusy(busy)) => {
             format!(
@@ -1398,6 +1862,60 @@ fn render_shell_result(shell: &api::RunShellCommandResult) -> String {
             shell.exit_code, shell.output
         ),
     }
+}
+
+/// The command line that actually ran, when the client reports it. It can
+/// differ from the tool call's when the user edited the command before running
+/// it, which the model must be able to see.
+fn render_executed_command(shell: &api::RunShellCommandResult) -> String {
+    if shell.command.is_empty() {
+        return String::new();
+    }
+    format!("Command run: {}\n", shell.command)
+}
+
+fn render_mcp_resource_content(content: &api::McpResourceContent) -> String {
+    match content.content_type.as_ref() {
+        Some(api::mcp_resource_content::ContentType::Text(text)) => {
+            format!("=== {} ===\n{}", content.uri, text.content)
+        }
+        Some(api::mcp_resource_content::ContentType::Binary(binary)) => {
+            format!(
+                "=== {} ===\n(binary content, {} bytes, {})",
+                content.uri,
+                binary.data.len(),
+                binary.mime_type
+            )
+        }
+        None => format!("=== {} ===\n(empty)", content.uri),
+    }
+}
+
+/// Renders the answers as JSON so the model sees which option the user picked
+/// for which question; a summary such as "completed" would hide the answer.
+fn render_ask_user_question_result(result: &api::AskUserQuestionResult) -> String {
+    use api::ask_user_question_result::Result as AskResult;
+    use api::ask_user_question_result::answer_item::Answer;
+
+    let value = match result.result.as_ref() {
+        Some(AskResult::Success(success)) => json!({
+            "status": "success",
+            "answers": success.answers.iter().map(|item| match item.answer.as_ref() {
+                Some(Answer::MultipleChoice(choice)) => json!({
+                    "question_id": item.question_id,
+                    "selected_options": choice.selected_options,
+                    "other_text": choice.other_text,
+                }),
+                Some(Answer::Skipped(())) | None => json!({
+                    "question_id": item.question_id,
+                    "skipped": true,
+                }),
+            }).collect::<Vec<_>>(),
+        }),
+        Some(AskResult::Error(error)) => json!({ "status": "error", "message": error.message }),
+        None => json!({ "status": "error", "message": "no result" }),
+    };
+    value.to_string()
 }
 
 fn render_file_content(content: &api::FileContent) -> String {
@@ -1436,6 +1954,22 @@ fn json_value_to_prost(value: &serde_json::Value) -> prost_types::Value {
     prost_types::Value { kind: Some(kind) }
 }
 
+/// Largest magnitude below which every integer is exactly representable as an
+/// `f64` (2^53).
+const MAX_EXACT_F64_INTEGER: f64 = 9_007_199_254_740_992.0;
+
+/// `prost_types::Value` stores every number as `f64`. Give integral values
+/// back as integers so schemas and replayed tool arguments read `10`, not
+/// `10.0`.
+fn json_number(number: f64) -> serde_json::Value {
+    if number.fract() == 0.0 && number.abs() <= MAX_EXACT_F64_INTEGER {
+        return serde_json::Value::from(number as i64);
+    }
+    serde_json::Number::from_f64(number)
+        .map(serde_json::Value::Number)
+        .unwrap_or(serde_json::Value::Null)
+}
+
 fn prost_struct_to_json(value: &prost_types::Struct) -> serde_json::Value {
     serde_json::Value::Object(
         value
@@ -1451,9 +1985,7 @@ fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
     match value.kind.as_ref() {
         None | Some(Kind::NullValue(_)) => serde_json::Value::Null,
         Some(Kind::BoolValue(value)) => serde_json::Value::Bool(*value),
-        Some(Kind::NumberValue(number)) => serde_json::Number::from_f64(*number)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null),
+        Some(Kind::NumberValue(number)) => json_number(*number),
         Some(Kind::StringValue(value)) => serde_json::Value::String(value.clone()),
         Some(Kind::ListValue(values)) => {
             serde_json::Value::Array(values.values.iter().map(prost_value_to_json).collect())
@@ -1467,6 +1999,23 @@ fn prost_value_to_json(value: &prost_types::Value) -> serde_json::Value {
 /// are direct fields of `Message` (the oneof name itself is not addressable).
 const AGENT_OUTPUT_TEXT_MASK: &str = "agent_output.text";
 
+/// Field-mask path for appending streamed summary text to an `AgentReasoning`
+/// message.
+const AGENT_REASONING_TEXT_MASK: &str = "agent_reasoning.reasoning";
+
+/// Field-mask path marking an `AgentReasoning` message as finished, which the
+/// UI renders as "Thought for N seconds" instead of a live "Thinking" header.
+const AGENT_REASONING_DURATION_MASK: &str = "agent_reasoning.finished_duration";
+
+/// Field-mask path for attaching a [`PersistedReplayItem`] to a message.
+const SERVER_MESSAGE_DATA_MASK: &str = "server_message_data";
+
+/// An `AgentReasoning` message still receiving streamed summary text.
+struct OpenReasoning {
+    message_id: String,
+    started_at: Instant,
+}
+
 /// Stateful mapper from engine events to the proto `ResponseEvent` sequence.
 /// Pure (no I/O), so golden tests can drive it directly.
 pub(crate) struct EventMapper {
@@ -1479,6 +2028,8 @@ pub(crate) struct EventMapper {
     registry: ToolRegistry,
     /// Id of the `AgentOutput` message currently receiving text appends.
     streaming_message_id: Option<String>,
+    /// Reasoning message currently receiving summary text appends.
+    open_reasoning: Option<OpenReasoning>,
     input_tokens: u64,
     output_tokens: u64,
 }
@@ -1494,6 +2045,7 @@ impl EventMapper {
             echo_messages: plan.input_echo_messages.clone(),
             registry: plan.tools.clone(),
             streaming_message_id: None,
+            open_reasoning: None,
             input_tokens: 0,
             output_tokens: 0,
         }
@@ -1548,9 +2100,11 @@ impl EventMapper {
     }
 
     /// Maps one engine event; text deltas become `AddMessagesToTask` then
-    /// `AppendToMessageContent`, completed tool calls become
-    /// `AddMessagesToTask`, `Done` becomes `CommitTransaction` + `Finished`,
-    /// errors become `RollbackTransaction` + terminal events.
+    /// `AppendToMessageContent`, reasoning summaries stream the same way into
+    /// `AgentReasoning` messages that also carry the turn's replay items,
+    /// completed tool calls become `AddMessagesToTask`, `Done` becomes
+    /// `CommitTransaction` + `Finished`, errors become `RollbackTransaction` +
+    /// terminal events.
     pub fn on_event(
         &mut self,
         event: Result<local_agent::AgentEvent, local_agent::LocalAgentError>,
@@ -1559,46 +2113,26 @@ impl EventMapper {
         use local_agent::AgentEvent;
 
         match event {
-            Ok(AgentEvent::TextDelta(text)) => match self.streaming_message_id.clone() {
-                Some(message_id) => vec![client_actions(vec![Action::AppendToMessageContent(
-                    api::client_action::AppendToMessageContent {
-                        task_id: self.root_task_id.clone(),
-                        message: Some(api::Message {
-                            id: message_id,
-                            ..new_task_message(
-                                &self.root_task_id,
-                                api::message::Message::AgentOutput(api::message::AgentOutput {
-                                    text,
-                                }),
-                            )
-                        }),
-                        mask: Some(prost_types::FieldMask {
-                            paths: vec![AGENT_OUTPUT_TEXT_MASK.to_string()],
-                        }),
-                    },
-                )])],
-                None => {
-                    let message = new_task_message(
-                        &self.root_task_id,
-                        api::message::Message::AgentOutput(api::message::AgentOutput { text }),
-                    );
-                    self.streaming_message_id = Some(message.id.clone());
-                    vec![self.add_messages(vec![message])]
-                }
-            },
-            // Reasoning is not surfaced in v1; the engine already keeps it
-            // out of the final text.
-            Ok(AgentEvent::ReasoningDelta(_)) => vec![],
-            // Persisting replay items is wired up by the Responses adapter work.
-            Ok(AgentEvent::ReplayItem(_)) => vec![],
+            Ok(AgentEvent::TextDelta(text)) => {
+                let mut events: Vec<Event> = self.close_reasoning(None).into_iter().collect();
+                events.push(self.text_delta_event(text));
+                events
+            }
+            Ok(AgentEvent::ReasoningDelta(delta)) => self.on_reasoning_delta(delta),
+            Ok(AgentEvent::ReplayItem(item)) => self.on_replay_item(item),
             Ok(AgentEvent::ToolCall(call)) => {
                 // Any text after this belongs to a new output message.
                 self.streaming_message_id = None;
                 match self.registry.to_proto_tool_call(&call) {
-                    Ok(tool_call) => vec![self.add_messages(vec![new_task_message(
-                        &self.root_task_id,
-                        api::message::Message::ToolCall(tool_call),
-                    )])],
+                    Ok(tool_call) => {
+                        let mut events: Vec<Event> =
+                            self.close_reasoning(None).into_iter().collect();
+                        events.push(self.add_messages(vec![new_task_message(
+                            &self.root_task_id,
+                            api::message::Message::ToolCall(tool_call),
+                        )]));
+                        events
+                    }
                     Err(err) => self.finish_with_rollback(
                         api::response_event::stream_finished::Reason::InternalError(
                             api::response_event::stream_finished::InternalError {
@@ -1617,14 +2151,16 @@ impl EventMapper {
                 vec![]
             }
             Ok(AgentEvent::Done) => {
-                vec![
-                    client_actions(vec![Action::CommitTransaction(
-                        api::client_action::CommitTransaction {},
-                    )]),
+                let mut events: Vec<Event> = self.close_reasoning(None).into_iter().collect();
+                events.push(client_actions(vec![Action::CommitTransaction(
+                    api::client_action::CommitTransaction {},
+                )]));
+                events.push(
                     self.finished(api::response_event::stream_finished::Reason::Done(
                         api::response_event::stream_finished::Done {},
                     )),
-                ]
+                );
+                events
             }
             Err(local_agent::LocalAgentError::InvalidApiKey { model_slug }) => self
                 .finish_with_rollback(api::response_event::stream_finished::Reason::InvalidApiKey(
@@ -1650,6 +2186,124 @@ impl EventMapper {
                 ]
             }
         }
+    }
+
+    /// Streams one text delta: the first creates the `AgentOutput` message,
+    /// later ones append to it.
+    fn text_delta_event(&mut self, text: String) -> Event {
+        let Some(message_id) = self.streaming_message_id.clone() else {
+            let message = new_task_message(
+                &self.root_task_id,
+                api::message::Message::AgentOutput(api::message::AgentOutput { text }),
+            );
+            self.streaming_message_id = Some(message.id.clone());
+            return self.add_messages(vec![message]);
+        };
+        client_actions(vec![api::client_action::Action::AppendToMessageContent(
+            api::client_action::AppendToMessageContent {
+                task_id: self.root_task_id.clone(),
+                message: Some(api::Message {
+                    id: message_id,
+                    ..new_task_message(
+                        &self.root_task_id,
+                        api::message::Message::AgentOutput(api::message::AgentOutput { text }),
+                    )
+                }),
+                mask: Some(prost_types::FieldMask {
+                    paths: vec![AGENT_OUTPUT_TEXT_MASK.to_string()],
+                }),
+            },
+        )])
+    }
+
+    /// Streams one reasoning-summary delta into the open `AgentReasoning`
+    /// message, opening it first if needed. The text is display-only: the
+    /// transcript rebuild never reads it back (see [`HistoryState`]).
+    fn on_reasoning_delta(&mut self, delta: String) -> Vec<Event> {
+        if delta.is_empty() {
+            return vec![];
+        }
+        // Text that follows reasoning belongs to a new output message, which
+        // keeps the task tree in chronological order.
+        self.streaming_message_id = None;
+        let Some(open) = self.open_reasoning.as_ref() else {
+            let message = reasoning_message(&self.root_task_id, delta, None, String::new());
+            self.open_reasoning = Some(OpenReasoning {
+                message_id: message.id.clone(),
+                started_at: Instant::now(),
+            });
+            return vec![self.add_messages(vec![message])];
+        };
+        vec![client_actions(vec![
+            api::client_action::Action::AppendToMessageContent(
+                api::client_action::AppendToMessageContent {
+                    task_id: self.root_task_id.clone(),
+                    message: Some(api::Message {
+                        id: open.message_id.clone(),
+                        ..reasoning_message(&self.root_task_id, delta, None, String::new())
+                    }),
+                    mask: Some(prost_types::FieldMask {
+                        paths: vec![AGENT_REASONING_TEXT_MASK.to_string()],
+                    }),
+                },
+            ),
+        ])]
+    }
+
+    /// Persists a provider replay item in the task tree so the next turn's
+    /// transcript rebuild can hand it back to the engine. It rides on the
+    /// reasoning message that displays the item's summary; an item without
+    /// summary text gets its own message with empty text, which the UI does
+    /// not render.
+    fn on_replay_item(&mut self, item: serde_json::Value) -> Vec<Event> {
+        let payload = match encode_replay_item(&self.config_key, item) {
+            Ok(payload) => payload,
+            Err(err) => {
+                log::warn!(
+                    "local agent loop: dropping replay item that failed to serialize: {err}"
+                );
+                return self.close_reasoning(None).into_iter().collect();
+            }
+        };
+        if self.open_reasoning.is_some() {
+            return self.close_reasoning(Some(payload)).into_iter().collect();
+        }
+        self.streaming_message_id = None;
+        let message = reasoning_message(
+            &self.root_task_id,
+            String::new(),
+            Some(prost_types::Duration::default()),
+            payload,
+        );
+        vec![self.add_messages(vec![message])]
+    }
+
+    /// Marks the open reasoning message as finished (and attaches the replay
+    /// item payload, if any). Returns `None` when no reasoning is open.
+    fn close_reasoning(&mut self, server_message_data: Option<String>) -> Option<Event> {
+        let open = self.open_reasoning.take()?;
+        let mut paths = vec![AGENT_REASONING_DURATION_MASK.to_string()];
+        if server_message_data.is_some() {
+            paths.push(SERVER_MESSAGE_DATA_MASK.to_string());
+        }
+        let finished_duration = prost_types::Duration::try_from(open.started_at.elapsed()).ok();
+        let message = api::Message {
+            id: open.message_id,
+            server_message_data: server_message_data.unwrap_or_default(),
+            ..reasoning_message(
+                &self.root_task_id,
+                String::new(),
+                finished_duration,
+                String::new(),
+            )
+        };
+        Some(client_actions(vec![
+            api::client_action::Action::UpdateTaskMessage(api::client_action::UpdateTaskMessage {
+                task_id: self.root_task_id.clone(),
+                message: Some(message),
+                mask: Some(prost_types::FieldMask { paths }),
+            }),
+        ]))
     }
 
     fn add_messages(&self, messages: Vec<api::Message>) -> Event {
@@ -1738,10 +2392,24 @@ pub(crate) fn generate_local_agent_output(
             }));
         }
     };
-    let mut mapper = EventMapper::new(&plan);
-    let initial_events = mapper.initial_events();
+    let mapper = EventMapper::new(&plan);
     let engine_events =
         local_agent::run_turn(plan.transcript, plan.tools.definitions(), route.endpoint);
+    response_stream(mapper, engine_events)
+}
+
+/// Chains the mapper's opening events with the mapped engine events. The
+/// returned stream owns the engine stream and spawns nothing, so dropping it
+/// (the client's cancellation path) drops the engine stream, which aborts the
+/// in-flight HTTP request.
+fn response_stream(
+    mut mapper: EventMapper,
+    engine_events: futures::stream::BoxStream<
+        'static,
+        Result<local_agent::AgentEvent, local_agent::LocalAgentError>,
+    >,
+) -> ResponseStream {
+    let initial_events = mapper.initial_events();
     let mapped_events =
         engine_events.flat_map(move |event| futures::stream::iter(mapper.on_event(event)));
     Box::pin(futures::stream::iter(initial_events).chain(mapped_events))

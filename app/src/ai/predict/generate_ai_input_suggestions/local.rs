@@ -8,8 +8,8 @@
 //! adapter that turns the suggestion request into a chat completion and parses
 //! the reply back.
 
-use ai::api_keys::{ApiKeyManager, CustomEndpoint};
-use local_agent::{ChatMessage, LocalEndpointConfig};
+use ai::api_keys::{ApiKeyManager, CustomEndpoint, CustomEndpointSchema};
+use local_agent::{ChatMessage, EndpointSchema, LocalEndpointConfig};
 use warpui::{AppContext, EntityId, SingletonEntity};
 
 use super::{GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2};
@@ -43,8 +43,20 @@ pub(crate) fn resolve_local_input_endpoint(
     )
 }
 
+/// Maps a configured endpoint schema onto the wire protocol the engine speaks,
+/// or `None` for protocols it cannot speak yet (Anthropic Messages).
+fn engine_schema(schema: CustomEndpointSchema) -> Option<EndpointSchema> {
+    match schema {
+        CustomEndpointSchema::OpenaiChatCompletions => Some(EndpointSchema::ChatCompletions),
+        CustomEndpointSchema::OpenaiResponses => Some(EndpointSchema::Responses),
+        CustomEndpointSchema::AnthropicMessages => None,
+    }
+}
+
 /// Finds the custom endpoint + model whose `config_key` matches the active base
-/// model id, skipping endpoints with an empty URL or API key.
+/// model id, skipping endpoints with an empty URL or a schema the engine cannot
+/// speak. The endpoint's schema is carried through so Responses endpoints are
+/// called with the Responses protocol.
 pub(crate) fn pick_custom_endpoint(
     active_model_id: &str,
     endpoints: &[CustomEndpoint],
@@ -57,6 +69,14 @@ pub(crate) fn pick_custom_endpoint(
         if base_url.is_empty() {
             continue;
         }
+        let Some(schema) = engine_schema(endpoint.schema) else {
+            log::debug!(
+                "local next command: skipping custom endpoint {:?}, unsupported schema {}",
+                endpoint.name,
+                endpoint.schema.display_name()
+            );
+            continue;
+        };
         let api_key = endpoint.api_key.trim();
         for model in &endpoint.models {
             let model_slug = model.name.trim();
@@ -68,7 +88,7 @@ pub(crate) fn pick_custom_endpoint(
                     base_url: base_url.to_string(),
                     api_key: api_key.to_string(),
                     model_slug: model_slug.to_string(),
-                    schema: local_agent::EndpointSchema::ChatCompletions,
+                    schema,
                 });
             }
         }
