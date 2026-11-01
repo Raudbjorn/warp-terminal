@@ -50,9 +50,7 @@ pub use crate::ai::agent_conversations_model::{
     query_conversation_entries,
 };
 pub use crate::ai::ambient_agents::AmbientAgentTaskId;
-pub use crate::ai::ambient_agents::telemetry::{
-    CloudAgentTelemetryEvent, HandoffEntryPoint, HandoffSurface,
-};
+pub use crate::ai::ambient_agents::telemetry::{HandoffEntryPoint, HandoffSurface};
 pub use crate::ai::blocklist::agent_view::{
     AgentViewController, AgentViewDisplayMode, AgentViewEntryOrigin, EnterAgentViewError,
     EphemeralMessageModel,
@@ -98,11 +96,6 @@ pub use crate::ai::blocklist::orchestration_topology::{
     descendant_conversations_in_pill_order, loaded_subtree_rollup,
     orchestration_root_conversation_id, orchestrator_agent_id_for_conversation,
     resolve_orchestration_participant,
-};
-pub use crate::ai::blocklist::telemetry::{
-    BlocklistOrchestrationTelemetryEvent, OrchestrationEnteredEvent, OrchestrationEntrySource,
-    PillBarActionKind, PillBarInteractionEvent, PillBarPillKind, PillSwitchOutcome,
-    RunAgentsCardDecision, run_agents_card_decision_event,
 };
 pub use crate::ai::blocklist::view_util::{
     CHATGPT_CONTINUED_WITH_WARP_CREDITS_TEXT, FAILED_OUTPUT_USAGE_NOTICE_TEXT,
@@ -192,7 +185,7 @@ pub use crate::server::server_api::ai::{
     AIClient, AgentConfigSnapshot, AttachmentInput, SpawnAgentRequest, SpawnAgentResponse,
 };
 pub use crate::server::team_scope::RequestTeamScope;
-pub use crate::server::telemetry::{SlashMenuSource, TelemetryEvent};
+pub use crate::server::telemetry::SlashMenuSource;
 pub use crate::settings::{AISettingsChangedEvent, InputSettings};
 pub use crate::terminal::alt_screen::{should_intercept_mouse, should_intercept_scroll};
 pub use crate::terminal::color::{Colors as TerminalColors, List as TerminalColorList};

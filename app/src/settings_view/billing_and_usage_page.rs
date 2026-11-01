@@ -54,7 +54,8 @@ use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::pricing::addon_pack::{PackAmount, addon_credits_description};
 use crate::pricing::{PricingInfoModel, PricingInfoModelEvent};
 use crate::server::ids::ServerId;
-use crate::server::telemetry::TelemetryEvent;
+
+use crate::WorkspaceAction;
 use crate::settings::ai::{AISettings, AISettingsChangedEvent, UsageDisplayUnit};
 use crate::settings_view::settings_page::TOGGLE_BUTTON_RIGHT_PADDING;
 use crate::ui_components::blended_colors;
@@ -70,7 +71,6 @@ use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 use crate::workspaces::workspace::{
     BillingMetadata, CustomerType, Workspace, WorkspaceMemberUsageInfo,
 };
-use crate::{WorkspaceAction, send_telemetry_from_ctx};
 
 const HEADER_FONT_SIZE: f32 = 16.;
 const OVERAGE_USAGE_LINK_TEXT: &str = "View details on overage usage";
@@ -1072,17 +1072,6 @@ impl TypedActionView for BillingAndUsagePageView {
                 self.show_addon_credit_modal(ctx);
             }
             BillingAndUsagePageAction::UpdateAutoReloadEnabled { team_uid, enabled } => {
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::AutoReloadToggledFromBillingSettings {
-                        enabled: *enabled,
-                        banner_toggle_flag_enabled: FeatureFlag::BuildPlanAutoReloadBannerToggle
-                            .is_enabled(),
-                        post_purchase_modal_flag_enabled:
-                            FeatureFlag::BuildPlanAutoReloadPostPurchaseModal.is_enabled(),
-                    },
-                    ctx
-                );
-
                 let selected_auto_reload_value = if *enabled {
                     self.addon_credits_options
                         .get(self.selected_addon_denomination)

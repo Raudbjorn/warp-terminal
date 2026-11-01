@@ -16,14 +16,14 @@ use vec1::Vec1;
 use warpui::r#async::executor::Background;
 
 use super::telemetry::{
-    DiffInvalidFileEvent, DiffMatchFailedEvent, MissingLineNumbersEvent,
-    RequestFileEditsTelemetryEvent, V4AMatchFinishedEvent, V4AMatchOutcomes,
+    DiffInvalidFileEvent, DiffMatchFailedEvent, MissingLineNumbersEvent, V4AMatchFinishedEvent,
+    V4AMatchOutcomes,
 };
 use crate::ai::agent::{AIIdentifiers, FileEdit};
 use crate::ai::blocklist::SessionContext;
 use crate::ai::paths::host_native_absolute_path;
 use crate::auth::auth_state::AuthState;
-use crate::{safe_debug, safe_warn, send_telemetry_on_executor};
+use crate::{safe_debug, safe_warn};
 
 /// Result of reading a file from disk or a remote server.
 ///
@@ -194,16 +194,6 @@ where
     Fut: Future<Output = FileReadResult>,
 {
     let result = apply_edits_internal(edits, session_context, &read_file).await;
-    if let Some(outcomes) = result.v4a_outcomes {
-        send_telemetry_on_executor!(
-            auth_state,
-            RequestFileEditsTelemetryEvent::V4AMatchFinished(V4AMatchFinishedEvent {
-                identifiers: ai_identifiers.clone(),
-                outcomes,
-            }),
-            background_executor
-        );
-    }
 
     // Send telemetry for all diff application errors.
 
@@ -212,17 +202,7 @@ where
 
     for error in result.errors.iter() {
         match error {
-            DiffApplicationError::UnmatchedDiffs { match_failures, .. } => {
-                send_telemetry_on_executor!(
-                    auth_state,
-                    RequestFileEditsTelemetryEvent::DiffMatchFailed(DiffMatchFailedEvent {
-                        identifiers: ai_identifiers.clone(),
-                        failures: match_failures.clone(),
-                        passive_diff,
-                    }),
-                    background_executor
-                );
-            }
+            DiffApplicationError::UnmatchedDiffs { match_failures, .. } => {}
             DiffApplicationError::MissingFile { .. }
             | DiffApplicationError::ReadFailed { .. }
             | DiffApplicationError::AlreadyExists { .. }
@@ -236,18 +216,6 @@ where
         }
     }
 
-    if invalid_file_count > 0 {
-        send_telemetry_on_executor!(
-            auth_state,
-            RequestFileEditsTelemetryEvent::DiffInvalidFile(DiffInvalidFileEvent {
-                count: invalid_file_count,
-                identifiers: ai_identifiers.clone(),
-                passive_diff,
-            }),
-            background_executor
-        );
-    }
-
     // Send telemetry for any warnings, which don't necessarily prevent diff application.
 
     let total_missing_line_numbers: u8 = result
@@ -257,18 +225,6 @@ where
             DiffWarning::MissingLineNumbers { count, .. } => *count,
         })
         .sum();
-
-    if total_missing_line_numbers > 0 {
-        send_telemetry_on_executor!(
-            auth_state,
-            RequestFileEditsTelemetryEvent::MissingLineNumbers(MissingLineNumbersEvent {
-                identifiers: ai_identifiers.clone(),
-                count: total_missing_line_numbers,
-                passive_diff,
-            }),
-            background_executor
-        );
-    }
 
     match Vec1::try_from_vec(result.errors) {
         Ok(errors) => Err(errors),

@@ -7,7 +7,7 @@ use settings::ToggleableSetting as _;
 use strum::IntoEnumIterator;
 use uuid::Uuid;
 use warp_core::features::FeatureFlag;
-use warp_core::send_telemetry_from_ctx;
+
 use warp_core::ui::Icon;
 use warp_core::ui::theme::color::internal_colors;
 use warp_errors::report_error;
@@ -51,7 +51,7 @@ use crate::editor::{
 use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::pane_group::Direction;
 use crate::search_bar::SearchBar;
-use crate::server::telemetry::{MCPTemplateInstallationSource, TelemetryEvent};
+use crate::server::telemetry::MCPTemplateInstallationSource;
 use crate::settings::{AISettings, AISettingsChangedEvent};
 use crate::settings_view::mcp_servers::server_card::{
     ServerCardEvent, ServerCardOptions, ServerCardStatus, ServerCardView, TitleChip,
@@ -732,10 +732,6 @@ impl MCPServersListPageView {
                             true => MCPTemplateInstallationSource::Shared,
                             false => MCPTemplateInstallationSource::Local,
                         };
-                        send_telemetry_from_ctx!(
-                            TelemetryEvent::MCPTemplateInstalled { source },
-                            ctx
-                        );
                     }
                 }
                 ServerCardItemId::TemplatableMCPInstallation(_) => {
@@ -983,12 +979,6 @@ impl MCPServersListPageView {
                     instructions_in_markdown: instructions,
                     origin: InstallOrigin::InApp,
                 });
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::MCPTemplateInstalled {
-                        source: MCPTemplateInstallationSource::Gallery
-                    },
-                    ctx
-                );
             }
             Err(e) => {
                 log::warn!("Could not install gallery item {gallery_uuid}: {e}");

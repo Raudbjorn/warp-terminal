@@ -36,11 +36,11 @@ use crate::ai::blocklist::block::keyboard_navigable_buttons::{
 use crate::ai::blocklist::inline_action::inline_action_header::{
     HeaderConfig, INLINE_ACTION_HORIZONTAL_PADDING,
 };
-use crate::server::telemetry::TelemetryEvent;
+
+use crate::Appearance;
 use crate::terminal::model::session::SessionId;
 use crate::terminal::warpify::settings::{SshExtensionInstallMode, WarpifySettings};
 use crate::ui_components::blended_colors;
-use crate::{Appearance, send_telemetry_from_ctx};
 
 const PROMPT_BORDER_RADIUS: f32 = 8.;
 
@@ -331,12 +331,6 @@ impl TypedActionView for SshRemoteServerChoiceView {
                             );
                         }
                     });
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::SetSshExtensionInstallMode {
-                            mode: mode.display_name(),
-                        },
-                        ctx
-                    );
                 }
                 ctx.emit(SshRemoteServerChoiceViewEvent::Install);
             }
@@ -350,23 +344,12 @@ impl TypedActionView for SshRemoteServerChoiceView {
                             );
                         }
                     });
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::SetSshExtensionInstallMode {
-                            mode: mode.display_name(),
-                        },
-                        ctx
-                    );
                 }
                 ctx.emit(SshRemoteServerChoiceViewEvent::Skip);
             }
             SshRemoteServerChoiceViewAction::ToggleDoNotAskAgain => {
                 self.do_not_ask_again = !self.do_not_ask_again;
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::SshRemoteServerChoiceDoNotAskAgainToggled {
-                        checked: self.do_not_ask_again,
-                    },
-                    ctx
-                );
+
                 ctx.notify();
             }
             SshRemoteServerChoiceViewAction::OpenWarpifySettings => {

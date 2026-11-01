@@ -22,7 +22,6 @@ use crate::settings::PrivacySettings;
 use crate::terminal::model::session::{IsSSHWrapperSession, SessionInfo};
 use crate::terminal::model_events::{ModelEvent, ModelEventDispatcher};
 use crate::terminal::warpify::settings::{SshExtensionInstallMode, WarpifySettings};
-use crate::{TelemetryEvent, send_telemetry_from_ctx};
 
 /// Per-SSH-init state machine. Encoding the state as an enum makes invalid
 /// transitions unrepresentable and ensures the `SessionInfo` stash cannot be
@@ -272,12 +271,10 @@ impl<T: EventLoopSender> RemoteServerController<T> {
             unreachable!("just matched AwaitingCheck above");
         };
         if let Some(PreinstallCheckResult {
-            status: PreinstallStatus::Unsupported { reason },
-            libc,
+            status: PreinstallStatus::Unsupported { .. },
             ..
         }) = preinstall_check.as_ref()
         {
-            send_unsupported_telemetry(self.remote_platform.as_ref(), reason, Some(libc), ctx);
             self.flush_stashed_bootstrap(session_info, ctx);
             return;
         }
@@ -471,16 +468,6 @@ impl<T: EventLoopSender> RemoteServerController<T> {
             .preinstall_check
             .as_ref()
             .map(|check| describe_libc(&check.libc));
-        send_telemetry_from_ctx!(
-            TelemetryEvent::RemoteServerSetupDuration {
-                duration_ms,
-                installed_binary: self.did_install,
-                remote_os,
-                remote_arch,
-                remote_libc,
-            },
-            ctx
-        );
     }
 
     /// Called when the remote server connection failed. Flushes the stashed
@@ -669,34 +656,6 @@ fn describe_libc(libc: &RemoteLibc) -> String {
         RemoteLibc::NonGlibc { name } => name.clone(),
         RemoteLibc::Unknown => "unknown".to_string(),
     }
-}
-
-fn send_unsupported_telemetry<T: EventLoopSender>(
-    remote_platform: Option<&RemotePlatform>,
-    unsupported_reason: &UnsupportedReason,
-    detected_libc: Option<&RemoteLibc>,
-    ctx: &mut ModelContext<RemoteServerController<T>>,
-) {
-    let (remote_os, remote_arch) = remote_platform
-        .map(|p| {
-            (
-                Some(p.os.as_str().to_owned()),
-                Some(p.arch.as_str().to_owned()),
-            )
-        })
-        .unwrap_or((None, None));
-    let detected_libc = detected_libc
-        .map(describe_libc)
-        .unwrap_or_else(|| "unknown".to_string());
-    send_telemetry_from_ctx!(
-        TelemetryEvent::RemoteServerHostUnsupported {
-            remote_os,
-            remote_arch,
-            unsupported_reason: unsupported_reason.clone(),
-            detected_libc,
-        },
-        ctx
-    );
 }
 
 #[cfg(test)]

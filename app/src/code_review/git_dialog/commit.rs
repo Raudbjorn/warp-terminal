@@ -4,7 +4,6 @@
 
 use std::path::Path;
 
-use warp_core::send_telemetry_from_ctx;
 use warp_core::ui::appearance::Appearance;
 use warp_errors::report_error;
 use warpui::elements::{
@@ -21,9 +20,7 @@ use crate::code_review::git_dialog::{
     GitDialog, GitDialogAction, GitDialogEvent, GitDialogMode, render_branch_section,
     render_file_changes_box, should_send_git_ops_ai_request, show_toast, user_facing_git_error,
 };
-use crate::code_review::telemetry_event::{
-    CodeReviewTelemetryEvent, GitDialogStatus, GitOperationKind,
-};
+use crate::code_review::telemetry_event::{GitDialogStatus, GitOperationKind};
 use crate::editor::{
     EditorOptions, EditorView, Event as EditorEvent, InteractionState,
     PropagateAndNoOpNavigationKeys, TextOptions,
@@ -278,7 +275,7 @@ pub(super) fn apply_generated_commit_message(
 }
 
 /// Kicks off AI commit-message autogen request.
-/// The model runs the generation (local in-process, remote on the daemon) and  
+/// The model runs the generation (local in-process, remote on the daemon) and
 /// the result returns via `DiffStateModelEvent::CommitMessageGenerated`, applied by `apply_generated_commit_message`.
 pub(super) fn maybe_start_commit_message_autogen(me: &GitDialog, ctx: &mut ViewContext<GitDialog>) {
     if !should_send_git_ops_ai_request(ctx) {
@@ -429,15 +426,7 @@ pub(super) fn finish_commit_chain(
             show_toast(user_facing_git_error(err), ctx);
         }
     }
-    send_telemetry_from_ctx!(
-        CodeReviewTelemetryEvent::GitDialogCompleted {
-            is_local: Some(!me.repo_location().is_remote()),
-            operation,
-            status,
-            error,
-        },
-        ctx
-    );
+
     ctx.emit(GitDialogEvent::Completed);
 }
 

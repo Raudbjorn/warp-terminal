@@ -1,6 +1,5 @@
 use std::collections::HashSet;
 
-use warp_core::send_telemetry_from_ctx;
 use warpui::{
     AppContext, Entity, EntityId, ModelContext, SingletonEntity, TypedActionView, ViewHandle,
     WindowId,
@@ -13,7 +12,7 @@ use super::{
 use crate::BlocklistAIHistoryModel;
 use crate::ai::active_agent_views_model::{ActiveAgentViewsModel, ConversationOrTaskId};
 use crate::ai::agent::conversation::{AIConversation, AIConversationId};
-use crate::ai::ambient_agents::telemetry::CloudAgentTelemetryEvent;
+
 use crate::ai::blocklist::orchestration_topology::has_local_orchestrated_children;
 use crate::ai::llms::LLMPreferences;
 use crate::settings::AISettings;
@@ -278,7 +277,6 @@ impl AutoCloudHandoffController {
         });
         if shown {
             log::info!("auto-handoff sleep prompt: showing modal on wake");
-            send_telemetry_from_ctx!(CloudAgentTelemetryEvent::SleepPromptShown, ctx);
         } else {
             log::info!(
                 "auto-handoff sleep prompt: not showing on wake, modal was already shown once"

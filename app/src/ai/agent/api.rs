@@ -7,10 +7,9 @@ mod local_adapter;
 #[cfg(not(target_family = "wasm"))]
 mod local_route;
 
-use std::collections::HashSet;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 
 pub use ai::agent::convert::ConvertToAPITypeError;
 use ai::api_keys::ApiKeyManager;
@@ -39,9 +38,9 @@ use crate::ai::execution_profiles::AIExecutionProfileAppExt;
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::ai::mcp::TemplatableMCPServerManager;
-use crate::send_telemetry_from_app_ctx;
+
 use crate::server::server_api::AIApiError;
-use crate::server::telemetry::TelemetryEvent;
+
 use crate::settings::AISettings;
 use crate::terminal::safe_mode_settings::get_secret_obfuscation_mode;
 use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
@@ -465,20 +464,14 @@ impl RequestParams {
             .flatten()
             .and_then(|s| s.parse().ok())
             .unwrap_or_default();
-        let is_ambient_agent = conversation.ambient_agent_task_id.is_some();
         let computer_use_requested = FeatureFlag::AgentModeComputerUse.is_enabled()
             && BlocklistAIPermissions::as_ref(app)
                 .get_computer_use_setting(terminal_view_id, scope, app)
                 .is_enabled()
-            && (FeatureFlag::LocalComputerUse.is_enabled() || is_ambient_agent);
+            && (FeatureFlag::LocalComputerUse.is_enabled()
+                || conversation.ambient_agent_task_id.is_some());
         let computer_use_supported = computer_use::is_supported_on_current_platform();
         let computer_use_enabled = computer_use_requested && computer_use_supported;
-        if computer_use_requested
-            && !computer_use_supported
-            && let Some(task_id) = conversation.ambient_agent_task_id
-        {
-            report_computer_use_unavailable(task_id, app_execution_mode.is_sandboxed(), app);
-        }
         let ask_user_question_enabled = BlocklistAIPermissions::as_ref(app)
             .get_ask_user_question_setting(app, terminal_view_id)
             != crate::ai::execution_profiles::AskUserQuestionPermission::Never;
@@ -540,27 +533,6 @@ impl RequestParams {
             agent_name: None,
         }
     }
-}
-
-/// Reports that computer use was enabled for a run but is unavailable on this host, at most once
-/// per run for the lifetime of the process. Request params are rebuilt for every request, so
-/// emitting unconditionally would produce one event per turn.
-fn report_computer_use_unavailable(task_id: AmbientAgentTaskId, sandboxed: bool, app: &AppContext) {
-    static REPORTED_TASKS: LazyLock<Mutex<HashSet<AmbientAgentTaskId>>> =
-        LazyLock::new(Default::default);
-    let newly_reported = REPORTED_TASKS
-        .lock()
-        .is_ok_and(|mut reported| reported.insert(task_id));
-    if !newly_reported {
-        return;
-    }
-    send_telemetry_from_app_ctx!(
-        TelemetryEvent::ComputerUseUnavailable {
-            ambient_agent_task_id: task_id,
-            sandboxed,
-        },
-        app
-    );
 }
 
 fn non_empty_string(value: String) -> Option<String> {

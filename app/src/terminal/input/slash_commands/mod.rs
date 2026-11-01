@@ -15,7 +15,7 @@ pub use view::{CloseReason, InlineSlashCommandView, SlashCommandsEvent};
 use warp_cli::agent::Harness;
 use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
-use warp_core::send_telemetry_from_ctx;
+
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::AnsiColorIdentifier;
 use warp_errors::report_error;
@@ -24,12 +24,9 @@ use warp_util::path::{CleanPathResult, LineAndColumnArg, expand_session_home};
 use warpui::clipboard::ClipboardContent;
 use warpui::{AppContext, SingletonEntity, ViewContext};
 
-use crate::TelemetryEvent;
 use crate::ai::agent::conversation::AIConversationId;
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::agent_conversations_model::AgentConversationsModel;
-#[cfg(not(target_family = "wasm"))]
-use crate::ai::agent_management::telemetry::AgentManagementTelemetryEvent;
 #[cfg(all(feature = "local_fs", not(target_family = "wasm")))]
 use crate::ai::ambient_agents::telemetry::HandoffEntryPoint;
 use crate::ai::blocklist::agent_view::{
@@ -132,15 +129,6 @@ pub fn record_static_slash_command_accepted(
     is_in_agent_view: bool,
     ctx: &mut AppContext,
 ) {
-    send_telemetry_from_ctx!(
-        TelemetryEvent::SlashCommandAccepted {
-            command_details: SlashCommandAcceptedDetails::StaticCommand {
-                command_name: command_name.to_owned(),
-            },
-            is_in_agent_view,
-        },
-        ctx
-    );
 }
 
 /// Records an input auto-detection setting toggle triggered from a TUI slash
@@ -152,25 +140,10 @@ pub fn record_autodetection_toggle_from_slash_command(
     is_autodetection_enabled: bool,
     ctx: &mut AppContext,
 ) {
-    send_telemetry_from_ctx!(
-        TelemetryEvent::AgentModeToggleAutoDetectionSetting {
-            is_autodetection_enabled,
-            origin: AgentModeAutoDetectionSettingOrigin::SlashCommand,
-        },
-        ctx
-    );
 }
 
 /// Records a saved prompt accepted from either the GUI or TUI slash menu.
-pub fn record_saved_prompt_accepted(is_in_agent_view: bool, ctx: &mut AppContext) {
-    send_telemetry_from_ctx!(
-        TelemetryEvent::SlashCommandAccepted {
-            command_details: SlashCommandAcceptedDetails::SavedPrompt,
-            is_in_agent_view,
-        },
-        ctx
-    );
-}
+pub fn record_saved_prompt_accepted(is_in_agent_view: bool, ctx: &mut AppContext) {}
 
 pub fn saved_prompt_text_for_id(id: &SyncId, ctx: &AppContext) -> Option<String> {
     let workflow = CloudModel::as_ref(ctx).get_workflow(id)?;
@@ -1192,11 +1165,6 @@ impl Input {
 
                 let destination =
                     ForkedConversationDestination::for_fork_trigger(trigger.is_cmd_or_ctrl_enter());
-
-                send_telemetry_from_ctx!(
-                    AgentManagementTelemetryEvent::SlashCommandContinueLocally,
-                    ctx
-                );
 
                 // Move any pending attachments out of the source input so they travel with the
                 // initial prompt into the continued local pane and no longer linger on the

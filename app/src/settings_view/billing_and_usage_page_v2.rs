@@ -53,7 +53,8 @@ use crate::modal::{Modal, ModalEvent, ModalViewState};
 use crate::pricing::PricingInfoModel;
 use crate::pricing::addon_pack::{PackAmount, addon_credits_description};
 use crate::server::ids::ServerId;
-use crate::server::telemetry::TelemetryEvent;
+
+use crate::WorkspaceAction;
 use crate::settings::ai::{AISettings, AISettingsChangedEvent, UsageDisplayUnit};
 use crate::ui_components::blended_colors;
 use crate::ui_components::buttons::icon_button;
@@ -64,7 +65,6 @@ use crate::view_components::action_button::{ActionButton, PrimaryTheme, Secondar
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_workspaces::{UserWorkspaces, UserWorkspacesEvent};
 use crate::workspaces::workspace::{CustomerType, Workspace, WorkspaceUid};
-use crate::{WorkspaceAction, send_telemetry_from_ctx};
 
 const ADDITIONAL_ADDON_CREDITS_DESCRIPTION_FOR_TEAM: &str =
     "Purchased add-on credits are added to your team's shared credit pool.";
@@ -2359,16 +2359,7 @@ impl TypedActionView for BillingAndUsagePageV2View {
                 } else {
                     None
                 };
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::AutoReloadToggledFromBillingSettings {
-                        enabled: *enabled,
-                        banner_toggle_flag_enabled: FeatureFlag::BuildPlanAutoReloadBannerToggle
-                            .is_enabled(),
-                        post_purchase_modal_flag_enabled:
-                            FeatureFlag::BuildPlanAutoReloadPostPurchaseModal.is_enabled(),
-                    },
-                    ctx
-                );
+
                 self.pending_auto_reload_toast = Some(if *enabled {
                     let unit = usage_display_unit(ctx);
                     let amount = self

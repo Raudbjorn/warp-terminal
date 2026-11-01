@@ -38,11 +38,9 @@ use channel_versions::{ChannelVersions, ParsedVersion};
 use futures::TryStreamExt as _;
 use warp::settings::TuiAutoupdateSettings;
 use warp_core::channel::{Channel, ChannelState};
-use warp_core::{safe_warn, send_telemetry_from_ctx};
+use warp_core::safe_warn;
 use warpui::r#async::Timer;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
-
-use crate::telemetry::TuiAutoupdateTelemetryEvent;
 
 /// Setting this environment variable (to any value) disables background
 /// auto-updates for a single launch, regardless of the
@@ -335,33 +333,6 @@ enum UpdateOutcome {
     UpdateAvailable { version: String },
 }
 
-impl UpdateOutcome {
-    /// Stable identifier for this kind of outcome, used for telemetry and
-    /// for detecting transitions between consecutive checks.
-    fn kind(&self) -> &'static str {
-        match self {
-            #[cfg(unix)]
-            UpdateOutcome::Locked => "locked",
-            UpdateOutcome::UpToDate { .. } => "up_to_date",
-            UpdateOutcome::PendingRestart { .. } => "pending_restart",
-            UpdateOutcome::Installed { .. } => "installed",
-            UpdateOutcome::UpdateAvailable { .. } => "update_available",
-        }
-    }
-
-    /// The version associated with this outcome, if any.
-    fn version(&self) -> Option<&str> {
-        match self {
-            #[cfg(unix)]
-            UpdateOutcome::Locked => None,
-            UpdateOutcome::UpToDate { version }
-            | UpdateOutcome::PendingRestart { version }
-            | UpdateOutcome::Installed { version }
-            | UpdateOutcome::UpdateAvailable { version } => Some(version),
-        }
-    }
-}
-
 /// User-visible status of the background updater, shown next to the version
 /// in the transcript zero state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -454,10 +425,6 @@ pub(crate) struct TuiAutoupdater {
     eligibility: AutoupdateEligibility,
     /// The user-visible status of the update loop.
     status: TuiAutoupdateStatus,
-    /// The outcome kind last reported to telemetry. Consecutive checks
-    /// usually resolve to the same outcome (e.g. `up_to_date` on every
-    /// poll), so only transitions are reported.
-    last_reported_outcome: Option<&'static str>,
 }
 
 impl Entity for TuiAutoupdater {
@@ -474,7 +441,6 @@ impl TuiAutoupdater {
         ctx.add_singleton_model(move |_| TuiAutoupdater {
             eligibility,
             status: TuiAutoupdateStatus::Idle,
-            last_reported_outcome: None,
         });
         TuiAutoupdater::handle(ctx).update(ctx, |me, ctx| match me.eligibility.clone() {
             AutoupdateEligibility::Native(layout) => me.check_native_now(layout, ctx),
@@ -552,7 +518,6 @@ impl TuiAutoupdater {
             Ok(outcome) => log::info!("TUI Homebrew update check finished: {outcome:?}"),
             Err(error) => log::warn!("TUI Homebrew update check failed: {error:#}"),
         }
-        self.report_outcome(&result, ctx);
         let status = settled_status(&result, fallback_status);
         self.set_status(status, ctx);
         ctx.spawn(
@@ -576,38 +541,12 @@ impl TuiAutoupdater {
             // from sleep) are common here.
             Err(error) => log::warn!("TUI autoupdate check failed: {error:#}"),
         }
-        self.report_outcome(&result, ctx);
         let status = settled_status(&result, fallback_status);
         self.set_status(status, ctx);
         ctx.spawn(
             async { Timer::after(CHECK_INTERVAL).await },
             move |me, _, ctx| me.check_native_now(layout, ctx),
         );
-    }
-
-    /// Sends a telemetry event when the outcome kind changed since the last
-    /// check, so the frequent poll doesn't emit repeated `up_to_date` (or
-    /// repeated-failure) events.
-    fn report_outcome(&mut self, result: &Result<UpdateOutcome>, ctx: &mut ModelContext<Self>) {
-        let kind = match result {
-            Ok(outcome) => outcome.kind(),
-            Err(_) => "failed",
-        };
-        if self.last_reported_outcome == Some(kind) {
-            return;
-        }
-        self.last_reported_outcome = Some(kind);
-
-        let event = match result {
-            Ok(outcome) => TuiAutoupdateTelemetryEvent::CheckCompleted {
-                outcome: kind,
-                version: outcome.version().map(ToOwned::to_owned),
-            },
-            Err(error) => TuiAutoupdateTelemetryEvent::CheckFailed {
-                error: format!("{error:#}"),
-            },
-        };
-        send_telemetry_from_ctx!(event, ctx);
     }
 }
 

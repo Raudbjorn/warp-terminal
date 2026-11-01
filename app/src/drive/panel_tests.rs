@@ -14,7 +14,7 @@ use crate::network::NetworkStatus;
 use crate::server::cloud_objects::update_manager::UpdateManager;
 use crate::server::server_api::ServerApiProvider;
 use crate::server::sync_queue::SyncQueue;
-use crate::server::telemetry::context_provider::AppTelemetryContextProvider;
+
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::terminal::resizable_data::ResizableData;
 use crate::terminal::shared_session::permissions_manager::SessionPermissionsManager;
@@ -38,7 +38,6 @@ fn initialize_app(app: &mut App) {
     app.add_singleton_model(|_| ObjectActions::new(Vec::new()));
     app.add_singleton_model(|_| ServerApiProvider::new_for_test());
     app.add_singleton_model(|_| AuthStateProvider::new_for_test());
-    app.add_singleton_model(AppTelemetryContextProvider::new_context_provider);
     app.add_singleton_model(AuthManager::new_for_test);
     app.add_singleton_model(SessionPermissionsManager::new);
     app.add_singleton_model(|_| KeybindingChangedNotifier::mock());

@@ -1,7 +1,7 @@
 use crate::util::bindings;
-use warp_core::channel::ChannelState;
 use std::sync::Arc;
 use std::time::Duration;
+use warp_core::channel::ChannelState;
 
 use chrono::Local;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
@@ -41,10 +41,10 @@ use crate::editor::{
     EditorOptions, EditorView, Event as EditorEvent, PropagateAndNoOpNavigationKeys, TextOptions,
 };
 use crate::input_suggestions::{Event as InputSuggestionsEvent, InputSuggestions};
-use crate::send_telemetry_from_ctx;
+
 use crate::server::server_api::ServerApi;
 use crate::server::server_api::ai::AIClient;
-use crate::server::telemetry::{TelemetryEvent, WarpAIActionType};
+use crate::server::telemetry::WarpAIActionType;
 use crate::terminal::resizable_data::{DEFAULT_WARP_AI_WIDTH, ModalType, ResizableData};
 use crate::ui_components::blended_colors;
 use crate::ui_components::buttons::icon_button;
@@ -427,13 +427,6 @@ impl AIAssistantPanelView {
             // Not supported by the AI Assistant. Only supported by blocklist AI.
             AskAIType::FromBlocks { .. } => (),
         }
-
-        send_telemetry_from_ctx!(
-            TelemetryEvent::OpenedWarpAI {
-                source: ask_type.into()
-            },
-            ctx
-        );
     }
 
     fn is_prompt_too_long(&self, prompt: &str) -> bool {
@@ -455,7 +448,6 @@ impl AIAssistantPanelView {
                     self.issue_request(buffer_text, ctx);
                 } else {
                     // Only send this event if the user tried to execute with a longer than permitted prompt.
-                    send_telemetry_from_ctx!(TelemetryEvent::WarpAICharacterLimitExceeded, ctx);
                 }
                 ctx.notify();
             }
@@ -1033,28 +1025,15 @@ impl TypedActionView for AIAssistantPanelView {
         match action {
             ResetContext => {
                 self.reset_context(ctx);
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::WarpAIAction {
-                        action_type: WarpAIActionType::Restart
-                    },
-                    ctx
-                );
             }
             CopyTranscript => {
                 self.copy_transcript(ctx);
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::WarpAIAction {
-                        action_type: WarpAIActionType::CopyTranscript
-                    },
-                    ctx
-                );
             }
             ClosePanel => {
                 ctx.emit(AIAssistantPanelEvent::ClosePanel);
             }
             PreparedPrompt(prompt) => {
                 self.issue_request(prompt.to_string(), ctx);
-                send_telemetry_from_ctx!(TelemetryEvent::UsedWarpAIPreparedPrompt { prompt }, ctx);
             }
             ClickedUrl(url) => {
                 ctx.open_url(&url.url);
@@ -1062,12 +1041,6 @@ impl TypedActionView for AIAssistantPanelView {
             CopyAnswerToClipboard(content) => {
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(content.to_string()));
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::WarpAIAction {
-                        action_type: WarpAIActionType::CopyAnswer
-                    },
-                    ctx
-                );
             }
             FocusTerminalInput => ctx.emit(AIAssistantPanelEvent::FocusTerminalInput),
             FocusEditor => {

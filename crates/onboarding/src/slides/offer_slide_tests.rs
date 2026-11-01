@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use ai::LLMId;
-use warp_core::telemetry::testing::MockTelemetryContextProvider;
+
 use warp_core::ui::appearance::Appearance;
 use warpui_core::elements::Empty;
 use warpui_core::platform::WindowStyle;
@@ -58,7 +58,7 @@ fn offer_slide_can_render_before_classification() {
 }
 
 #[test]
-fn head_start_copy_and_telemetry_names_match_spec() {
+fn head_start_copy_matches_spec() {
     let variant = OfferVariant::HeadStart;
 
     assert_eq!(variant.title(), "You've got a head start");
@@ -84,13 +84,10 @@ fn head_start_copy_and_telemetry_names_match_spec() {
             "Use the Warp Agent locally and in the cloud",
         ]
     );
-    assert_eq!(variant.slide_name(), "head_start");
-    assert_eq!(variant.account_class(), "free_icp");
-    assert_eq!(variant.primary_action(), "get_more_ai");
 }
 
 #[test]
-fn choose_how_to_start_copy_and_telemetry_names_match_spec() {
+fn choose_how_to_start_copy_matches_spec() {
     let variant = OfferVariant::ChooseHowToStart;
 
     assert_eq!(variant.title(), "Choose how to start");
@@ -109,9 +106,6 @@ fn choose_how_to_start_copy_and_telemetry_names_match_spec() {
         "Explore the terminal, bring your own inference, or use another CLI agent. Add AI usage and features anytime."
     );
     assert!(variant.included_features().is_empty());
-    assert_eq!(variant.slide_name(), "choose_how_to_start");
-    assert_eq!(variant.account_class(), "free_standard");
-    assert_eq!(variant.primary_action(), "use_warp_with_ai");
 }
 
 #[test]
@@ -177,7 +171,6 @@ fn only_the_free_standard_offer_sells_ai_usage() {
 fn classified_offer_renders_in_every_selection_state() {
     App::test((), |mut app| async move {
         app.add_singleton_model(|_| Appearance::mock());
-        app.update(MockTelemetryContextProvider::register);
 
         // `show_post_auth_offer` is sticky, so each variant needs its own model.
         for variant in [OfferVariant::HeadStart, OfferVariant::ChooseHowToStart] {
@@ -220,7 +213,6 @@ fn classified_offer_renders_in_every_selection_state() {
 fn selecting_the_primary_card_does_not_launch_upgrade() {
     App::test((), |mut app| async move {
         app.add_singleton_model(|_| Appearance::mock());
-        app.update(MockTelemetryContextProvider::register);
         let onboarding_state = add_onboarding_state(&mut app);
         let (_, slide) = app.add_window(WindowStyle::NotStealFocus, {
             let onboarding_state = onboarding_state.clone();
@@ -251,7 +243,6 @@ fn selecting_the_primary_card_does_not_launch_upgrade() {
 fn arrow_keys_move_through_both_options() {
     App::test((), |mut app| async move {
         app.add_singleton_model(|_| Appearance::mock());
-        app.update(MockTelemetryContextProvider::register);
         let onboarding_state = add_onboarding_state(&mut app);
         let (_, slide) = app.add_window(WindowStyle::NotStealFocus, {
             let onboarding_state = onboarding_state.clone();
@@ -281,7 +272,6 @@ fn arrow_keys_move_through_both_options() {
 fn get_warping_on_set_up_later_emits_exactly_one_event() {
     App::test((), |mut app| async move {
         app.add_singleton_model(|_| Appearance::mock());
-        app.update(MockTelemetryContextProvider::register);
         let onboarding_state = add_onboarding_state(&mut app);
         let (_, slide) = app.add_window(WindowStyle::NotStealFocus, {
             let onboarding_state = onboarding_state.clone();

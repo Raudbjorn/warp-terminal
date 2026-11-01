@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use warp_core::channel::ChannelState;
-use warp_core::send_telemetry_from_ctx;
+
 use warp_core::ui::Icon;
 use warp_core::ui::theme::color::internal_colors;
 use warp_errors::report_error;
@@ -21,7 +21,6 @@ use warpui::{
     ViewContext, ViewHandle, WeakViewHandle,
 };
 
-use crate::TelemetryEvent;
 use crate::ai::agent::conversation::AIConversationId;
 use crate::ai::agent_conversations_model::AgentConversationsModel;
 use crate::appearance::Appearance;
@@ -1002,14 +1001,6 @@ impl LeftPanelView {
                     }
                 };
 
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::CodePanelsFileOpened {
-                        entrypoint: CodePanelsFileOpenEntrypoint::GlobalSearch,
-                        target: target.clone(),
-                    },
-                    ctx
-                );
-
                 ctx.emit(LeftPanelEvent::OpenFileWithTarget {
                     location: location.clone(),
                     target,
@@ -1225,23 +1216,7 @@ impl LeftPanelView {
             LeftPanelAction::ProjectExplorer => {
                 active_view_state::set(self, ToolPanelView::ProjectExplorer, ctx);
                 if force_open {
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::FileTreeToggled {
-                            source: FileTreeSource::ForceOpened,
-                            is_code_mode_v2: true,
-                            cli_agent: None,
-                        },
-                        ctx
-                    );
                 } else {
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::FileTreeToggled {
-                            source: FileTreeSource::LeftPanelToolbelt,
-                            is_code_mode_v2: true,
-                            cli_agent: None,
-                        },
-                        ctx
-                    );
                 }
             }
             LeftPanelAction::GlobalSearch { entry_focus } => {
@@ -1256,37 +1231,17 @@ impl LeftPanelView {
                     },
                     ctx,
                 );
-                if !was_active {
-                    send_telemetry_from_ctx!(TelemetryEvent::GlobalSearchOpened, ctx);
-                }
             }
             LeftPanelAction::WarpDrive => {
                 active_view_state::set(self, ToolPanelView::WarpDrive, ctx);
                 if self.active_view_availability(ctx) == ToolPanelAvailability::Available {
                     if force_open {
-                        send_telemetry_from_ctx!(
-                            TelemetryEvent::WarpDriveOpened {
-                                source: WarpDriveSource::ForceOpened,
-                                is_code_mode_v2: true
-                            },
-                            ctx
-                        );
                     } else {
-                        send_telemetry_from_ctx!(
-                            TelemetryEvent::WarpDriveOpened {
-                                source: WarpDriveSource::LeftPanelToolbelt,
-                                is_code_mode_v2: true
-                            },
-                            ctx
-                        );
                     }
                 }
             }
             LeftPanelAction::ConversationListView => {
                 active_view_state::set(self, ToolPanelView::ConversationListView, ctx);
-                if self.active_view_availability(ctx) == ToolPanelAvailability::Available {
-                    send_telemetry_from_ctx!(TelemetryEvent::ConversationListViewOpened, ctx);
-                }
             }
             LeftPanelAction::SignIn => {
                 if !ChannelState::is_local_only() {

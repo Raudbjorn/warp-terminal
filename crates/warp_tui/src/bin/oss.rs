@@ -21,7 +21,6 @@ fn main() -> Result<()> {
             server_config: WarpServerConfig::local_only(),
             oz_config: OzConfig::local_only(),
             services_mode: ServicesMode::LocalOnly,
-            telemetry_config: None,
             autoupdate_config: None,
             mcp_static_config: None,
         },

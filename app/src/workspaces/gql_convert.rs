@@ -19,8 +19,7 @@ use warp_graphql::billing::{
     SessionSharingPolicy as GqlSessionSharingPolicy,
     SharedNotebooksPolicy as GqlSharedNotebooksPolicy,
     SharedWorkflowsPolicy as GqlSharedWorkflowsPolicy, StripeSubscriptionPlan,
-    TeamSizePolicy as GqlTeamSizePolicy,
-    TelemetryDataCollectionPolicy as GqlTelemetryDataCollectionPolicy, Tier as GqlTier,
+    TeamSizePolicy as GqlTeamSizePolicy, Tier as GqlTier,
     UgcDataCollectionPolicy as GqlUgcDataCollectionPolicy,
     UsageBasedPricingPolicy as GqlUsageBasedPricingPolicy,
     UsageVisibilityGranularity as GqlUsageVisibilityGranularity,
@@ -66,11 +65,10 @@ use super::workspace::{
     LlmSettings, MaxPriorCycles, SandboxedAgentSettings, SecretRedactionSettings,
     SessionSharingPolicy, SharedNotebooksPolicy, SharedWorkflowsPolicy, SplitListSetting,
     TeamAiAutonomySettings, TeamAiPermissionsSettings, TeamByoSettings, TeamLinkSharingSettings,
-    TeamSandboxedAgentSettings, TeamSecretRedactionSettings, TeamSettings,
-    TelemetryDataCollectionPolicy, TelemetrySettings, Tier, UgcCollectionEnablementSetting,
-    UgcCollectionSettings, UgcDataCollectionPolicy, UsageBasedPricingPolicy,
-    UsageVisibilityGranularity, UsageVisibilityPolicy, WarpAiPolicy, Workspace, WorkspaceMember,
-    WorkspaceMemberUsageInfo, WorkspaceSettings, WorkspaceSizePolicy,
+    TeamSandboxedAgentSettings, TeamSecretRedactionSettings, TeamSettings, Tier,
+    UgcCollectionEnablementSetting, UgcCollectionSettings, UgcDataCollectionPolicy,
+    UsageBasedPricingPolicy, UsageVisibilityGranularity, UsageVisibilityPolicy, WarpAiPolicy,
+    Workspace, WorkspaceMember, WorkspaceMemberUsageInfo, WorkspaceSettings, WorkspaceSizePolicy,
 };
 use crate::ai::blocklist::usage::conversation_usage_view::ConversationUsageInfo;
 use crate::ai::execution_profiles::{
@@ -504,17 +502,6 @@ impl From<GqlUgcDataCollectionPolicy> for UgcDataCollectionPolicy {
     }
 }
 
-impl From<GqlTelemetryDataCollectionPolicy> for TelemetryDataCollectionPolicy {
-    fn from(
-        gql_telemetry_data_collection_policy: GqlTelemetryDataCollectionPolicy,
-    ) -> TelemetryDataCollectionPolicy {
-        Self {
-            default: gql_telemetry_data_collection_policy.default,
-            toggleable: gql_telemetry_data_collection_policy.toggleable,
-        }
-    }
-}
-
 impl From<GqlUsageBasedPricingPolicy> for UsageBasedPricingPolicy {
     fn from(gql_usage_based_pricing_policy: GqlUsageBasedPricingPolicy) -> UsageBasedPricingPolicy {
         Self {
@@ -737,9 +724,6 @@ impl From<GqlTier> for Tier {
             shared_workflows_policy: gql_tier.shared_workflows_policy.map(From::from),
             session_sharing_policy: gql_tier.session_sharing_policy.map(From::from),
             ai_autonomy_policy: gql_tier.ai_autonomy_policy.map(From::from),
-            telemetry_data_collection_policy: gql_tier
-                .telemetry_data_collection_policy
-                .map(From::from),
             ugc_data_collection_policy: gql_tier.ugc_data_collection_policy.map(From::from),
             usage_based_pricing_policy: gql_tier.usage_based_pricing_policy.map(From::from),
             codebase_context_policy: gql_tier.codebase_context_policy.map(From::from),
@@ -1049,9 +1033,6 @@ impl From<GqlWorkspaceSettings> for WorkspaceSettings {
         Self {
             llm_settings: gql_workspace_settings.llm_settings.into(),
             team_byo: gql_workspace_settings.team_byo.map(From::from),
-            telemetry_settings: TelemetrySettings {
-                force_enabled: gql_workspace_settings.telemetry_settings.force_enabled,
-            },
             ugc_collection_settings: UgcCollectionSettings {
                 setting: UgcCollectionEnablementSetting::from(
                     gql_workspace_settings.ugc_collection_settings.setting,
@@ -1341,9 +1322,6 @@ impl From<GqlTeamSettings> for TeamSettings {
                 ),
             },
             llm_settings: gql_team_settings.llm_settings.into(),
-            telemetry_settings: TelemetrySettings {
-                force_enabled: gql_team_settings.telemetry_settings.force_enabled,
-            },
             usage_based_pricing_settings: UsageBasedPricingSettings {
                 enabled: gql_team_settings.usage_based_pricing_settings.enabled,
                 max_monthly_spend_cents: gql_team_settings

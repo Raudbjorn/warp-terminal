@@ -26,7 +26,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use futures::channel::oneshot;
 use futures::future::{Either, select};
-use warp_core::send_telemetry_from_ctx;
+
 use warp_errors::report_error;
 use warp_util::standardized_path::StandardizedPath;
 use warpui::{AppContext, EntityId, ModelHandle, SingletonEntity};
@@ -38,7 +38,7 @@ use crate::ai::agent::conversation::{AIConversation, AIConversationId};
 use crate::ai::agent::{CancellationReason, extract_user_query_mode};
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::ambient_agents::telemetry::{
-    CloudAgentTelemetryEvent, HandoffEntryPoint, HandoffInjectionPath, HandoffSurface,
+    HandoffEntryPoint, HandoffInjectionPath, HandoffSurface,
 };
 use crate::ai::blocklist::orchestration_topology::descendant_conversation_ids_in_spawn_order;
 use crate::ai::blocklist::{
@@ -569,16 +569,6 @@ pub fn prepare_handoff(
     } else {
         HandoffInjectionPath::SnapshotRehydration
     };
-    send_telemetry_from_ctx!(
-        CloudAgentTelemetryEvent::HandoffInitiated {
-            entry_point,
-            surface,
-            forked_existing_conversation: source_conversation.is_some(),
-            empty_prompt,
-            injection_path,
-        },
-        ctx
-    );
 
     Ok(PendingHandoff {
         source_conversation,

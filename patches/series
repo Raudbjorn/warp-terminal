@@ -11,7 +11,6 @@
 0009-Add-in-process-gRPC-agent-bridge-oh-my-warp.patch
 0010-Add-gRPC-harness-dropdown-to-Settings-oh-my-warp.patch
 0011-Synthesize-ambient-task-state-for-host-owned-runs-oh.patch
-0012-Disable-RudderStack-telemetry-egress-oh-my-warp.patch
 0013-Disable-Sentry-crash-reporting-egress-oh-my-warp.patch
 0014-Enable-the-JavaScript-plugin-host-in-the-default-bui.patch
 0015-Add-base-warp.log-warp.version-plugin-API-oh-my-warp.patch

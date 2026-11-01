@@ -26,7 +26,6 @@ mod context_chips;
 mod crash_recovery;
 mod debug_dump;
 mod default_terminal;
-mod download_method;
 mod drive;
 #[cfg(windows)]
 mod dynamic_libraries;
@@ -169,7 +168,6 @@ use repo_metadata::{
     RepoMetadataModel, repositories::DetectedRepositories, watcher::DirectoryWatcher,
 };
 use server::network_log_pane_manager::NetworkLogPaneManager;
-use server::telemetry::context_provider::AppTelemetryContextProvider;
 use server::voice_transcriber::ServerVoiceTranscriber;
 #[cfg(feature = "local_fs")]
 use settings::import::model::ImportedConfigModel;
@@ -222,9 +220,6 @@ use url::Url;
 // Re-export the debounce function to simplify imports.
 pub use warp_core::r#async::debounce;
 use warp_core::execution_mode::{AppExecutionMode, ExecutionMode};
-// Re-export the send_telemetry_from_ctx macro at the crate root level
-pub use warp_core::send_telemetry_from_app_ctx;
-pub use warp_core::send_telemetry_from_ctx;
 // Re-export the safe logging macros at the crate root level for backwards compatibility
 pub use warp_core::{safe_debug, safe_error, safe_info, safe_warn};
 use warp_errors::{report_error, report_if_error};
@@ -297,10 +292,8 @@ use crate::server::experiments::ServerExperiments;
 use crate::server::iap_identity_minter::ManagedSecretsIapMinter;
 use crate::server::server_api::managed_secrets::AppManagedSecretManager as ManagedSecretManager;
 use crate::server::sync_queue::{QueueItem, SyncQueue};
-pub use crate::server::telemetry::{
-    AgentModeEntrypoint, AgentModeEntrypointSelectionType, TelemetryEvent,
-};
-use crate::server::telemetry::{AppStartupInfo, CloseTarget, PaletteSource, TelemetryCollector};
+pub use crate::server::telemetry::{AgentModeEntrypoint, AgentModeEntrypointSelectionType};
+use crate::server::telemetry::{CloseTarget, PaletteSource};
 use crate::session_management::{RunningSessionSummary, SessionNavigationData};
 use crate::settings::cloud_preferences_syncer::{
     CloudPreferencesSyncerEvent, initialize_cloud_preferences_syncer,
@@ -897,10 +890,6 @@ pub fn run() -> Result<()> {
             warp_cli::Command::DumpSettingsSchema { output_path } => {
                 return settings::schema_generation::dump_settings_schema(output_path.as_deref());
             }
-            #[cfg(not(target_family = "wasm"))]
-            warp_cli::Command::PrintTelemetryEvents => {
-                return TelemetryEvent::print_telemetry_events_json();
-            }
         }
     }
 
@@ -1251,17 +1240,11 @@ fn run_internal(mut launch_mode: LaunchMode) -> Result<()> {
     let pty_spawner =
         terminal::local_tty::spawner::PtySpawner::new().context("Failed to create pty spawner")?;
 
-    // The TUI front-end skips the GUI lifecycle callbacks, which reach for
-    // windows and GUI-only state, but still flushes telemetry and reporting on
-    // termination.
+    // The TUI front-end skips GUI lifecycle callbacks, which reach for windows.
     let callbacks = if matches!(launch_mode, LaunchMode::Tui { .. }) {
         let mut tracing_initialization = tracing_initialization.take();
         warpui::platform::AppCallbacks {
             on_will_terminate: Some(Box::new(move |ctx| {
-                TelemetryCollector::handle(ctx).update(ctx, |telemetry_collector, ctx| {
-                    telemetry_collector.flush_telemetry_events_for_shutdown(ctx);
-                });
-
                 profiling::teardown();
                 if let Some(initialization) = tracing_initialization.as_mut() {
                     initialization.shutdown();
@@ -1632,8 +1615,6 @@ pub(crate) fn initialize_app(
 
     ctx.add_singleton_model(|_ctx| AuthStateProvider::new(auth_state.clone()));
 
-    ctx.add_singleton_model(AppTelemetryContextProvider::new_context_provider);
-
     ctx.add_singleton_model(|ctx| {
         AuthManager::new(
             server_api.clone(),
@@ -1891,8 +1872,6 @@ pub(crate) fn initialize_app(
 
     ctx.add_singleton_model(AntivirusInfo::new);
 
-    // Crash reporting (Sentry) has been removed from this fork.
-    let is_crash_reporting_enabled = false;
     timer.mark_interval_end("INIT_CRASH_REPORTING");
 
     if let LaunchMode::App { .. } = launch_mode {
@@ -2006,21 +1985,10 @@ pub(crate) fn initialize_app(
     let user_is_logged_in = auth_state.is_logged_in();
 
     if user_is_logged_in {
-        // Set the first frame callback to record the app's startup time.
-        // This is only sent for logged-in users so that new users don't skew performance metrics.
-        let is_screen_reader_enabled = ctx.is_screen_reader_enabled();
-        let from_relaunch = launch_mode.args().finish_update;
+        // Complete startup work after the first frame is drawn.
         ctx.on_first_frame_drawn(move |ctx| {
-            let timing_data = IntervalTimer::handle(ctx).update(ctx, |timer, _| {
+            IntervalTimer::handle(ctx).update(ctx, |timer, _| {
                 timer.mark_interval_end("FIRST_FRAME_DRAWN");
-                timer.compute_stats()
-            });
-            let event = TelemetryEvent::AppStartup(AppStartupInfo {
-                is_session_restoration_on: user_defaults_on_startup.should_restore_session,
-                is_screen_reader_enabled,
-                from_relaunch,
-                is_crash_reporting_enabled,
-                timing_data,
             });
 
             GPUState::handle(ctx).update(ctx, |gpu_state, ctx| {
@@ -2035,8 +2003,6 @@ pub(crate) fn initialize_app(
                         settings.refresh_preferred_graphics_backend_dropdown(ctx);
                     })
             }
-
-            send_telemetry_from_app_ctx!(event, ctx);
         });
 
         #[cfg(enable_crash_recovery)]
@@ -2045,14 +2011,6 @@ pub(crate) fn initialize_app(
                 crash_recovery.on_frame_drawn(window_id, ctx);
             });
         })
-    } else {
-        // If the app was opened while logged out, record an event for measuring new users.
-        // This is sent immediately in case they quit the app on the signup screen.
-        send_telemetry_sync_from_app_ctx!(TelemetryEvent::LoggedOutStartup, ctx);
-        download_method::determine_and_report(
-            auth_state.clone(),
-            ctx.background_executor().clone(),
-        );
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -2142,15 +2100,6 @@ pub(crate) fn initialize_app(
     ctx.add_singleton_model(move |_| History::new(command_history));
 
     ctx.add_singleton_model(CustomSecretRegexUpdater::new);
-
-    // Register the `TelemetryCollection` singleton model.
-    let server_api_clone = server_api.clone();
-    ctx.add_singleton_model(|ctx| {
-        let telemetry_collector = TelemetryCollector::new(server_api_clone);
-        telemetry_collector.initialize_telemetry_collection(ctx);
-        telemetry_collector
-    });
-    timer.mark_interval_end("INITIALIZE_TELEMETRY_COLLECTION");
 
     // Register initial keybindings prior to creating menus
     ai::init(ctx);
@@ -2716,13 +2665,6 @@ pub(crate) fn app_callbacks(
             NetworkStatus::handle(ctx)
                 .update(ctx, move |me, ctx| me.reachability_changed(reachable, ctx));
         })),
-        on_become_active: Some(Box::new(move |ctx| {
-            let auth_state = AuthStateProvider::as_ref(ctx).get();
-            ctx.record_app_focus(
-                auth_state.user_id().map(|uid| uid.as_string()),
-                auth_state.anonymous_id(),
-            );
-        })),
         on_screen_changed: Some(Box::new(move |ctx| {
             ctx.dispatch_global_action(
                 "root_view:move_quake_mode_window_from_screen_change",
@@ -2770,12 +2712,6 @@ pub(crate) fn app_callbacks(
                 }
             }
             ctx.dispatch_global_action("root_view:update_quake_mode_state", &update_quake_mode_arg);
-
-            let auth_state = AuthStateProvider::as_ref(ctx).get();
-            ctx.record_app_blur(
-                auth_state.user_id().map(|uid| uid.as_string()),
-                auth_state.anonymous_id(),
-            );
         })),
         on_will_terminate: Some(Box::new(move |ctx| {
             NotebookManager::handle(ctx).update(ctx, |manager, ctx| {
@@ -2786,15 +2722,6 @@ pub(crate) fn app_callbacks(
 
             PersistenceWriter::handle(ctx).update(ctx, |writer, _ctx| {
                 writer.terminate();
-            });
-
-            let auth_state = AuthStateProvider::as_ref(ctx).get();
-            ctx.try_record_daily_app_focus_duration(
-                auth_state.user_id().map(|uid| uid.as_string()),
-                auth_state.anonymous_id(),
-            );
-            TelemetryCollector::handle(ctx).update(ctx, |telemetry_collector, ctx| {
-                telemetry_collector.flush_telemetry_events_for_shutdown(ctx);
             });
 
             // Shutdown all LSP servers gracefully before app termination
@@ -2848,13 +2775,6 @@ pub(crate) fn app_callbacks(
 
             let summary = UnsavedStateSummary::for_window(window_id, ctx);
 
-            send_telemetry_from_app_ctx!(
-                TelemetryEvent::UserInitiatedClose {
-                    initiated_on: CloseTarget::Window,
-                },
-                ctx
-            );
-
             // Don't show dialog on integration test. Machine can't press buttons.
             if !is_integration_test && summary.save_unsaved_code_and_should_warn(ctx) {
                 let shown = summary
@@ -2893,13 +2813,6 @@ pub(crate) fn app_callbacks(
                 return ApproveTerminateResult::Terminate;
             }
 
-            send_telemetry_from_app_ctx!(
-                TelemetryEvent::UserInitiatedClose {
-                    initiated_on: CloseTarget::App,
-                },
-                ctx
-            );
-
             // If there's a pending autoupdate, apply that before showing the unsaved changes
             // dialog. We apply the update first so that the dialog can force-terminate.
             let applying_update = autoupdate::apply_pending_update(ctx, |ctx| {
@@ -2936,7 +2849,6 @@ pub(crate) fn app_callbacks(
                         .toggle_and_save_value(ctx)
                 );
             });
-            send_telemetry_from_app_ctx!(TelemetryEvent::QuitModalDisabled, ctx);
         })),
         on_notification_clicked: Some(Box::new(move |notification_response, ctx| {
             if let Some(notification_data) = notification_response.data() {
@@ -3063,14 +2975,6 @@ fn focus_running_window_and_show_native_modal(
 fn on_close_app_cancelled(open_navigation_palette: bool, ctx: &mut AppContext) {
     autoupdate::cancel_relaunch(ctx);
 
-    send_telemetry_from_app_ctx!(
-        TelemetryEvent::QuitModalCancel {
-            nav_palette: open_navigation_palette,
-            modal_for: CloseTarget::App,
-        },
-        ctx
-    );
-
     let sessions = SessionNavigationData::all_sessions(ctx).collect_vec();
     let sessions_summary = RunningSessionSummary::new(&sessions);
 
@@ -3117,14 +3021,6 @@ fn on_close_window_cancelled(
     open_navigation_palette: bool,
     ctx: &mut AppContext,
 ) {
-    send_telemetry_from_app_ctx!(
-        TelemetryEvent::QuitModalCancel {
-            nav_palette: open_navigation_palette,
-            modal_for: CloseTarget::Window,
-        },
-        ctx
-    );
-
     let sessions = SessionNavigationData::all_sessions(ctx).collect_vec();
     let sessions_summary = RunningSessionSummary::new(&sessions);
     let num_processes_in_window = sessions_summary.processes_in_window(&window_id).len();

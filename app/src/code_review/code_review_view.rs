@@ -60,8 +60,6 @@ use super::comments::{AttachedReviewComment, CommentOrigin, attach_pending_impor
 use super::diff_size_limits::DiffSize;
 use super::git_dialog::{GitDialog, GitDialogEvent, GitDialogKind};
 use super::{GlobalCodeReviewEvent, GlobalCodeReviewModel};
-#[cfg(feature = "local_fs")]
-use crate::TelemetryEvent;
 use crate::ai::agent::{
     AIAgentAttachment, AgentReviewCommentBatch, CurrentHead, DiffBase, DiffSetHunk,
 };
@@ -107,8 +105,7 @@ use crate::code_review::hidden_lines::calculate_hidden_lines;
 #[cfg(feature = "local_fs")]
 use crate::code_review::telemetry_event::DiffSetContextScope;
 use crate::code_review::telemetry_event::{
-    AddToContextOrigin, CodeReviewContextDestination, CodeReviewTelemetryEvent, GitButtonKind,
-    PaneStateChange,
+    AddToContextOrigin, CodeReviewContextDestination, GitButtonKind, PaneStateChange,
 };
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
 use crate::editor::InteractionState;
@@ -117,7 +114,7 @@ use crate::pane_group::PaneId;
 use crate::pane_group::focus_state::{PaneFocusHandle, PaneGroupFocusEvent};
 use crate::pane_group::pane::{BackingView, PaneEvent, view};
 use crate::quit_warning::UnsavedStateSummary;
-use crate::send_telemetry_from_ctx;
+
 #[cfg(feature = "local_fs")]
 use crate::server::telemetry::CodePanelsFileOpenEntrypoint;
 use crate::settings::{AISettings, CodeSettings};
@@ -1583,14 +1580,6 @@ impl CodeReviewView {
             return;
         }
 
-        send_telemetry_from_ctx!(
-            CodeReviewTelemetryEvent::BaseChanged {
-                is_local: self.repo_is_local(),
-                mode: mode.clone(),
-            },
-            ctx
-        );
-
         let preferred_session = self.preferred_review_session(ctx);
         self.diff_state_model.update(ctx, |model, ctx| {
             model.set_diff_mode(mode, false, true, preferred_session, ctx);
@@ -2252,13 +2241,6 @@ impl CodeReviewView {
             });
         }
 
-        send_telemetry_from_ctx!(
-            CodeReviewTelemetryEvent::FindBarToggled {
-                is_local: self.repo_is_local(),
-                is_open: true,
-            },
-            ctx
-        );
         ctx.focus(&self.find_bar);
         self.update_search_decorations(ctx);
         ctx.notify();
@@ -2275,14 +2257,6 @@ impl CodeReviewView {
             model.update_query(None, editor_handles.into_iter(), model_ctx);
             model.clear_results();
         });
-
-        send_telemetry_from_ctx!(
-            CodeReviewTelemetryEvent::FindBarToggled {
-                is_local: self.repo_is_local(),
-                is_open: false,
-            },
-            ctx
-        );
 
         // Clear finder match decorations
         #[cfg(not(target_family = "wasm"))]
@@ -2552,19 +2526,6 @@ impl CodeReviewView {
             });
         }
 
-        send_telemetry_from_ctx!(
-            CodeReviewTelemetryEvent::DiffLoadCompleted {
-                is_local,
-                mode: diff_mode,
-                file_count: diff_data.files.len(),
-                files_changed: diff_data.files_changed,
-                total_additions: diff_data.total_additions,
-                total_deletions: diff_data.total_deletions,
-                load_duration,
-            },
-            ctx
-        );
-
         if self.all_editors_loaded() {
             let diff_mode = self.diff_state_model.as_ref(ctx).diff_mode(ctx);
             self.reposition_comments_in_file(&diff_mode, ctx);
@@ -2772,19 +2733,7 @@ impl CodeReviewView {
 
         // Telemetry: record whether this was a new comment or an edit.
         if is_existing {
-            send_telemetry_from_ctx!(
-                CodeReviewTelemetryEvent::CommentEdited {
-                    is_local: self.repo_is_local(),
-                },
-                ctx
-            );
         } else {
-            send_telemetry_from_ctx!(
-                CodeReviewTelemetryEvent::CommentAdded {
-                    is_local: self.repo_is_local(),
-                },
-                ctx
-            );
         }
 
         ctx.focus_self();
@@ -2812,14 +2761,6 @@ impl CodeReviewView {
             model.update(ctx, |batch, ctx| {
                 batch.delete_comment(id, ctx);
             });
-
-            send_telemetry_from_ctx!(
-                CodeReviewTelemetryEvent::CommentDeleted {
-                    is_local: self.repo_is_local(),
-                    is_imported,
-                },
-                ctx
-            );
         }
     }
 
@@ -3197,12 +3138,6 @@ impl CodeReviewView {
     ) {
         match event {
             LocalCodeEditorEvent::FileSaved { .. } => {
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::FileSaved {
-                        is_local: self.repo_is_local(),
-                    },
-                    ctx
-                );
                 ctx.notify();
             }
             LocalCodeEditorEvent::FailedToSave { .. } => {}
@@ -3626,16 +3561,6 @@ impl CodeReviewView {
             fallback_count,
         } = Self::relocate_comments(comments, state, &repo_path, ctx);
 
-        if fallback_count > 0 {
-            send_telemetry_from_ctx!(
-                CodeReviewTelemetryEvent::CommentRelocationFailed {
-                    is_local: self.repo_is_local(),
-                    fallback_count,
-                },
-                ctx
-            );
-        }
-
         if !newly_imported_ids.is_empty() {
             let (active_count, outdated_count) = relocated_comments
                 .iter()
@@ -3647,14 +3572,6 @@ impl CodeReviewView {
                         (active + 1, outdated)
                     }
                 });
-            send_telemetry_from_ctx!(
-                CodeReviewTelemetryEvent::CommentsAttached {
-                    is_local: self.repo_is_local(),
-                    active_count,
-                    outdated_count,
-                },
-                ctx
-            );
         }
 
         model.update(ctx, |batch, ctx| {
@@ -4270,16 +4187,6 @@ impl CodeReviewView {
                 destination,
             } => {
                 log::info!("Successfully submitted review comments to terminal");
-
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::ReviewSubmitted {
-                        is_local: self.repo_is_local(),
-                        comment_count,
-                        file_count,
-                        destination,
-                    },
-                    ctx
-                );
 
                 self.clear_review_comments(ctx);
                 ToastStack::handle(ctx).update(ctx, |stack, ctx| {
@@ -5649,12 +5556,6 @@ impl CodeReviewView {
                 self.insert_diff_hunk_as_context(file_path, line_range.clone(), ctx);
             }
             CodeEditorEvent::DiffReverted => {
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::RevertHunkClicked {
-                        is_local: self.repo_is_local(),
-                    },
-                    ctx
-                );
                 // Show toast notification that diff was removed.
                 let version = editor.as_ref(ctx).version(ctx);
                 self.last_revert = Some((editor, version));
@@ -5685,14 +5586,7 @@ impl CodeReviewView {
             CodeEditorEvent::Focused => {
                 ctx.emit(CodeReviewViewEvent::Pane(PaneEvent::FocusSelf));
             }
-            CodeEditorEvent::CommentEditorOpened => {
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::CommentEditorOpened {
-                        is_local: self.repo_is_local(),
-                    },
-                    ctx
-                );
-            }
+            CodeEditorEvent::CommentEditorOpened => {}
             CodeEditorEvent::ContentChanged { origin, .. } => {
                 if origin.from_user() {
                     if let Some((view_handle, content_version)) = self.last_revert.take() {
@@ -5745,15 +5639,7 @@ impl CodeReviewView {
                     CliAgentRouting::RichInput => CodeReviewContextDestination::RichInput,
                     CliAgentRouting::Pty => CodeReviewContextDestination::Pty,
                 };
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::AddToContext {
-                        is_local: self.repo_is_local(),
-                        origin: AddToContextOrigin::SelectedText,
-                        destination,
-                        diff_set_scope: None,
-                    },
-                    ctx
-                );
+
                 return;
             }
 
@@ -5774,15 +5660,7 @@ impl CodeReviewView {
 
             // Otherwise insert the location snippet into the input buffer (original behavior).
             let location = format!("{file_path}:{start_line}-{end_line} ");
-            send_telemetry_from_ctx!(
-                CodeReviewTelemetryEvent::AddToContext {
-                    is_local: self.repo_is_local(),
-                    origin: AddToContextOrigin::SelectedText,
-                    destination: CodeReviewContextDestination::AgentInput,
-                    diff_set_scope: None,
-                },
-                ctx
-            );
+
             terminal_view.update(ctx, |terminal_view, ctx| {
                 terminal_view.input().update(ctx, |input, ctx| {
                     input.append_to_buffer(&location, ctx);
@@ -5851,15 +5729,6 @@ impl CodeReviewView {
                         Some(CliAgentRouting::RichInput) => CodeReviewContextDestination::RichInput,
                         _ => CodeReviewContextDestination::Pty,
                     };
-                    send_telemetry_from_ctx!(
-                        CodeReviewTelemetryEvent::AddToContext {
-                            is_local: self.repo_is_local(),
-                            origin: AddToContextOrigin::CodeReviewHeader,
-                            destination,
-                            diff_set_scope: Some(diff_set_scope),
-                        },
-                        ctx
-                    );
                 }
                 return;
             }
@@ -5931,16 +5800,6 @@ impl CodeReviewView {
                         input.ensure_agent_mode_for_ai_features(true, None, ctx);
                     });
                 });
-
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::AddToContext {
-                        is_local: self.repo_is_local(),
-                        origin: AddToContextOrigin::CodeReviewHeader,
-                        destination: CodeReviewContextDestination::AgentAttachment,
-                        diff_set_scope: Some(diff_set_scope),
-                    },
-                    ctx
-                );
 
                 // Register the DiffSet attachment in the terminal view's AI context model.
                 let current = self.get_current_head(ctx);
@@ -6058,15 +5917,6 @@ impl CodeReviewView {
                         Some(CliAgentRouting::RichInput) => CodeReviewContextDestination::RichInput,
                         _ => CodeReviewContextDestination::Pty,
                     };
-                    send_telemetry_from_ctx!(
-                        CodeReviewTelemetryEvent::AddToContext {
-                            is_local: self.repo_is_local(),
-                            origin: AddToContextOrigin::Gutter,
-                            destination,
-                            diff_set_scope: None,
-                        },
-                        ctx
-                    );
                 }
                 return;
             }
@@ -6082,15 +5932,7 @@ impl CodeReviewView {
                 terminal_view.update(ctx, |terminal_view, ctx| {
                     terminal_view.handle_file_tree_drop_on_active_command(&path_with_range, ctx);
                 });
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::AddToContext {
-                        is_local: self.repo_is_local(),
-                        origin: AddToContextOrigin::Gutter,
-                        destination: CodeReviewContextDestination::ActiveCommandBuffer,
-                        diff_set_scope: None,
-                    },
-                    ctx
-                );
+
                 return;
             }
             if let Some((hunk, lines_added, lines_removed)) =
@@ -6140,15 +5982,6 @@ impl CodeReviewView {
                     DiffMode::OtherBranch(branch_name) => DiffBase::BranchName(branch_name),
                 };
 
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::AddToContext {
-                        is_local: self.repo_is_local(),
-                        origin: AddToContextOrigin::Gutter,
-                        destination: CodeReviewContextDestination::AgentAttachment,
-                        diff_set_scope: None,
-                    },
-                    ctx
-                );
                 // Create the DiffHunk attachment
                 let attachment = AIAgentAttachment::DiffHunk {
                     file_path: filename.clone(),
@@ -6958,14 +6791,6 @@ impl CodeReviewView {
             None,
         );
 
-        send_telemetry_from_ctx!(
-            TelemetryEvent::CodePanelsFileOpened {
-                entrypoint: CodePanelsFileOpenEntrypoint::CodeReview,
-                target: target.clone(),
-            },
-            ctx
-        );
-
         ctx.emit(CodeReviewViewEvent::OpenFileWithTarget {
             path: full_path,
             target,
@@ -7311,14 +7136,6 @@ impl TypedActionView for CodeReviewView {
                     PaneStateChange::Maximized
                 };
 
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::PaneStateChanged {
-                        is_local: self.repo_is_local(),
-                        state_change,
-                    },
-                    ctx
-                );
-
                 ctx.emit(CodeReviewViewEvent::Pane(PaneEvent::ToggleMaximized));
             }
             CodeReviewAction::SaveAllFiles { paths } => {
@@ -7520,53 +7337,18 @@ impl TypedActionView for CodeReviewView {
                 }
             }
             CodeReviewAction::OpenCommitDialog => {
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::GitButtonTriggered {
-                        is_local: self.repo_is_local(),
-                        button: GitButtonKind::Commit,
-                    },
-                    ctx
-                );
                 self.open_git_dialog(GitDialogKind::Commit, ctx);
             }
             CodeReviewAction::PublishBranch => {
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::GitButtonTriggered {
-                        is_local: self.repo_is_local(),
-                        button: GitButtonKind::Publish,
-                    },
-                    ctx
-                );
                 self.open_git_dialog(GitDialogKind::Push { publish: true }, ctx);
             }
             CodeReviewAction::OpenPushDialog => {
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::GitButtonTriggered {
-                        is_local: self.repo_is_local(),
-                        button: GitButtonKind::Push,
-                    },
-                    ctx
-                );
                 self.open_git_dialog(GitDialogKind::Push { publish: false }, ctx);
             }
             CodeReviewAction::OpenCreatePrDialog => {
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::GitButtonTriggered {
-                        is_local: self.repo_is_local(),
-                        button: GitButtonKind::CreatePr,
-                    },
-                    ctx
-                );
                 self.open_git_dialog(GitDialogKind::CreatePr, ctx);
             }
             CodeReviewAction::ViewPr(url) => {
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::GitButtonTriggered {
-                        is_local: self.repo_is_local(),
-                        button: GitButtonKind::ViewPr,
-                    },
-                    ctx
-                );
                 ctx.open_url(url);
             }
             CodeReviewAction::ToggleGitOperationsMenu => {
