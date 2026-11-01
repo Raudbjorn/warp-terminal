@@ -10,7 +10,7 @@
 //!
 //! A team-scoped policy only bites once its workspace-level entitlement turns it on -- a plan that
 //! does not manage credentials centrally has no `team_byo` to enforce, so members fall back to the
-//! plan's own BYO entitlement.
+//! plain BYO gate ([`UserWorkspaces::is_byo_api_key_enabled`]).
 
 use std::rc::Rc;
 use std::sync::OnceLock;
@@ -349,7 +349,7 @@ impl UserWorkspaces {
     /// Whether `scope`'s team admins allows its members to use their own provider API keys.
     ///
     /// Without the managed BYOK/BYOE policy there is no team-level restriction, so this returns
-    /// true and the normal BYO entitlement applies.
+    /// true and the plain BYO gate applies.
     pub fn are_member_byo_keys_allowed<S: TeamScope + ?Sized>(&self, scope: &S) -> bool {
         !self.is_managed_byok_byoe_enabled()
             || self
