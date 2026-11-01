@@ -18,6 +18,7 @@ fn route() -> LocalRoute {
             base_url: ENDPOINT_URL.to_string(),
             api_key: "sk-test".to_string(),
             model_slug: MODEL_SLUG.to_string(),
+            schema: local_agent::EndpointSchema::ChatCompletions,
         },
         config_key: CONFIG_KEY.to_string(),
     }
@@ -280,6 +281,7 @@ mod transcript {
                 ChatMessage::Assistant {
                     text: "first answer".to_string(),
                     tool_calls: vec![],
+                    replay_items: vec![],
                 },
                 ChatMessage::User("second question".to_string()),
             ]
