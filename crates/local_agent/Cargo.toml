@@ -6,9 +6,11 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+async-io.workspace = true
 async-stream.workspace = true
 futures.workspace = true
 log.workspace = true
+rand.workspace = true
 reqwest.workspace = true
 reqwest-eventsource.workspace = true
 serde.workspace = true
@@ -17,4 +19,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 mockito.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
