@@ -46,6 +46,61 @@ See [docs/local-ai.md](docs/local-ai.md) for every setting, the OpenCode
 provider, and exactly what the local-only network policy does and does not
 cover.
 
+### Save and stream command output to files
+
+Block and session context menus offer local file capture in place of cloud
+sharing, adapted from [thikone/warp-terminal](https://github.com/thikone/warp-terminal).
+Choose a destination in the native save dialog:
+
+| Command | Content | Default shortcut |
+|---|---|---|
+| Save output to file | Selected blocks' output | `Ctrl+Shift+S` |
+| Stream output to file | Output, updated while the command runs | `Ctrl+Alt+Shift+S` |
+| Save block to file | Working directory, command and output | Unbound |
+| Stream block to file | Working directory, command and live output | Unbound |
+| Save session to file | Retained commands and output in the current pane | Unbound |
+| Stream session to file | Retained history and subsequent commands in the pane | Unbound |
+
+On macOS, Save Output uses `Cmd+Shift+S`. Without a block selection, block captures
+use the latest command. Block streams
+finish with the command; session streams can start at an empty prompt and continue
+across commands until the pane closes. Starting another session stream replaces
+that pane's previous session stream. The tab context menu captures its focused
+pane without switching tabs. Captures contain rendered text: progress-line
+redraws replace the current tail instead of appending every intermediate frame.
+Live capture mirrors the terminal's retained output: if the active command exceeds
+the configured grid limit, older lines can also disappear from its captured tail.
+Use shell redirection or a PTY recording when a complete byte log is required.
+
+File operations run in the background. The app allows up to eight open or pending
+file captures at a time; a stalled destination retains its place until its I/O finishes.
+Closing a pane or clearing its history drains the last available snapshot. If the
+file is still opening, capture stops with an incomplete-snapshot warning. Abrupt
+application termination can leave the final write incomplete.
+
+All six actions are listed in the Resource Center's **Terminal** shortcuts and
+can be assigned keys in **Settings → Keyboard Shortcuts**. Filename patterns live
+under **Settings → Features → Session** and are stored locally:
+
+| TOML key | Default |
+|---|---|
+| `terminal.file_capture.output_pattern` | `{command}_{timestamp}.log` |
+| `terminal.file_capture.block_pattern` | `{command}_{timestamp}.log` |
+| `terminal.file_capture.session_pattern` | `{session-or-command}_{timestamp}.log` |
+
+Patterns support `{command}`, `{timestamp}`, `{finished-timestamp}` and
+`{session-or-command}`. For session captures, `{session-or-command}` uses the
+custom tab name from any capture entry point, falling back to the first command.
+For output and block captures, it uses the target command.
+Command and tab-name tokens are sanitized and limited to 64 UTF-8 bytes without
+splitting characters. Custom pattern text can still make a filename too long.
+Clearing a settings field restores its default. The pattern suggests a filename;
+the save dialog lets you change it.
+
+**Captured files include secrets in plaintext, even if the terminal masks them.**
+New files are created with owner-only permissions on Unix; overwriting an
+existing file preserves that file's permissions.
+
 ## Building and running this fork
 
 The build is driven by the scripts in [`script/`](script). This fork builds as

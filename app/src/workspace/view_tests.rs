@@ -3327,17 +3327,19 @@ fn test_tab_context_menu_share_session_items() {
                 });
         });
 
-        // When there's a single shared session in a tab (unfocused), the options
-        // for sharing are "Share session" and "Stop sharing all".
+        // When the shared session is unfocused, only "Stop sharing all" remains
+        // in the sharing section; local file capture has its own section.
         workspace.read(&app, |workspace, ctx| {
             let items =
                 workspace.tabs[1].menu_items(1, 3, &workspace.tab_groups, false, true, true, ctx);
-            assert!(
-                items[0].is_approximately_same_item_as(
-                    &MenuItemFields::new("Share session").into_item()
+            // "Share session" is gone in this fork -- the tab menu offers file
+            // capture instead -- so "Stop sharing all" is now first.
+            assert!(items.iter().all(|item| {
+                !item.is_approximately_same_item_as(
+                    &MenuItemFields::new("Share session").into_item(),
                 )
-            );
-            assert!(items[1].is_approximately_same_item_as(
+            }));
+            assert!(items[0].is_approximately_same_item_as(
                 &MenuItemFields::new("Stop sharing all").into_item()
             ));
         });
@@ -3348,16 +3350,102 @@ fn test_tab_context_menu_share_session_items() {
             workspace.stop_sharing_all_panes_in_tab(&tab, ctx);
         });
 
-        // When there's no shared sessions in a tab, the only option is "Share session".
+        // With no shared sessions the sharing section is empty in this fork,
+        // because "Share session" was replaced by the file-capture items.
         workspace.read(&app, |workspace, ctx| {
             let items =
                 workspace.tabs[1].menu_items(1, 3, &workspace.tab_groups, false, true, true, ctx);
-            assert!(
-                items[0].is_approximately_same_item_as(
-                    &MenuItemFields::new("Share session").into_item()
+            assert!(items.iter().all(|item| {
+                !item.is_approximately_same_item_as(
+                    &MenuItemFields::new("Share session").into_item(),
                 )
+            }));
+            // Streaming can always be armed, even on a session with no output.
+            assert!(items.iter().any(|item| item.is_approximately_same_item_as(
+                &MenuItemFields::new("Stream session to file...").into_item()
+            )));
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_tab_capture_without_session_sharing_preserves_active_tab() {
+    let _guard = FeatureFlag::CreatingSharedSessions.override_enabled(false);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.activate_tab(0, ctx);
+            let items =
+                workspace.tabs[1].menu_items(1, 2, &workspace.tab_groups, false, true, true, ctx);
+            let action = items
+                .iter()
+                .filter_map(MenuItem::item_on_select_action)
+                .find(|action| {
+                    matches!(
+                        action,
+                        WorkspaceAction::StreamSessionToFileFromTab { tab_index: 1 }
+                    )
+                })
+                .expect("an idle terminal can stream without cloud sharing")
+                .clone();
+
+            // The test platform's picker is inert; dispatch still exercises tab routing.
+            workspace.handle_action(&action, ctx);
+            assert_eq!(workspace.active_tab_index(), 0);
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn test_tab_capture_hidden_for_focused_notebook() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let temp_dir = TempDir::new().expect("failed to create temp dir");
+        let markdown_path = temp_dir.path().join("README.md");
+        std::fs::write(&markdown_path, "# Test\n").expect("failed to write markdown file");
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.open_file_with_target(
+                markdown_path.clone(),
+                FileTarget::MarkdownViewer(EditorLayout::SplitPane),
+                None,
+                CodeSource::Link {
+                    path: markdown_path,
+                    range_start: None,
+                    range_end: None,
+                },
+                ctx,
             );
-            assert!(items[1].is_approximately_same_item_as(&MenuItem::Separator));
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            let pane_group = workspace.active_tab_pane_group().as_ref(ctx);
+            assert_eq!(pane_group.file_notebook_panes(ctx).count(), 1);
+            assert!(pane_group.focused_session_view(ctx).is_none());
+            let index = workspace.active_tab_index();
+            let items = workspace.tabs[index].menu_items(
+                index,
+                workspace.tab_count(),
+                &workspace.tab_groups,
+                false,
+                true,
+                true,
+                ctx,
+            );
+            assert!(items.iter().all(|item| !matches!(
+                item.item_on_select_action(),
+                Some(
+                    WorkspaceAction::SaveSessionToFileFromTab { .. }
+                        | WorkspaceAction::StreamSessionToFileFromTab { .. }
+                )
+            )));
         });
     });
 }

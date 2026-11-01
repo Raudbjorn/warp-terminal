@@ -2251,6 +2251,54 @@ impl Block {
             .contents_to_string_with_secrets_unobfuscated(false, None)
     }
 
+    /// The command line followed by its output, with secrets left in plaintext.
+    ///
+    /// The unobfuscated counterpart of [`Self::command_and_output_to_string`],
+    /// used when capturing to a file: a saved log is meant to record what
+    /// actually ran, so it deliberately contains more than the screen shows.
+    ///
+    /// Unlike the obfuscating version this never takes the `honor_ps1`
+    /// `bounds_to_string` shortcut, because that path reads straight from the
+    /// grid and would re-apply obfuscation.
+    pub fn command_and_output_with_secrets_unobfuscated(&self) -> String {
+        format!(
+            "{}\n{}",
+            self.command_line_with_pwd(),
+            self.output_with_secrets_unobfuscated()
+        )
+    }
+
+    /// The command prefixed with the directory it ran in, prompt-style:
+    /// `PS C:\src> cargo build` or `~/src$ make`.
+    ///
+    /// Uses this block's *own* recorded directory rather than the session's
+    /// current one, so a `cd` partway through a captured session is reflected on
+    /// the blocks that followed it instead of every line reporting where the
+    /// session happens to have ended up.
+    ///
+    /// Falls back to the bare command when the directory is unknown, which is
+    /// the case for restored blocks and for anything that ran before the first
+    /// precmd.
+    pub fn command_line_with_pwd(&self) -> String {
+        let command = self.command_with_secrets_unobfuscated(false);
+        let Some(pwd) = self.user_friendly_pwd() else {
+            return command;
+        };
+
+        // Match the shell rather than assuming one; a bash transcript with a
+        // PowerShell prompt would be actively misleading.
+        let sigil = match self.shell_host().map(|host| host.shell_type) {
+            Some(ShellType::PowerShell) => "PS ",
+            _ => "",
+        };
+        let terminator = match self.shell_host().map(|host| host.shell_type) {
+            Some(ShellType::PowerShell) | None => ">",
+            Some(_) => "$",
+        };
+
+        format!("{sigil}{pwd}{terminator} {command}")
+    }
+
     /// Returns an iterator over all grids in the block.
     pub fn all_grids_iter(&self) -> impl Iterator<Item = &BlockGrid> {
         [

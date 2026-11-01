@@ -11009,3 +11009,587 @@ fn visible_bootstrap_block_leaves_focus_on_tab_group_rename_editor() {
         }));
     });
 }
+
+#[cfg(feature = "local_fs")]
+async fn await_file_captures(terminal: &ViewHandle<TerminalView>, app: &mut App) {
+    loop {
+        let pending = terminal.update(app, |view, ctx| {
+            view.capture_tasks
+                .values()
+                .map(|task| ctx.await_spawned_future(task.future_id()))
+                .collect_vec()
+        });
+        if pending.is_empty() {
+            break;
+        }
+        for future in pending {
+            future.await;
+        }
+    }
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_output_stream_keeps_output_scope_until_completion() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.log");
+        let id = terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            let ids = view.capture_block_ids(ctx);
+            view.finish_capture(path.clone(), CaptureRequest::block_output(true), &ids, ctx);
+            ids[0]
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "output");
+        terminal.update(&mut app, |view, ctx| {
+            view.model.lock().process_bytes(" more");
+            view.pump_file_captures(ctx);
+            view.model.lock().finish_block();
+            view.on_block_completed_for_captures(id, ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "output more");
+        terminal.update(&mut app, |view, _| {
+            assert!(view.block_capture_stream.is_none())
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_uses_last_completed_block_and_keeps_picker_target() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.log");
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            view.model.lock().finish_block();
+            // Background output must never become the fallback command target.
+            view.model
+                .lock()
+                .process_bytes("background notification\r\n");
+            let ids = view.capture_block_ids(ctx);
+            view.model.lock().simulate_block("next", "different output");
+            view.finish_capture(path.clone(), CaptureRequest::block_output(true), &ids, ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "output");
+        terminal.update(&mut app, |view, _| {
+            assert!(view.block_capture_stream.is_none())
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_idle_session_follows_future_commands_and_preserves_separators() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.log");
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            view.model.lock().finish_block();
+            view.finish_capture(path.clone(), CaptureRequest::session(true), &[], ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        let before = std::fs::read_to_string(&path).unwrap();
+        assert!(before.ends_with("output\n"));
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .simulate_long_running_block("next", "new output");
+            view.pump_file_captures(ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with(&before));
+        assert!(after.ends_with("next\nnew output"));
+        terminal.update(&mut app, |view, ctx| {
+            let id = *view.model.lock().block_list().active_block_id();
+            view.model.lock().finish_block();
+            view.model
+                .lock()
+                .simulate_long_running_block("last", "last output");
+            // Completion must persist later output in this same update, with no extra wakeup.
+            view.on_block_completed_for_captures(id, ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        let captured = std::fs::read_to_string(&path).unwrap();
+        assert!(captured.contains("new output\n"));
+        assert!(captured.ends_with("last\nlast output"));
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_does_not_overwrite_an_active_destination() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.log");
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            let ids = view.capture_block_ids(ctx);
+            view.finish_capture(path.clone(), CaptureRequest::block_output(true), &ids, ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        terminal.update(&mut app, |view, ctx| {
+            view.finish_capture(path.clone(), CaptureRequest::session(false), &[], ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "output");
+        terminal.update(&mut app, |view, ctx| {
+            view.model.lock().process_bytes(" more");
+            view.pump_file_captures(ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "output more");
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_missing_block_preserves_recorded_output() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.log");
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            let ids = view.capture_block_ids(ctx);
+            view.finish_capture(path.clone(), CaptureRequest::block_output(true), &ids, ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        terminal.update(&mut app, |view, ctx| {
+            view.model.lock().finish_block();
+            view.model.lock().clear_screen(ClearMode::ResetAndClear);
+            view.pump_file_captures(ctx);
+            assert!(view.block_capture_stream.is_none());
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "output");
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_deleted_picker_target_preserves_existing_file() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.log");
+        std::fs::write(&path, "keep this file").unwrap();
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            let ids = view.capture_block_ids(ctx);
+            view.model.lock().finish_block();
+            view.model.lock().clear_screen(ClearMode::ResetAndClear);
+            view.finish_capture(path.clone(), CaptureRequest::block_output(false), &ids, ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep this file");
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_session_survives_shell_reported_typeahead_repair() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.log");
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            view.finish_capture(path.clone(), CaptureRequest::session(true), &[], ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        let background_id = terminal.update(&mut app, |view, ctx| {
+            let completed = *view.model.lock().block_list().active_block_id();
+            view.model.lock().finish_block();
+            view.model.lock().process_bytes("queued\r\n");
+            let background_id = *view
+                .model
+                .lock()
+                .block_list()
+                .blocks()
+                .iter()
+                .find(|block| block.is_background())
+                .unwrap()
+                .id();
+            view.on_block_completed_for_captures(completed, ctx);
+            background_id
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert!(std::fs::read_to_string(&path).unwrap().contains("queued"));
+        terminal.update(&mut app, |view, ctx| {
+            view.model.lock().preexec(PreexecValue {
+                command: "queued".to_string(),
+                session_id: None,
+            });
+            assert!(
+                view.model
+                    .lock()
+                    .block_list()
+                    .block_with_id(&background_id)
+                    .is_none()
+            );
+            view.model.lock().process_bytes("queued output");
+            view.pump_file_captures(ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        let captured = std::fs::read_to_string(&path).unwrap();
+        assert!(captured.ends_with("queued\nqueued output"));
+        assert!(captured.contains("long-command\noutput\n"));
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_session_includes_background_output_inserted_before_idle_prompt() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.log");
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            view.model.lock().finish_block();
+            view.finish_capture(path.clone(), CaptureRequest::session(true), &[], ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .process_bytes("background notification\r\n");
+            view.pump_file_captures(ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("background notification")
+        );
+        terminal.update(&mut app, |view, ctx| {
+            view.model
+                .lock()
+                .simulate_long_running_block("next", "next output");
+            let completed = *view.model.lock().block_list().active_block_id();
+            view.model.lock().finish_block();
+            view.on_block_completed_for_captures(completed, ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        let captured = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(captured.matches("background notification").count(), 1);
+        assert!(captured.contains("next\nnext output"));
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_busy_session_completion_then_clear_keeps_final_suffix_once() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.log");
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            view.finish_capture(path.clone(), CaptureRequest::session(true), &[], ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        terminal.update(&mut app, |view, ctx| {
+            view.model.lock().finish_block();
+            view.model
+                .lock()
+                .simulate_long_running_block("next", "initial");
+            view.pump_file_captures(ctx);
+            assert!(
+                view.session_capture_stream
+                    .as_ref()
+                    .unwrap()
+                    .stream
+                    .is_none()
+            );
+            view.model.lock().process_bytes(" final");
+            view.stop_file_captures(ctx);
+            view.model.lock().clear_screen(ClearMode::ResetAndClear);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        // Off-thread close may drain a final snapshot queued after the worker returned.
+        blocking::unblock(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                if file.try_lock().is_ok() {
+                    break;
+                }
+                assert!(std::time::Instant::now() < deadline);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let captured = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(captured.matches("long-command").count(), 1);
+            assert!(captured.ends_with("next\ninitial final"));
+        })
+        .await;
+    });
+}
+
+#[test]
+fn file_capture_selection_excludes_hidden_blocks_inside_range() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            let (first_index, first_id, hidden_index, last_index, last_id) = {
+                let mut model = view.model.lock();
+                let first_index = model.block_list().active_block_index();
+                let first_id = *model.block_list().active_block_id();
+                model.finish_block();
+                let hidden_index = model.block_list().active_block_index();
+                model.simulate_block("hidden-command", "hidden output");
+                let last_index = model.block_list().active_block_index();
+                let last_id = *model.block_list().active_block_id();
+                model.simulate_block("visible-command", "visible output");
+                model
+                    .block_list_mut()
+                    .block_at_mut(hidden_index)
+                    .unwrap()
+                    .hide();
+                (first_index, first_id, hidden_index, last_index, last_id)
+            };
+            view.selected_blocks.reset_to_single(first_index);
+            view.selected_blocks.range_select(last_index);
+            assert!(view.selected_blocks.is_selected(hidden_index));
+            // A contiguous selection includes hidden indices, but exported text must not.
+            assert_eq!(view.capture_block_ids(ctx), vec![first_id, last_id]);
+        });
+    });
+}
+
+#[test]
+fn file_capture_session_filename_uses_containing_tabs_custom_title() {
+    App::test((), |mut app| async move {
+        initialize_workspace_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let terminal = workspace.update(&mut app, |workspace, ctx| {
+            workspace.active_tab_pane_group().update(ctx, |group, ctx| {
+                group.set_title("capture tab", ctx);
+                group.active_session_view(ctx).unwrap()
+            })
+        });
+        terminal.update(&mut app, |view, ctx| {
+            assert!(view.pending_capture_session_name.is_none());
+            let filename = view.capture_filename(CaptureRequest::session(false), ctx);
+            // Direct session actions must resolve the title without a tab-menu override.
+            assert!(filename.starts_with("capture_tab_"), "{filename}");
+            assert!(filename.ends_with(".log"), "{filename}");
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_busy_wakeups_coalesce_into_latest_render() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("output.log");
+        terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            let ids = view.capture_block_ids(ctx);
+            view.finish_capture(path.clone(), CaptureRequest::block_output(true), &ids, ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        let expected = terminal.update(&mut app, |view, ctx| {
+            view.model.lock().process_bytes(" first");
+            view.pump_file_captures(ctx);
+            for _ in 0..100 {
+                view.model.lock().process_bytes("x");
+                view.pump_file_captures(ctx);
+            }
+            // Callbacks cannot run while this UI update owns the view. Every busy wakeup
+            // must reuse one dirty flag, with no additional writer jobs or render queue.
+            assert_eq!(view.capture_tasks.len(), 1);
+            assert!(view.block_capture_stream.as_ref().unwrap().dirty);
+            view.model
+                .lock()
+                .block_list()
+                .active_block()
+                .output_with_secrets_unobfuscated()
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        terminal.update(&mut app, |view, _| {
+            assert!(!view.block_capture_stream.as_ref().unwrap().dirty);
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_superseded_open_callback_cannot_replace_new_capture() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.log");
+        let second = directory.path().join("second.log");
+        let newest = terminal.update(&mut app, |view, ctx| {
+            bootstrap_with_long_running_block(view);
+            let ids = view.capture_block_ids(ctx);
+            view.finish_capture(first.clone(), CaptureRequest::block_output(true), &ids, ctx);
+            view.finish_capture(
+                second.clone(),
+                CaptureRequest::block_output(true),
+                &ids,
+                ctx,
+            );
+            view.capture_open_ids[0].unwrap()
+        });
+        await_file_captures(&terminal, &mut app).await;
+        terminal.update(&mut app, |view, ctx| {
+            assert_eq!(view.block_capture_stream.as_ref().unwrap().id, newest);
+            view.model.lock().process_bytes(" newest");
+            view.pump_file_captures(ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "output");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "output newest");
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn file_capture_menu_actions_restore_focus_and_preserve_selected_targets() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let (window, terminal) = add_window_with_id_and_terminal(&mut app, None);
+        terminal.update(&mut app, |view, _| {
+            bootstrap_with_long_running_block(view);
+            let index = view.model.lock().block_list().active_block_index();
+            view.selected_blocks.reset_to_single(index);
+        });
+        for action in [
+            ContextMenuAction::SaveOutputToFile,
+            ContextMenuAction::StreamOutputToFile,
+            ContextMenuAction::SaveBlockToFile,
+            ContextMenuAction::StreamBlockToFile,
+            ContextMenuAction::SaveSessionToFile,
+            ContextMenuAction::StreamSessionToFile,
+        ] {
+            let menu_id = terminal.update(&mut app, |view, ctx| {
+                view.context_menu_state = Some(ContextMenuState {
+                    menu_type: ContextMenuType::Prompt {
+                        position: vec2f(0., 0.),
+                    },
+                });
+                ctx.focus(&view.context_menu);
+                view.context_menu.id()
+            });
+            assert_eq!(app.focused_view_id(window), Some(menu_id));
+            terminal.update(&mut app, |view, ctx| {
+                let targets = view.capture_block_ids(ctx);
+                view.context_menu_action(&action, ctx);
+                assert!(!view.is_context_menu_open());
+                assert_eq!(view.capture_block_ids(ctx), targets);
+            });
+            // The test picker is inert; focus must already have left the dismissed menu.
+            assert_ne!(app.focused_view_id(window), Some(menu_id));
+        }
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn file_capture_cached_output_reuses_output_and_only_builds_requested_header() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        terminal.update(&mut app, |view, _| {
+            bootstrap_with_long_running_block(view);
+            let model = view.model.lock();
+            let block = model.block_list().active_block();
+            let mut cache = HashMap::new();
+            let mut output = String::new();
+            TerminalView::append_capture_block_text_cached(
+                block,
+                CaptureRequest::block_output(true),
+                &mut cache,
+                &mut output,
+                false,
+            );
+            assert_eq!(
+                output,
+                TerminalView::capture_block_text(block, CaptureRequest::block_output(true))
+            );
+            let cached = cache.get(block.id()).unwrap();
+            assert!(cached.header.is_none());
+            let output_allocation = cached.output.as_ptr();
+            let mut full = String::new();
+            TerminalView::append_capture_block_text_cached(
+                block,
+                CaptureRequest::session(true),
+                &mut cache,
+                &mut full,
+                false,
+            );
+            assert_eq!(
+                full,
+                TerminalView::capture_block_text(block, CaptureRequest::session(true))
+            );
+            let cached = cache.get(block.id()).unwrap();
+            assert!(cached.header.is_some());
+            // Overlapping scopes reuse the same rendered output allocation, storing only
+            // the additional command header instead of another full copy of the output.
+            assert_eq!(cached.output.as_ptr(), output_allocation);
+            assert_eq!(cache.len(), 1);
+        });
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+fn file_capture_unnamed_tab_does_not_reread_borrowed_workspace() {
+    App::test((), |mut app| async move {
+        initialize_workspace_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            assert!(
+                workspace
+                    .active_tab_pane_group()
+                    .as_ref(ctx)
+                    .custom_title(ctx)
+                    .is_none()
+            );
+            // This nested route owns a mutable workspace borrow. The terminal must use
+            // the explicitly supplied unnamed title rather than resolve the workspace again.
+            workspace.handle_action(
+                &WorkspaceAction::StreamSessionToFileFromTab { tab_index: 0 },
+                ctx,
+            );
+        });
+    });
+}

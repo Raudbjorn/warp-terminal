@@ -4916,6 +4916,31 @@ impl Workspace {
         }
     }
 
+    /// Capture a tab's session to a file from its right-click menu.
+    ///
+    /// Resolves the tab by index without calling `set_active_tab_index`, so
+    /// saving another tab's session does not pull focus away from the one you
+    /// are working in. Modelled on `copy_shared_session_link_from_tab` below.
+    fn capture_session_from_tab(
+        &mut self,
+        tab_index: usize,
+        keep_open: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(pane_group) = self.tabs.get(tab_index).map(|tab| tab.pane_group.clone()) else {
+            return;
+        };
+        // Only a tab the user explicitly renamed contributes a name; auto titles
+        // are derived from the working directory and make poor filenames.
+        let session_name = pane_group.as_ref(ctx).custom_title(ctx);
+        let Some(terminal_view) = pane_group.as_ref(ctx).focused_session_view(ctx) else {
+            return;
+        };
+        terminal_view.update(ctx, |view, ctx| {
+            view.capture_session_to_file(session_name, keep_open, ctx);
+        });
+    }
+
     fn copy_shared_session_link_from_tab(&mut self, tab_index: usize, ctx: &mut ViewContext<Self>) {
         // Get the pane group for the specified tab
         let Some(pane_group) = self.tabs.get(tab_index).map(|tab| tab.pane_group.clone()) else {
@@ -25858,6 +25883,12 @@ impl TypedActionView for Workspace {
             }
             StopSharingAllSessionsInTab { pane_group } => {
                 self.stop_sharing_all_panes_in_tab(pane_group, ctx)
+            }
+            SaveSessionToFileFromTab { tab_index } => {
+                self.capture_session_from_tab(*tab_index, false, ctx)
+            }
+            StreamSessionToFileFromTab { tab_index } => {
+                self.capture_session_from_tab(*tab_index, true, ctx)
             }
             CopySharedSessionLinkFromTab { tab_index } => {
                 self.copy_shared_session_link_from_tab(*tab_index, ctx)
