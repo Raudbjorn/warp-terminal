@@ -817,18 +817,6 @@ impl BillingMetadata {
         }
     }
 
-    pub fn is_byo_api_key_enabled(&self) -> bool {
-        self.tier
-            .byo_api_key_policy
-            .is_some_and(|policy| policy.enabled)
-    }
-
-    pub fn is_byo_endpoint_enabled(&self) -> bool {
-        self.tier
-            .byo_endpoint_policy
-            .is_some_and(|policy| policy.enabled)
-    }
-
     pub fn is_managed_byok_byoe_enabled(&self) -> bool {
         self.tier
             .managed_byok_byoe_policy

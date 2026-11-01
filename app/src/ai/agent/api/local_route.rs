@@ -3,12 +3,25 @@
 //!
 //! This build always runs the agent loop locally. A request routes locally
 //! when the selected base model belongs to one of the user's custom endpoints
-//! (its `config_key` appears in `settings.custom_model_providers`) and the
-//! input is of a kind the local engine supports (user queries, tool call
-//! results, and passive prompt suggestions). Anything else is blocked rather
-//! than forwarded — the client never talks to the Warp API server.
+//! (its `config_key` appears in `settings.custom_model_providers`), that
+//! endpoint speaks a wire protocol the engine implements (OpenAI Chat
+//! Completions or OpenAI Responses), and the input is of a kind the local
+//! engine supports (user queries, tool call results, and passive prompt
+//! suggestions). Anything else is blocked rather than forwarded — the client
+//! never talks to the Warp API server.
 
+use api::request::settings::custom_model_providers::{
+    CustomEndpointSchema, CustomModel, CustomModelProvider,
+};
 use warp_multi_agent_api as api;
+
+const ANTHROPIC_MESSAGES_UNSUPPORTED: &str = "the selected model's endpoint uses the Anthropic \
+     Messages schema, which the local agent loop does not support yet (switch the endpoint to \
+     OpenAI Chat Completions or OpenAI Responses)";
+const RESUME_UNSUPPORTED: &str = "the local agent loop cannot resume an interrupted request yet \
+     (send your message again)";
+const UNRECOGNIZED_SCHEMA: &str =
+    "the selected model's endpoint uses an API schema this build does not recognize";
 
 /// A resolved local route: the endpoint to call plus the `config_key` the
 /// adapter reports back in `TokenUsage`/`ModelUsed` events.
@@ -51,15 +64,27 @@ pub(crate) fn route_request(request: &api::Request) -> RequestDisposition {
 /// [`resolve_local_route`] returned `None`, so exactly one of the preconditions
 /// failed.
 fn block_reason(request: &api::Request) -> &'static str {
-    let input_supported = request
+    let input_type = request
         .input
         .as_ref()
-        .and_then(|input| input.r#type.as_ref())
-        .is_some_and(is_supported_input);
-    if !input_supported {
-        "the local agent loop does not support this kind of request"
-    } else {
-        "the selected model is not a custom endpoint model"
+        .and_then(|input| input.r#type.as_ref());
+    // The host sends this after a failed request. The failed attempt's task
+    // messages were rolled back, so there is nothing to continue from.
+    if matches!(
+        input_type,
+        Some(api::request::input::Type::ResumeConversation(_))
+    ) {
+        return RESUME_UNSUPPORTED;
+    }
+    if !input_type.is_some_and(is_supported_input) {
+        return "the local agent loop does not support this kind of request";
+    }
+    match find_custom_model(request) {
+        None => "the selected model is not a custom endpoint model",
+        Some((provider, _)) => engine_schema(provider.schema)
+            .err()
+            // A supported input and schema resolve, so this is purely defensive.
+            .unwrap_or("the selected model could not be resolved to a custom endpoint"),
     }
 }
 
@@ -68,6 +93,22 @@ pub(crate) fn resolve_local_route(request: &api::Request) -> Option<LocalRoute> 
         return None;
     }
 
+    let (provider, custom_model) = find_custom_model(request)?;
+    let schema = engine_schema(provider.schema).ok()?;
+    Some(LocalRoute {
+        endpoint: local_agent::LocalEndpointConfig {
+            base_url: provider.base_url.clone(),
+            api_key: provider.api_key.clone(),
+            model_slug: custom_model.slug.clone(),
+            schema,
+        },
+        config_key: custom_model.config_key.clone(),
+    })
+}
+
+/// Finds the custom endpoint provider and model whose `config_key` matches the
+/// request's selected base model, regardless of the endpoint's schema.
+fn find_custom_model(request: &api::Request) -> Option<(&CustomModelProvider, &CustomModel)> {
     let settings = request.settings.as_ref()?;
     let model = &settings.model_config.as_ref()?.base;
     settings
@@ -76,22 +117,25 @@ pub(crate) fn resolve_local_route(request: &api::Request) -> Option<LocalRoute> 
         .providers
         .iter()
         .find_map(|provider| {
-            if provider.schema != api::request::settings::custom_model_providers::CustomEndpointSchema::OpenaiChatCompletions as i32 {
-                return None;
-            }
             provider
                 .models
                 .iter()
                 .find(|custom_model| custom_model.config_key == *model)
-                .map(|custom_model| LocalRoute {
-                    endpoint: local_agent::LocalEndpointConfig {
-                        base_url: provider.base_url.clone(),
-                        api_key: provider.api_key.clone(),
-                        model_slug: custom_model.slug.clone(),
-                    },
-                    config_key: custom_model.config_key.clone(),
-                })
+                .map(|custom_model| (provider, custom_model))
         })
+}
+
+/// Maps a provider's proto schema tag to the wire protocol the engine speaks,
+/// or the reason it cannot be served locally.
+fn engine_schema(schema: i32) -> Result<local_agent::EndpointSchema, &'static str> {
+    match CustomEndpointSchema::try_from(schema) {
+        Ok(CustomEndpointSchema::OpenaiChatCompletions) => {
+            Ok(local_agent::EndpointSchema::ChatCompletions)
+        }
+        Ok(CustomEndpointSchema::OpenaiResponses) => Ok(local_agent::EndpointSchema::Responses),
+        Ok(CustomEndpointSchema::AnthropicMessages) => Err(ANTHROPIC_MESSAGES_UNSUPPORTED),
+        Err(_) => Err(UNRECOGNIZED_SCHEMA),
+    }
 }
 
 /// The local engine understands the plain agent-loop inputs and passive

@@ -1286,7 +1286,8 @@ fn test_has_any_ai_remaining_false_both_payg_and_autoreload_disabled() {
 #[test]
 fn test_has_any_ai_remaining_true_with_byok_enabled_and_key_provided() {
     App::test((), |mut app| async move {
-        // Create a workspace with BYOK (Bring Your Own Key) enabled.
+        // Create a workspace with BYOK (Bring Your Own Key) enabled. The policy is a no-op
+        // (BYOK is open to every signed-in user) and is set only to mirror a paid plan.
         let (_uid, mut workspace) = create_test_workspace();
         workspace.billing_metadata.tier.byo_api_key_policy =
             Some(ByoApiKeyPolicy { enabled: true });
@@ -1314,7 +1315,8 @@ fn test_has_any_ai_remaining_true_with_byok_enabled_and_key_provided() {
 #[test]
 fn test_has_any_ai_remaining_false_with_byok_enabled_but_no_key() {
     App::test((), |mut app| async move {
-        // Create a workspace with BYOK enabled but no key provided.
+        // Create a workspace with BYOK enabled but no key provided. The policy is a no-op
+        // (BYOK is open to every signed-in user); only the missing key decides.
         let (_uid, mut workspace) = create_test_workspace();
         workspace.billing_metadata.tier.byo_api_key_policy =
             Some(ByoApiKeyPolicy { enabled: true });
@@ -1338,8 +1340,8 @@ fn test_has_any_ai_remaining_false_with_byok_enabled_but_no_key() {
 #[test]
 fn test_has_any_ai_remaining_true_with_grok_subscription_connected() {
     App::test((), |mut app| async move {
-        // Workspace with BYO enabled — the policy a connected Grok
-        // subscription's OAuth token rides on.
+        // Workspace with BYO enabled. The policy is a no-op (BYOK is open to every signed-in
+        // user); a connected Grok subscription's OAuth token rides on the BYO gate.
         let (_uid, mut workspace) = create_test_workspace();
         workspace.billing_metadata.tier.byo_api_key_policy =
             Some(ByoApiKeyPolicy { enabled: true });
@@ -1372,11 +1374,13 @@ fn test_has_any_ai_remaining_true_with_grok_subscription_connected() {
 }
 
 #[test]
-fn test_has_any_ai_remaining_false_with_grok_subscription_but_byo_disabled() {
+fn test_has_any_ai_remaining_true_with_grok_subscription_on_workspace_with_byok_policy_disabled() {
     App::test((), |mut app| async move {
-        // No BYO policy: the Grok token can't be sent, so it must not count as
-        // available AI.
-        let (_uid, workspace) = create_test_workspace();
+        // The workspace's plan explicitly disables BYOK, but BYOK is open to every signed-in
+        // user: the Grok token is still sent, so it counts as available AI.
+        let (_uid, mut workspace) = create_test_workspace();
+        workspace.billing_metadata.tier.byo_api_key_policy =
+            Some(ByoApiKeyPolicy { enabled: false });
 
         add_user_workspaces_with_workspace(&mut app, workspace);
         let request_usage_model = add_request_usage_model(&mut app);
@@ -1396,8 +1400,8 @@ fn test_has_any_ai_remaining_false_with_grok_subscription_but_byo_disabled() {
             model.bonus_grants.clear();
 
             assert!(
-                !model.has_any_ai_remaining(&TeamlessScopeForTest, ctx),
-                "expected has_any_ai_remaining to be false when a Grok subscription is connected but BYO is disabled",
+                model.has_any_ai_remaining(&TeamlessScopeForTest, ctx),
+                "expected has_any_ai_remaining to be true when a Grok subscription is connected, whatever the workspace's BYO policy",
             );
         });
     });
@@ -1406,7 +1410,8 @@ fn test_has_any_ai_remaining_false_with_grok_subscription_but_byo_disabled() {
 #[test]
 fn test_has_any_ai_remaining_true_with_byo_key_and_no_workspace() {
     App::test((), |mut app| async move {
-        let _guard = FeatureFlag::SoloUserByok.override_enabled(true);
+        // The flag is forced off: a signed-in solo user's BYOK does not depend on it.
+        let _guard = FeatureFlag::SoloUserByok.override_enabled(false);
 
         // No workspace — user is not on a team.
         app.add_singleton_model(UserWorkspaces::default_mock);
@@ -1601,7 +1606,8 @@ fn test_reset_server_availability_restores_prefetch_fallback() {
 #[test]
 fn test_out_of_credits_refined_by_local_byo_key() {
     App::test((), |mut app| async move {
-        // BYOK is allowed by policy, but no key has been stored locally.
+        // BYOK is open to the signed-in user (the policy below is a no-op), but no key has
+        // been stored locally.
         let (_uid, mut workspace) = create_test_workspace();
         workspace.billing_metadata.tier.byo_api_key_policy =
             Some(ByoApiKeyPolicy { enabled: true });

@@ -8,24 +8,36 @@
 //! adapter that turns the suggestion request into a chat completion and parses
 //! the reply back.
 
-use ai::api_keys::{ApiKeyManager, CustomEndpoint};
-use local_agent::{ChatMessage, LocalEndpointConfig};
+use ai::api_keys::{ApiKeyManager, CustomEndpoint, CustomEndpointSchema};
+use local_agent::{ChatMessage, EndpointSchema, LocalEndpointConfig};
 use warpui::{AppContext, EntityId, SingletonEntity};
 
 use super::{GenerateAIInputSuggestionsRequest, GenerateAIInputSuggestionsResponseV2};
 use crate::ai::execution_profiles::profiles::AIExecutionProfilesModel;
 use crate::ai::llms::LLMPreferences;
 use crate::server::server_api::AIApiError;
-use crate::server::team_scope::RequestTeamScope;
+use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
 
 /// Resolves the local endpoint to use for a next-command prediction, or `None`
-/// to fall back to the server. Returns a config only when the active base model
-/// belongs to one of the user's custom endpoints.
+/// to fall back to the server. Returns a config only when custom endpoints are
+/// permitted for `scope` and the active base model belongs to one of the user's
+/// custom endpoints.
+///
+/// `scope` is the live team scope rather than a resolved `RequestTeamScope`
+/// because the endpoint policy is read per team.
 pub(crate) fn resolve_local_input_endpoint(
     ctx: &AppContext,
     terminal_view_id: Option<EntityId>,
-    scope: &RequestTeamScope,
+    scope: &(impl TeamScope + ?Sized),
 ) -> Option<LocalEndpointConfig> {
+    // The same gate agent requests apply (`ai::agent::api`): without it, a user or team that
+    // may not use custom endpoints would still have next-command predictions sent to one.
+    let user_workspaces = UserWorkspaces::as_ref(ctx);
+    if !(user_workspaces.is_byo_endpoint_enabled(ctx)
+        && user_workspaces.are_member_byo_endpoints_allowed(scope))
+    {
+        return None;
+    }
     let active_model_id = LLMPreferences::as_ref(ctx)
         .get_active_base_model_for_team_uid(scope.team_uid(), ctx, terminal_view_id)
         .id
@@ -43,8 +55,20 @@ pub(crate) fn resolve_local_input_endpoint(
     )
 }
 
+/// Maps a configured endpoint schema onto the wire protocol the engine speaks,
+/// or `None` for protocols it cannot speak yet (Anthropic Messages).
+fn engine_schema(schema: CustomEndpointSchema) -> Option<EndpointSchema> {
+    match schema {
+        CustomEndpointSchema::OpenaiChatCompletions => Some(EndpointSchema::ChatCompletions),
+        CustomEndpointSchema::OpenaiResponses => Some(EndpointSchema::Responses),
+        CustomEndpointSchema::AnthropicMessages => None,
+    }
+}
+
 /// Finds the custom endpoint + model whose `config_key` matches the active base
-/// model id, skipping endpoints with an empty URL or API key.
+/// model id, skipping endpoints with an empty URL or a schema the engine cannot
+/// speak. The endpoint's schema is carried through so Responses endpoints are
+/// called with the Responses protocol.
 pub(crate) fn pick_custom_endpoint(
     active_model_id: &str,
     endpoints: &[CustomEndpoint],
@@ -57,6 +81,14 @@ pub(crate) fn pick_custom_endpoint(
         if base_url.is_empty() {
             continue;
         }
+        let Some(schema) = engine_schema(endpoint.schema) else {
+            log::debug!(
+                "local next command: skipping custom endpoint {:?}, unsupported schema {}",
+                endpoint.name,
+                endpoint.schema.display_name()
+            );
+            continue;
+        };
         let api_key = endpoint.api_key.trim();
         for model in &endpoint.models {
             let model_slug = model.name.trim();
@@ -68,6 +100,7 @@ pub(crate) fn pick_custom_endpoint(
                     base_url: base_url.to_string(),
                     api_key: api_key.to_string(),
                     model_slug: model_slug.to_string(),
+                    schema,
                 });
             }
         }

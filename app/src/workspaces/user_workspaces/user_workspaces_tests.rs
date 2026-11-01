@@ -86,10 +86,11 @@ use crate::workspaces::team_tester::TeamTesterStatus;
 use crate::workspaces::update_manager::TeamUpdateManager;
 use crate::workspaces::user_workspaces::UserWorkspaces;
 use crate::workspaces::workspace::{
-    AdminEnablementSetting, ByoFirstPartyKey, ChargeUnit, EnforceableSetting,
-    HostEnablementSetting, LinkSharingSettings, LlmHostSettings, ManagedByokByoePolicy,
-    MultiAdminPolicy, PurchaseAddOnCreditsPolicy, SandboxedAgentSettings, SplitListSetting,
-    TeamByoSettings, TeamLinkSharingSettings, Workspace, WorkspaceMember, WorkspaceMemberUsageInfo,
+    AdminEnablementSetting, ByoApiKeyPolicy, ByoEndpointPolicy, ByoFirstPartyKey, ChargeUnit,
+    EnforceableSetting, HostEnablementSetting, LinkSharingSettings, LlmHostSettings,
+    ManagedByokByoePolicy, MultiAdminPolicy, PurchaseAddOnCreditsPolicy, SandboxedAgentSettings,
+    SplitListSetting, TeamByoSettings, TeamLinkSharingSettings, Workspace, WorkspaceMember,
+    WorkspaceMemberUsageInfo,
 };
 
 #[derive(Default)]
@@ -315,6 +316,151 @@ fn test_codebase_context_enabled_with_no_workspace() {
             assert!(
                 codebase_context_enabled,
                 "codebase context should be on by default"
+            );
+        });
+    })
+}
+
+/// BYOK and custom endpoints are open to every signed-in user, whatever the workspace's plan says
+/// and whether or not the `SoloUserByok` flag is on. The flag is forced off so a regression that
+/// reintroduces the old flag-gated no-workspace fallback fails here.
+#[test]
+fn byo_gates_open_for_signed_in_user_without_a_workspace() {
+    let _flag = FeatureFlag::SoloUserByok.override_enabled(false);
+
+    App::test((), |mut app| async move {
+        initialize_app(
+            &mut app,
+            CachedResources { workspaces: vec![] },
+            Arc::new(MockTeamClient::new()),
+            Arc::new(MockWorkspaceClient::new()),
+        );
+
+        app.read(|ctx| {
+            let user_workspaces = UserWorkspaces::as_ref(ctx);
+            assert!(
+                user_workspaces.is_byo_api_key_enabled(ctx),
+                "a signed-in user with no workspace should be able to use BYO API keys",
+            );
+            assert!(
+                user_workspaces.is_byo_endpoint_enabled(ctx),
+                "a signed-in user with no workspace should be able to use custom endpoints",
+            );
+        });
+    })
+}
+
+/// A workspace whose billing tier explicitly disables BYOK/BYOE, and one whose tier carries no
+/// policy at all (how a free plan arrives), must both leave the gates open. The explicit-disable
+/// case is the one the plan entitlement used to close.
+#[test]
+fn byo_gates_ignore_the_workspace_billing_policy() {
+    let _flag = FeatureFlag::SoloUserByok.override_enabled(false);
+
+    let mut explicitly_disabled = workspace_for_test(&team_for_test());
+    explicitly_disabled.billing_metadata.tier.byo_api_key_policy =
+        Some(ByoApiKeyPolicy { enabled: false });
+    explicitly_disabled
+        .billing_metadata
+        .tier
+        .byo_endpoint_policy = Some(ByoEndpointPolicy { enabled: false });
+    let mut no_policy = workspace_for_test(&team_for_test());
+    no_policy.billing_metadata.tier.byo_api_key_policy = None;
+    no_policy.billing_metadata.tier.byo_endpoint_policy = None;
+
+    for workspace in [explicitly_disabled, no_policy] {
+        App::test((), |mut app| async move {
+            initialize_app(
+                &mut app,
+                CachedResources {
+                    workspaces: vec![workspace],
+                },
+                Arc::new(MockTeamClient::new()),
+                Arc::new(MockWorkspaceClient::new()),
+            );
+
+            app.read(|ctx| {
+                let user_workspaces = UserWorkspaces::as_ref(ctx);
+                assert!(
+                    user_workspaces.current_workspace().is_some(),
+                    "the test workspace should be the current workspace",
+                );
+                assert!(
+                    user_workspaces.is_byo_api_key_enabled(ctx),
+                    "the workspace's BYO API key policy must not close the gate",
+                );
+                assert!(
+                    user_workspaces.is_byo_endpoint_enabled(ctx),
+                    "the workspace's BYO endpoint policy must not close the gate",
+                );
+            });
+        })
+    }
+}
+
+/// Anonymous and logged-out users stay gated: opening BYOK for every *account* does not open it
+/// for users who have none. Pins the one branch of the gates that the billing policy does not
+/// decide.
+#[test]
+fn byo_gates_stay_closed_for_anonymous_and_logged_out_users() {
+    for auth_state_provider in [
+        AuthStateProvider::new_anonymous_for_test(),
+        AuthStateProvider::new_logged_out_for_test(),
+    ] {
+        App::test((), |mut app| async move {
+            initialize_app_with_auth(
+                &mut app,
+                CachedResources { workspaces: vec![] },
+                Arc::new(MockTeamClient::new()),
+                Arc::new(MockWorkspaceClient::new()),
+                auth_state_provider,
+            );
+
+            app.read(|ctx| {
+                let user_workspaces = UserWorkspaces::as_ref(ctx);
+                assert!(!user_workspaces.is_byo_api_key_enabled(ctx));
+                assert!(!user_workspaces.is_byo_endpoint_enabled(ctx));
+            });
+        })
+    }
+}
+
+/// Opening the plan-level gates must leave the admin's managed-BYOK policy in force: a team that
+/// forbids member credentials still does, on a workspace whose billing policy disables BYOK.
+#[test]
+fn managed_byok_team_policy_still_binds_when_the_byo_gates_are_open() {
+    let (_team_a, team_b) = two_teams_with_opposing_byo_policy();
+    let mut workspace = workspace_for_test(&team_b);
+    workspace.billing_metadata.tier.byo_api_key_policy = Some(ByoApiKeyPolicy { enabled: false });
+    workspace.billing_metadata.tier.byo_endpoint_policy =
+        Some(ByoEndpointPolicy { enabled: false });
+
+    App::test((), |mut app| async move {
+        initialize_app(
+            &mut app,
+            CachedResources {
+                workspaces: vec![workspace],
+            },
+            Arc::new(MockTeamClient::new()),
+            Arc::new(MockWorkspaceClient::new()),
+        );
+
+        app.read(|ctx| {
+            let user_workspaces = UserWorkspaces::as_ref(ctx);
+            let scope = TeamContextForOperation::new_for_test(team_b.uid);
+            assert!(user_workspaces.is_byo_api_key_enabled(ctx));
+            assert!(user_workspaces.is_byo_endpoint_enabled(ctx));
+            assert!(
+                !user_workspaces.are_member_byo_keys_allowed(&scope),
+                "the team admin's managed BYOK policy must still forbid member keys",
+            );
+            assert!(
+                !user_workspaces.are_member_byo_endpoints_allowed(&scope),
+                "the team admin's managed BYOE policy must still forbid member endpoints",
+            );
+            assert!(
+                !user_workspaces.is_byo_endpoint_enabled_for_any_team(ctx),
+                "no team allows member endpoints, so the any-team gate must stay closed",
             );
         });
     })
@@ -2614,7 +2760,7 @@ fn member_byo_policy_for_a_teamless_scope_ignores_teams_in_another_workspace() {
 }
 
 /// `team_byo` is only administered by plans that manage credentials centrally, so without
-/// that entitlement the team's policy is inert and the plan's own BYO entitlement decides.
+/// that entitlement the team's policy is inert and the plain BYO gate decides.
 #[test]
 fn member_byo_policy_is_unrestricted_without_the_managed_byok_entitlement() {
     let (_team_a, mut team_b) = two_teams_with_opposing_byo_policy();

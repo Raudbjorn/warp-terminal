@@ -1,7 +1,7 @@
 //! Unit tests for the pure parts of the local next-command adapter: transcript
 //! building, model-output parsing, and custom-endpoint resolution.
 
-use ai::api_keys::{CustomEndpoint, CustomEndpointModel};
+use ai::api_keys::{CustomEndpoint, CustomEndpointModel, CustomEndpointSchema};
 
 use super::*;
 
@@ -165,4 +165,60 @@ fn skips_endpoints_with_empty_url() {
     ];
     assert!(pick_custom_endpoint("cfg-1", &endpoints).is_none());
     assert!(pick_custom_endpoint("cfg-2", &endpoints).is_some());
+}
+
+fn endpoint_with_schema(schema: CustomEndpointSchema, config_key: &str) -> CustomEndpoint {
+    CustomEndpoint {
+        schema,
+        ..endpoint(
+            "Provider",
+            "https://llm.example.com/v1",
+            "sk-test",
+            &[("gpt-5", config_key)],
+        )
+    }
+}
+
+#[test]
+fn chat_completions_endpoints_resolve_to_the_chat_schema() {
+    let endpoints = vec![endpoint_with_schema(
+        CustomEndpointSchema::OpenaiChatCompletions,
+        "cfg-1",
+    )];
+
+    let resolved = pick_custom_endpoint("cfg-1", &endpoints).expect("should resolve");
+    assert_eq!(resolved.schema, EndpointSchema::ChatCompletions);
+}
+
+#[test]
+fn responses_endpoints_resolve_to_the_responses_schema() {
+    let endpoints = vec![endpoint_with_schema(
+        CustomEndpointSchema::OpenaiResponses,
+        "cfg-1",
+    )];
+
+    let resolved = pick_custom_endpoint("cfg-1", &endpoints).expect("should resolve");
+    assert_eq!(resolved.schema, EndpointSchema::Responses);
+    assert_eq!(resolved.model_slug, "gpt-5");
+}
+
+#[test]
+fn schema_follows_the_matched_endpoint_not_the_first_one() {
+    let endpoints = vec![
+        endpoint_with_schema(CustomEndpointSchema::OpenaiChatCompletions, "cfg-chat"),
+        endpoint_with_schema(CustomEndpointSchema::OpenaiResponses, "cfg-responses"),
+    ];
+
+    let resolved = pick_custom_endpoint("cfg-responses", &endpoints).expect("should resolve");
+    assert_eq!(resolved.schema, EndpointSchema::Responses);
+}
+
+#[test]
+fn anthropic_messages_endpoints_are_not_resolved() {
+    let endpoints = vec![endpoint_with_schema(
+        CustomEndpointSchema::AnthropicMessages,
+        "cfg-1",
+    )];
+
+    assert!(pick_custom_endpoint("cfg-1", &endpoints).is_none());
 }

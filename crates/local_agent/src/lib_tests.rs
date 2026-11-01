@@ -14,6 +14,7 @@ fn config_for(server: &ServerGuard) -> LocalEndpointConfig {
         base_url: server.url(),
         api_key: "test-key".to_string(),
         model_slug: "test-model".to_string(),
+        schema: crate::EndpointSchema::ChatCompletions,
     }
 }
 
@@ -429,6 +430,7 @@ async fn sends_chat_completions_request_with_expected_shape() {
                 name: "run_shell_command".to_string(),
                 arguments: json!({ "command": "ls" }),
             }],
+            replay_items: vec![],
         },
         ChatMessage::Tool {
             tool_call_id: "call_prev".to_string(),
@@ -465,6 +467,7 @@ async fn base_url_already_ending_in_chat_completions_is_used_as_is() {
         base_url: format!("{}/chat/completions", server.url()),
         api_key: "test-key".to_string(),
         model_slug: "test-model".to_string(),
+        schema: crate::EndpointSchema::ChatCompletions,
     };
 
     let events = expect_ok(collect_events(user_only_transcript(), vec![], config).await);
