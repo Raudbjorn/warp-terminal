@@ -371,11 +371,13 @@ impl DisableReason {
 /// user between devices and teams, so a team-scoped answer here would propagate a clear
 /// everywhere. A team that forbids a credential blocks it where the user acts instead.
 ///
-/// The plan entitlement is the whole question: `has_byok_key` only reaches the
-/// `RequiresUpgrade` arm, and the team-managed key half would always be `false` there anyway,
-/// since `has_team_first_party_key` requires managed BYOK/BYOE (enterprise) while
-/// `RequiresUpgrade` is a free-plan reason. That invariant is product shape, not something the
-/// types or the server contract enforce; it stops holding if enterprise gains such a tier.
+/// Whether the user holds a key for the model's provider is the whole question: the BYO gate
+/// behind `has_byok_key` is open to every signed-in user, so no plan entitlement decides it.
+/// `has_byok_key` only reaches the `RequiresUpgrade` arm, and the team-managed key half would
+/// always be `false` there anyway, since `has_team_first_party_key` requires managed BYOK/BYOE
+/// (enterprise) while `RequiresUpgrade` is a free-plan reason. That invariant is product shape,
+/// not something the types or the server contract enforce; it stops holding if enterprise gains
+/// such a tier.
 fn is_usable_llm(info: &LLMInfo, app: &AppContext) -> bool {
     let has_byok_key = is_using_api_key_for_provider(&info.provider, app);
     info.disable_reason
