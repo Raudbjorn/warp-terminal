@@ -53,8 +53,12 @@ This fork selectively integrates the following features from
   use a formatter selected by the project, falling back to the existing language
   server where applicable. Configure **Format on save** and **Use project
   formatters** in **Settings → Code → Editor & Code Review**. Project formatting
-  runs installed tools; it does not download formatters. A failed or stale result
-  cannot replace newer editor text. Typing-triggered autosave skips formatting;
+  runs installed tools; it does not download formatters. Before using a project's
+  tools, plugins, or executable configuration, invoke **Format document** and
+  approve that project for the current application session. Ordinary saves use
+  the existing language-server path until approval; the global setting does not
+  grant permission. Discovery runs off the UI thread with a bounded wait. A failed
+  or stale result cannot replace newer editor text. Typing-triggered autosave skips formatting;
   saves during tab closure flush immediately without waiting for a formatter.
 - **Multi-repository Git:** open source control from a terminal in a local folder
   containing repositories or linked worktrees. Each repository has its own
@@ -64,12 +68,19 @@ This fork selectively integrates the following features from
   confirmation and removes untracked files as well as tracked changes.
 
 Replacement skips unsafe or unsupported files (including binary files and files
-over 16 MiB). Its undo journal stores copies under the app's local state directory,
+or open buffers over 16 MiB). Selected replacement output and edit allocations
+are bounded by the same per-file budget. Its undo journal stores copies under the app's local state directory,
 including unsaved buffer contents, and keeps up to five transactions within a
 512 MiB total budget. Unix journals use owner-only permissions; on Windows they
 inherit the state directory's ACL. Project replacement clears ordinary buffer
 undo history; use the replacement journal to undo it. Undo refuses files that
 have grown beyond its 256 MiB read limit.
+
+Replacement and undo wait for required buffer saves to finish. Failed saves are
+reported and retain their journal entries for retry; intentionally dirty buffers
+stay unsaved. Disk replacement checks resolved containment and rechecks file
+identity and content after preparing the temporary file. A concurrent filesystem
+change in the final check-to-rename interval is still possible.
 
 Repository discovery searches up to six levels, skips `node_modules` and symlinked
 directories, and avoids scanning the home directory or its ancestors. The overview

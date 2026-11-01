@@ -16,7 +16,7 @@ use crate::engine::{FindError, MatchFinder, SearchSpec};
 use crate::journal::{
     EntryKind, Journal, RecordError, TransactionDescription, TransactionWriter, sha256_hex,
 };
-use crate::plan::{FileExpectation, TextEdit, apply_edits, plan_edits};
+use crate::plan::{FileExpectation, TextEdit, apply_edits, plan_selected_edits};
 use crate::replacement::ReplaceSpec;
 use crate::report::{ReplaceCounts, ReplacedFile, SkipReason, SkippedFile};
 use crate::scope::{Scope, ScopeError, ScopeGlobs};
@@ -106,6 +106,8 @@ pub struct AppliedBufferEdits {
     /// The editor's text after the edits.
     pub text_after: String,
     pub occurrences: usize,
+    /// The buffer changed, but persisting it failed. Its undo copy must still be retained.
+    pub save_error: Option<String>,
 }
 
 /// The whole of a finished replace.
@@ -142,10 +144,19 @@ impl ReplaceOutcome {
         self.skipped.extend(skipped);
         for planned in &self.buffer_edits {
             if let Some(applied) = applied.iter().find(|applied| applied.path == planned.path) {
-                self.replaced.push(ReplacedFile {
-                    path: applied.path.clone(),
-                    occurrences: applied.occurrences,
-                });
+                if let Some(error) = &applied.save_error {
+                    self.skipped.push(SkippedFile {
+                        path: applied.path.clone(),
+                        reason: SkipReason::WriteFailed(format!(
+                            "buffer changed but remains unsaved: {error}"
+                        )),
+                    });
+                } else {
+                    self.replaced.push(ReplacedFile {
+                        path: applied.path.clone(),
+                        occurrences: applied.occurrences,
+                    });
+                }
             } else if let Err(err) = self.writer.retract(planned.journal_index) {
                 log::warn!("could not retract an unapplied buffer replacement: {err}");
             }
@@ -179,6 +190,15 @@ pub fn replace_in_files(
 ) -> Result<ReplaceOutcome, ReplaceError> {
     let finder = MatchFinder::new(&request.search, Some(&request.replace))?;
     let scope = Scope::parse(&request.scope)?;
+    let roots: Vec<_> = request
+        .roots
+        .iter()
+        .filter_map(|root| {
+            fs::canonicalize(root)
+                .ok()
+                .map(|resolved| (root.clone(), resolved))
+        })
+        .collect();
     let open_buffers = OpenBuffers::new(&request.open_buffers);
     let mut writer = journal.begin(TransactionDescription {
         pattern: request.search.pattern.clone(),
@@ -197,26 +217,48 @@ pub fn replace_in_files(
             break;
         }
 
-        let result = if !in_scope(&request.roots, &scope, &target.path) {
-            Err(SkipReason::OutOfScope)
-        } else if let Some(buffer) = open_buffers.for_path(&target.path) {
-            plan_buffer_edits(&finder, target, buffer, &mut writer).map(|edits| {
-                if let Some(edits) = edits {
-                    buffer_edits.push(edits);
+        let result = match scoped_path(&roots, &scope, &target.path) {
+            Err(reason) => Err(reason),
+            Ok(resolved_path) => {
+                if let Some(buffer) = open_buffers.for_path(&target.path) {
+                    plan_buffer_edits(
+                        &finder,
+                        target,
+                        buffer,
+                        request.max_file_bytes,
+                        &mut writer,
+                        cancel,
+                    )
+                    .map(|edits| {
+                        if let Some(edits) = edits {
+                            buffer_edits.push(edits);
+                        }
+                    })
+                } else {
+                    replace_on_disk(
+                        &finder,
+                        target,
+                        &resolved_path,
+                        request.max_file_bytes,
+                        &mut writer,
+                        cancel,
+                    )
+                    .map(|occurrences| {
+                        if occurrences > 0 {
+                            outcome_replaced.push(ReplacedFile {
+                                path: target.path.clone(),
+                                occurrences,
+                            });
+                        }
+                    })
                 }
-            })
-        } else {
-            replace_on_disk(&finder, target, request.max_file_bytes, &mut writer).map(
-                |occurrences| {
-                    if occurrences > 0 {
-                        outcome_replaced.push(ReplacedFile {
-                            path: target.path.clone(),
-                            occurrences,
-                        });
-                    }
-                },
-            )
+            }
         };
+
+        if cancel.load(Ordering::Relaxed) && result.is_err() {
+            not_attempted = total - done;
+            break;
+        }
         if let Err(reason) = result {
             skipped.push(SkippedFile {
                 path: target.path.clone(),
@@ -238,10 +280,31 @@ pub fn replace_in_files(
     })
 }
 
-fn in_scope(roots: &[PathBuf], scope: &Scope, path: &Path) -> bool {
-    roots
+fn scoped_path(
+    roots: &[(PathBuf, PathBuf)],
+    scope: &Scope,
+    path: &Path,
+) -> Result<PathBuf, SkipReason> {
+    if !roots
         .iter()
-        .any(|root| path.starts_with(root) && scope.includes(root, path))
+        .any(|(root, _)| path.starts_with(root) && scope.includes(root, path))
+    {
+        return Err(SkipReason::OutOfScope);
+    }
+    let resolved = fs::canonicalize(path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            SkipReason::Missing
+        } else {
+            SkipReason::ReadFailed(err.to_string())
+        }
+    })?;
+    if roots.iter().any(|(root, resolved_root)| {
+        path.starts_with(root) && scope.includes(root, path) && resolved.starts_with(resolved_root)
+    }) {
+        Ok(resolved)
+    } else {
+        Err(SkipReason::OutOfScope)
+    }
 }
 
 /// Looks open editors up by the file they hold, whichever way the path to it is spelled.
@@ -275,19 +338,27 @@ fn canonical(path: &Path) -> PathBuf {
 fn replace_on_disk(
     finder: &MatchFinder,
     target: &FileTarget,
+    resolved_path: &Path,
     max_file_bytes: u64,
     writer: &mut TransactionWriter,
+    cancel: &AtomicBool,
 ) -> Result<usize, SkipReason> {
     let (bytes, stamp) = read_rewritable(&target.path, max_file_bytes)?;
+    if stamp.resolved_path() != resolved_path {
+        return Err(SkipReason::ChangedDuringReplace);
+    }
     let decoded = decode(&bytes).map_err(|err| match err {
         DecodeError::Binary => SkipReason::Binary,
         DecodeError::UnsupportedEncoding => SkipReason::UnsupportedEncoding,
     })?;
-    let found = finder
-        .find(&decoded.text)
-        .map_err(|err| SkipReason::SearchFailed(err.to_string()))?;
-    let edits = plan_edits(&found, &target.expectation, false)
-        .map_err(|_| SkipReason::ChangedSinceSearch)?;
+    let edits = plan_selected_edits(
+        finder,
+        &decoded.text,
+        &target.expectation,
+        false,
+        max_file_bytes,
+        cancel,
+    )?;
     if edits.is_empty() {
         return Ok(0);
     }
@@ -304,7 +375,7 @@ fn replace_on_disk(
 
     let index = writer
         .record(
-            &target.path,
+            stamp.resolved_path(),
             EntryKind::Disk,
             &bytes,
             sha256_hex(&new_bytes),
@@ -321,11 +392,15 @@ fn replace_on_disk(
         }
         return Err(SkipReason::ChangedDuringReplace);
     }
-    if let Err(err) = write_atomically(&target.path, &new_bytes, stamp.metadata()) {
+    if let Err(err) = write_atomically(&target.path, &new_bytes, &stamp) {
         if let Err(retract_err) = writer.retract(index) {
             log::warn!("could not take back a replace journal entry: {retract_err}");
         }
-        return Err(SkipReason::WriteFailed(err.to_string()));
+        return Err(if err.kind() == std::io::ErrorKind::WouldBlock {
+            SkipReason::ChangedDuringReplace
+        } else {
+            SkipReason::WriteFailed(err.to_string())
+        });
     }
     Ok(edits.len())
 }
@@ -336,8 +411,16 @@ fn plan_buffer_edits(
     finder: &MatchFinder,
     target: &FileTarget,
     buffer: &OpenBuffer,
+    max_file_bytes: u64,
     writer: &mut TransactionWriter,
+    cancel: &AtomicBool,
 ) -> Result<Option<BufferEdits>, SkipReason> {
+    if buffer.text.len() as u64 > max_file_bytes {
+        return Err(SkipReason::TooLarge {
+            bytes: buffer.text.len() as u64,
+            limit: max_file_bytes,
+        });
+    }
     // The search does not count the byte order mark as part of the first line.
     let searched = buffer
         .text
@@ -348,11 +431,14 @@ fn plan_buffer_edits(
         return Err(SkipReason::Binary);
     }
 
-    let found = finder
-        .find(searched)
-        .map_err(|err| SkipReason::SearchFailed(err.to_string()))?;
-    let mut edits = plan_edits(&found, &target.expectation, true)
-        .map_err(|_| SkipReason::ChangedSinceSearch)?;
+    let mut edits = plan_selected_edits(
+        finder,
+        searched,
+        &target.expectation,
+        true,
+        max_file_bytes.saturating_sub(offset as u64),
+        cancel,
+    )?;
     if edits.is_empty() || apply_edits(searched, &edits) == searched {
         return Ok(None);
     }
@@ -363,7 +449,11 @@ fn plan_buffer_edits(
     let journal_index = writer
         .record(
             &target.path,
-            EntryKind::Buffer,
+            if buffer.has_unsaved_changes {
+                EntryKind::Buffer
+            } else {
+                EntryKind::SavedBuffer
+            },
             buffer.text.as_bytes(),
             sha256_hex(apply_edits(&buffer.text, &edits).as_bytes()),
             edits.len(),
@@ -383,3 +473,7 @@ fn plan_buffer_edits(
 #[cfg(test)]
 #[path = "apply_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "containment_tests.rs"]
+mod containment_tests;

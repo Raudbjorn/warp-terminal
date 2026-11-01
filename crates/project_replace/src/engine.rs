@@ -1,15 +1,16 @@
 //! The search configuration shared by the search worker and by replacing, so that replacing finds
 //! exactly the matches the search showed.
 
-use std::io;
+use std::cell::Cell;
+use std::io::{self, Read};
 use std::ops::{Not, Range};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use grep::matcher::{Captures, Match, Matcher};
 use grep::printer::JSONBuilder;
 use grep::regex::{RegexMatcher, RegexMatcherBuilder};
-use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder};
-use serde::Deserialize;
-use serde_json::value::RawValue;
+use grep::searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkError, SinkMatch};
 use thiserror::Error;
 
 use crate::replacement::{ReplaceSpec, preserve_case};
@@ -121,6 +122,16 @@ pub enum FindError {
     Search(String),
     #[error("the search result could not be read: {0}")]
     Output(String),
+    #[error("replacement exceeds the {limit} byte limit")]
+    TooLarge { bytes: usize, limit: usize },
+    #[error("replacement was cancelled")]
+    Cancelled,
+}
+
+impl SinkError for FindError {
+    fn error_message<T: std::fmt::Display>(message: T) -> Self {
+        Self::Search(message.to_string())
+    }
 }
 
 /// Finds the occurrences of a search in a text the way the search worker finds them in a file,
@@ -150,123 +161,227 @@ impl MatchFinder {
         })
     }
 
-    /// Every occurrence in `text`, in the order they appear.
+    /// Every occurrence in `text`, bounded even for callers collecting all results.
     pub fn find(&self, text: &str) -> Result<Vec<FoundMatch>, FindError> {
-        let mut output = Vec::new();
-        {
-            let mut printer = JSONBuilder::new()
-                .replacement(self.template.clone())
-                .build(&mut output);
-            build_searcher(self.multiline)
-                .search_reader(&self.matcher, text.as_bytes(), printer.sink(&self.matcher))
-                .map_err(|err| FindError::Search(err.to_string()))?;
-        }
-
         let mut found = Vec::new();
-        for line in output.split(|byte| *byte == b'\n') {
-            if line.is_empty() {
-                continue;
-            }
-            let envelope: Envelope =
-                serde_json::from_slice(line).map_err(|err| FindError::Output(err.to_string()))?;
-            if envelope.kind != "match" {
-                continue;
-            }
-            let data: MatchData = serde_json::from_str(envelope.data.get())
-                .map_err(|err| FindError::Output(err.to_string()))?;
-            self.collect(text, data, &mut found)?;
-        }
+        let mut remaining = crate::apply::DEFAULT_MAX_FILE_BYTES as usize;
+        self.visit(text, &AtomicBool::new(false), |matched| {
+            let cost = std::mem::size_of::<FoundMatch>().saturating_add(matched.matched.len());
+            remaining = remaining.checked_sub(cost).ok_or(FindError::TooLarge {
+                bytes: cost,
+                limit: remaining,
+            })?;
+            let replacement = self.expand(&matched, remaining)?;
+            remaining -= replacement.len();
+            found.push(FoundMatch {
+                line: matched.line,
+                column: matched.column,
+                range: matched.range.clone(),
+                matched: matched.matched.to_owned(),
+                replacement,
+            });
+            Ok(true)
+        })?;
         Ok(found)
     }
 
-    fn collect(
+    /// Visits borrowed matches without collecting JSON or expanding replacements. Returning
+    /// false stops at the selected search prefix instead of scanning the rest of the file.
+    pub(crate) fn visit(
         &self,
         text: &str,
-        data: MatchData,
-        found: &mut Vec<FoundMatch>,
+        cancel: &AtomicBool,
+        visitor: impl FnMut(MatchContext<'_>) -> Result<bool, FindError>,
     ) -> Result<(), FindError> {
-        let lines = data
-            .lines
-            .text
-            .ok_or_else(|| FindError::Output("a matched line is not text".to_string()))?;
-        let line = data
-            .line_number
-            .and_then(|line| u32::try_from(line).ok())
-            .ok_or_else(|| FindError::Output("missing line number".to_string()))?;
-        let offset = usize::try_from(data.absolute_offset)
-            .map_err(|err| FindError::Output(err.to_string()))?;
+        let result = build_searcher(self.multiline).search_reader(
+            &self.matcher,
+            CancelReader {
+                remaining: text.as_bytes(),
+                cancel,
+            },
+            MatchSink {
+                finder: self,
+                text,
+                cancel,
+                visitor,
+            },
+        );
+        if cancel.load(Ordering::Relaxed) {
+            Err(FindError::Cancelled)
+        } else {
+            result
+        }
+    }
 
-        for submatch in data.submatches {
-            // A pattern that matches bytes can stop in the middle of a character. Such a match
-            // has no place in a text and is left out, as the search results leave it out.
-            let (Some(matched), Some(column)) =
-                (submatch.matched.text, column_of(&lines, submatch.start))
-            else {
-                continue;
-            };
-            let range = offset + submatch.start..offset + submatch.end;
-            // The offsets come from the search library; never edit a range that does not hold
-            // what it said it matched.
-            if text.get(range.clone()) != Some(matched.as_str()) {
-                return Err(FindError::Output(
-                    "a match is not where the search reported it".to_string(),
-                ));
-            }
-
-            let replacement = match submatch.replacement {
-                Some(replacement) => {
-                    let replacement = replacement.text.ok_or_else(|| {
-                        FindError::Output("a replacement is not text".to_string())
-                    })?;
-                    if self.preserve_case {
-                        preserve_case(&matched, &replacement)
-                    } else {
-                        replacement
-                    }
-                }
-                None => String::new(),
-            };
-            found.push(FoundMatch {
-                line,
-                column,
-                range,
-                matched,
-                replacement,
+    pub(crate) fn expand(
+        &self,
+        matched: &MatchContext<'_>,
+        limit: usize,
+    ) -> Result<String, FindError> {
+        let Some(template) = &self.template else {
+            return Ok(String::new());
+        };
+        // Unicode case conversion can triple UTF-8 byte length.
+        let expansion_limit = if self.preserve_case { limit / 3 } else { limit };
+        if template.len() > expansion_limit {
+            return Err(FindError::TooLarge {
+                bytes: template.len(),
+                limit: expansion_limit,
             });
         }
-        Ok(())
+        let mut captures = self
+            .matcher
+            .new_captures()
+            .map_err(FindError::error_message)?;
+        if !self
+            .matcher
+            .captures_at(matched.context, matched.start, &mut captures)
+            .map_err(FindError::error_message)?
+        {
+            return Err(FindError::Output("a match lost its captures".to_owned()));
+        }
+        // Ask the same interpolator to count capture bytes before allowing it to copy them.
+        let counted = CaptureLengths {
+            inner: &captures,
+            bytes: Cell::new(0),
+        };
+        let mut output = Vec::new();
+        counted.interpolate(
+            |name| self.matcher.capture_index(name),
+            &[],
+            template,
+            &mut output,
+        );
+        let bytes = output.len().saturating_add(counted.bytes.get());
+        if bytes > expansion_limit {
+            return Err(FindError::TooLarge {
+                bytes,
+                limit: expansion_limit,
+            });
+        }
+        output.clear();
+        output.reserve_exact(bytes);
+        captures.interpolate(
+            |name| self.matcher.capture_index(name),
+            matched.context,
+            template,
+            &mut output,
+        );
+        let replacement =
+            String::from_utf8(output).map_err(|err| FindError::Output(err.to_string()))?;
+        Ok(if self.preserve_case {
+            preserve_case(matched.matched, &replacement)
+        } else {
+            replacement
+        })
     }
 }
 
-#[derive(Deserialize)]
-struct Envelope<'a> {
-    #[serde(rename = "type")]
-    kind: &'a str,
-    #[serde(borrow)]
-    data: &'a RawValue,
+struct CaptureLengths<'a, C> {
+    inner: &'a C,
+    bytes: Cell<usize>,
 }
 
-#[derive(Deserialize)]
-struct MatchData {
-    lines: Data,
-    line_number: Option<u64>,
-    absolute_offset: u64,
-    submatches: Vec<SubmatchData>,
+impl<C: Captures> Captures for CaptureLengths<'_, C> {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+    fn get(&self, index: usize) -> Option<Match> {
+        let matched = self.inner.get(index)?;
+        self.bytes
+            .set(self.bytes.get().saturating_add(matched.len()));
+        Some(Match::new(0, 0))
+    }
 }
 
-#[derive(Deserialize)]
-struct SubmatchData {
-    #[serde(rename = "match")]
-    matched: Data,
-    replacement: Option<Data>,
+pub(crate) struct MatchContext<'a> {
+    pub line: u32,
+    pub column: usize,
+    pub range: Range<usize>,
+    pub matched: &'a str,
+    context: &'a [u8],
     start: usize,
-    end: usize,
 }
 
-/// Text the search library reports. It has no `text` when the bytes are not valid UTF-8.
-#[derive(Deserialize)]
-struct Data {
-    text: Option<String>,
+struct CancelReader<'a> {
+    remaining: &'a [u8],
+    cancel: &'a AtomicBool,
+}
+
+impl Read for CancelReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::other("replacement cancelled"));
+        }
+        self.remaining.read(output)
+    }
+}
+
+struct MatchSink<'a, F> {
+    finder: &'a MatchFinder,
+    text: &'a str,
+    cancel: &'a AtomicBool,
+    visitor: F,
+}
+
+impl<F: FnMut(MatchContext<'_>) -> Result<bool, FindError>> Sink for MatchSink<'_, F> {
+    type Error = FindError;
+    fn matched(&mut self, searcher: &Searcher, block: &SinkMatch<'_>) -> Result<bool, FindError> {
+        let range = block.bytes_range_in_buffer();
+        let mut bytes = block.buffer();
+        // Keep the same context and trailing-newline rules as grep's JSON printer.
+        if searcher.multi_line_with_matcher(&self.finder.matcher) {
+            const JSON_LOOK_AHEAD_BYTES: usize = 128;
+            bytes = &bytes[..bytes
+                .len()
+                .min(range.end.saturating_add(JSON_LOOK_AHEAD_BYTES))];
+        } else {
+            let end =
+                range.end - usize::from(searcher.line_terminator().is_suffix(&bytes[..range.end]));
+            bytes = &bytes[..end];
+        }
+        let offset =
+            usize::try_from(block.absolute_byte_offset()).map_err(FindError::error_message)?;
+        let line = block
+            .line_number()
+            .and_then(|line| u32::try_from(line).ok())
+            .ok_or_else(|| FindError::Output("missing line number".to_owned()))?;
+        let mut keep_going = true;
+        let mut previous_start = 0;
+        let mut previous_column = 1;
+        self.finder
+            .matcher
+            .try_find_iter_at(bytes, range.start, |found| {
+                if self.cancel.load(Ordering::Relaxed) {
+                    return Err(FindError::Cancelled);
+                }
+                if found.start() >= range.end {
+                    return Ok(false);
+                }
+                let start = found.start() - range.start;
+                let end = found.end() - range.start;
+                let Some(matched) = self.text.get(offset + start..offset + end) else {
+                    return Ok(true);
+                };
+                let Some(prefix) = self.text.get(offset + previous_start..offset + start) else {
+                    return Ok(true);
+                };
+                let column = previous_column + prefix.chars().count();
+                previous_start = start;
+                previous_column = column;
+                keep_going = (self.visitor)(MatchContext {
+                    line,
+                    column,
+                    range: offset + start..offset + end,
+                    matched,
+                    context: bytes,
+                    start: found.start(),
+                })?;
+                Ok(keep_going)
+            })
+            .map_err(FindError::error_message)??;
+        Ok(keep_going)
+    }
 }
 
 #[cfg(test)]

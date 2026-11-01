@@ -9,17 +9,16 @@ pub struct SearchScope {
 }
 
 impl SearchScope {
-    /// Builds the scope for `file`. The boundary is the repository enclosing `project_root`, so a
-    /// tool installed at the top of a monorepo is found from a nested project. Without a usable
-    /// `project_root` the boundary is the repository enclosing the file, or failing that the
-    /// file's own directory, so nothing outside the project is ever consulted.
+    /// Builds the scope for `file`, stopping at its nearest repository. This finds a monorepo's
+    /// tools from nested packages without crossing out of a nested checkout. Without a repository,
+    /// a usable `project_root` or the file's own directory supplies the boundary.
     pub fn new(file: &Path, project_root: Option<&Path>) -> Self {
         let Some(file_dir) = file.parent().filter(|dir| dir.is_absolute()) else {
             return Self { dirs: Vec::new() };
         };
         let project_root = project_root.filter(|root| file_dir.starts_with(root));
         let start = project_root.unwrap_or(file_dir);
-        let boundary = enclosing_repository(start).unwrap_or(start);
+        let boundary = enclosing_repository(file_dir).unwrap_or(start);
 
         let mut dirs = Vec::new();
         for dir in file_dir.ancestors() {

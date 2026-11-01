@@ -551,6 +551,7 @@ fn an_open_file_is_handed_to_its_editor_instead_of_being_written() {
             text_before: "foo saved\nfoo too\n".to_string(),
             text_after,
             occurrences: 2,
+            save_error: None,
         }],
         Vec::new(),
     );
@@ -569,7 +570,8 @@ fn an_open_file_is_handed_to_its_editor_instead_of_being_written() {
         .iter()
         .find(|entry| entry.path == path)
         .unwrap();
-    assert_eq!(entry.kind, EntryKind::Buffer);
+    // Undo of an originally clean editor must also wait for its disk save.
+    assert_eq!(entry.kind, EntryKind::SavedBuffer);
 }
 
 #[test]
@@ -848,4 +850,48 @@ fn an_open_buffers_undo_copy_exists_before_the_editor_changes_it() {
     // Losing the app callback must not lose the only undo copy.
     drop(outcome);
     assert!(project.journal.latest().unwrap().is_some());
+}
+
+#[test]
+fn oversized_clean_and_dirty_open_buffers_are_skipped_before_matching() {
+    for dirty in [false, true] {
+        let project = Project::new();
+        let path = project.write("open.txt", "foo\n");
+        let spec = literal("foo");
+        let targets = project.search_all(&spec, &["open.txt"]);
+        let text = format!("foo\n{}", "x".repeat(DEFAULT_MAX_FILE_BYTES as usize));
+        let mut request = project.request(&spec, "bar", targets);
+        request.open_buffers = vec![open_buffer(&path, &text, dirty)];
+        let outcome = project.replace(&request);
+        assert!(outcome.buffer_edits.is_empty());
+        assert_eq!(
+            skipped(&outcome),
+            vec![(
+                "open.txt".to_owned(),
+                SkipReason::TooLarge {
+                    bytes: text.len() as u64,
+                    limit: DEFAULT_MAX_FILE_BYTES,
+                }
+            )]
+        );
+        assert_eq!(project.read_text("open.txt"), "foo\n");
+        assert!(!finish(outcome).can_undo);
+    }
+}
+
+#[test]
+fn oversized_replacement_output_leaves_disk_and_journal_untouched() {
+    let project = Project::new();
+    project.write("a.txt", "foo\n");
+    let spec = literal("foo");
+    let targets = project.search_all(&spec, &["a.txt"]);
+    let mut request = project.request(&spec, &"x".repeat(256), targets);
+    request.max_file_bytes = 128;
+    let outcome = project.replace(&request);
+    assert!(matches!(
+        outcome.skipped[0].reason,
+        SkipReason::TooLarge { .. }
+    ));
+    assert_eq!(project.read_text("a.txt"), "foo\n");
+    assert!(!finish(outcome).can_undo);
 }

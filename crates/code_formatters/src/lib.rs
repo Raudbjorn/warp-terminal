@@ -8,7 +8,8 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::{fmt, thread};
 
 pub mod config;
@@ -52,6 +53,10 @@ pub enum FormatOutcome {
     NoFormatter,
     /// The user turned formatting off for the file.
     Disabled,
+    /// Project code must not run until the user approves this exact canonical project root.
+    NeedsAuthorization {
+        project_root: PathBuf,
+    },
     /// The formatter ran and left the text as it was, which is also how tools report an ignored
     /// file.
     Unchanged {
@@ -93,7 +98,8 @@ pub fn may_apply(file: &Path, preference: &Preference) -> bool {
 }
 
 /// Formats the request's text. This blocks on the formatter process, for up to the request's
-/// timeout.
+/// timeout. Callers must have authorized project code; UI callers should use
+/// [`format_authorized_in_background`] instead.
 pub fn format(request: &FormatRequest) -> FormatOutcome {
     let selection = select(
         &request.file,
@@ -101,6 +107,10 @@ pub fn format(request: &FormatRequest) -> FormatOutcome {
         request.path_env.as_deref(),
         &request.preference,
     );
+    format_selected(request, selection)
+}
+
+fn format_selected(request: &FormatRequest, selection: Selection) -> FormatOutcome {
     let invocation = match selection {
         Selection::LanguageServer => return FormatOutcome::NoFormatter,
         Selection::Off => return FormatOutcome::Disabled,
@@ -155,7 +165,7 @@ pub fn format_with(
 pub fn format_in_background(
     request: FormatRequest,
 ) -> impl Future<Output = FormatOutcome> + Send + 'static {
-    in_background(move || format(&request))
+    in_background(move |_| format(&request))
 }
 
 /// Runs [`format_with`] on its own thread, like [`format_in_background`].
@@ -165,23 +175,120 @@ pub fn format_with_in_background(
     path_env: Option<String>,
     limits: Limits,
 ) -> impl Future<Output = FormatOutcome> + Send + 'static {
-    in_background(move || format_with(&invocation, &text, path_env.as_deref(), &limits))
+    in_background(move |_| format_with(&invocation, &text, path_env.as_deref(), &limits))
+}
+
+/// Resolves the project and discovers/runs its formatter off the calling thread. Approval is
+/// exact and session-scoped at the caller; a global formatter toggle is never authorization.
+pub fn format_authorized_in_background(
+    request: FormatRequest,
+    authorized_roots: HashSet<PathBuf>,
+) -> impl Future<Output = FormatOutcome> + Send + 'static {
+    in_background(move |cancelled| format_authorized(request, &authorized_roots, cancelled))
+}
+
+fn format_authorized(
+    mut request: FormatRequest,
+    authorized_roots: &HashSet<PathBuf>,
+    cancelled: &AtomicBool,
+) -> FormatOutcome {
+    if matches!(request.preference, Preference::Off) {
+        return FormatOutcome::Disabled;
+    }
+    if !may_apply(&request.file, &request.preference) {
+        return FormatOutcome::NoFormatter;
+    }
+    // Resolve aliases before deciding which project the file belongs to. A trusted directory
+    // must not authorize a symlink into another checkout.
+    request.file = match std::fs::canonicalize(&request.file) {
+        Ok(file) => file,
+        Err(error) => return background_failure(format!("could not resolve the file: {error}")),
+    };
+    request.project_root = request
+        .project_root
+        .and_then(|root| std::fs::canonicalize(root).ok());
+    let scope = discovery::SearchScope::new(&request.file, request.project_root.as_deref());
+    let Some(root) = scope.root() else {
+        return FormatOutcome::NoFormatter;
+    };
+    if !authorized_roots.contains(root) {
+        return FormatOutcome::NeedsAuthorization {
+            project_root: root.to_path_buf(),
+        };
+    }
+    let selection = select(
+        &request.file,
+        request.project_root.as_deref(),
+        request.path_env.as_deref(),
+        &request.preference,
+    );
+    // Discovery may outlive the caller on a stalled filesystem. It must not launch code later.
+    if cancelled.load(Ordering::Acquire) {
+        return background_failure("the formatting request was cancelled".to_owned());
+    }
+    format_selected(&request, selection)
+}
+
+const MAX_BACKGROUND_FORMATTERS: usize = 8;
+static ACTIVE_FORMATTERS: AtomicUsize = AtomicUsize::new(0);
+
+struct BackgroundPermit<'a>(&'a AtomicUsize);
+
+impl<'a> BackgroundPermit<'a> {
+    fn acquire(active: &'a AtomicUsize) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_BACKGROUND_FORMATTERS).then_some(count + 1)
+            })
+            .ok()
+            .map(|_| Self(active))
+    }
+}
+
+impl Drop for BackgroundPermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+struct CancelOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+fn background_failure(message: String) -> FormatOutcome {
+    FormatOutcome::Failed(FormatFailure {
+        tool: "formatter".to_owned(),
+        message,
+    })
 }
 
 fn in_background(
-    work: impl FnOnce() -> FormatOutcome + Send + 'static,
+    work: impl FnOnce(&AtomicBool) -> FormatOutcome + Send + 'static,
 ) -> impl Future<Output = FormatOutcome> + Send + 'static {
-    let (sender, receiver) = async_channel::bounded(1);
-    thread::spawn(move || {
-        let _ = sender.try_send(work());
-    });
     async move {
-        receiver.recv().await.unwrap_or_else(|_| {
-            FormatOutcome::Failed(FormatFailure {
-                tool: "formatter".to_owned(),
-                message: "stopped unexpectedly".to_owned(),
+        let Some(permit) = BackgroundPermit::acquire(&ACTIVE_FORMATTERS) else {
+            return background_failure("too many formatters are still running".to_owned());
+        };
+        let (sender, receiver) = async_channel::bounded(1);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+        if let Err(error) = thread::Builder::new()
+            .name("project-formatter".to_owned())
+            .spawn(move || {
+                let _permit = permit;
+                let _ = sender.try_send(work(&cancelled));
             })
-        })
+        {
+            return background_failure(format!("could not start formatting: {error}"));
+        }
+        receiver
+            .recv()
+            .await
+            .unwrap_or_else(|_| background_failure("stopped unexpectedly".to_owned()))
     }
 }
 

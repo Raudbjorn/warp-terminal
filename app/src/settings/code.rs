@@ -100,7 +100,7 @@ define_settings_group!(CodeSettings, settings: [
         surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "code.editor.use_project_formatters",
-        description: "Whether files are formatted with the formatter their project is set up with (Prettier, Biome, Ruff, Black, rustfmt, gofmt and others) when it is installed, instead of with the language server.",
+        description: "Whether files are formatted with the formatter their project is set up with (Prettier, Biome, Ruff, Black, rustfmt, gofmt and others) when it is installed and the project has been explicitly approved for this application session, instead of with the language server. Use Format document to approve a project.",
     },
     // Formatter choice per language, keyed by a language identifier ("typescript"), a file
     // extension ("md") or "*". Not synced because the tools available differ per machine.
@@ -124,7 +124,7 @@ define_settings_group!(CodeSettings, settings: [
         surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "code.editor.formatter_timeout_ms",
-        description: "How long, in milliseconds, a project formatter may run before it is stopped and the file left unformatted.",
+        description: "How long, in milliseconds, to wait for shell PATH capture, project formatter discovery and execution before saving the file unformatted.",
     },
     // Controls whether the Warp text editor automatically saves file changes as the
     // user types (debounced) and when the editor loses focus. Only applies to the

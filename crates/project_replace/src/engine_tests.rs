@@ -503,3 +503,17 @@ fn effective_pattern_escapes_literals_and_wraps_whole_words() {
     assert!(literal("a\nb").is_multiline());
     assert!(!regex(r"a\nb").is_multiline());
 }
+
+#[test]
+fn cancellation_is_observed_between_matches_within_one_file() {
+    let finder = MatchFinder::new(&literal("foo"), None).unwrap();
+    let cancel = AtomicBool::new(false);
+    let mut visited = 0;
+    let result = finder.visit("foo foo foo\n", &cancel, |_| {
+        visited += 1;
+        cancel.store(true, Ordering::Relaxed);
+        Ok(true)
+    });
+    assert_eq!(result, Err(FindError::Cancelled));
+    assert_eq!(visited, 1);
+}

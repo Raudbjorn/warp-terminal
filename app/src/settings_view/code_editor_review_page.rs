@@ -712,7 +712,7 @@ impl SettingsWidget for UseProjectFormattersToggleWidget {
                 })
                 .finish(),
             Some(
-                "Formats with the tool a project is set up with, such as Prettier, Biome, Ruff, Black, rustfmt or gofmt, when that tool is installed and the project is configured for it. Other files keep using the language server. Choose a formatter per language under code.editor.formatters in the settings file."
+                "Formats with the tool a project is set up with, such as Prettier, Biome, Ruff, Black, rustfmt or gofmt, when that tool is installed and the project is configured for it. Project code runs only after you use Format document and approve that project for the current application session. Enabling this switch does not grant approval. Other files keep using the language server. Choose a formatter per language under code.editor.formatters in the settings file."
                     .into(),
             ),
         )

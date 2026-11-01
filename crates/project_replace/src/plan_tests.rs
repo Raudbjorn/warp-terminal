@@ -158,3 +158,94 @@ fn an_empty_match_is_an_insertion() {
     }];
     assert_eq!(apply_edits("foo bar", &edits), "foo! bar");
 }
+
+fn streaming_plan(
+    text: &str,
+    replacement: &str,
+    shown: &FileExpectation,
+    limit: u64,
+) -> Result<Vec<TextEdit>, SkipReason> {
+    let finder = MatchFinder::new(
+        &crate::test_support::literal("a"),
+        Some(&crate::replacement::ReplaceSpec {
+            replacement: replacement.to_owned(),
+            preserve_case: false,
+        }),
+    )
+    .unwrap();
+    plan_selected_edits(&finder, text, shown, false, limit, &AtomicBool::new(false))
+}
+
+#[test]
+fn a_dense_eight_megabyte_file_expands_only_its_selected_prefix() {
+    let text = "a\n".repeat(4 * 1024 * 1024);
+    let shown = FileExpectation {
+        matches: vec![expected(1, 1, "a", true)],
+        may_be_truncated: true,
+    };
+    let replacement = "x".repeat(1024);
+    let edits = streaming_plan(
+        &text,
+        &replacement,
+        &shown,
+        crate::apply::DEFAULT_MAX_FILE_BYTES,
+    )
+    .unwrap();
+    assert_eq!(
+        edits,
+        vec![TextEdit {
+            range: 0..1,
+            replacement
+        }]
+    );
+}
+
+#[test]
+fn unselected_occurrences_do_not_expand_an_oversized_replacement() {
+    let shown = expectation(vec![expected(1, 1, "a", false), expected(2, 1, "a", false)]);
+    let edits = streaming_plan("a\na\n", &"x".repeat(4096), &shown, 128).unwrap();
+    assert!(edits.is_empty());
+}
+
+#[test]
+fn capture_expansion_is_bounded_before_copying_captures() {
+    let text = "a".repeat(4096);
+    let finder = MatchFinder::new(
+        &crate::test_support::regex("(.+)"),
+        Some(&crate::replacement::ReplaceSpec {
+            replacement: "$1".repeat(1024),
+            preserve_case: false,
+        }),
+    )
+    .unwrap();
+    let shown = expectation(vec![expected(1, 1, &text, true)]);
+    let error = plan_selected_edits(&finder, &text, &shown, false, 8192, &AtomicBool::new(false))
+        .unwrap_err();
+    assert!(matches!(error, SkipReason::TooLarge { .. }), "{error:?}");
+}
+
+#[test]
+fn deletion_edit_metadata_is_also_bounded() {
+    let text = "a\n".repeat(1000);
+    let shown = expectation(
+        (1..=1000)
+            .map(|line| expected(line, 1, "a", true))
+            .collect(),
+    );
+    let error = streaming_plan(&text, "", &shown, 16 * 1024).unwrap_err();
+    assert!(matches!(error, SkipReason::TooLarge { .. }), "{error:?}");
+}
+
+#[test]
+fn a_truncated_selection_stops_before_an_unbounded_trailing_line() {
+    let text = format!(
+        "a\n{}\n",
+        "x".repeat(128 * 1024) // Larger than the searcher's 64 KiB line buffer.
+    );
+    let shown = FileExpectation {
+        matches: vec![expected(1, 1, "a", true)],
+        may_be_truncated: true,
+    };
+    let edits = streaming_plan(&text, "b", &shown, crate::apply::DEFAULT_MAX_FILE_BYTES).unwrap();
+    assert_eq!(edits.len(), 1);
+}

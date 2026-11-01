@@ -56,6 +56,7 @@ fn replace_foo_in_editor(project: &Project, file: &str, editor_text: &str, dirty
             text_before: editor_text.to_string(),
             text_after: text_after.clone(),
             occurrences,
+            save_error: None,
         }],
         Vec::new(),
     );
@@ -324,6 +325,7 @@ fn an_editor_that_still_holds_the_replaced_text_gets_its_text_back() {
     assert_eq!(restore.buffer_path, path);
     assert_eq!(restore.current_text, replaced);
     assert_eq!(restore.restored_text, unsaved);
+    assert!(!restore.save, "intentionally dirty buffers stay unsaved");
 
     // Until the editor reports back, the entry stays in the journal.
     assert!(project.journal.latest().unwrap().is_some());
@@ -350,6 +352,54 @@ fn an_editor_that_could_not_restore_keeps_its_journal_entry() {
     assert!(report.restored.is_empty());
     assert_eq!(report.refused.len(), 1);
     assert_eq!(project.journal.latest().unwrap().unwrap().entries.len(), 1);
+}
+
+#[test]
+fn a_failed_buffer_save_is_reported_and_keeps_a_retryable_undo_copy() {
+    let project = Project::new();
+    let path = project.write("open.txt", "foo\n");
+    let spec = literal("foo");
+    let targets = project.search_all(&spec, &["open.txt"]);
+    let mut request = project.request(&spec, "quux", targets);
+    request.open_buffers = vec![open_buffer(&path, "foo\n", false)];
+    let outcome = project.replace(&request);
+    let report = outcome.finish(
+        vec![AppliedBufferEdits {
+            path: path.clone(),
+            text_before: "foo\n".into(),
+            text_after: "quux\n".into(),
+            occurrences: 1,
+            save_error: Some("disk full".into()),
+        }],
+        Vec::new(),
+    );
+    assert!(report.replaced.is_empty());
+    assert!(matches!(
+        &report.skipped[0].reason,
+        SkipReason::WriteFailed(_)
+    ));
+    assert!(report.can_undo);
+
+    let outcome = undo(&project, &[open_buffer(&path, "quux\n", true)]).unwrap();
+    assert!(outcome.buffer_restores[0].save);
+    // Mutation succeeded but persistence failed: keep the entry even after the buffer
+    // contains the original text, and retry the save on the next undo.
+    let report = outcome.finish(
+        &[],
+        vec![RefusedFile {
+            path: path.clone(),
+            reason: RefusalReason::WriteFailed("disk full".into()),
+        }],
+    );
+    assert!(report.restored.is_empty());
+    let retry = undo(&project, &[open_buffer(&path, "foo\n", true)]).unwrap();
+    assert!(retry.restored.is_empty());
+    assert_eq!(retry.buffer_restores.len(), 1);
+    assert!(retry.buffer_restores[0].save);
+    assert_eq!(retry.buffer_restores[0].current_text, "foo\n");
+    assert_eq!(retry.buffer_restores[0].restored_text, "foo\n");
+    retry.finish(std::slice::from_ref(&path), Vec::new());
+    assert!(project.journal.latest().unwrap().is_none());
 }
 
 #[test]

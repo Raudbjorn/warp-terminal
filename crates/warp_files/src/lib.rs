@@ -60,8 +60,7 @@ pub enum FileModelEvent {
     },
 }
 
-/// Resolves with the outcome of one dispatched file operation. For local operations, the sender is
-/// only dropped on app teardown, in which case the outcome is treated as success.
+/// Resolves with the outcome of one dispatched file operation.
 pub type SaveFuture = BoxFuture<'static, Result<(), Arc<FileSaveError>>>;
 
 impl FileModelEvent {
@@ -815,7 +814,14 @@ impl FileModel {
             }
         }
 
-        Ok(async move { rx.await.unwrap_or(Ok(())) }.boxed())
+        Ok(async move {
+            rx.await.unwrap_or_else(|_| {
+                Err(Arc::new(FileSaveError::Other(
+                    "Save completion was lost".to_string(),
+                )))
+            })
+        }
+        .boxed())
     }
 
     /// Saves content before a native rename; a rename failure leaves the saved content at the source.

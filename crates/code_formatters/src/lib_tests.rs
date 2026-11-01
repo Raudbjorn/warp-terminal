@@ -247,3 +247,142 @@ fn a_failure_is_reported_once_per_file() {
     assert!(reported.record(second));
     assert!(!reported.record(first));
 }
+
+#[test]
+fn project_formatters_require_explicit_exact_project_authorization() {
+    let project = prettier_project("#!/bin/sh\necho ran > formatter-ran\ncat\n");
+    project.write("a.ts", "text\n");
+    let request = request(&project, "a.ts", "text\n");
+    let run = |roots| {
+        futures_lite::future::block_on(format_authorized_in_background(request.clone(), roots))
+    };
+
+    assert_eq!(
+        run(HashSet::new()),
+        FormatOutcome::NeedsAuthorization {
+            project_root: project.root()
+        }
+    );
+    assert!(!project.path("formatter-ran").exists());
+    assert!(matches!(
+        run(HashSet::from([project.root()])),
+        FormatOutcome::Unchanged { .. }
+    ));
+    assert!(project.path("formatter-ran").exists());
+}
+
+#[test]
+fn global_formatters_with_project_executable_configuration_still_require_authorization() {
+    let project = Project::new();
+    project.write(".prettierrc.cjs", "module.exports = {};\n");
+    project.write("a.ts", "text\n");
+    project.script(
+        "global/bin/prettier",
+        "#!/bin/sh\necho ran > formatter-ran\nprintf 'text\\n'\n",
+    );
+    let mut request = request(&project, "a.ts", "text\n");
+    request.path_env = Some(project.path_env(&["global/bin"]));
+    let outcome =
+        futures_lite::future::block_on(format_authorized_in_background(request, HashSet::new()));
+
+    assert_eq!(
+        outcome,
+        FormatOutcome::NeedsAuthorization {
+            project_root: project.root()
+        }
+    );
+    assert!(!project.path("formatter-ran").exists());
+}
+
+#[test]
+fn formatter_override_does_not_grant_execution_permission() {
+    let project = Project::new();
+    project.write("a.ts", "text\n");
+    project.script(
+        "node_modules/.bin/prettier",
+        "#!/bin/sh\necho ran > formatter-ran\ncat\n",
+    );
+    let mut request = request(&project, "a.ts", "text\n");
+    request.preference = Preference::Tool("prettier".to_owned());
+
+    let outcome =
+        futures_lite::future::block_on(format_authorized_in_background(request, HashSet::new()));
+    assert!(matches!(outcome, FormatOutcome::NeedsAuthorization { .. }));
+    assert!(!project.path("formatter-ran").exists());
+}
+
+#[test]
+fn authorizing_a_parent_does_not_authorize_another_checkout_or_symlink_target() {
+    let trusted = Project::new();
+    let other = prettier_project("#!/bin/sh\necho ran > formatter-ran\ncat\n");
+    other.mkdir(".git");
+    let target = other.write("a.ts", "text\n");
+    std::os::unix::fs::symlink(&target, trusted.path("alias.ts")).unwrap();
+
+    let outcome = futures_lite::future::block_on(format_authorized_in_background(
+        request(&trusted, "alias.ts", "text\n"),
+        HashSet::from([trusted.root()]),
+    ));
+    assert_eq!(
+        outcome,
+        FormatOutcome::NeedsAuthorization {
+            project_root: other.root()
+        }
+    );
+    assert!(!other.path("formatter-ran").exists());
+
+    trusted.mkdir("nested/.git");
+    trusted.write("nested/a.ts", "text\n");
+    let nested = request(&trusted, "nested/a.ts", "text\n");
+    let outcome = futures_lite::future::block_on(format_authorized_in_background(
+        nested,
+        HashSet::from([trusted.root()]),
+    ));
+    assert_eq!(
+        outcome,
+        FormatOutcome::NeedsAuthorization {
+            project_root: trusted.path("nested")
+        }
+    );
+}
+
+#[test]
+fn stalled_background_discovery_is_off_thread_and_cannot_execute_after_cancellation() {
+    let project = prettier_project("#!/bin/sh\necho ran > formatter-ran\ncat\n");
+    project.write("a.ts", "text\n");
+    let request = request(&project, "a.ts", "text\n");
+    let authorized = HashSet::from([project.root()]);
+    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+    let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+    let caller_thread = std::thread::current().id();
+    let mut future = Box::pin(in_background(move |cancelled| {
+        started_tx.send(std::thread::current().id()).unwrap();
+        release_rx.recv().unwrap();
+        let outcome = format_authorized(request, &authorized, cancelled);
+        done_tx.send(outcome.clone()).unwrap();
+        outcome
+    }));
+
+    assert!(futures_lite::future::block_on(futures_lite::future::poll_once(&mut future)).is_none());
+    assert_ne!(
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        caller_thread
+    );
+    drop(future);
+    release_tx.send(()).unwrap();
+    let outcome = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(matches!(outcome, FormatOutcome::Failed(_)));
+    assert!(!project.path("formatter-ran").exists());
+}
+
+#[test]
+fn stalled_formatter_workers_cannot_grow_without_bound() {
+    let active = AtomicUsize::new(0);
+    let permits: Vec<_> = (0..MAX_BACKGROUND_FORMATTERS)
+        .map(|_| BackgroundPermit::acquire(&active).unwrap())
+        .collect();
+    assert!(BackgroundPermit::acquire(&active).is_none());
+    drop(permits);
+    assert!(BackgroundPermit::acquire(&active).is_some());
+}

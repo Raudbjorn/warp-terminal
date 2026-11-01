@@ -56,6 +56,8 @@ pub enum EntryKind {
     /// The file was edited through an editor. The copy holds the editor's text, with `\n` line
     /// endings.
     Buffer,
+    /// The editor was clean before replacement, so restoring it must also persist its text.
+    SavedBuffer,
 }
 
 /// One changed file of a transaction.
@@ -110,20 +112,31 @@ impl Journal {
 
     /// Starts a transaction, dropping the oldest ones to stay within the limits.
     pub fn begin(&self, description: TransactionDescription) -> io::Result<TransactionWriter> {
+        if self.limits.max_transactions == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                "the undo journal is disabled",
+            ));
+        }
         create_private_dir(&self.root)?;
-        self.prune(self.limits.max_transactions.saturating_sub(1));
+        let header = encode_record(&Record::Header {
+            version: MANIFEST_VERSION,
+            description,
+        })?;
+        let budget = self
+            .limits
+            .max_total_bytes
+            .checked_sub(header.len() as u64)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::StorageFull, "the undo journal is full")
+            })?;
+        self.prune(self.limits.max_transactions.saturating_sub(1), budget, None)?;
 
         let id = new_transaction_id();
         let directory = self.root.join(&id);
         create_private_dir(&directory)?;
         let mut manifest = create_private(&directory.join(MANIFEST_FILE))?;
-        write_record(
-            &mut manifest,
-            &Record::Header {
-                version: MANIFEST_VERSION,
-                description,
-            },
-        )?;
+        manifest.write_all(&header)?;
         Ok(TransactionWriter {
             id,
             directory,
@@ -132,12 +145,13 @@ impl Journal {
             live_entries: 0,
             bytes_reserved: 0,
             max_bytes: self.limits.max_transaction_bytes,
+            journal: self.clone(),
         })
     }
 
     /// The most recent transaction that still has something to undo.
     pub fn latest(&self) -> io::Result<Option<Transaction>> {
-        for id in self.transaction_ids().into_iter().rev() {
+        for id in self.transaction_ids()?.into_iter().rev() {
             let directory = self.root.join(&id);
             match Transaction::load(id, directory.clone()) {
                 Ok(transaction) if !transaction.entries.is_empty() => {
@@ -159,48 +173,51 @@ impl Journal {
 
     /// Transaction ids, oldest first. Ids start with their creation time, so sorting them orders
     /// them by age.
-    fn transaction_ids(&self) -> Vec<String> {
-        let Ok(entries) = fs::read_dir(&self.root) else {
-            return Vec::new();
+    fn transaction_ids(&self) -> io::Result<Vec<String>> {
+        let entries = match fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => return Err(err),
         };
-        let mut ids: Vec<String> = entries
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .filter_map(|entry| entry.file_name().into_string().ok())
-            .collect();
+        let mut ids = Vec::new();
+        for entry in entries {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                if let Ok(name) = entry.file_name().into_string() {
+                    ids.push(name);
+                }
+            }
+        }
         ids.sort();
-        ids
+        Ok(ids)
     }
 
-    /// Drops the oldest transactions until at most `max_count` are left and they fit within the
-    /// total size limit.
-    fn prune(&self, max_count: usize) {
-        let mut ids = self.transaction_ids();
+    /// Drops old transactions before allocating more bytes, never the active transaction.
+    fn prune(&self, max_count: usize, max_bytes: u64, protected: Option<&str>) -> io::Result<()> {
+        let mut ids = self.transaction_ids()?;
         let mut sizes: Vec<u64> = ids
             .iter()
             .map(|id| directory_size(&self.root.join(id)))
-            .collect();
-        while !ids.is_empty()
-            && (ids.len() > max_count || sizes.iter().sum::<u64>() > self.limits.max_total_bytes)
-        {
-            let oldest = ids.remove(0);
-            sizes.remove(0);
-            if let Err(err) = fs::remove_dir_all(self.root.join(&oldest)) {
-                log::warn!("could not drop old replace journal {oldest}: {err}");
-            }
+            .collect::<io::Result<_>>()?;
+        while ids.len() > max_count || sizes.iter().sum::<u64>() > max_bytes {
+            let Some(index) = ids.iter().position(|id| Some(id.as_str()) != protected) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "the undo journal is full",
+                ));
+            };
+            fs::remove_dir_all(self.root.join(&ids[index]))?;
+            ids.remove(index);
+            sizes.remove(index);
         }
+        Ok(())
     }
 }
 
-fn directory_size(directory: &Path) -> u64 {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| entry.metadata().ok())
-        .map(|metadata| metadata.len())
-        .sum()
+fn directory_size(directory: &Path) -> io::Result<u64> {
+    fs::read_dir(directory)?.try_fold(0u64, |size, entry| {
+        Ok(size.saturating_add(entry?.metadata()?.len()))
+    })
 }
 
 fn new_transaction_id() -> String {
@@ -216,10 +233,14 @@ fn new_transaction_id() -> String {
     )
 }
 
-fn write_record(manifest: &mut File, record: &Record) -> io::Result<()> {
+fn encode_record(record: &Record) -> io::Result<Vec<u8>> {
     let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
     line.push(b'\n');
-    manifest.write_all(&line)
+    Ok(line)
+}
+
+fn write_record(manifest: &mut File, record: &Record) -> io::Result<()> {
+    manifest.write_all(&encode_record(record)?)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -240,6 +261,7 @@ pub struct TransactionWriter {
     live_entries: usize,
     bytes_reserved: u64,
     max_bytes: u64,
+    journal: Journal,
 }
 
 impl TransactionWriter {
@@ -268,7 +290,14 @@ impl TransactionWriter {
         occurrences: usize,
     ) -> Result<usize, RecordError> {
         self.reserve(pre_image.len() as u64)?;
-        Ok(self.record_reserved(path, kind, pre_image, post_sha256, occurrences)?)
+        self.record_reserved(path, kind, pre_image, post_sha256, occurrences)
+            .map_err(|err| {
+                if err.kind() == io::ErrorKind::StorageFull {
+                    RecordError::Full
+                } else {
+                    RecordError::Io(err)
+                }
+            })
     }
 
     /// Like [`Self::record`], for a copy whose room was set aside with [`Self::reserve`].
@@ -281,31 +310,44 @@ impl TransactionWriter {
         occurrences: usize,
     ) -> io::Result<usize> {
         let index = self.next_index;
+        let record = encode_record(&Record::Entry(Entry {
+            index,
+            path: path.to_path_buf(),
+            kind,
+            pre_sha256: sha256_hex(pre_image),
+            post_sha256,
+            occurrences,
+        }))?;
+        self.make_room((pre_image.len() as u64).saturating_add(record.len() as u64))?;
         let mut blob = create_private(&self.directory.join(Entry::blob_name(index)))?;
         blob.write_all(pre_image)?;
         blob.sync_all()?;
         drop(blob);
-
-        write_record(
-            &mut self.manifest,
-            &Record::Entry(Entry {
-                index,
-                path: path.to_path_buf(),
-                kind,
-                pre_sha256: sha256_hex(pre_image),
-                post_sha256,
-                occurrences,
-            }),
-        )?;
+        self.manifest.write_all(&record)?;
         self.manifest.sync_all()?;
         self.next_index += 1;
         self.live_entries += 1;
         Ok(index)
     }
 
+    fn make_room(&self, additional_bytes: u64) -> io::Result<()> {
+        let budget = self
+            .journal
+            .limits
+            .max_total_bytes
+            .checked_sub(additional_bytes)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::StorageFull, "the undo journal is full")
+            })?;
+        self.journal
+            .prune(self.journal.limits.max_transactions, budget, Some(&self.id))
+    }
+
     /// Takes back the entry at `index`, whose file ended up not being changed.
     pub fn retract(&mut self, index: usize) -> io::Result<()> {
-        write_record(&mut self.manifest, &Record::Retract { index })?;
+        let record = encode_record(&Record::Retract { index })?;
+        self.make_room(record.len() as u64)?;
+        self.manifest.write_all(&record)?;
         self.live_entries = self.live_entries.saturating_sub(1);
         let _ = fs::remove_file(self.directory.join(Entry::blob_name(index)));
         Ok(())
@@ -320,6 +362,7 @@ impl TransactionWriter {
             return Ok(None);
         }
         self.manifest.sync_all()?;
+        self.make_room(0)?;
         Ok(Some(self.id))
     }
 }

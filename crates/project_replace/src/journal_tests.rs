@@ -84,7 +84,7 @@ fn a_transaction_that_changed_nothing_leaves_no_trace() {
     let writer = journal.begin(description("old")).unwrap();
     assert_eq!(writer.finish().unwrap(), None);
     assert!(journal.latest().unwrap().is_none());
-    assert_eq!(journal.transaction_ids(), Vec::<String>::new());
+    assert_eq!(journal.transaction_ids().unwrap(), Vec::<String>::new());
 
     let mut writer = journal.begin(description("old")).unwrap();
     let index = writer
@@ -157,7 +157,7 @@ fn the_oldest_transactions_are_dropped_beyond_the_count_limit() {
         .map(|index| record_one(&journal, &format!("replace {index}"), b"copy"))
         .collect();
 
-    assert_eq!(journal.transaction_ids(), ids[3..]);
+    assert_eq!(journal.transaction_ids().unwrap(), ids[3..]);
     assert_eq!(journal.latest().unwrap().unwrap().id, ids[5]);
 }
 
@@ -175,8 +175,15 @@ fn the_oldest_transactions_are_dropped_beyond_the_total_size_limit() {
         .map(|index| record_one(&journal, &format!("replace {index}"), &[b'x'; 10_000]))
         .collect();
 
-    // Each transaction holds a bit over 10,000 bytes, so only two fit when the next one starts.
-    assert_eq!(journal.transaction_ids(), ids[2..]);
+    // Pruning before each record includes the incoming transaction, so two fit immediately.
+    assert_eq!(journal.transaction_ids().unwrap(), ids[3..]);
+    let retained = journal
+        .transaction_ids()
+        .unwrap()
+        .iter()
+        .map(|id| directory_size(&journal.root.join(id)).unwrap())
+        .sum::<u64>();
+    assert!(retained <= limits.max_total_bytes);
 }
 
 #[test]
@@ -322,4 +329,74 @@ fn hashes_are_hexadecimal_sha256() {
         sha256_hex(b""),
         "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
     );
+}
+
+#[test]
+fn the_total_budget_is_enforced_before_an_active_transaction_finishes() {
+    let directory = tempfile::tempdir().unwrap();
+    let limits = JournalLimits {
+        max_transactions: 5,
+        max_transaction_bytes: 2_000,
+        max_total_bytes: 5_000,
+    };
+    let journal = journal_in(directory.path(), limits);
+    record_one(&journal, "first", &[b'x'; 2_000]);
+    record_one(&journal, "second", &[b'y'; 2_000]);
+    let mut writer = journal.begin(description("third")).unwrap();
+    writer
+        .record(
+            Path::new("file"),
+            EntryKind::Disk,
+            &[b'z'; 2_000],
+            sha256_hex(b"after"),
+            1,
+        )
+        .unwrap();
+    let retained = journal
+        .transaction_ids()
+        .unwrap()
+        .iter()
+        .map(|id| directory_size(&journal.root.join(id)).unwrap())
+        .sum::<u64>();
+    assert!(retained <= limits.max_total_bytes);
+    assert_eq!(journal.latest().unwrap().unwrap().id, writer.id());
+}
+
+#[test]
+fn a_copy_that_cannot_fit_the_total_budget_leaves_its_transaction_intact() {
+    let directory = tempfile::tempdir().unwrap();
+    let limits = JournalLimits {
+        max_transactions: 5,
+        max_transaction_bytes: 10_000,
+        max_total_bytes: 1_000,
+    };
+    let journal = journal_in(directory.path(), limits);
+    let mut writer = journal.begin(description("replace")).unwrap();
+    writer
+        .record(
+            Path::new("first"),
+            EntryKind::Disk,
+            b"before",
+            sha256_hex(b"after"),
+            1,
+        )
+        .unwrap();
+    assert!(
+        writer
+            .record(
+                Path::new("too-big"),
+                EntryKind::Disk,
+                &[b'x'; 1_000],
+                sha256_hex(b"after"),
+                1
+            )
+            .is_err()
+    );
+    let transaction = journal.latest().unwrap().unwrap();
+    assert_eq!(transaction.entries.len(), 1);
+    assert_eq!(
+        transaction.pre_image(&transaction.entries[0]).unwrap(),
+        b"before"
+    );
+    assert!(directory_size(&journal.root.join(writer.id())).unwrap() <= limits.max_total_bytes);
 }

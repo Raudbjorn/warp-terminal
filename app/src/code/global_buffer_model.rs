@@ -972,8 +972,8 @@ impl GlobalBufferModel {
     /// Applies `edits` to the loaded buffer of a file, provided the buffer still holds
     /// `expected_text`. Each edit pairs a byte range of that text with its replacement, and the
     /// edits are in the order of the text and apart. With `save`, the result is then written to
-    /// the file; if that fails the edits stay in the buffer, unsaved. Returns the text of the
-    /// buffer after the edits.
+    /// the file; if that fails the edits stay in the buffer, unsaved. Returns the changed text
+    /// and a per-request completion future, which must succeed before reporting persistence.
     ///
     /// The edits go through the buffer so that every editor showing the file shows them, and so
     /// that changes the buffer holds beyond what is on disk are kept. The undo history of the
@@ -986,31 +986,37 @@ impl GlobalBufferModel {
         edits: Vec<(Range<usize>, String)>,
         save: bool,
         ctx: &mut ModelContext<Self>,
-    ) -> Result<String, BufferTextEditError> {
+    ) -> Result<(String, warp_files::SaveFuture), BufferTextEditError> {
         let buffer = self
             .buffer_handle_for_id(file_id, ctx)
             .ok_or(BufferTextEditError::NotLoaded)?;
         if buffer.as_ref(ctx).text().into_string() != expected_text {
             return Err(BufferTextEditError::TextChanged);
         }
-        if edits.is_empty() {
-            return Ok(expected_text.to_string());
-        }
-
         let new_version = ContentVersion::new();
-        buffer.update(ctx, |buffer, ctx| {
-            let char_edits = TextDiff { edits }.to_char_offset_edits(buffer);
-            buffer.insert_at_char_offset_ranges(char_edits, new_version, ctx);
-        });
+        if !edits.is_empty() {
+            buffer.update(ctx, |buffer, ctx| {
+                let char_edits = TextDiff { edits }.to_char_offset_edits(buffer);
+                buffer.insert_at_char_offset_ranges(char_edits, new_version, ctx);
+            });
+        }
 
         let text = buffer.as_ref(ctx).text().into_string();
-        if save {
+        let completion: warp_files::SaveFuture = if save {
             let content = buffer.as_ref(ctx).text_with_line_ending().into_string();
-            if let Err(err) = self.save(file_id, content, new_version, ctx) {
-                log::warn!("could not save a buffer after applying edits to it: {err}");
+            let version = buffer.as_ref(ctx).version();
+            // Project replacement only supplies local buffers. Keep the per-request future
+            // instead of the fire-and-forget editor save path.
+            match FileModel::handle(ctx)
+                .update(ctx, |model, ctx| model.save(file_id, content, version, ctx))
+            {
+                Ok(completion) => completion,
+                Err(error) => Box::pin(async move { Err(Arc::new(error)) }),
             }
-        }
-        Ok(text)
+        } else {
+            Box::pin(async { Ok(()) })
+        };
+        Ok((text, completion))
     }
 
     /// Discard any in progress changes and reload the buffer with the canonical version from the file system.

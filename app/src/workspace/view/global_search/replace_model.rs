@@ -235,7 +235,7 @@ impl ProjectReplace {
             }
         };
 
-        let mut applied = Vec::new();
+        let mut pending = Vec::new();
         let mut skipped = Vec::new();
         for buffer_edits in &outcome.buffer_edits {
             let open_buffer = request
@@ -260,12 +260,16 @@ impl ProjectReplace {
                 model.apply_text_edits(open_file.file_id, &open_buffer.text, edits, save, ctx)
             });
             match edited {
-                Ok(text_after) => applied.push(AppliedBufferEdits {
-                    path: buffer_edits.path.clone(),
-                    text_before: open_buffer.text.clone(),
-                    text_after,
-                    occurrences: buffer_edits.edits.len(),
-                }),
+                Ok((text_after, completion)) => pending.push((
+                    AppliedBufferEdits {
+                        path: buffer_edits.path.clone(),
+                        text_before: open_buffer.text.clone(),
+                        text_after,
+                        occurrences: buffer_edits.edits.len(),
+                        save_error: None,
+                    },
+                    completion,
+                )),
                 Err(BufferTextEditError::NotLoaded | BufferTextEditError::TextChanged) => {
                     skipped.push(SkippedFile {
                         path: buffer_edits.path.clone(),
@@ -279,6 +283,11 @@ impl ProjectReplace {
         ctx.spawn(
             async move {
                 let _permit = permit;
+                let mut applied = Vec::new();
+                for (mut edits, completion) in pending {
+                    edits.save_error = completion.await.err().map(|error| error.to_string());
+                    applied.push(edits);
+                }
                 outcome.finish(applied, skipped)
             },
             |me, report, ctx| {
@@ -412,19 +421,24 @@ impl ProjectReplace {
             }
         };
 
-        let mut restored = Vec::new();
+        let mut pending = Vec::new();
         let mut refused = Vec::new();
         for (restore, edits) in outcome.buffer_restores.iter().zip(restoring_edits) {
             let Some(open_file) = open_files.get(&restore.buffer_path) else {
                 continue;
             };
             // As when replacing: an editor in step with its file stays in step with it.
-            let save = !open_file.has_unsaved_changes;
             let edited = GlobalBufferModel::handle(ctx).update(ctx, |model, ctx| {
-                model.apply_text_edits(open_file.file_id, &restore.current_text, edits, save, ctx)
+                model.apply_text_edits(
+                    open_file.file_id,
+                    &restore.current_text,
+                    edits,
+                    restore.save,
+                    ctx,
+                )
             });
             match edited {
-                Ok(_) => restored.push(restore.buffer_path.clone()),
+                Ok((_, completion)) => pending.push((restore.buffer_path.clone(), completion)),
                 Err(BufferTextEditError::NotLoaded | BufferTextEditError::TextChanged) => {
                     refused.push(RefusedFile {
                         path: restore.buffer_path.clone(),
@@ -439,6 +453,18 @@ impl ProjectReplace {
         ctx.spawn(
             async move {
                 let _permit = permit;
+                let mut restored = Vec::new();
+                for (path, completion) in pending {
+                    match completion.await {
+                        Ok(()) => restored.push(path),
+                        Err(error) => refused.push(RefusedFile {
+                            path,
+                            reason: RefusalReason::WriteFailed(format!(
+                                "buffer restored but remains unsaved: {error}"
+                            )),
+                        }),
+                    }
+                }
                 outcome.finish(&restored, refused)
             },
             move |me, report, ctx| {

@@ -27,7 +27,7 @@ fn a_regular_file_is_read_and_rewritten() {
     assert_eq!(bytes, b"before");
     assert!(stamp.still_matches(&path));
 
-    write_atomically(&path, b"after and longer", stamp.metadata()).unwrap();
+    write_atomically(&path, b"after and longer", &stamp).unwrap();
     assert_eq!(fs::read(&path).unwrap(), b"after and longer");
     assert!(!stamp.still_matches(&path));
     assert_eq!(names_in(directory.path()), ["file.txt"]);
@@ -43,7 +43,7 @@ fn rewriting_keeps_the_permissions_of_the_file() {
         fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
 
         let (_, stamp) = read_rewritable(&path, NO_LIMIT).unwrap();
-        write_atomically(&path, b"#!/bin/bash\n", stamp.metadata()).unwrap();
+        write_atomically(&path, b"#!/bin/bash\n", &stamp).unwrap();
 
         let rewritten = fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
         assert_eq!(rewritten, mode, "mode {mode:o}");
@@ -61,7 +61,7 @@ fn a_failed_write_leaves_the_file_and_no_temporary_file() {
 
     // A directory that cannot be written to refuses the temporary file.
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o555)).unwrap();
-    let result = write_atomically(&path, b"after", stamp.metadata());
+    let result = write_atomically(&path, b"after", &stamp);
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
 
     assert!(result.is_err());
@@ -170,4 +170,86 @@ fn private_files_and_directories_are_closed_to_other_users() {
     let mode = fs::metadata(&private_file).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600);
     assert!(create_private(&private_file).is_err());
+}
+
+#[test]
+fn an_edit_during_temporary_file_preparation_is_not_overwritten() {
+    let (directory, path) = temp_file(b"before");
+    let (_, stamp) = read_rewritable(&path, NO_LIMIT).unwrap();
+    let temp = directory.path().join("prepared");
+    let error = write_and_rename(&temp, &path, b"replacement", &stamp, || {
+        fs::write(&path, b"edited").unwrap();
+        // Same length and timestamp must not hide an intervening edit.
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp.metadata.modified().unwrap())
+            .unwrap();
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(fs::read(&path).unwrap(), b"edited");
+}
+
+#[test]
+fn a_recreated_file_is_not_overwritten_even_with_the_same_bytes() {
+    let (directory, path) = temp_file(b"before");
+    let (_, stamp) = read_rewritable(&path, NO_LIMIT).unwrap();
+    let temp = directory.path().join("prepared");
+    let error = write_and_rename(&temp, &path, b"replacement", &stamp, || {
+        // Keep the original inode allocated, preventing immediate inode reuse.
+        fs::rename(&path, directory.path().join("old-file")).unwrap();
+        fs::write(&path, b"before").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp.metadata.modified().unwrap())
+            .unwrap();
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(fs::read(&path).unwrap(), b"before");
+}
+
+#[cfg(unix)]
+#[test]
+fn an_ancestor_retargeted_after_preparation_is_not_followed() {
+    let directory = tempfile::tempdir().unwrap();
+    let original = directory.path().join("original");
+    let outside = directory.path().join("outside");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&outside).unwrap();
+    fs::write(original.join("file"), b"before").unwrap();
+    fs::write(outside.join("file"), b"before").unwrap();
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(&original, &alias).unwrap();
+    let path = alias.join("file");
+    let (_, stamp) = read_rewritable(&path, NO_LIMIT).unwrap();
+    let temp = original.join("prepared");
+    let error = write_and_rename(&temp, &path, b"replacement", &stamp, || {
+        fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(fs::read(original.join("file")).unwrap(), b"before");
+    assert_eq!(fs::read(outside.join("file")).unwrap(), b"before");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn a_new_hard_link_during_preparation_is_preserved() {
+    let (directory, path) = temp_file(b"before");
+    let (_, stamp) = read_rewritable(&path, NO_LIMIT).unwrap();
+    let temp = directory.path().join("prepared");
+    let other = directory.path().join("other-name");
+    let error = write_and_rename(&temp, &path, b"replacement", &stamp, || {
+        fs::hard_link(&path, &other).unwrap();
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(fs::read(&path).unwrap(), b"before");
+    assert_eq!(fs::read(other).unwrap(), b"before");
 }

@@ -143,10 +143,13 @@ fn test_save_file() {
         let new_version = ContentVersion::new();
 
         // Save new content to the file.
-        files.update(app, |model, ctx| {
-            let result = model.save(file_id, "Overwrite content".to_string(), new_version, ctx);
-            assert!(result.is_ok());
+        let completion = files.update(app, |model, ctx| {
+            model
+                .save(file_id, "Overwrite content".to_string(), new_version, ctx)
+                .unwrap()
         });
+        // Dispatch alone does not prove persistence; the per-request completion does.
+        completion.await.unwrap();
 
         // Make sure that the file saved event was emitted.
         match receiver.recv().await.expect("Could not receive the result") {
@@ -162,6 +165,34 @@ fn test_save_file() {
         let model_version = files.read(app, |files, _ctx| files.version(file_id));
         assert_ne!(old_version, model_version);
         assert_eq!(Some(new_version), model_version);
+    });
+}
+
+#[test]
+fn save_completion_reports_a_write_failure_after_dispatch() {
+    App::test((), |mut app| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let files = app.add_singleton_model(FileModel::new);
+        let events = setup_event_channel(&mut app, &files);
+        let file_id = files.update(&mut app, |model, ctx| model.open(&path, false, ctx));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TestFileModelEvent::FileLoaded { .. }
+        ));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let completion = files.update(&mut app, |model, ctx| {
+            model
+                .save(file_id, "replacement".into(), ContentVersion::new(), ctx)
+                .unwrap()
+        });
+        assert!(
+            completion.await.is_err(),
+            "a dispatched write is not a successful save"
+        );
+        assert!(path.is_dir());
     });
 }
 

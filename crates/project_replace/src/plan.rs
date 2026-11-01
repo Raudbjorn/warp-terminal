@@ -3,8 +3,10 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
+use std::sync::atomic::AtomicBool;
 
-use crate::engine::FoundMatch;
+use crate::engine::{FindError, FoundMatch, MatchFinder};
+use crate::report::SkipReason;
 
 /// A match of a file as the search results showed it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -90,6 +92,91 @@ pub fn plan_edits(
                 replacement: found.replacement.clone(),
             });
         }
+    }
+    Ok(edits)
+}
+
+/// Validates matches as they arrive and expands only selected occurrences within the file budget.
+pub(crate) fn plan_selected_edits(
+    finder: &MatchFinder,
+    text: &str,
+    expectation: &FileExpectation,
+    ignore_line_endings: bool,
+    max_file_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<Vec<TextEdit>, SkipReason> {
+    let limit = usize::try_from(max_file_bytes).unwrap_or(usize::MAX);
+    let expected_bytes = expectation
+        .matches
+        .len()
+        .saturating_mul(std::mem::size_of::<&ExpectedMatch>());
+    if text.len() > limit || expected_bytes > limit {
+        return Err(SkipReason::TooLarge {
+            bytes: text.len().max(expected_bytes) as u64,
+            limit: max_file_bytes,
+        });
+    }
+    let mut expected: Vec<_> = expectation.matches.iter().collect();
+    expected.sort_by_key(|expected| (expected.line, expected.column));
+    let mut edits = Vec::new();
+    let mut index = 0;
+    let mut previous_end = 0;
+    let mut output_bytes = text.len();
+    let mut edit_bytes = 0usize;
+    let mut aligned = true;
+    finder
+        .visit(text, cancel, |found| {
+            let Some(expected) = expected.get(index) else {
+                aligned = expectation.may_be_truncated;
+                return Ok(false);
+            };
+            let same_text = if ignore_line_endings {
+                without_carriage_returns(found.matched)
+                    == without_carriage_returns(&expected.matched)
+            } else {
+                found.matched == expected.matched
+            };
+            if found.line != expected.line
+                || found.column != expected.column
+                || !same_text
+                || found.range.start < previous_end
+            {
+                aligned = false;
+                return Ok(false);
+            }
+            previous_end = found.range.end;
+            index += 1;
+            if expected.replace {
+                let metadata_bytes = edit_bytes.saturating_add(std::mem::size_of::<TextEdit>());
+                if metadata_bytes > limit {
+                    return Err(FindError::TooLarge {
+                        bytes: metadata_bytes,
+                        limit,
+                    });
+                }
+                let unchanged_bytes = output_bytes - found.range.len();
+                let replacement = finder.expand(
+                    &found,
+                    (limit - unchanged_bytes).min(limit - metadata_bytes),
+                )?;
+                output_bytes = unchanged_bytes + replacement.len();
+                edit_bytes = metadata_bytes + replacement.len();
+                edits.push(TextEdit {
+                    range: found.range,
+                    replacement,
+                });
+            }
+            Ok(!(expectation.may_be_truncated && index == expectation.matches.len()))
+        })
+        .map_err(|error| match error {
+            FindError::TooLarge { bytes, limit } => SkipReason::TooLarge {
+                bytes: bytes as u64,
+                limit: limit as u64,
+            },
+            error => SkipReason::SearchFailed(error.to_string()),
+        })?;
+    if !aligned || index != expected.len() {
+        return Err(SkipReason::ChangedSinceSearch);
     }
     Ok(edits)
 }

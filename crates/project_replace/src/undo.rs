@@ -20,6 +20,8 @@ pub struct BufferRestore {
     pub current_text: String,
     /// The text the editor had before the replace.
     pub restored_text: String,
+    /// Whether restoring this buffer must complete a disk save before forgetting the entry.
+    pub save: bool,
     entry_index: usize,
     entry_path: PathBuf,
 }
@@ -156,12 +158,13 @@ fn undo_entry(
         .map_err(|err| RefusalReason::JournalDamaged(err.to_string()))?;
 
     match (entry.kind, open_buffer) {
-        (EntryKind::Buffer, Some(buffer)) => {
+        (EntryKind::Buffer | EntryKind::SavedBuffer, Some(buffer)) => {
             let current = sha256_hex(buffer.text.as_bytes());
-            if current == entry.pre_sha256 {
+            let needs_save = entry.kind == EntryKind::SavedBuffer && buffer.has_unsaved_changes;
+            if current == entry.pre_sha256 && !needs_save {
                 return Ok(Undone::Restored);
             }
-            if current != entry.post_sha256 {
+            if current != entry.post_sha256 && current != entry.pre_sha256 {
                 return Err(RefusalReason::EditedSinceReplace);
             }
             let restored_text = String::from_utf8(pre_image)
@@ -170,6 +173,7 @@ fn undo_entry(
                 buffer_path: buffer.path.clone(),
                 current_text: buffer.text.clone(),
                 restored_text,
+                save: entry.kind == EntryKind::SavedBuffer || !buffer.has_unsaved_changes,
                 entry_index: entry.index,
                 entry_path: entry.path.clone(),
             }))
@@ -182,7 +186,9 @@ fn undo_entry(
         (EntryKind::Disk, Some(_) | None) => restore_on_disk(&entry.path, entry, &pre_image, false),
         // The editor that was edited is gone. The file holds its text if it was saved, though
         // possibly with other line endings than the editor's `\n`.
-        (EntryKind::Buffer, None) => restore_on_disk(&entry.path, entry, &pre_image, true),
+        (EntryKind::Buffer | EntryKind::SavedBuffer, None) => {
+            restore_on_disk(&entry.path, entry, &pre_image, true)
+        }
     }
 }
 
@@ -247,8 +253,13 @@ fn restore_on_disk(
     } else {
         std::borrow::Cow::Borrowed(pre_image)
     };
-    write_atomically(path, &pre_image, stamp.metadata())
-        .map_err(|err| RefusalReason::WriteFailed(err.to_string()))?;
+    write_atomically(path, &pre_image, &stamp).map_err(|err| {
+        if err.kind() == io::ErrorKind::WouldBlock {
+            RefusalReason::EditedSinceReplace
+        } else {
+            RefusalReason::WriteFailed(err.to_string())
+        }
+    })?;
     Ok(Undone::Restored)
 }
 

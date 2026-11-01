@@ -163,6 +163,7 @@ persistence.workspace = true
 pin-project.workspace = true
 plist = "1"
 pprof = { workspace = true, optional = true, features = ["protobuf-codec"] }
+project_replace.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 qrcode.workspace = true
@@ -171,7 +172,6 @@ rand.workspace = true
 rangemap.workspace = true
 rayon.workspace = true
 regex-automata.workspace = true
-project_replace.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 rust-embed.workspace = true
