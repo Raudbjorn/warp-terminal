@@ -1,7 +1,7 @@
-use warp_core::channel::ChannelState;
 use std::collections::HashMap;
 
 use uuid::Uuid;
+use warp_core::channel::ChannelState;
 use warp_errors::report_error;
 use warpui::elements::{ChildView, Container};
 use warpui::ui_components::components::{Coords, UiComponentStyles};

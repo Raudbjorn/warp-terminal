@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use warpui::elements::Element;
 use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
-use super::display_chip::{render_udi_chip, UdiChipConfig};
+use super::display_chip::{UdiChipConfig, render_udi_chip};
 use crate::appearance::Appearance;
 
 /// Which side of the prompt a segment is grouped on. Left segments render first (after the built-in

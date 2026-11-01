@@ -1171,12 +1171,10 @@ pub(crate) struct LocalOpenAISettingsSnapshot {
     pub provider_kind: LocalProviderKind,
     pub opencode_command: String,
     pub opencode_args: Vec<String>,
-    /// When `true`, multi-turn callers can opt into the OpenAI
-    /// Responses API (`/v1/responses`) and the local provider will
-    /// round-trip reasoning items between turns. The single-shot
-    /// command generation, prediction, and AI input suggestion
-    /// methods continue to use `/v1/chat/completions` regardless
-    /// of this flag.
+    /// When `true`, an OpenAI-compatible provider is sent requests on the Responses API
+    /// (`/v1/responses`) instead of Chat Completions. This covers command generation, workflow
+    /// metadata and prediction. The OpenCode provider ignores it. Callers that hold a
+    /// conversation can additionally have reasoning items round-tripped between turns.
     pub use_responses_api: bool,
 }
 
@@ -1475,7 +1473,17 @@ define_settings_group!(AISettings, settings: [
         surface: settings::SettingSurfaces::ALL,
         private: false,
         toml_path: "agents.local_openai.use_responses_api",
-        description: "Whether multi-turn local-AI callers should use the OpenAI Responses API (`/v1/responses`) and round-trip reasoning items between turns. Single-shot command generation and prediction keep using `/v1/chat/completions` regardless of this flag.",
+        description: "Send local AI requests to the OpenAI Responses API (`/v1/responses`) instead of Chat Completions (`/v1/chat/completions`). Needed for models that are only served on the Responses API. Applies to the OpenAI-compatible provider; the OpenCode provider ignores it.",
+    }
+    local_openai_allowed_private_hosts: LocalOpenAIAllowedPrivateHosts {
+        type: String,
+        default: String::new(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::ALL,
+        private: false,
+        toml_path: "agents.local_openai.allowed_private_hosts",
+        description: "Private-network hosts that local-only mode may connect to, as a comma-separated list of IP addresses or CIDR ranges, for example `192.168.1.50, 100.64.0.0/10`. Loopback is always allowed. Only RFC 1918, Tailscale (100.64.0.0/10), link-local and IPv6 unique-local ranges are accepted; host names cannot be listed. Empty (the default) keeps local-only mode loopback-only. An invalid value is ignored and nothing extra is allowed.",
     }
     // This field should not be referenced directly to lookup Prompt Suggestions
     // enablement -- use the `is_prompt_suggestions_enabled()` getter.
@@ -2439,6 +2447,20 @@ impl AISettings {
         }
     }
 
+    /// Applies the user's allowed private hosts to the process-wide network policy. An invalid
+    /// value (for example from a hand-edited settings file) allows nothing extra rather than
+    /// being partly applied.
+    pub(crate) fn apply_network_policy(&self) {
+        let raw = self.local_openai_allowed_private_hosts.value();
+        match network_policy::parse_allowed_private_hosts(raw) {
+            Ok(hosts) => network_policy::set_allowed_private_hosts(hosts),
+            Err(err) => {
+                log::warn!("Ignoring invalid agents.local_openai.allowed_private_hosts: {err}");
+                network_policy::set_allowed_private_hosts(Vec::new());
+            }
+        }
+    }
+
     pub(crate) fn local_provider_kind(&self) -> LocalProviderKind {
         parse_provider_kind(self.local_openai_provider_kind.value().as_str())
     }
@@ -2489,6 +2511,8 @@ impl AISettings {
 
     pub fn register_and_subscribe_to_events(app: &mut AppContext) {
         Self::register(app);
+        // The allowed private hosts must be in force before the first request is made.
+        Self::as_ref(app).apply_network_policy();
         app.add_singleton_model(FocusedTerminalInfo::new);
         CompiledCommandsForCodingAgentToolbar::register(app);
 

@@ -218,11 +218,13 @@ mod tests {
         );
 
         let denied = url::Url::parse("wss://rtc.app.warp.dev/graphql/v2").unwrap();
-        assert!(network_policy::check_url_for_mode(
-            network_policy::ServicesMode::LocalOnly,
-            &denied,
-            "websocket",
-        )
-        .is_err());
+        assert!(
+            network_policy::check_url_for_mode(
+                network_policy::ServicesMode::LocalOnly,
+                &denied,
+                "websocket",
+            )
+            .is_err()
+        );
     }
 }

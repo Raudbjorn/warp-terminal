@@ -2050,9 +2050,7 @@ impl PaneGroup {
             LeafContents::Welcome { .. } => {
                 // Welcome panes are not restored from persistence.
                 // They are opened on-demand via workspace actions.
-                Err(anyhow::anyhow!(
-                    "Welcome panes are not restored"
-                ))
+                Err(anyhow::anyhow!("Welcome panes are not restored"))
             }
         };
 

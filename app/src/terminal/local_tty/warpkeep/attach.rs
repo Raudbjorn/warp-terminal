@@ -8,10 +8,10 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
-use nix::fcntl::{flock, FlockArg};
+use anyhow::{Context, Result, bail};
+use nix::fcntl::{FlockArg, flock};
 
-use super::{get_winsize, set_nonblocking, READ_CHUNK, TAG_DATA, TAG_WINCH};
+use super::{READ_CHUNK, TAG_DATA, TAG_WINCH, get_winsize, set_nonblocking};
 
 /// Attach entry point. `dir` holds the session sockets; `command` is the shell
 /// (plus its args) to run if a new master must be created.

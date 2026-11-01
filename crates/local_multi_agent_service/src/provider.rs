@@ -1,26 +1,22 @@
-use std::{
-    collections::HashMap,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
-use crate::{
-    autocomplete::{
-        AUTOCOMPLETE_MAX_TOKENS, AUTOCOMPLETE_MODEL_ALIAS, LocalCommandAutocompleteRequest,
-        LocalCommandAutocompleteResponse, autocomplete_provider_messages,
-        deterministic_autocomplete_command,
-    },
-    config::{
-        Config, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MODEL, non_empty_str, trim_trailing_slash,
-    },
-    model::resolve_provider_model,
-    request::{ContextImage, McpToolSummary},
+use crate::autocomplete::{
+    AUTOCOMPLETE_MAX_TOKENS, AUTOCOMPLETE_MODEL_ALIAS, LocalCommandAutocompleteRequest,
+    LocalCommandAutocompleteResponse, autocomplete_provider_messages,
+    deterministic_autocomplete_command,
 };
+use crate::config::{
+    Config, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MODEL, non_empty_str, trim_trailing_slash,
+};
+use crate::model::resolve_provider_model;
+use crate::request::{ContextImage, McpToolSummary};
 
 const MODEL_CONTEXT_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -128,7 +124,11 @@ impl ProviderRuntime {
     pub fn new() -> Self {
         crate::install_tls_provider();
         Self {
-            client: reqwest::Client::new(),
+            // Follows the network policy: redirects are re-checked (this client sends the
+            // transcript and the API key) and, in local-only mode, system proxies are not used.
+            client: network_policy::apply_to_client_builder(reqwest::Client::builder())
+                .build()
+                .expect("HTTP client should build"),
             context_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -195,9 +195,18 @@ impl ProviderRuntime {
             request_body
         };
 
+        let completions_url = format!("{base_url}/chat/completions");
+        network_policy::check_url_str(&completions_url, "provider chat completion request")
+            .map_err(|error| {
+                LocalAgentError::new(
+                    error.to_string(),
+                    FinishReason::LlmUnavailable,
+                    Some(model.clone()),
+                )
+            })?;
         let response = self
             .client
-            .post(format!("{base_url}/chat/completions"))
+            .post(completions_url)
             .bearer_auth(&api_key)
             .json(&request_body)
             .send()
@@ -366,9 +375,16 @@ impl ProviderRuntime {
             return fallback_local_models(config);
         };
         let base_url = trim_trailing_slash(base_url);
+        let models_url = format!("{base_url}/models");
+        if let Err(error) =
+            network_policy::check_url_str(&models_url, "provider model list request")
+        {
+            log::warn!("{error}");
+            return fallback_local_models(config);
+        }
         let mut request = self
             .client
-            .get(format!("{base_url}/models"))
+            .get(models_url)
             .header(reqwest::header::ACCEPT, "application/json");
         if let Some(api_key) = config.openai_api_key.as_deref().and_then(non_empty_str) {
             request = request.bearer_auth(api_key);
@@ -443,9 +459,16 @@ impl ProviderRuntime {
         }
 
         let mut context_windows_by_model = HashMap::new();
+        let models_url = format!("{base_url}/models");
+        if let Err(error) =
+            network_policy::check_url_str(&models_url, "provider model list request")
+        {
+            log::warn!("{error}");
+            return context_windows_by_model;
+        }
         let result = self
             .client
-            .get(format!("{base_url}/models"))
+            .get(models_url)
             .bearer_auth(api_key)
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
@@ -1268,10 +1291,7 @@ impl HarmonyToolCallValueParser<'_> {
             return self.parse_json_string();
         }
         let start = self.index;
-        let end = self
-            .rest()
-            .find(':')
-            .unwrap_or_else(|| self.rest().len());
+        let end = self.rest().find(':').unwrap_or_else(|| self.rest().len());
         self.index += end;
         non_empty_str(self.input[start..self.index].trim()).map(str::to_owned)
     }

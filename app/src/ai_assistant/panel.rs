@@ -1,10 +1,9 @@
-use crate::util::bindings;
-use warp_core::channel::ChannelState;
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Local;
 use pathfinder_geometry::vector::{Vector2F, vec2f};
+use warp_core::channel::ChannelState;
 use warp_editor::editor::NavigationKey;
 use warp_errors::report_error;
 use warpui::r#async::Timer;
@@ -48,6 +47,7 @@ use crate::server::telemetry::{TelemetryEvent, WarpAIActionType};
 use crate::terminal::resizable_data::{DEFAULT_WARP_AI_WIDTH, ModalType, ResizableData};
 use crate::ui_components::blended_colors;
 use crate::ui_components::buttons::icon_button;
+use crate::util::bindings;
 use crate::util::bindings::{CustomAction, cmd_or_ctrl_shift};
 use crate::workspace::{ActiveSession, TAB_BAR_HEIGHT};
 use crate::workspaces::user_workspaces::UserWorkspaces;

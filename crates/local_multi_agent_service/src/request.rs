@@ -1,6 +1,7 @@
 #![allow(deprecated)]
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 use warp_multi_agent_api as api;
@@ -1358,8 +1359,9 @@ fn random_uuid() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use warp_multi_agent_api::request;
+
+    use super::*;
 
     #[test]
     fn decodes_basic_user_query() {

@@ -10,40 +10,35 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use pathfinder_geometry::vector::vec2f;
 use serde::Deserialize;
+use warpui::r#async::FutureExt as _;
+use warpui::elements::{
+    Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable,
+    ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Fill, Flex, Hoverable,
+    MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, Padding, ParentAnchor,
+    ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack, Text,
+};
+use warpui::fonts::{Properties, Weight};
+use warpui::platform::Cursor;
+use warpui::ui_components::button::ButtonVariant;
+use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
-    elements::{
-        Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable,
-        ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Fill, Flex,
-        Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle, OffsetPositioning, Padding,
-        ParentAnchor, ParentElement, ParentOffsetBounds, Radius, ScrollbarWidth, Shrinkable, Stack,
-        Text,
-    },
-    fonts::{Properties, Weight},
-    platform::Cursor,
-    r#async::FutureExt as _,
-    ui_components::{
-        button::ButtonVariant,
-        components::{Coords, UiComponent, UiComponentStyles},
-    },
     AppContext, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
     ViewHandle, WeakViewHandle,
 };
 
-use crate::{
-    appearance::Appearance,
-    code::buffer_location::LocalOrRemotePath,
-    editor::{
-        EditorView, Event as EditorEvent, PropagateAndNoOpNavigationKeys, SingleLineEditorOptions,
-        TextOptions,
-    },
-    menu::{Event as MenuEvent, Menu, MenuItemFields},
-    pane_group::PaneGroup,
-    remote_server::manager::RemoteServerManager,
-    terminal::model::session::{ExecuteCommandOptions, Session, SessionType},
-    ui_components::icons::Icon,
-    ui_components::menu_button::{icon_button_with_context_menu, MenuDirection},
-    util::time_format::format_approx_duration_from_now_utc,
+use crate::appearance::Appearance;
+use crate::code::buffer_location::LocalOrRemotePath;
+use crate::editor::{
+    EditorView, Event as EditorEvent, PropagateAndNoOpNavigationKeys, SingleLineEditorOptions,
+    TextOptions,
 };
+use crate::menu::{Event as MenuEvent, Menu, MenuItemFields};
+use crate::pane_group::PaneGroup;
+use crate::remote_server::manager::RemoteServerManager;
+use crate::terminal::model::session::{ExecuteCommandOptions, Session, SessionType};
+use crate::ui_components::icons::Icon;
+use crate::ui_components::menu_button::{MenuDirection, icon_button_with_context_menu};
+use crate::util::time_format::format_approx_duration_from_now_utc;
 
 const DOCKER_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const DOCKER_LIST_COMMAND: &str = r#"sh -lc 'docker ps --format '"'"'{{json .}}'"'"''"#;

@@ -12,11 +12,12 @@
 //! never re-enter `plugin.get_mut()` from inside the calling callback). See PLUGIN_SPEC.md (M4).
 
 use fuzzy_match::match_indices_case_insensitive;
+use warp_editor::editor::NavigationKey;
 use warpui::elements::{
-    Border, ChildView, ClippedScrollStateHandle, ClippedScrollable, Clipped, ConstrainedBox,
-    Container, CornerRadius, CrossAxisAlignment, Element, Fill, Flex, Hoverable,
-    MainAxisAlignment, MainAxisSize, MouseStateHandle, Padding, ParentElement, Radius,
-    ScrollbarWidth, Shrinkable, Text,
+    Border, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
+    Container, CornerRadius, CrossAxisAlignment, Element, Fill, Flex, Hoverable, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, Padding, ParentElement, Radius, ScrollbarWidth, Shrinkable,
+    Text,
 };
 use warpui::platform::Cursor;
 use warpui::{
@@ -30,7 +31,6 @@ use crate::editor::{
     PropagateHorizontalNavigationKeys, SingleLineEditorOptions, TextOptions,
 };
 use crate::plugin::app_requests::PalettePluginItem;
-use warp_editor::editor::NavigationKey;
 
 const SEARCH_BOX_HORIZONTAL_PADDING: f32 = 12.;
 const SEARCH_BOX_VERTICAL_PADDING: f32 = 8.;
@@ -426,7 +426,6 @@ impl View for PluginPaletteModal {
                 list.add_child(self.render_row(filtered_idx, item, is_selected, appearance));
             }
         }
-
 
         // Wrap the list in a vertical scrollable so a long picker (more items than
         // fit in the 480px-tall modal) stays accessible instead of being clipped off.

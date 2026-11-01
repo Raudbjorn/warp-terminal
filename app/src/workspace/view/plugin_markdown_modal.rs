@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 
-use markdown_parser::{parse_markdown, FormattedText};
+use markdown_parser::{FormattedText, parse_markdown};
 use warpui::elements::{
     ClippedScrollStateHandle, ClippedScrollable, Container, Element, Fill, FormattedTextElement,
     HighlightedHyperlink, ScrollbarWidth,

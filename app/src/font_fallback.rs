@@ -123,9 +123,10 @@ fn cjk_han_font_for_ui_locale() -> ExternalFontFamily {
     } else if primary == "zh" || primary == "zho" {
         // Traditional Chinese: either an explicit region (TW/HK/MO) or the
         // Hant script subtag. Region-less `zh-CN` / `zh-SG` stays Simplified.
-        if rest.split(|c: char| c == '-' || c == '_').any(|s| {
-            matches!(s.as_str(), "tw" | "hk" | "mo" | "hant")
-        }) {
+        if rest
+            .split(|c: char| c == '-' || c == '_')
+            .any(|s| matches!(s.as_str(), "tw" | "hk" | "mo" | "hant"))
+        {
             NOTO_SANS_TC.clone()
         } else {
             NOTO_SANS_SC.clone()

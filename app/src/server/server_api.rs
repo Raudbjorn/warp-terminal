@@ -1635,9 +1635,11 @@ impl ServerApiProvider {
             .server_api
             .set_local_openai_config(AISettings::as_ref(ctx).local_openai_settings());
         ctx.subscribe_to_model(&AISettings::handle(ctx), |provider, _, _, ctx| {
+            let settings = AISettings::as_ref(ctx);
+            settings.apply_network_policy();
             provider
                 .server_api
-                .set_local_openai_config(AISettings::as_ref(ctx).local_openai_settings());
+                .set_local_openai_config(settings.local_openai_settings());
         });
 
         provider

@@ -731,13 +731,14 @@ impl View {
     /// and showing the returned string (if any) as a toast. See PLUGIN_SPEC.md (Milestone 1).
     #[cfg(feature = "plugin_host")]
     fn run_plugin_command(&mut self, command_id: String, ctx: &mut ViewContext<Self>) {
+        use warp_js::SerializedJsValue;
+
+        use crate::plugin::PluginHost;
         use crate::plugin::service::{
             CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
         };
-        use crate::plugin::PluginHost;
         use crate::view_components::{DismissibleToast, ToastFlavor};
         use crate::workspace::ToastStack;
-        use warp_js::SerializedJsValue;
 
         let window_id = ctx.window_id();
         let Some(function_id) = crate::plugin::commands::function_id(&command_id) else {
