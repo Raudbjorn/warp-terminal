@@ -21,15 +21,22 @@ fork changes and is **not** a pristine mirror of upstream.
 
 ## Last synced upstream revision
 
-Not recorded. The resync PRs are squash merges, so git history does not keep
-the upstream commit they were cut from; the commit message of each squash lists
-the upstream changes it contains (`git show a7b16b82` for "Resync 3").
+Resync 3 (#25) brought in upstream up to
+[`89de3f5c`](https://github.com/warpdotdev/warp/commit/89de3f5c9945eeee277e713f111d707d39857dff)
+("feat: preview url idle retention (#16649)", 2026-10-30).
 
-**At the next resync, write the upstream SHA here**:
+The squash merge did not keep that commit in `master`'s history. It was
+recovered from the `resync-3` branch (tip `4cd773a6`): there the fork commit
+`3dae2d44` sits directly on `89de3f5c`, and every other commit on the branch is
+either already in `master` or a fork commit. The commit message of the squash
+lists the upstream changes it contains (`git show a7b16b82`).
+
+**After every resync, add a row with the upstream SHA you noted in step 2.**
+The next resync needs it as its merge base (step 3).
 
 | Resync | Date | Upstream SHA |
 |---|---|---|
-| Resync 3 (#25) | 2026-10-31 | not recorded |
+| Resync 3 (#25) | 2026-10-31 | `89de3f5c9945eeee277e713f111d707d39857dff` |
 
 ## Resync procedure
 
@@ -38,8 +45,26 @@ and keep this file current.
 
 1. Add the upstream remote once: `git remote add upstream https://github.com/warpdotdev/warp`.
 2. `git fetch upstream` and note `git rev-parse upstream/master`.
-3. Branch from `master` (for example `resync-4`) and **merge** `upstream/master`
-   into it. Do not rebase `master` or the resync branch onto upstream.
+3. Give the resync branch a true merge base, then **merge** `upstream/master`.
+   Resync PRs are squash merges, so `master` has no ancestry link to upstream.
+   `git merge-base master upstream/master` still returns an old commit from the
+   shared history (`81d02ea4`, 2026-06-16, when Resync 3 was checked), and a
+   plain merge would replay every upstream change since then, including roughly
+   1,500 commits that earlier resyncs already integrated. Make a commit that has
+   `master`'s tree and the last synced upstream SHA (the last row of the table
+   above) as its second parent, and branch from it. Resync 3 did the same
+   (`c856dbf1`).
+
+   ```bash
+   BASE=89de3f5c9945eeee277e713f111d707d39857dff
+   G=$(git commit-tree 'master^{tree}' -p master -p "$BASE" \
+         -m "graft: master tree with true upstream base $BASE")
+   git switch -c resync-4 "$G"
+   git merge-base HEAD upstream/master   # must print $BASE
+   git merge upstream/master
+   ```
+
+   Do not rebase `master` or the resync branch onto upstream.
 4. Resolve conflicts keeping the fork's side where it matters:
    - Files deleted on `master` stay deleted (Resync #24 preserved 537 of
      them). The removals so far: Warp-internal infrastructure, specs and agent
@@ -60,7 +85,8 @@ and keep this file current.
 6. Build and test (`cargo check -p warp --lib`, the targeted crate tests, and
    `./script/presubmit` as far as it passes on `master`) and put what you ran,
    and what you did not, in the PR description.
-7. Squash-merge, then fill in the table above.
+7. Squash-merge, then add a row to the table above with the SHA you noted in
+   step 2. Without it the next resync has no merge base to start from.
 
 ## Things that are deliberately different from upstream
 
