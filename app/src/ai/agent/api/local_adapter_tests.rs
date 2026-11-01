@@ -226,6 +226,7 @@ fn event_kinds(events: &[Event]) -> Vec<String> {
                             api::client_action::Action::CreateTask(_) => "create_task",
                             api::client_action::Action::AddMessagesToTask(_) => "add_messages",
                             api::client_action::Action::AppendToMessageContent(_) => "append",
+                            api::client_action::Action::UpdateTaskMessage(_) => "update",
                             _ => "other_action",
                         };
                         kinds.push(kind.to_string());
@@ -896,6 +897,538 @@ mod event_mapping {
             events.iter().any(|e| e.is_err()),
             "transport failures must surface as stream errors so the existing retry machinery applies"
         );
+    }
+}
+
+/// Reasoning surfacing and replay-item persistence: engine events -> task-tree
+/// messages -> rebuilt transcript.
+mod reasoning {
+    use super::*;
+
+    const CALL_ID: &str = "call_1";
+
+    fn replay_item() -> serde_json::Value {
+        json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "summary": [{ "type": "summary_text", "text": "Plan: list the files \u{1F4C1}" }],
+            "encrypted_content": "gAAAAABo+/=="
+        })
+    }
+
+    fn second_replay_item() -> serde_json::Value {
+        json!({ "type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "gAAAAACp//==" })
+    }
+
+    fn shell_call(id: &str) -> AgentEvent {
+        AgentEvent::ToolCall(ToolCallRequest {
+            id: id.to_string(),
+            name: "run_shell_command".to_string(),
+            arguments: json!({ "command": "ls" }),
+        })
+    }
+
+    /// The task-tree actions of a batch of events, in order.
+    fn task_actions(events: &[Event]) -> Vec<api::client_action::Action> {
+        events
+            .iter()
+            .filter_map(|event| event.as_ref().ok())
+            .filter_map(|event| match event.r#type.as_ref() {
+                Some(api::response_event::Type::ClientActions(actions)) => Some(&actions.actions),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|action| action.action.clone())
+            .collect()
+    }
+
+    /// Applies task-tree actions through the same field-mask machinery the
+    /// client's `task.rs` uses, so a bad mask path fails here.
+    fn apply_task_actions(messages: &mut Vec<api::Message>, events: &[Event]) {
+        use api::client_action::Action;
+        for action in task_actions(events) {
+            match action {
+                Action::AddMessagesToTask(add) => messages.extend(add.messages),
+                Action::AppendToMessageContent(append) => {
+                    let patch = append.message.expect("append message");
+                    let existing = messages
+                        .iter_mut()
+                        .find(|message| message.id == patch.id)
+                        .expect("message to append to");
+                    let merged = field_mask::FieldMaskOperation::append(
+                        &api::MESSAGE_DESCRIPTOR,
+                        &*existing,
+                        &patch,
+                        append.mask.expect("mask"),
+                    )
+                    .apply()
+                    .expect("append must apply");
+                    *existing = merged;
+                }
+                Action::UpdateTaskMessage(update) => {
+                    let patch = update.message.expect("update message");
+                    let existing = messages
+                        .iter_mut()
+                        .find(|message| message.id == patch.id)
+                        .expect("message to update");
+                    let merged = field_mask::FieldMaskOperation::update(
+                        &api::MESSAGE_DESCRIPTOR,
+                        &*existing,
+                        &patch,
+                        update.mask.expect("mask"),
+                    )
+                    .apply()
+                    .expect("update must apply");
+                    *existing = merged;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Runs one first turn through the mapper and returns the task messages the
+    /// next request's `task_context` would carry.
+    fn persisted_messages(events: Vec<AgentEvent>) -> Vec<api::Message> {
+        let req = request(vec![], user_inputs(vec![user_query_input("hi")]), "");
+        let plan = plan_turn(&req, &route()).expect("plan");
+        let mut mapper = EventMapper::new(&plan);
+        let mut messages = Vec::new();
+        apply_task_actions(&mut messages, &mapper.initial_events());
+        for event in events {
+            apply_task_actions(&mut messages, &mapper.on_event(Ok(event)));
+        }
+        messages
+    }
+
+    fn transcript_after(
+        messages: Vec<api::Message>,
+        input: api::request::input::user_inputs::user_input::Input,
+        route: &LocalRoute,
+    ) -> Vec<ChatMessage> {
+        let req = request(
+            vec![root_task(messages)],
+            user_inputs(vec![input]),
+            "conv-1",
+        );
+        plan_turn(&req, route).expect("plan").transcript
+    }
+
+    fn tool_result_follow_up(messages: Vec<api::Message>) -> Vec<ChatMessage> {
+        transcript_after(messages, shell_result_input(CALL_ID, "ok", 0), &route())
+    }
+
+    fn assistants(transcript: &[ChatMessage]) -> Vec<&ChatMessage> {
+        transcript
+            .iter()
+            .filter(|message| matches!(message, ChatMessage::Assistant { .. }))
+            .collect()
+    }
+
+    fn reasoning_messages(
+        messages: &[api::Message],
+    ) -> Vec<(&api::Message, &api::message::AgentReasoning)> {
+        messages
+            .iter()
+            .filter_map(|message| match &message.message {
+                Some(api::message::Message::AgentReasoning(reasoning)) => {
+                    Some((message, reasoning))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn summary_deltas_stream_into_one_reasoning_message_that_is_finished_by_the_answer() {
+        let plan = {
+            let req = request(vec![], user_inputs(vec![user_query_input("hi")]), "");
+            plan_turn(&req, &route()).expect("plan")
+        };
+        let mut mapper = EventMapper::new(&plan);
+        mapper.initial_events();
+
+        let first = mapper.on_event(Ok(AgentEvent::ReasoningDelta("Think".to_string())));
+        let second = mapper.on_event(Ok(AgentEvent::ReasoningDelta("ing".to_string())));
+        let answer = mapper.on_event(Ok(AgentEvent::TextDelta("Hi".to_string())));
+
+        assert_eq!(event_kinds(&first), vec!["add_messages"]);
+        assert_eq!(event_kinds(&second), vec!["append"]);
+        assert_eq!(
+            event_kinds(&answer),
+            vec!["update", "add_messages"],
+            "the answer finishes the reasoning message, then opens its own output message"
+        );
+
+        let added = added_messages(&first);
+        assert!(matches!(
+            &added[0].message,
+            Some(api::message::Message::AgentReasoning(r)) if r.reasoning == "Think"
+        ));
+        let Some(api::client_action::Action::AppendToMessageContent(append)) =
+            task_actions(&second).pop()
+        else {
+            panic!("expected an append action");
+        };
+        assert_eq!(
+            append.mask.expect("mask").paths,
+            vec!["agent_reasoning.reasoning"]
+        );
+        assert_eq!(append.message.expect("message").id, added[0].id);
+    }
+
+    #[test]
+    fn reasoning_text_lands_in_the_task_tree_and_is_marked_finished() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReasoningDelta("Think".to_string()),
+            AgentEvent::ReasoningDelta("ing".to_string()),
+            AgentEvent::TextDelta("Hi".to_string()),
+            AgentEvent::Done,
+        ]);
+
+        let reasoning = reasoning_messages(&messages);
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0].1.reasoning, "Thinking");
+        assert!(
+            reasoning[0].1.finished_duration.is_some(),
+            "finished reasoning must stop showing the live 'Thinking' header"
+        );
+        assert!(
+            reasoning[0].0.server_message_data.is_empty(),
+            "reasoning without a replay item (Chat Completions) carries no payload"
+        );
+    }
+
+    #[test]
+    fn done_and_tool_calls_finish_an_open_reasoning_message() {
+        let plan = {
+            let req = request(vec![], user_inputs(vec![user_query_input("hi")]), "");
+            plan_turn(&req, &route()).expect("plan")
+        };
+        let mut reasoning_then_done = EventMapper::new(&plan);
+        reasoning_then_done.initial_events();
+        reasoning_then_done.on_event(Ok(AgentEvent::ReasoningDelta("hm".to_string())));
+        let mut reasoning_then_call = EventMapper::new(&plan);
+        reasoning_then_call.initial_events();
+        reasoning_then_call.on_event(Ok(AgentEvent::ReasoningDelta("hm".to_string())));
+
+        let done = reasoning_then_done.on_event(Ok(AgentEvent::Done));
+        let call = reasoning_then_call.on_event(Ok(shell_call(CALL_ID)));
+
+        assert_eq!(
+            event_kinds(&done),
+            vec!["update", "commit_transaction", "finished"]
+        );
+        assert_eq!(event_kinds(&call), vec!["update", "add_messages"]);
+    }
+
+    #[test]
+    fn empty_reasoning_deltas_are_ignored() {
+        let plan = {
+            let req = request(vec![], user_inputs(vec![user_query_input("hi")]), "");
+            plan_turn(&req, &route()).expect("plan")
+        };
+        let mut mapper = EventMapper::new(&plan);
+        mapper.initial_events();
+
+        assert!(
+            mapper
+                .on_event(Ok(AgentEvent::ReasoningDelta(String::new())))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replay_item_rides_on_the_reasoning_message_that_shows_its_summary() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReasoningDelta("Plan".to_string()),
+            AgentEvent::ReplayItem(replay_item()),
+            shell_call(CALL_ID),
+            AgentEvent::Done,
+        ]);
+
+        let reasoning = reasoning_messages(&messages);
+        assert_eq!(reasoning.len(), 1, "one provider item, one carrier message");
+        assert_eq!(reasoning[0].1.reasoning, "Plan");
+        assert!(reasoning[0].1.finished_duration.is_some());
+        assert!(!reasoning[0].0.server_message_data.is_empty());
+    }
+
+    #[test]
+    fn replay_item_without_summary_text_gets_an_empty_carrier_message() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReplayItem(replay_item()),
+            shell_call(CALL_ID),
+            AgentEvent::Done,
+        ]);
+
+        let reasoning = reasoning_messages(&messages);
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(
+            reasoning[0].1.reasoning, "",
+            "an empty reasoning message is not rendered by the UI"
+        );
+        assert!(!reasoning[0].0.server_message_data.is_empty());
+
+        let transcript = tool_result_follow_up(messages);
+        assert!(matches!(
+            assistants(&transcript)[0],
+            ChatMessage::Assistant { replay_items, .. } if *replay_items == vec![replay_item()]
+        ));
+    }
+
+    #[test]
+    fn tool_turn_replays_reasoning_items_before_the_assistant_tool_calls() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReasoningDelta("Plan".to_string()),
+            AgentEvent::ReplayItem(replay_item()),
+            shell_call(CALL_ID),
+            AgentEvent::Done,
+        ]);
+
+        let transcript = tool_result_follow_up(messages);
+
+        // [system, user, assistant(replay items + tool call), tool result]
+        assert_eq!(transcript.len(), 4, "got {transcript:?}");
+        let ChatMessage::Assistant {
+            text,
+            tool_calls,
+            replay_items,
+        } = &transcript[2]
+        else {
+            panic!("expected the assistant turn, got {:?}", transcript[2]);
+        };
+        assert_eq!(text, "");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, CALL_ID);
+        assert_eq!(replay_items, &vec![replay_item()]);
+        assert!(matches!(
+            &transcript[3],
+            ChatMessage::Tool { tool_call_id, .. } if tool_call_id == CALL_ID
+        ));
+    }
+
+    #[test]
+    fn text_answer_replays_reasoning_items_with_the_assistant_text() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReasoningDelta("Plan".to_string()),
+            AgentEvent::ReplayItem(replay_item()),
+            AgentEvent::TextDelta("All done.".to_string()),
+            AgentEvent::Done,
+        ]);
+
+        let transcript = transcript_after(messages, user_query_input("thanks"), &route());
+
+        let assistants = assistants(&transcript);
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(
+            assistants[0],
+            &ChatMessage::Assistant {
+                text: "All done.".to_string(),
+                tool_calls: vec![],
+                replay_items: vec![replay_item()],
+            }
+        );
+        assert_eq!(
+            transcript.last(),
+            Some(&ChatMessage::User("thanks".to_string()))
+        );
+    }
+
+    #[test]
+    fn several_reasoning_items_keep_stream_order() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReasoningDelta("first".to_string()),
+            AgentEvent::ReplayItem(replay_item()),
+            AgentEvent::ReplayItem(second_replay_item()),
+            shell_call(CALL_ID),
+            AgentEvent::Done,
+        ]);
+
+        let transcript = tool_result_follow_up(messages);
+
+        assert!(matches!(
+            assistants(&transcript)[0],
+            ChatMessage::Assistant { replay_items, .. }
+                if *replay_items == vec![replay_item(), second_replay_item()]
+        ));
+    }
+
+    #[test]
+    fn parallel_tool_calls_share_one_assistant_message_that_adopts_the_replay_items() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReplayItem(replay_item()),
+            shell_call("call_a"),
+            shell_call("call_b"),
+            AgentEvent::Done,
+        ]);
+
+        let transcript =
+            transcript_after(messages, shell_result_input("call_a", "ok", 0), &route());
+
+        let assistants = assistants(&transcript);
+        assert_eq!(assistants.len(), 1);
+        let ChatMessage::Assistant {
+            tool_calls,
+            replay_items,
+            ..
+        } = assistants[0]
+        else {
+            unreachable!();
+        };
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(replay_items, &vec![replay_item()]);
+    }
+
+    #[test]
+    fn reasoning_summary_text_is_never_replayed_as_assistant_text() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReasoningDelta("secret chain of thought".to_string()),
+            AgentEvent::ReplayItem(replay_item()),
+            shell_call(CALL_ID),
+            AgentEvent::Done,
+        ]);
+
+        let transcript = tool_result_follow_up(messages);
+
+        let transcript_text = format!("{transcript:?}");
+        assert!(
+            !transcript_text.contains("secret chain of thought"),
+            "reasoning text leaked into the transcript: {transcript_text}"
+        );
+    }
+
+    #[test]
+    fn chat_completions_reasoning_adds_nothing_to_the_transcript() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReasoningDelta("thinking out loud".to_string()),
+            AgentEvent::TextDelta("answer".to_string()),
+            AgentEvent::Done,
+        ]);
+
+        let transcript = transcript_after(messages, user_query_input("next"), &route());
+
+        assert_eq!(
+            &transcript[1..],
+            &[
+                ChatMessage::User("hi".to_string()),
+                ChatMessage::Assistant {
+                    text: "answer".to_string(),
+                    tool_calls: vec![],
+                    replay_items: vec![],
+                },
+                ChatMessage::User("next".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn replay_items_round_trip_losslessly() {
+        let item = json!({
+            "type": "reasoning",
+            "id": "rs_\u{1F9E0}",
+            "summary": [
+                { "type": "summary_text", "text": "line one\nline \"two\" \\ \t" },
+                { "type": "summary_text", "text": "" }
+            ],
+            "encrypted_content": "A".repeat(4096),
+            "nested": { "numbers": [0, -1, 9007199254740993_i64, 1.5, 1e-7], "none": null, "flag": false },
+        });
+        let messages = persisted_messages(vec![
+            AgentEvent::ReplayItem(item.clone()),
+            shell_call(CALL_ID),
+            AgentEvent::Done,
+        ]);
+
+        let transcript = tool_result_follow_up(messages);
+
+        let ChatMessage::Assistant { replay_items, .. } = assistants(&transcript)[0] else {
+            unreachable!();
+        };
+        assert_eq!(replay_items, &vec![item]);
+    }
+
+    #[test]
+    fn replay_items_are_not_handed_to_a_different_model() {
+        let messages = persisted_messages(vec![
+            AgentEvent::ReplayItem(replay_item()),
+            shell_call(CALL_ID),
+            AgentEvent::Done,
+        ]);
+        let other_model = LocalRoute {
+            config_key: "cfg-other".to_string(),
+            ..route()
+        };
+
+        let transcript = transcript_after(
+            messages.clone(),
+            shell_result_input(CALL_ID, "ok", 0),
+            &other_model,
+        );
+        let same_model = transcript_after(messages, shell_result_input(CALL_ID, "ok", 0), &route());
+
+        assert!(matches!(
+            assistants(&transcript)[0],
+            ChatMessage::Assistant { replay_items, tool_calls, .. }
+                if replay_items.is_empty() && tool_calls.len() == 1
+        ));
+        assert!(matches!(
+            assistants(&same_model)[0],
+            ChatMessage::Assistant { replay_items, .. } if replay_items.len() == 1
+        ));
+    }
+
+    #[test]
+    fn replay_items_without_a_following_assistant_message_do_not_leak_into_later_turns() {
+        // The first turn ended after reasoning (no text, no tool call).
+        let mut messages = persisted_messages(vec![
+            AgentEvent::ReplayItem(replay_item()),
+            AgentEvent::Done,
+        ]);
+        messages.push(user_query_message("m-next", "try again"));
+        messages.push(agent_output_message("m-answer", "here you go"));
+
+        let transcript = transcript_after(messages, user_query_input("thanks"), &route());
+
+        assert!(
+            assistants(&transcript).iter().all(|message| matches!(
+                message,
+                ChatMessage::Assistant { replay_items, .. } if replay_items.is_empty()
+            )),
+            "dangling reasoning must not be attached to a later turn: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn foreign_or_malformed_payloads_on_reasoning_messages_are_ignored() {
+        let reasoning = |id: &str, payload: &str| api::Message {
+            server_message_data: payload.to_string(),
+            ..message(
+                id,
+                api::message::Message::AgentReasoning(api::message::AgentReasoning {
+                    reasoning: "server reasoning".to_string(),
+                    finished_duration: None,
+                }),
+            )
+        };
+        let messages = vec![
+            user_query_message("m1", "list files"),
+            // An opaque server-issued blob, not JSON.
+            reasoning("m2", "CgdvcGFxdWUSCQ=="),
+            // Our envelope, but the item is not an object.
+            reasoning(
+                "m3",
+                &format!(r#"{{"config_key":"{CONFIG_KEY}","local_agent_replay_item":"oops"}}"#),
+            ),
+            shell_tool_call_message("m4", CALL_ID, "ls"),
+        ];
+
+        let transcript = tool_result_follow_up(messages);
+
+        assert!(matches!(
+            assistants(&transcript)[0],
+            ChatMessage::Assistant { replay_items, tool_calls, .. }
+                if replay_items.is_empty() && tool_calls.len() == 1
+        ));
     }
 }
 
