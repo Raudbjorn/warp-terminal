@@ -21,7 +21,15 @@ known to be incomplete, the text says so and links the tracking issue.
 | Providers | OpenAI-compatible Chat Completions, or OpenCode | Custom endpoints that use the OpenAI Chat Completions schema | OpenAI-compatible Chat Completions |
 | Network policy | Enforced: loopback only (see [Network behavior](#network-behavior-in-the-oss-build)) | Not enforced: the engine uses a plain `reqwest` client | Not enforced: the service and the app's health and `/models` calls use plain `reqwest` clients ([#32](https://github.com/Raudbjorn/warp-terminal/issues/32)) |
 
-Changing one of these settings does not change the other two.
+> **Turn on *Use Local AI provider* first.** In the OSS build AI counts as
+> enabled only while `agents.local_openai.enabled` is on: `is_any_ai_enabled`
+> (`app/src/settings/ai.rs`) returns that value, and the AI surfaces check it.
+> While it is off, the *LOCAL INFERENCE* fields in Agent Profiles are disabled
+> too. Turn it on even if you only want the Warp Agent. The provider fields of
+> the Local AI page matter only for the single-shot features.
+
+Apart from that switch, changing one of these settings does not change the
+other two.
 
 ## Single-shot features: Local AI settings
 
@@ -32,7 +40,7 @@ Open **Settings → Local AI**, turn on *Use Local AI provider*, pick a
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `enabled` | bool | `false` | Master switch for the single-shot features. |
+| `enabled` | bool | `false` | Master switch for AI in the OSS build, not only for the single-shot features: `is_any_ai_enabled` returns this value, so with it off the AI surfaces, including the Agent Profile *LOCAL INFERENCE* fields, are disabled. |
 | `base_url` | string | `http://127.0.0.1:1234/v1` | OpenAI-compatible base URL. Must be loopback (see below). Not used by the OpenCode provider. |
 | `api_key` | string | empty | Optional. Local servers such as Ollama and LM Studio usually do not need one. |
 | `command_model` | string | `google/gemma-4-e4b` | Model for command generation and workflow metadata. |

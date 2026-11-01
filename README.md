@@ -22,6 +22,10 @@ OpenRouter, or any gateway that speaks the OpenAI API), or
 [OpenCode](https://opencode.ai). Until an endpoint is configured, the terminal
 works normally but AI actions have nowhere to go.
 
+Turn on **Settings → Local AI → Use Local AI provider** first: the OSS build
+treats AI as disabled while it is off, which also disables the Agent Profile
+fields below, even if you only want the Warp Agent.
+
 There are three separate AI paths, each with its own settings:
 
 - **Natural-language commands, workflow metadata and command prediction:**
