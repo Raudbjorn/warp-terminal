@@ -339,10 +339,7 @@ where
 
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).context("Failed to read zip entry")?;
-            let file_name = file
-                .name()
-                .context("Zip entry has an invalid file name")?
-                .into_owned();
+            let file_name = file.name().context("Zip entry has an invalid file name")?;
 
             if let Some(ref filter) = file_filter
                 && !filter(&file_name)
