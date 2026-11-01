@@ -104,7 +104,77 @@ pub fn remote_image_path(mime_type: &str) -> String {
 
 /// Largest clipboard image Warp sends over SSH.
 pub const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
+pub(super) const SOCKET_ONLY_PROXY_COMMAND: &str = "ProxyCommand=false";
 const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Collect both pipes concurrently, terminating the child on timeout or either byte limit.
+#[cfg(not(target_family = "wasm"))]
+pub(super) async fn bounded_output(
+    command: &mut command::r#async::Command,
+    stdout_limit: usize,
+    stderr_limit: usize,
+    timeout: std::time::Duration,
+) -> anyhow::Result<std::process::Output> {
+    use std::process::Stdio;
+
+    use anyhow::Context as _;
+    use warpui::r#async::FutureExt as _;
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to start SSH helper")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("SSH helper has no stdout pipe")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("SSH helper has no stderr pipe")?;
+    let collect = async {
+        let (stdout, stderr, status) = futures::try_join!(
+            read_limited(stdout, stdout_limit),
+            read_limited(stderr, stderr_limit),
+            async {
+                child
+                    .status()
+                    .await
+                    .context("failed to wait for SSH helper")
+            },
+        )?;
+        Ok::<_, anyhow::Error>(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
+    };
+    collect
+        .with_timeout(timeout)
+        .await
+        .context("SSH helper timed out")?
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn read_limited(
+    stream: impl futures::io::AsyncRead + Unpin,
+    limit: usize,
+) -> anyhow::Result<Vec<u8>> {
+    use futures::io::AsyncReadExt as _;
+    let mut bytes = Vec::new();
+    stream
+        .take(limit as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    anyhow::ensure!(
+        bytes.len() <= limit,
+        "SSH helper output exceeds {limit} bytes"
+    );
+    Ok(bytes)
+}
 
 /// Copies `data` to `remote_path` through the ControlMaster at `control_path`, failing instead of
 /// opening a new connection if the master is gone.
@@ -116,15 +186,15 @@ pub async fn upload(
 ) -> anyhow::Result<()> {
     use std::io::Write as _;
 
-    use anyhow::{Context as _, anyhow, bail};
-    use warpui::r#async::FutureExt as _;
+    use anyhow::bail;
 
     // The temp file is 0600 and `scp -p` keeps that mode, so the copy isn't readable by other
     // users of the remote host.
     let mut local = tempfile::NamedTempFile::new()?;
     local.write_all(&data)?;
     local.flush()?;
-    let output = command::r#async::Command::new("scp")
+    let mut command = command::r#async::Command::new("scp");
+    command
         .arg("-p")
         .arg("-q")
         .args([
@@ -133,19 +203,14 @@ pub async fn upload(
         ])
         .args(["-o", "ControlMaster=no"])
         .args(["-o", "BatchMode=yes"])
-        .args(["-o", "ProxyCommand=none"])
+        .args(["-o", SOCKET_ONLY_PROXY_COMMAND])
         .args(["-o", "ProxyJump=none"])
         .args(["-o", "ConnectTimeout=15"])
         .arg("--")
         .arg(local.path())
-        // The host is ignored while the ControlMaster is up, and `.invalid` never resolves if not.
-        .arg(format!("warp-control-master.invalid:{remote_path}"))
-        .kill_on_drop(true)
-        .output()
-        .with_timeout(UPLOAD_TIMEOUT)
-        .await
-        .map_err(|_| anyhow!("scp timed out after {UPLOAD_TIMEOUT:?}"))?
-        .context("failed to run scp")?;
+        // The failing proxy forbids a fresh connection if the original master has gone away.
+        .arg(format!("warp-control-master.invalid:{remote_path}"));
+    let output = bounded_output(&mut command, 64 * 1024, 16 * 1024, UPLOAD_TIMEOUT).await?;
     if !output.status.success() {
         bail!(
             "scp exited with {:?}: {}",

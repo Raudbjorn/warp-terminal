@@ -16,8 +16,6 @@ use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
     AppContext, Element, Entity, SingletonEntity, TypedActionView, View, ViewContext, ViewHandle,
 };
-use warpui_extras::secure_storage::AppContextExt as _;
-use zeroize::Zeroizing;
 
 use crate::appearance::Appearance;
 use crate::editor::{
@@ -25,9 +23,7 @@ use crate::editor::{
     TextOptions,
 };
 use crate::ssh_manager::panel::jump_host_points_at;
-use crate::ssh_manager::profile::{
-    SshHostProfile, SshJumpHost, default_ssh_port, ssh_profile_password_key,
-};
+use crate::ssh_manager::profile::{SshHostProfile, SshJumpHost, default_ssh_port};
 use crate::ui_components::buttons::icon_button;
 use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{ActionButton, PrimaryTheme, SecondaryTheme};
@@ -37,7 +33,7 @@ const SCROLLBAR_WIDTH: f32 = 4.;
 const JUMP_HOST_DROPDOWN_WIDTH: f32 = 460.;
 const FIELD_RADIUS: f32 = 6.;
 const FIELD_LABEL_SPACING: f32 = 5.;
-const EDITOR_COUNT: usize = 7;
+const EDITOR_COUNT: usize = 6;
 const LABEL_FORBIDDEN_CHARACTERS: [char; 6] = ['#', '*', '?', '!', '"', '\''];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +45,6 @@ pub enum SshProfileModalMode {
 #[derive(Clone)]
 pub enum PasswordIntent {
     Keep,
-    Set(Zeroizing<String>),
     Clear,
 }
 
@@ -57,7 +52,6 @@ impl std::fmt::Debug for PasswordIntent {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Keep => formatter.write_str("Keep"),
-            Self::Set(_) => formatter.write_str("Set(<redacted>)"),
             Self::Clear => formatter.write_str("Clear"),
         }
     }
@@ -77,7 +71,6 @@ pub enum SshProfileModalEvent {
 pub enum SshProfileModalAction {
     Cancel,
     Save,
-    TogglePasswordVisibility,
     ClearPassword,
     JumpHostDropdownPlaceholder,
     AddJumpHost(Uuid),
@@ -91,18 +84,15 @@ pub struct SshProfileModalView {
     host_editor: ViewHandle<EditorView>,
     user_editor: ViewHandle<EditorView>,
     port_editor: ViewHandle<EditorView>,
-    password_editor: ViewHandle<EditorView>,
     identity_file_editor: ViewHandle<EditorView>,
     tags_editor: ViewHandle<EditorView>,
     jump_host_dropdown: ViewHandle<Dropdown<SshProfileModalAction>>,
     available_profiles: Vec<SshHostProfile>,
     selected_jump_hosts: Vec<SshJumpHost>,
     password_clear: bool,
-    had_stored_password: bool,
     error: Option<String>,
     cancel_button: ViewHandle<ActionButton>,
     save_button: ViewHandle<ActionButton>,
-    password_eye_mouse_state: MouseStateHandle,
     password_clear_mouse_state: MouseStateHandle,
     jump_host_chip_mouse_states: RefCell<HashMap<usize, MouseStateHandle>>,
     form_scroll_state: ClippedScrollStateHandle,
@@ -111,10 +101,9 @@ pub struct SshProfileModalView {
 impl SshProfileModalView {
     pub fn new(ctx: &mut ViewContext<Self>) -> Self {
         let name_editor = Self::editor("Label", false, ctx);
-        let host_editor = Self::editor("Host", false, ctx);
+        let host_editor = Self::editor("From SSH config", false, ctx);
         let user_editor = Self::editor("Username", false, ctx);
         let port_editor = Self::editor("From SSH config", false, ctx);
-        let password_editor = Self::editor("Password", true, ctx);
         let identity_file_editor = Self::editor("~/.ssh/id_ed25519", false, ctx);
         let tags_editor = Self::editor("prod, db", false, ctx);
         let cancel_button = ctx.add_typed_action_view(|_| {
@@ -142,7 +131,6 @@ impl SshProfileModalView {
             &host_editor,
             &user_editor,
             &port_editor,
-            &password_editor,
             &identity_file_editor,
             &tags_editor,
         ]
@@ -161,18 +149,15 @@ impl SshProfileModalView {
             host_editor,
             user_editor,
             port_editor,
-            password_editor,
             identity_file_editor,
             tags_editor,
             jump_host_dropdown,
             available_profiles: Vec::new(),
             selected_jump_hosts: Vec::new(),
             password_clear: false,
-            had_stored_password: false,
             error: None,
             cancel_button,
             save_button,
-            password_eye_mouse_state: Default::default(),
             password_clear_mouse_state: Default::default(),
             jump_host_chip_mouse_states: Default::default(),
             form_scroll_state: Default::default(),
@@ -209,13 +194,11 @@ impl SshProfileModalView {
         self.available_profiles = profiles;
         self.selected_jump_hosts.clear();
         self.password_clear = false;
-        self.had_stored_password = false;
         self.error = None;
         self.set_editor_text("", &self.name_editor, ctx);
         self.set_editor_text("", &self.host_editor, ctx);
         self.set_editor_text("", &self.user_editor, ctx);
         self.set_editor_text(&default_ssh_port().to_string(), &self.port_editor, ctx);
-        self.reset_password_editor(ctx);
         self.set_editor_text("", &self.identity_file_editor, ctx);
         self.set_editor_text("", &self.tags_editor, ctx);
         self.jump_host_chip_mouse_states.borrow_mut().clear();
@@ -240,7 +223,15 @@ impl SshProfileModalView {
         self.password_clear = false;
         self.error = None;
         self.set_editor_text(&profile.name, &self.name_editor, ctx);
-        self.set_editor_text(&profile.host, &self.host_editor, ctx);
+        self.set_editor_text(
+            if profile.host_is_explicit {
+                &profile.host
+            } else {
+                ""
+            },
+            &self.host_editor,
+            ctx,
+        );
         self.set_editor_text(
             profile.user.as_deref().unwrap_or_default(),
             &self.user_editor,
@@ -255,20 +246,6 @@ impl SshProfileModalView {
             &self.port_editor,
             ctx,
         );
-        let stored_password = match ctx
-            .secure_storage()
-            .read_value(&ssh_profile_password_key(&profile))
-        {
-            Ok(password) => Some(Zeroizing::new(password)),
-            Err(err) => {
-                if !matches!(err, warpui_extras::secure_storage::Error::NotFound) {
-                    log::warn!("Failed to read SSH profile password: {err:#}");
-                }
-                None
-            }
-        };
-        self.had_stored_password = stored_password.is_some();
-        self.reset_password_editor(ctx);
         self.set_editor_text(
             profile.identity_file.as_deref().unwrap_or_default(),
             &self.identity_file_editor,
@@ -285,19 +262,9 @@ impl SshProfileModalView {
         ctx.focus(&self.name_editor);
     }
 
-    pub(super) fn reset_sensitive_state(&mut self, ctx: &mut ViewContext<Self>) {
+    pub(super) fn reset_sensitive_state(&mut self, _ctx: &mut ViewContext<Self>) {
         self.password_clear = false;
-        self.had_stored_password = false;
         self.error = None;
-        self.reset_password_editor(ctx);
-    }
-
-    fn reset_password_editor(&mut self, ctx: &mut ViewContext<Self>) {
-        self.password_editor.update(ctx, |editor, ctx| {
-            editor.clear_buffer_and_reset_undo_stack(ctx);
-            editor.set_placeholder_text("Password", ctx);
-            editor.set_is_password(true, ctx);
-        });
     }
 
     pub(super) fn set_error(&mut self, error: Option<String>, ctx: &mut ViewContext<Self>) {
@@ -322,7 +289,6 @@ impl SshProfileModalView {
             &self.host_editor,
             &self.user_editor,
             &self.port_editor,
-            &self.password_editor,
             &self.identity_file_editor,
             &self.tags_editor,
         ]
@@ -384,7 +350,6 @@ impl SshProfileModalView {
     fn is_valid(&self, app: &AppContext) -> bool {
         !self.editor_text(&self.name_editor, app).is_empty()
             && self.label_error(app).is_none()
-            && !self.editor_text(&self.host_editor, app).is_empty()
             && self.parse_port(app).is_some()
     }
 
@@ -398,9 +363,11 @@ impl SshProfileModalView {
     fn build_profile(&self, app: &AppContext) -> Option<SshHostProfile> {
         let name = self.editor_text(&self.name_editor, app);
         let host = self.editor_text(&self.host_editor, app);
-        if name.is_empty() || host.is_empty() {
+        if name.is_empty() {
             return None;
         }
+        let host_is_explicit = !host.is_empty();
+        let host = if host_is_explicit { host } else { name.clone() };
 
         let user = self.optional_editor_text(&self.user_editor, app);
         let identity_file = self.optional_editor_text(&self.identity_file_editor, app);
@@ -416,6 +383,7 @@ impl SshProfileModalView {
             id: self.draft_id,
             name,
             host,
+            host_is_explicit,
             user,
             port: self.parse_port(app)?,
             port_is_explicit: !self.editor_text(&self.port_editor, app).is_empty(),
@@ -434,11 +402,8 @@ impl SshProfileModalView {
         (!value.is_empty()).then_some(value)
     }
 
-    fn password_intent(&self, app: &AppContext) -> PasswordIntent {
-        let password = self.password_editor.as_ref(app).buffer_text(app);
-        if !password.is_empty() {
-            PasswordIntent::Set(Zeroizing::new(password))
-        } else if self.password_clear {
+    fn password_intent(&self) -> PasswordIntent {
+        if self.password_clear {
             PasswordIntent::Clear
         } else {
             PasswordIntent::Keep
@@ -460,16 +425,17 @@ impl SshProfileModalView {
         ctx.emit(SshProfileModalEvent::Submit {
             mode: self.mode.clone(),
             profile: Box::new(profile),
-            password: self.password_intent(ctx),
+            password: self.password_intent(),
         });
     }
 
     fn jump_host_from_profile(profile: &SshHostProfile) -> SshJumpHost {
         SshJumpHost {
             source_profile_id: Some(profile.id),
-            host: profile.host.clone(),
+            host: profile.name.clone(),
             user: profile.user.clone(),
             port: profile.port,
+            port_is_explicit: profile.port_is_explicit,
             identity_file: profile.identity_file.clone(),
         }
     }
@@ -620,73 +586,44 @@ impl SshProfileModalView {
         column.finish()
     }
 
-    fn render_password_field(&self, app: &AppContext, appearance: &Appearance) -> Box<dyn Element> {
-        let password_is_visible = !self.password_editor.as_ref(app).is_password();
-        let eye = icon_button(
-            appearance,
-            Icon::Eye,
-            password_is_visible,
-            self.password_eye_mouse_state.clone(),
-        )
-        .build()
-        .on_click(|ctx, _, _| {
-            ctx.dispatch_typed_action(SshProfileModalAction::TogglePasswordVisibility)
-        })
-        .finish();
-
-        let clear = icon_button(
-            appearance,
-            Icon::X,
-            self.password_clear,
-            self.password_clear_mouse_state.clone(),
-        )
-        .build()
-        .on_click(|ctx, _, _| ctx.dispatch_typed_action(SshProfileModalAction::ClearPassword))
-        .finish();
-
-        Flex::column()
-            .with_spacing(FIELD_LABEL_SPACING)
-            .with_child(Self::render_label("Password", appearance))
-            .with_child(
+    fn render_password_field(&self, appearance: &Appearance) -> Box<dyn Element> {
+        let mut content =
+            Flex::column()
+                .with_spacing(FIELD_LABEL_SPACING)
+                .with_child(Self::render_label(
+                    "SSH requests passwords in the terminal.",
+                    appearance,
+                ));
+        if matches!(self.mode, SshProfileModalMode::Edit(_)) {
+            content = content.with_child(
                 Flex::row()
                     .with_cross_axis_alignment(CrossAxisAlignment::Center)
                     .with_spacing(6.)
+                    .with_child(Self::render_label(
+                        if self.password_clear {
+                            "Previously saved password will be removed"
+                        } else {
+                            "Clear previously saved password"
+                        },
+                        appearance,
+                    ))
                     .with_child(
-                        Expanded::new(
-                            1.,
-                            self.render_text_input(&self.password_editor, appearance),
+                        icon_button(
+                            appearance,
+                            Icon::X,
+                            self.password_clear,
+                            self.password_clear_mouse_state.clone(),
                         )
+                        .build()
+                        .on_click(|ctx, _, _| {
+                            ctx.dispatch_typed_action(SshProfileModalAction::ClearPassword)
+                        })
                         .finish(),
                     )
-                    .with_child(eye)
-                    .with_child(clear)
                     .finish(),
-            )
-            .with_child(
-                Text::new(
-                    if self.password_clear
-                        && self.password_editor.as_ref(app).buffer_text(app).is_empty()
-                    {
-                        "Stored password will be removed"
-                    } else if self.had_stored_password
-                        && self.password_editor.as_ref(app).buffer_text(app).is_empty()
-                    {
-                        "Saved password kept only if the destination is unchanged"
-                    } else {
-                        ""
-                    },
-                    appearance.ui_font_family(),
-                    10.,
-                )
-                .with_color(
-                    appearance
-                        .theme()
-                        .sub_text_color(appearance.theme().background())
-                        .into(),
-                )
-                .finish(),
-            )
-            .finish()
+            );
+        }
+        content.finish()
     }
 
     fn render_jump_hosts(&self, appearance: &Appearance) -> Box<dyn Element> {
@@ -743,7 +680,8 @@ impl SshProfileModalView {
             .with_spacing(7.)
             .with_child(Self::render_label("Jump hosts", appearance))
             .with_child(ChildView::new(&self.jump_host_dropdown).finish())
-            .with_child(selected.finish());
+            .with_child(selected.finish())
+            .with_child(Self::render_label("Earlier Host or Include rules can override this route; check your SSH configuration if a jump is ignored.", appearance));
 
         if available_is_empty {
             content = content.with_child(
@@ -768,18 +706,8 @@ impl TypedActionView for SshProfileModalView {
         match action {
             SshProfileModalAction::Cancel => ctx.emit(SshProfileModalEvent::Cancel),
             SshProfileModalAction::Save => self.submit(ctx),
-            SshProfileModalAction::TogglePasswordVisibility => {
-                self.password_editor.update(ctx, |editor, ctx| {
-                    editor.set_is_password(!editor.is_password(), ctx);
-                });
-                ctx.notify();
-            }
             SshProfileModalAction::ClearPassword => {
                 self.password_clear = !self.password_clear;
-                if self.password_clear {
-                    let password_editor = self.password_editor.clone();
-                    self.set_editor_text("", &password_editor, ctx);
-                }
                 ctx.notify();
             }
             SshProfileModalAction::JumpHostDropdownPlaceholder => {}
@@ -801,7 +729,7 @@ impl View for SshProfileModalView {
         let form = Flex::column()
             .with_spacing(12.)
             .with_child(self.render_name_field(app, appearance))
-            .with_child(self.render_field("Host *", &self.host_editor, appearance))
+            .with_child(self.render_field("Host", &self.host_editor, appearance))
             .with_child(
                 Flex::row()
                     .with_spacing(10.)
@@ -829,7 +757,7 @@ impl View for SshProfileModalView {
                     .with_style(Properties::default().weight(Weight::Medium))
                     .finish(),
             )
-            .with_child(self.render_password_field(app, appearance))
+            .with_child(self.render_password_field(appearance))
             .with_child(self.render_field("Identity file", &self.identity_file_editor, appearance))
             .with_child(
                 Text::new("Advanced", appearance.ui_font_family(), 11.)

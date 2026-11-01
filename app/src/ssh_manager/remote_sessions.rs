@@ -34,6 +34,8 @@ exec sqlite3 -readonly -json "$newest" "SELECT n.id, n.tab_id, n.parent_pane_nod
 const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 const MAX_SESSION_NODES: usize = 4096;
+// Bound both local terminal creation and simultaneous authentication work per restore.
+pub const MAX_RESTORED_PANES: usize = 8;
 const MAX_SPLIT_DEPTH: usize = 64;
 const MAX_SESSION_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -82,6 +84,13 @@ pub fn parse_remote_output(output: &str) -> anyhow::Result<RemoteSessions> {
     ensure!(
         rows.len() <= MAX_SESSION_NODES,
         "too many remote session panes"
+    );
+    ensure!(
+        rows.iter()
+            .filter(|row| row.is_leaf != 0 && row.kind.as_deref() == Some("terminal"))
+            .count()
+            <= MAX_RESTORED_PANES,
+        "the host has more than {MAX_RESTORED_PANES} terminal panes; close some before reopening its tabs"
     );
     let nodes: HashMap<_, _> = rows.iter().map(|row| (row.id, row)).collect();
     ensure!(nodes.len() == rows.len(), "duplicate remote pane ids");
@@ -181,36 +190,71 @@ fn parse_tab_color(value: &str) -> Option<AnsiColorIdentifier> {
     }
 }
 
+/// Fingerprints OpenSSH's effective settings, including earlier Host rules and Include files.
+#[cfg(not(target_family = "wasm"))]
+pub async fn effective_config(profile: super::profile::SshHostProfile) -> anyhow::Result<String> {
+    effective_config_for_command(&profile.to_saved_ssh_command()).await
+}
+
+#[cfg(not(target_family = "wasm"))]
+async fn effective_config_for_command(saved_command: &str) -> anyhow::Result<String> {
+    use sha2::{Digest as _, Sha256};
+
+    use super::control_master::bounded_output;
+    let words = shell_words::split(saved_command)?;
+    let mut command = command::r#async::Command::new("ssh");
+    command.arg("-G").args(words.iter().skip(2));
+    let output = bounded_output(
+        &mut command,
+        256 * 1024,
+        16 * 1024,
+        std::time::Duration::from_secs(5),
+    )
+    .await?;
+    ensure!(
+        output.status.success(),
+        "could not resolve SSH settings: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(format!("{:x}", Sha256::digest(&output.stdout)))
+}
+
+#[cfg(target_family = "wasm")]
+pub async fn effective_config(_: super::profile::SshHostProfile) -> anyhow::Result<String> {
+    anyhow::bail!("Reading SSH settings is not supported on this platform")
+}
+
 /// Runs [`REMOTE_SCRIPT`] on the host through the ControlMaster of a live connection to it, so
 /// nothing has to authenticate again.
 #[cfg(not(target_family = "wasm"))]
 pub async fn fetch(control_path: PathBuf) -> anyhow::Result<RemoteSessions> {
-    use anyhow::{anyhow, bail};
-    use warpui::r#async::FutureExt as _;
+    use anyhow::bail;
 
-    use super::control_master::escape_ssh_tokens;
+    use super::control_master::{SOCKET_ONLY_PROXY_COMMAND, bounded_output, escape_ssh_tokens};
     use super::profile::shell_quote_arg;
 
-    let output = command::r#async::Command::new("ssh")
+    let mut command = command::r#async::Command::new("ssh");
+    command
         .args([
             "-o",
             &format!("ControlPath={}", escape_ssh_tokens(&control_path)),
         ])
         .args(["-o", "ControlMaster=no"])
         .args(["-o", "BatchMode=yes"])
-        .args(["-o", "ProxyCommand=none"])
+        .args(["-o", SOCKET_ONLY_PROXY_COMMAND])
         .args(["-o", "ProxyJump=none"])
         .args(["-o", "ConnectTimeout=15"])
         .arg("--")
-        // The host is ignored while the ControlMaster is up, and `.invalid` never resolves if not.
+        // The failing proxy forbids a fresh connection if the original master has gone away.
         .arg("warp-control-master.invalid")
-        .arg(format!("sh -c {}", shell_quote_arg(REMOTE_SCRIPT)))
-        .kill_on_drop(true)
-        .output()
-        .with_timeout(FETCH_TIMEOUT)
-        .await
-        .map_err(|_| anyhow!("ssh timed out after {FETCH_TIMEOUT:?}"))?
-        .context("failed to run ssh")?;
+        .arg(format!("sh -c {}", shell_quote_arg(REMOTE_SCRIPT)));
+    let output = bounded_output(
+        &mut command,
+        MAX_SESSION_OUTPUT_BYTES,
+        16 * 1024,
+        FETCH_TIMEOUT,
+    )
+    .await?;
     if !output.status.success() {
         bail!("{}", String::from_utf8_lossy(&output.stderr).trim());
     }

@@ -502,7 +502,8 @@ fn looks_like_destination(query: &str) -> bool {
     query.contains('@')
         || query.starts_with("ssh ")
         || query.contains(char::is_whitespace)
-        || QuickConnectDestination::parse(query).is_some_and(|destination| destination.port != 22)
+        || QuickConnectDestination::parse(query)
+            .is_some_and(|destination| destination.port_is_explicit)
 }
 
 fn build_items(query: &str, profiles: &[SshHostProfile], usage: &SshHostUsage) -> Vec<Item> {
@@ -546,6 +547,7 @@ fn build_items(query: &str, profiles: &[SshHostProfile], usage: &SshHostUsage) -
                 profile.host == destination.host
                     && profile.user == destination.user
                     && profile.port == destination.port
+                    && profile.port_is_explicit == destination.port_is_explicit
             });
             if !already_saved {
                 items.push(Item::Header {

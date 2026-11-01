@@ -524,28 +524,16 @@ impl SshProfilesPanelView {
         password: PasswordIntent,
         ctx: &mut ViewContext<Self>,
     ) -> Result<(), String> {
-        if matches!(password, PasswordIntent::Set(_))
-            && (profile.user.as_deref().is_none_or(str::is_empty) || !profile.port_is_explicit)
-        {
-            return Err(
-                "Set an explicit username and port before saving a password for this host."
-                    .to_string(),
-            );
-        }
         let mut profile = profile;
-        let mut password = password;
+        let mut previous_profile = None;
         if let SshProfileModalMode::Edit(id) = mode {
             profile.id = id;
-            if let Some(previous) = Self::profiles(ctx).into_iter().find(|old| {
-                old.id == id && ssh_profile_password_key(old) != ssh_profile_password_key(&profile)
-            }) {
-                // Fail before changing the destination if its old credential cannot be removed.
-                self.remove_profile_password(&previous, ctx).map_err(|err| {
-                    format!("Could not clear the old destination's password; profile unchanged: {err}")
-                })?;
-                if matches!(password, PasswordIntent::Keep) {
-                    password = PasswordIntent::Clear;
-                }
+            let profiles = Self::profiles(ctx);
+            previous_profile = profiles.iter().find(|old| old.id == id).cloned();
+            if rename_breaks_jump_route(&profile, &profiles) {
+                return Err(
+                    "Remove this host from saved jump-host routes before renaming it.".to_string(),
+                );
             }
         }
 
@@ -558,28 +546,12 @@ impl SshProfilesPanelView {
 
         match password {
             PasswordIntent::Keep => Ok(()),
-            PasswordIntent::Set(password) => {
-                self.write_profile_password(&profile, password.as_str(), ctx)
-            }
-            PasswordIntent::Clear => self.remove_profile_password(&profile, ctx).map_err(|err| {
-                format!("The profile was saved, but its stored password is still there: {err}")
-            }),
+            PasswordIntent::Clear => self
+                .remove_profile_password(previous_profile.as_ref().unwrap_or(&profile), ctx)
+                .map_err(|err| {
+                    format!("The profile was saved, but its stored password is still there: {err}")
+                }),
         }
-    }
-
-    fn write_profile_password(
-        &self,
-        profile: &SshHostProfile,
-        password: &str,
-        ctx: &mut ViewContext<Self>,
-    ) -> Result<(), String> {
-        let key = ssh_profile_password_key(profile);
-        ctx.secure_storage()
-            .write_value_with_owner_only_fallback(&key, password)
-            .map_err(|err| {
-                log::error!("Failed to write SSH profile password: {err:#}");
-                format!("The profile was saved, but its password could not be stored: {err:#}")
-            })
     }
 
     fn remove_profile_password(
@@ -630,11 +602,6 @@ impl SshProfilesPanelView {
             ));
         }
 
-        if let Err(err) = config_file::remove_profile(profile_id) {
-            log::error!("Failed to remove SSH profile from ~/.ssh/config: {err:#}");
-            return Err(format!("Could not write ~/.ssh/config: {err:#}"));
-        }
-
         for mut other in profiles.into_iter().filter(|other| {
             other.id != profile_id
                 && warp_owned_ids.contains(&other.id)
@@ -650,24 +617,29 @@ impl SshProfilesPanelView {
                 log::error!("Failed to drop jump host from ~/.ssh/config: {err:#}");
                 self.sync_profiles(ctx);
                 return Err(format!(
-                    "\"{}\" was deleted, but \"{}\" still lists it as a jump host: {err:#}",
+                    "Could not remove \"{}\" from jump host \"{}\": {err:#}",
                     profile.name, other.name
                 ));
             }
         }
 
+        if let Err(err) = self.remove_profile_password(&profile, ctx) {
+            self.sync_profiles(ctx);
+            return Err(format!(
+                "Could not clear the old password; profile was not deleted: {err}"
+            ));
+        }
+        if let Err(err) = config_file::remove_profile(profile_id) {
+            log::error!("Failed to remove SSH profile from ~/.ssh/config: {err:#}");
+            self.sync_profiles(ctx);
+            return Err(format!("Could not write ~/.ssh/config: {err:#}"));
+        }
         self.sync_profiles(ctx);
         self.row_mouse_states
             .borrow_mut()
             .retain(|(_, id), _| *id != profile_id);
         ctx.notify();
-
-        self.remove_profile_password(&profile, ctx).map_err(|err| {
-            format!(
-                "\"{}\" was deleted, but its stored password is still there: {err}",
-                profile.name
-            )
-        })
+        Ok(())
     }
 
     fn render_header(
@@ -1578,11 +1550,7 @@ fn sync_profiles_with_ssh_config(ctx: &mut ViewContext<SshProfilesPanelView>) ->
     let reassignments = normalize_ssh_host_profiles(&mut profiles);
     let mut ids_recorded = true;
     if !reassignments.is_empty() {
-        let ids = profiles
-            .iter()
-            .map(|profile| profile.id)
-            .collect::<Vec<_>>();
-        if let Err(err) = config_file::rewrite_profile_ids(&ids) {
+        if let Err(err) = config_file::rewrite_profile_ids(&profiles) {
             log::error!("Failed to write the new SSH profile ids to ~/.ssh/config: {err:#}");
             notices.push(failure_notice(
                 "record the new profile ids in ~/.ssh/config",
@@ -1683,7 +1651,7 @@ fn discard_secrets_of_reassigned_ids(
         reassignments.len()
     );
     notice.push_str(match ids_recorded {
-        true => " Open each of them and save the password again.",
+        true => " Their updated ids were saved.",
         false => " Their ids will change again on every launch until ~/.ssh/config can be updated.",
     });
     if orphans_left_behind {
@@ -1705,5 +1673,47 @@ pub(super) fn jump_host_points_at(jump_host: &SshJumpHost, profile: &SshHostProf
                 && jump_host.port == profile.port
                 && jump_host.identity_file == profile.identity_file
         }
+    }
+}
+
+fn rename_breaks_jump_route(profile: &SshHostProfile, profiles: &[SshHostProfile]) -> bool {
+    profiles
+        .iter()
+        .any(|old| old.id == profile.id && old.name != profile.name)
+        && profiles.iter().any(|other| {
+            other
+                .jump_hosts
+                .iter()
+                .any(|jump| jump.source_profile_id == Some(profile.id))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn renaming_a_linked_jump_host_is_rejected_until_routes_are_removed() {
+        let jump = SshHostProfile::new("bastion".into(), "gateway.example".into());
+        let mut destination = SshHostProfile::new("work".into(), "work.example".into());
+        destination.jump_hosts.push(SshJumpHost {
+            source_profile_id: Some(jump.id),
+            host: jump.name.clone(),
+            user: None,
+            port: 22,
+            port_is_explicit: true,
+            identity_file: None,
+        });
+        let mut renamed = jump.clone();
+        renamed.name = "renamed".into();
+        assert!(rename_breaks_jump_route(
+            &renamed,
+            &[jump.clone(), destination.clone()]
+        ));
+        assert!(!rename_breaks_jump_route(
+            &jump,
+            &[jump.clone(), destination]
+        ));
+        assert!(!rename_breaks_jump_route(&renamed, &[jump]));
     }
 }

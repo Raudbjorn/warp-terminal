@@ -1,8 +1,4 @@
-use std::time::Duration;
-
 use crate::terminal::ssh::util::parse_interactive_ssh_command;
-
-pub const SSH_PROFILE_WARPIFY_DISABLED_COMMAND_TTL: Duration = Duration::from_secs(30);
 
 pub fn normalize_ssh_command(command: &str) -> &str {
     let command = command.trim();

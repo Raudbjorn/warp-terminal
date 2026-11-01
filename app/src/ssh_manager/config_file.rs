@@ -364,6 +364,7 @@ impl HostBlock {
                 .unwrap_or_else(|| derived_profile_id(&self.alias, alias_ordinal)),
             name: self.alias.clone(),
             host,
+            host_is_explicit: self.directive("HostName").is_some(),
             user: self.directive("User"),
             port,
             port_is_explicit: self.directive("Port").is_some(),
@@ -395,21 +396,46 @@ impl HostBlock {
             );
         }
 
+        let identity_changed = self.directive("IdentityFile").as_deref()
+            != non_empty(profile.identity_file.as_deref()).as_deref();
+        if identity_changed
+            && self
+                .body
+                .iter()
+                .filter(|line| {
+                    parse_directive(line)
+                        .is_some_and(|directive| directive.key.eq_ignore_ascii_case("IdentityFile"))
+                })
+                .count()
+                > 1
+        {
+            anyhow::bail!(
+                "Host `{}` uses multiple IdentityFile entries; edit its identities in ~/.ssh/config",
+                self.alias
+            );
+        }
+
         self.warp_id = Some(profile.id);
         self.tags = profile.tags.clone();
         self.meta_rewritten = true;
         self.set_alias(&profile.name);
 
-        self.set_directive("HostName", Some(&profile.host));
+        self.set_directive(
+            "HostName",
+            profile.host_is_explicit.then_some(&profile.host),
+        );
         self.set_directive("User", non_empty(profile.user.as_deref()));
         self.set_directive(
             "Port",
             profile.port_is_explicit.then(|| profile.port.to_string()),
         );
-        self.set_directive(
-            "IdentityFile",
-            non_empty(profile.identity_file.as_deref()).map(|value| quote_config_value(&value)),
-        );
+        // IdentityFile is additive: an unrelated edit must preserve every configured key.
+        if identity_changed {
+            self.set_directive(
+                "IdentityFile",
+                non_empty(profile.identity_file.as_deref()).map(|value| quote_config_value(&value)),
+            );
+        }
 
         if profile.jump_hosts.is_empty() {
             self.set_directive("ProxyJump", None::<&str>);
@@ -523,13 +549,31 @@ fn upsert_profile_at(path: &Path, profile: &SshHostProfile) -> Result<()> {
     validate_profile(profile)?;
     edit(path, |config| {
         let owned = config.host_block_position(|block| block.warp_id == Some(profile.id));
+        let mut alias_ordinals: HashMap<&str, usize> = HashMap::new();
+        let imported = config
+            .segments
+            .iter()
+            .enumerate()
+            .find_map(|(idx, segment)| {
+                let Segment::Host(block) = segment else {
+                    return None;
+                };
+                if block.is_pattern() {
+                    return None;
+                }
+                let ordinal = alias_ordinals.entry(&block.alias).or_default();
+                let matches = block.warp_id.is_none()
+                    && derived_profile_id(&block.alias, *ordinal) == profile.id;
+                *ordinal += 1;
+                matches.then_some(idx)
+            });
         let unclaimed = || {
             config.host_block_position(|block| {
                 block.warp_id.is_none() && !block.is_pattern() && block.alias == profile.name
             })
         };
 
-        let target = owned.or_else(unclaimed);
+        let target = owned.or(imported).or_else(unclaimed);
         match target {
             Some(idx) => {
                 let Segment::Host(block) = &mut config.segments[idx] else {
@@ -546,12 +590,12 @@ fn upsert_profile_at(path: &Path, profile: &SshHostProfile) -> Result<()> {
 }
 
 /// Update the `# warp-id:` of the Warp-owned stanzas, one id per profile stanza in file order.
-pub fn rewrite_profile_ids(ids: &[Uuid]) -> Result<()> {
+pub fn rewrite_profile_ids(profiles: &[SshHostProfile]) -> Result<()> {
     let path = config_path()?;
-    rewrite_profile_ids_at(&path, ids)
+    rewrite_profile_ids_at(&path, profiles)
 }
 
-fn rewrite_profile_ids_at(path: &Path, ids: &[Uuid]) -> Result<()> {
+fn rewrite_profile_ids_at(path: &Path, profiles: &[SshHostProfile]) -> Result<()> {
     edit(path, |config| {
         let mut blocks = config
             .segments
@@ -561,16 +605,27 @@ fn rewrite_profile_ids_at(path: &Path, ids: &[Uuid]) -> Result<()> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if blocks.len() != ids.len() {
+        if blocks.len() != profiles.len() {
             anyhow::bail!(
                 "{} now holds {} profile stanzas instead of {}; it changed while Warp was updating profile ids",
                 path.display(),
                 blocks.len(),
-                ids.len()
+                profiles.len()
             );
         }
 
-        for (block, id) in blocks.iter_mut().zip(ids) {
+        if blocks
+            .iter()
+            .zip(profiles)
+            .any(|(block, profile)| block.alias != profile.name)
+        {
+            anyhow::bail!(
+                "{} profile aliases changed while Warp was updating profile ids",
+                path.display()
+            );
+        }
+        for (block, profile) in blocks.iter_mut().zip(profiles) {
+            let id = &profile.id;
             if block.warp_id.is_none() || block.warp_id == Some(*id) {
                 continue;
             }
@@ -634,7 +689,8 @@ fn edit(path: &Path, mutate: impl FnOnce(&mut ConfigFile) -> Result<()>) -> Resu
         .context("Failed to open the SSH config edit lock")?;
     lock.try_lock()
         .context("Another Warp window is editing the SSH config; try again")?;
-    let contents = if target.exists() {
+    let existed = target.exists();
+    let contents = if existed {
         fs::read_to_string(&target)
             .with_context(|| format!("Failed to read {}", target.display()))?
     } else {
@@ -661,10 +717,10 @@ fn edit(path: &Path, mutate: impl FnOnce(&mut ConfigFile) -> Result<()>) -> Resu
         }
     }
 
-    write_atomically(&target, &updated)
+    write_atomically(&target, &updated, existed.then_some(contents.as_str()))
 }
 
-fn write_atomically(path: &Path, contents: &str) -> Result<()> {
+fn write_atomically(path: &Path, contents: &str, expected: Option<&str>) -> Result<()> {
     let mode = existing_file_mode(path)?;
     let mut file = tempfile::NamedTempFile::new_in(path.parent().unwrap_or(Path::new(".")))?;
     file.write_all(contents.as_bytes())
@@ -675,6 +731,19 @@ fn write_atomically(path: &Path, contents: &str) -> Result<()> {
     file.as_file()
         .sync_all()
         .with_context(|| format!("Failed to flush {} to disk", path.display()))?;
+    // The lock coordinates Warp writers only. Refuse an observed external change immediately
+    // before replacement. An editor racing the final check and rename still needs its own lock.
+    let current = match fs::read_to_string(path) {
+        Ok(contents) => Some(contents),
+        Err(err) if err.kind() == ErrorKind::NotFound => None,
+        Err(err) => return Err(err).context("Failed to recheck SSH config before saving"),
+    };
+    if current.as_deref() != expected {
+        anyhow::bail!(
+            "{} changed outside Warp while being edited; reload and try again",
+            path.display()
+        );
+    }
     file.persist(path)
         .map_err(|err| err.error)
         .with_context(|| format!("Failed to replace {}", path.display()))?;
@@ -1003,7 +1072,7 @@ fn format_proxy_jump(jump_hosts: &[SshJumpHost]) -> String {
             } else {
                 target.push_str(&jump.host);
             }
-            if jump.port != default_ssh_port() {
+            if jump.port_is_explicit || jump.port != default_ssh_port() {
                 target.push(':');
                 target.push_str(&jump.port.to_string());
             }
@@ -1028,19 +1097,20 @@ fn parse_proxy_jump(
                 Some((user, rest)) => (non_empty(Some(user)), rest),
                 None => (None, hop),
             };
-            let (host, port) = split_jump_host_port(rest)?;
+            let (host, port, port_is_explicit) = split_jump_host_port(rest)?;
             Ok(SshJumpHost {
                 source_profile_id: sources.get(idx).copied().flatten(),
                 host,
                 user,
                 port,
+                port_is_explicit,
                 identity_file: identities.get(idx).and_then(|id| non_empty(Some(id))),
             })
         })
         .collect()
 }
 
-fn split_jump_host_port(rest: &str) -> Result<(String, u16)> {
+fn split_jump_host_port(rest: &str) -> Result<(String, u16, bool)> {
     if let Some(inner) = rest.strip_prefix('[') {
         let Some((host, after)) = inner.split_once(']') else {
             anyhow::bail!("`{rest}` is missing the closing bracket of its address");
@@ -1050,12 +1120,14 @@ fn split_jump_host_port(rest: &str) -> Result<(String, u16)> {
             None if after.is_empty() => default_ssh_port(),
             None => anyhow::bail!("`{rest}` has trailing characters after its address"),
         };
-        return Ok((host.to_string(), port));
+        return Ok((host.to_string(), port, !after.is_empty()));
     }
 
     match rest.rsplit_once(':') {
-        Some((host, port)) if !host.contains(':') => Ok((host.to_string(), parse_port(port)?)),
-        _ => Ok((rest.to_string(), default_ssh_port())),
+        Some((host, port)) if !host.contains(':') => {
+            Ok((host.to_string(), parse_port(port)?, true))
+        }
+        _ => Ok((rest.to_string(), default_ssh_port(), false)),
     }
 }
 

@@ -16,6 +16,8 @@ pub struct SshJumpHost {
     pub user: Option<String>,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
+    #[serde(default)]
+    pub port_is_explicit: bool,
     pub identity_file: Option<String>,
 }
 
@@ -23,7 +25,11 @@ impl settings_value::SettingsValue for SshJumpHost {}
 
 impl SshJumpHost {
     pub fn target(&self) -> String {
-        ssh_target(&self.user, &self.host, self.port, true)
+        let mut target = ssh_target(&self.user, &self.host, self.port, true);
+        if self.port_is_explicit && self.port == default_ssh_port() {
+            target.push_str(":22");
+        }
+        target
     }
 
     fn destination(&self) -> String {
@@ -44,7 +50,7 @@ impl SshJumpHost {
             argv.push(escape_openssh_percent(identity_file));
         }
 
-        if self.port != default_ssh_port() {
+        if self.port_is_explicit || self.port != default_ssh_port() {
             argv.push("-p".to_string());
             argv.push(self.port.to_string());
         }
@@ -58,6 +64,8 @@ pub struct SshHostProfile {
     pub id: Uuid,
     pub name: String,
     pub host: String,
+    #[serde(default)]
+    pub host_is_explicit: bool,
     pub user: Option<String>,
     #[serde(default = "default_ssh_port")]
     pub port: u16,
@@ -79,6 +87,7 @@ impl SshHostProfile {
             id: new_profile_id(),
             name,
             host,
+            host_is_explicit: true,
             user: None,
             port: default_ssh_port(),
             port_is_explicit: true,
@@ -110,7 +119,11 @@ impl SshHostProfile {
     }
 
     pub fn to_ssh_command(&self) -> String {
-        self.ssh_command(self.target(), self.port != default_ssh_port())
+        self.ssh_command(
+            self.target(),
+            self.port != default_ssh_port(),
+            Some(host_with_port(&self.host, self.port)),
+        )
     }
 
     /// Uses the saved alias so OpenSSH also applies directives the editor does not model.
@@ -118,10 +131,16 @@ impl SshHostProfile {
         self.ssh_command(
             ssh_target(&self.user, &self.name, self.port, false),
             self.port_is_explicit,
+            None,
         )
     }
 
-    fn ssh_command(&self, destination: String, explicit_port: bool) -> String {
+    fn ssh_command(
+        &self,
+        destination: String,
+        explicit_port: bool,
+        proxy_destination: Option<String>,
+    ) -> String {
         let mut argv = SSH_COMMAND_LAUNCHER
             .iter()
             .map(|arg| (*arg).to_string())
@@ -151,12 +170,7 @@ impl SshHostProfile {
                 argv.push("-o".to_string());
                 argv.push(format!(
                     "ProxyCommand={}",
-                    proxy_command_for_jump_hosts(
-                        &self.jump_hosts,
-                        self.port_is_explicit
-                            .then(|| host_with_port(&self.host, self.port))
-                            .as_deref()
-                    )
+                    proxy_command_for_jump_hosts(&self.jump_hosts, proxy_destination.as_deref())
                 ));
             } else {
                 argv.push("-J".to_string());
@@ -183,6 +197,8 @@ fn proxy_command_for_jump_hosts(jump_hosts: &[SshJumpHost], destination: Option<
     let mut proxy_command: Option<String> = None;
     for (index, jump_host) in jump_hosts.iter().enumerate() {
         let next_destination = match jump_hosts.get(index + 1) {
+            // The enclosing SSH process resolves its own alias and port before expanding this.
+            Some(next) if next.source_profile_id.is_some() => "[%h]:%p".to_string(),
             Some(next) => escape_openssh_percent(&next.host_port()),
             None => destination
                 .map(escape_openssh_percent)
@@ -324,6 +340,7 @@ pub struct QuickConnectDestination {
     pub user: Option<String>,
     pub host: String,
     pub port: u16,
+    pub port_is_explicit: bool,
 }
 
 impl QuickConnectDestination {
@@ -342,18 +359,18 @@ impl QuickConnectDestination {
             Some(_) => return None,
             None => (None, input),
         };
-        let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let (host, port, port_is_explicit) = if let Some(rest) = host_port.strip_prefix('[') {
             let (host, after) = rest.split_once(']')?;
             match after.strip_prefix(':') {
-                Some(port) => (host, port.parse().ok()?),
-                None if after.is_empty() => (host, default_ssh_port()),
+                Some(port) => (host, port.parse().ok()?, true),
+                None if after.is_empty() => (host, default_ssh_port(), false),
                 None => return None,
             }
         } else {
             match host_port.split_once(':') {
                 // More than one colon is a bare IPv6 address.
-                Some((host, port)) if !port.contains(':') => (host, port.parse().ok()?),
-                _ => (host_port, default_ssh_port()),
+                Some((host, port)) if !port.contains(':') => (host, port.parse().ok()?, true),
+                _ => (host_port, default_ssh_port(), false),
             }
         };
         if !is_plain_ssh_word(host) || user.as_deref().is_some_and(|user| !is_plain_ssh_word(user))
@@ -364,6 +381,7 @@ impl QuickConnectDestination {
             user,
             host: host.to_string(),
             port,
+            port_is_explicit,
         })
     }
 
@@ -371,6 +389,8 @@ impl QuickConnectDestination {
         let mut profile = SshHostProfile::new(self.host.clone(), self.host.clone());
         profile.user = self.user.clone();
         profile.port = self.port;
+        profile.port_is_explicit = self.port_is_explicit;
+        profile.host_is_explicit = false;
         profile
     }
 }
@@ -388,7 +408,7 @@ pub fn quick_connect_args(input: &str) -> Option<String> {
             destination.port,
             false,
         );
-        return Some(if destination.port == default_ssh_port() {
+        return Some(if !destination.port_is_explicit {
             shell_quote_arg(&target)
         } else {
             format!("{} -p {}", shell_quote_arg(&target), destination.port)

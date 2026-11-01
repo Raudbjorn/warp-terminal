@@ -151,3 +151,53 @@ fn accepts_a_root_after_its_child_in_the_listing() {
     assert_eq!(sessions.tabs.len(), 1);
     assert_eq!(sessions.tabs[0].directories, vec![Some("/child".into())]);
 }
+
+#[test]
+fn rejects_restore_before_more_than_eight_connections_can_be_created() {
+    let rows: Vec<_> = (0..MAX_RESTORED_PANES)
+        .map(|id| row(id as i64, id as i64, None, Some(("terminal", "/")), false))
+        .collect();
+    assert_eq!(
+        parse_remote_output(&output(rows.clone()))
+            .unwrap()
+            .tabs
+            .len(),
+        MAX_RESTORED_PANES
+    );
+    let mut too_many = rows;
+    too_many.push(row(100, 100, None, Some(("terminal", "/")), false));
+    assert!(
+        parse_remote_output(&output(too_many))
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("more than 8 terminal panes")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn effective_settings_detect_earlier_host_and_include_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config");
+    let included = dir.path().join("included");
+    let command = format!(
+        "command ssh -F {} -- saved-host",
+        super::super::profile::shell_quote_arg(config.to_str().unwrap())
+    );
+    let resolve = || futures::executor::block_on(effective_config_for_command(&command)).unwrap();
+    std::fs::write(&included, "Host saved-host\n User original-user\n").unwrap();
+    let write_config = |hostname: &str| {
+        std::fs::write(&config, format!(
+        "Host *\n HostName {hostname}\nInclude {}\nHost saved-host\n HostName ignored.example\n", included.display()
+    )).unwrap()
+    };
+    write_config("first.example");
+    let first = resolve();
+    assert_eq!(first, resolve());
+    write_config("second.example");
+    let changed_host = resolve();
+    assert_ne!(first, changed_host);
+    std::fs::write(&included, "Host saved-host\n User changed-user\n").unwrap();
+    assert_ne!(changed_host, resolve());
+}
