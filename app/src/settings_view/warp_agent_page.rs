@@ -5884,7 +5884,8 @@ impl CustomInferenceVisibility {
         let member_byo_keys_allowed = workspaces.are_member_byo_keys_allowed(team_scope);
         let member_byo_endpoints_allowed = workspaces.are_member_byo_endpoints_allowed(team_scope);
 
-        // BYOK: shown even when BYO is off so the upgrade CTA can render.
+        // BYOK: shown even when BYO is off so the sign-up CTA can render (only anonymous or
+        // logged-out users have it off).
         let show_provider_keys = member_byo_keys_allowed;
         let provider_keys_enabled = show_provider_keys && is_any_ai_enabled && is_byo_enabled;
 
@@ -6055,7 +6056,9 @@ impl SettingsWidget for ApiKeysWidget {
             );
         }
 
-        // Upgrade CTA if BYOK not enabled
+        // CTA if BYOK not enabled. Only anonymous or logged-out users get here: the workspace's
+        // plan no longer closes the BYO gate, so the team and upgrade branches below are
+        // effectively unreachable.
         if !is_byo_enabled && show_provider_keys {
             let auth_state = AuthStateProvider::as_ref(app).get();
             let upgrade_text_fragments = if let Some(team) =
@@ -6089,6 +6092,7 @@ impl SettingsWidget for ApiKeysWidget {
             } else if FeatureFlag::SoloUserByok.is_enabled()
                 && auth_state.is_anonymous_or_logged_out()
             {
+                // With the flag on, point signed-out users at account creation, not a plan upgrade.
                 vec![
                     FormattedTextFragment::hyperlink_action(
                         "Create an account",
