@@ -116,6 +116,10 @@ arboard = { workspace = true, features = ["image-data"] }
 [target.'cfg(target_family = "wasm")'.dependencies]
 gloo.workspace = true
 wasm-bindgen-futures.workspace = true
+# `platform/wasm.rs` calls `Window::navigator`, which needs web-sys's `Navigator` feature. Without
+# this dependency it is only enabled when another crate (such as `warpui`) is built alongside, so
+# `cargo check -p warpui_core` alone failed on wasm.
+web-sys.workspace = true
 woothee = "0.13.0"
 
 [build-dependencies]

@@ -215,69 +215,33 @@ impl Args {
                 use clap::FromArgMatches as _;
 
                 let args: Vec<String> = env::args().collect();
-                if ChannelState::is_local_only() {
-                    exit_if_disabled_subcommand(&args, LOCAL_ONLY_DISABLED_SUBCOMMANDS);
-                }
+                let command = Self::clap_command();
+                let disabled = disabled_subcommands();
 
                 // Check for disabled commands before parsing to prevent help from showing (e.g.
-                // `warp environment` should not return help text)
-                if !FeatureFlag::CloudEnvironments.is_enabled() {
-                    exit_if_disabled_subcommand(&args, &["environment"]);
+                // `warp environment` should not return help text).
+                exit_if_disabled_subcommand(&command, &args, &disabled);
+
+                let matches = command.try_get_matches().unwrap_or_else(|err| {
+                    // We attach a console to ensure help and error messages are printed
+                    // when using the CLI.
+                    #[cfg(windows)]
+                    warp_util::windows::attach_to_parent_console();
+                    err.exit()
+                });
+
+                // The scan above only exists to keep help for a disabled subcommand from printing.
+                // clap's own reading of the arguments has the last word on what runs, so a scan
+                // that disagrees with it can show help but never lets a disabled command through.
+                if let Some(name) = parsed_disabled_subcommand(&matches, &disabled) {
+                    exit_unrecognized_subcommand(name);
                 }
 
-                if !FeatureFlag::ProviderCommand.is_enabled() {
-                    exit_if_disabled_subcommand(&args, &["provider"]);
-                }
-
-                if !FeatureFlag::IntegrationCommand.is_enabled() {
-                    exit_if_disabled_subcommand(&args, &["integration"]);
-                }
-
-                if !FeatureFlag::ScheduledAmbientAgents.is_enabled() {
-                    exit_if_disabled_subcommand(&args, &["schedule"]);
-                }
-
-                if !FeatureFlag::WarpManagedSecrets.is_enabled() {
-                    exit_if_disabled_subcommand(&args, &["secret"]);
-                }
-
-                if !FeatureFlag::OzIdentityFederation.is_enabled() {
-                    exit_if_disabled_subcommand(&args, &["federate"]);
-                }
-
-                if !FeatureFlag::ArtifactCommand.is_enabled() {
-                    exit_if_disabled_subcommand(&args, &["artifact"]);
-                }
-
-                if !FeatureFlag::APIKeyManagement.is_enabled() {
-                    let args: Vec<String> = env::args().collect();
-                    if args.len() > 1 && args[1] == "api-key" {
-                        eprintln!("error: unrecognized subcommand 'api-key'\n");
-                        eprintln!("For more information, try '--help'");
-                        std::process::exit(2);
-                    }
-                }
-
-                if !FeatureFlag::CloudAgentRunners.is_enabled() {
-                    let args: Vec<String> = env::args().collect();
-                    if args.len() > 1 && args[1] == "runner" {
-                        eprintln!("error: unrecognized subcommand 'runner'\n");
-                        eprintln!("For more information, try '--help'");
-                        std::process::exit(2);
-                    }
-                }
-
-                let command = Self::clap_command();
-
-                command.try_get_matches()
-                    .and_then(|matches| Self::from_arg_matches(&matches))
-                    .unwrap_or_else(|err| {
-                        // We attach a console to ensure help and error messages are printed
-                        // when using the CLI.
-                        #[cfg(windows)]
-                        warp_util::windows::attach_to_parent_console();
-                        err.exit()
-                    })
+                Self::from_arg_matches(&matches).unwrap_or_else(|err| {
+                    #[cfg(windows)]
+                    warp_util::windows::attach_to_parent_console();
+                    err.exit()
+                })
             }
         }
     }
@@ -480,31 +444,10 @@ impl Args {
     }
 }
 
+/// Subcommands that need Warp's online services, hidden from `--help` and refused in local-only
+/// mode. These are canonical names: [`clap::Command::mut_subcommand`] panics on an alias, and an
+/// alias typed by the user (`task` for `run`) is resolved to its canonical name when gating.
 const LOCAL_ONLY_DISABLED_SUBCOMMANDS: &[&str] = &[
-    "agent",
-    "environment",
-    "run",
-    "task",
-    "model",
-    "login",
-    "logout",
-    "whoami",
-    "provider",
-    "integration",
-    "schedule",
-    "secret",
-    "federate",
-    "harness-support",
-    "artifact",
-    "task",
-];
-
-/// Subcommands hidden from `--help` in local-only mode. These are passed to
-/// [`clap::Command::mut_subcommand`], which panics on any name that isn't a subcommand's canonical
-/// name, so aliases must not be listed here. Notably `task` is an alias of `run`, which hides it
-/// too. It is still in [`LOCAL_ONLY_DISABLED_SUBCOMMANDS`], since that list is matched against raw
-/// argv.
-const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
     "agent",
     "environment",
     "run",
@@ -527,95 +470,156 @@ fn apply_local_only_help(mut command: clap::Command) -> clap::Command {
     command = command
         .about("Local terminal CLI")
         .long_about("Local terminal CLI for commands that do not require Warp online services.");
-    for subcommand in LOCAL_ONLY_HIDDEN_SUBCOMMANDS {
+    for subcommand in LOCAL_ONLY_DISABLED_SUBCOMMANDS {
         command = command.mut_subcommand(subcommand, |c| c.hide(true));
     }
     command
 }
 
+/// Top-level subcommands this build refuses to run, by canonical name: all of
+/// [`LOCAL_ONLY_DISABLED_SUBCOMMANDS`] in local-only mode, plus every subcommand whose feature
+/// flag is off.
 #[cfg(not(target_family = "wasm"))]
-const GLOBAL_OPTIONS_WITH_VALUES: &[&str] = &[
-    // The skip-with-value heuristic below uses the long-form names from this
-    // list. If/when a short option that takes a separate value is introduced
-    // (e.g. `-k KEY` as a single-character alias for `--api-key KEY`), add its
-    // long-form equivalent here AND its short form, so both `warp --api-key KEY agent`
-    // and `warp -k KEY agent` skip the value when detecting the subcommand.
-    // The current CLI has no short option aliases that consume a separate value.
-    "--api-key",
-    "--output-format",
-    "--server-root-url",
-    "--ws-server-url",
-    "--session-sharing-server-url",
-    "--parent-pid",
-    "--parent-handle",
-    "--crash-recovery-mechanism",
-];
-
-#[cfg(not(target_family = "wasm"))]
-fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) -> Option<&'a str> {
-    let mut index = 1;
-    while index < args.len() {
-        let arg = args[index].as_str();
-        if arg == "--" {
-            return None;
-        }
-
-        if arg.starts_with('-') && arg != "-" {
-            // Skip options so they aren't mistaken for the subcommand. Only
-            // options listed in `GLOBAL_OPTIONS_WITH_VALUES` consume the next
-            // argument; the rest (`--debug`, `-h`, `-obar`, `--foo=bar`) skip
-            // one. A test keeps that list in sync with the clap definition, so
-            // a new value-taking top-level option (long or short) can't slip
-            // past the gate.
-            let option_name = arg.split_once('=').map_or(arg, |(name, _)| name);
-            index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name) && !arg.contains('=') {
-                2
-            } else {
-                1
-            };
-            continue;
-        }
-
-        if arg == "help" {
-            // Find the help target, skipping option values the same way the main loop does
-            // (e.g. `help --output-format json agent` should target `agent`, not `json`; `help -v agent`
-            // should likewise target `agent`, not get blocked by `-v`).
-            let mut help_index = index + 1;
-            while help_index < args.len() {
-                let candidate = args[help_index].as_str();
-                if candidate.starts_with('-') {
-                    let option_name = candidate
-                        .split_once('=')
-                        .map_or(candidate, |(name, _)| name);
-                    help_index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name)
-                        && !candidate.contains('=')
-                    {
-                        2
-                    } else {
-                        1
-                    };
-                    continue;
-                }
-                return disabled_subcommands
-                    .contains(&candidate)
-                    .then_some(candidate);
-            }
-            return None;
-        }
-
-        return disabled_subcommands.contains(&arg).then_some(arg);
+fn disabled_subcommands() -> Vec<&'static str> {
+    let mut disabled = Vec::new();
+    if ChannelState::is_local_only() {
+        disabled.extend_from_slice(LOCAL_ONLY_DISABLED_SUBCOMMANDS);
     }
+    let flagged = [
+        ("environment", FeatureFlag::CloudEnvironments),
+        ("provider", FeatureFlag::ProviderCommand),
+        ("integration", FeatureFlag::IntegrationCommand),
+        ("schedule", FeatureFlag::ScheduledAmbientAgents),
+        ("secret", FeatureFlag::WarpManagedSecrets),
+        ("federate", FeatureFlag::OzIdentityFederation),
+        ("artifact", FeatureFlag::ArtifactCommand),
+        ("api-key", FeatureFlag::APIKeyManagement),
+        ("runner", FeatureFlag::CloudAgentRunners),
+    ];
+    disabled.extend(
+        flagged
+            .into_iter()
+            .filter(|(_, flag)| !flag.is_enabled())
+            .map(|(name, _)| name),
+    );
+    disabled
+}
 
-    None
+/// Whether `command` has a top-level option named `--name` that consumes the next argument as its
+/// value. An option that requires `=` never does.
+#[cfg(not(target_family = "wasm"))]
+fn long_option_takes_next_arg(command: &clap::Command, name: &str) -> bool {
+    command.get_arguments().any(|arg| {
+        arg.get_action().takes_values()
+            && !arg.is_require_equals_set()
+            && (arg.get_long() == Some(name)
+                || arg
+                    .get_all_aliases()
+                    .is_some_and(|aliases| aliases.contains(&name)))
+    })
+}
+
+/// Same as [`long_option_takes_next_arg`], for a short option `-flag`.
+#[cfg(not(target_family = "wasm"))]
+fn short_option_takes_next_arg(command: &clap::Command, flag: char) -> bool {
+    command.get_arguments().any(|arg| {
+        arg.get_action().takes_values()
+            && !arg.is_require_equals_set()
+            && (arg.get_short() == Some(flag)
+                || arg
+                    .get_all_short_aliases()
+                    .is_some_and(|aliases| aliases.contains(&flag)))
+    })
+}
+
+/// The first `limit` arguments of `args` that are neither options nor option values, up to `--`.
+///
+/// This reads argv before clap does, so that nothing clap would print for a disabled subcommand
+/// (help, usage in an error) is shown. Which options consume a separate value comes from
+/// `command`, so a new option cannot fall out of step with this scan. Every top-level option takes
+/// zero or one value; an option with more would need handling here.
+#[cfg(not(target_family = "wasm"))]
+fn leading_positionals<'a>(
+    command: &clap::Command,
+    args: &'a [String],
+    limit: usize,
+) -> Vec<&'a str> {
+    let mut found = Vec::new();
+    // `args[0]` is the program name.
+    let mut index = 1;
+    while index < args.len() && found.len() < limit {
+        let arg = args[index].as_str();
+        index += 1;
+        if arg == "--" {
+            break;
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            // `--name=value` carries its value; `--name value` takes the next argument.
+            if !long.contains('=') && long_option_takes_next_arg(command, long) {
+                index += 1;
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-').filter(|rest| !rest.is_empty()) {
+            // A cluster of short options such as `-vk KEY`: the first one that takes a value
+            // ends the cluster. It takes whatever follows it in the same argument (`-kKEY`), or
+            // the next argument when nothing does.
+            if let Some((offset, flag)) = cluster
+                .char_indices()
+                .find(|(_, flag)| short_option_takes_next_arg(command, *flag))
+                && offset + flag.len_utf8() == cluster.len()
+            {
+                index += 1;
+            }
+        } else {
+            found.push(arg);
+        }
+    }
+    found
+}
+
+/// The subcommand `args` asks for, as typed, if it is one of `disabled` (canonical names). `help
+/// <subcommand>` asks for that subcommand's help, so it counts as asking for the subcommand.
+#[cfg(not(target_family = "wasm"))]
+fn disabled_subcommand<'a>(
+    command: &clap::Command,
+    args: &'a [String],
+    disabled: &[&str],
+) -> Option<&'a str> {
+    let requested = match leading_positionals(command, args, 2).as_slice() {
+        ["help", target, ..] => *target,
+        [name, ..] => *name,
+        [] => return None,
+    };
+    // `find_subcommand` also matches aliases, which are not in `disabled`.
+    let canonical = command
+        .find_subcommand(requested)
+        .map_or(requested, |subcommand| subcommand.get_name());
+    disabled.contains(&canonical).then_some(requested)
+}
+
+/// The subcommand clap parsed, if it is one of `disabled`. `ArgMatches` names a subcommand
+/// by its canonical name whichever alias was typed.
+#[cfg(not(target_family = "wasm"))]
+fn parsed_disabled_subcommand<'a>(
+    matches: &'a clap::ArgMatches,
+    disabled: &[&str],
+) -> Option<&'a str> {
+    matches
+        .subcommand_name()
+        .filter(|name| disabled.contains(name))
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn exit_if_disabled_subcommand(args: &[String], disabled_subcommands: &[&str]) {
-    if let Some(command) = disabled_subcommand(args, disabled_subcommands) {
-        eprintln!("error: unrecognized subcommand '{command}'\n");
-        eprintln!("For more information, try '--help'");
-        std::process::exit(2);
+fn exit_if_disabled_subcommand(command: &clap::Command, args: &[String], disabled: &[&str]) {
+    if let Some(name) = disabled_subcommand(command, args, disabled) {
+        exit_unrecognized_subcommand(name);
     }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn exit_unrecognized_subcommand(name: &str) -> ! {
+    eprintln!("error: unrecognized subcommand '{name}'\n");
+    eprintln!("For more information, try '--help'");
+    std::process::exit(2);
 }
 
 /// Warp may spawn several worker processes - mostly servers that support the main application.

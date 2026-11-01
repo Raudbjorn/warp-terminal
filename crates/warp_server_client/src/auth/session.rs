@@ -556,3 +556,7 @@ impl AuthSession {
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "session_skip_login_tests.rs"]
+mod skip_login_tests;

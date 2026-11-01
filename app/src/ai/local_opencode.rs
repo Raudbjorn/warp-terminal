@@ -53,6 +53,16 @@ pub const DEFAULT_OPENCODE_ARGS: &[&str] = &["serve", "--port", "0"];
 /// start (database migration) has been observed to take ~20s.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Budget for confirming that the announced port is the sidecar's own. A port
+/// that refuses connections is retried every `VERIFY_RETRY_DELAY`, at most
+/// `VERIFY_ATTEMPTS` times.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const VERIFY_RETRY_DELAY: Duration = Duration::from_millis(200);
+const VERIFY_ATTEMPTS: u32 = 25;
+
+/// Upper bound on one verification request.
+const VERIFY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Longest startup line buffered while waiting for the port announcement. The
 /// announcement itself is a short line, so a sidecar that writes this much
 /// without a newline is not announcing anything.
@@ -81,6 +91,10 @@ pub enum OpenCodeError {
     StartupFailure(#[allow(dead_code)] String),
     #[error("OpenCode sidecar stdout could not be parsed: {0}")]
     BadAnnouncement(String),
+    #[error(
+        "port {port} announced by the OpenCode sidecar does not answer as that sidecar: {reason}"
+    )]
+    PortNotVerified { port: u16, reason: String },
     #[error("No working directory available for OpenCode sidecar")]
     NoWorkingDirectory,
     #[error("OpenCode sidecar I/O failed: {0}")]
@@ -95,89 +109,73 @@ pub enum OpenCodeError {
     EmptyResponse,
 }
 
-/// JSON announcement OpenCode prints once it is bound to a port.
-/// We accept the minimum subset; unknown fields are ignored.
-#[derive(Debug, Deserialize)]
+/// Hosts an announcement may name. `spawn` always connects to `127.0.0.1`
+/// whatever host the sidecar prints, so the host only has to say that the
+/// listener is on this machine: a line about some other address is not ours.
+const ANNOUNCED_HOSTS: [&str; 5] = ["127.0.0.1", "localhost", "[::1]", "0.0.0.0", "[::]"];
+
+/// Text that precedes the address in OpenCode's own startup line,
+/// `server listening on http://127.0.0.1:43123`.
+const LISTENING_MARKER: &str = "listening on ";
+
+/// The port a sidecar announced on stdout.
+///
+/// Two forms are accepted, and nothing looser: a JSON object with a numeric
+/// `port` (or a `url`/`address` string holding a loopback URL), and OpenCode's
+/// own `listening on <loopback URL>` line. Startup output is mostly log lines,
+/// so a lenient reading (a `port=` scan, the digits after any `:`) takes
+/// timestamps and documentation links for ports and sends the prompt there.
+/// `spawn` still checks that the port answers as this sidecar before using it.
+#[derive(Debug)]
 struct OpenCodeAnnouncement {
-    /// Listening port. Newer OpenCode versions print a bare JSON number
-    /// (`{"port": 43123}`); the `#[serde(alias)]`s also accept a *numeric*
-    /// `address`/`url` field. String forms (`{"url":"http://127.0.0.1:43123"}`
-    /// or the plain-text `ready:43123`) cannot deserialize into `u16`, so they
-    /// fall through to the URL/heuristic parsing in `from_line`.
-    #[serde(alias = "address", alias = "url")]
     port: u16,
 }
 
 impl OpenCodeAnnouncement {
     fn from_line(line: &str) -> Result<Self, OpenCodeError> {
-        if let Ok(parsed) = serde_json::from_str::<OpenCodeAnnouncement>(line) {
-            // Reject port 0 even in JSON form (bind(2) would assign a random
-            // port, but the announcement should report the actual bound port).
-            if parsed.port == 0 {
-                return Err(OpenCodeError::BadAnnouncement(line.to_string()));
-            }
-            return Ok(parsed);
-        }
-
-        // JSON parse failed; try the most explicit patterns first so
-        // that URL-style addresses (e.g. `http://127.0.0.1:43123`) do
-        // not get the wrong port from the first `:` separator.
-        for marker in ["port=", "\"port\":"] {
-            if let Some(idx) = line.find(marker) {
-                let tail = &line[idx + marker.len()..];
-                let digits: String = tail
-                    .chars()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(port) = digits.parse::<u16>() {
-                    if port > 0 {
-                        return Ok(OpenCodeAnnouncement { port });
-                    }
-                }
-            }
-        }
-
-        // URL pattern: `scheme://host:port` — the port is after the
-        // `:` that follows the host portion, not the `:` in `://`.
-        if line.contains("://") {
-            if let Some(scheme_end) = line.find("://") {
-                let after_scheme = &line[scheme_end + 3..];
-                // Use `rfind` so the port separator is found after the host,
-                // including IPv6 hosts like `[::1]:43123` whose host contains `:`.
-                if let Some(host_end) = after_scheme.rfind(':') {
-                    let port_str: String = after_scheme[host_end + 1..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect();
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        if port > 0 {
-                            return Ok(OpenCodeAnnouncement { port });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Last resort: the whole line is `word:NNNN` (e.g. `ready:43123`).
-        // Anchoring on the whole line keeps the tail of an unrelated log
-        // line, such as the seconds in a `12:34:56Z` timestamp, from being
-        // read as a port.
-        if let Some((word, digits)) = line.split_once(':') {
-            let is_word = !word.is_empty()
-                && word
-                    .chars()
-                    .all(|c| c.is_ascii_alphabetic() || c == '_' || c == '-');
-            if is_word && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-                if let Ok(port) = digits.parse::<u16>() {
-                    if port > 0 {
-                        return Ok(OpenCodeAnnouncement { port });
-                    }
-                }
-            }
-        }
-        Err(OpenCodeError::BadAnnouncement(line.to_string()))
+        Self::parse(line).ok_or_else(|| OpenCodeError::BadAnnouncement(line.to_string()))
     }
+
+    fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        let port = if line.starts_with('{') {
+            port_from_json(line)?
+        } else {
+            port_from_listening_line(line)?
+        };
+        // Port 0 means "pick one for me" to bind(2); an announcement has to
+        // name the port that was actually bound.
+        (port != 0).then_some(Self { port })
+    }
+}
+
+fn port_from_json(line: &str) -> Option<u16> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object()?;
+    if let Some(port) = object.get("port") {
+        return u16::try_from(port.as_u64()?).ok();
+    }
+    ["url", "address"]
+        .into_iter()
+        .find_map(|key| port_from_url(object.get(key)?.as_str()?))
+}
+
+fn port_from_listening_line(line: &str) -> Option<u16> {
+    // ASCII lowercasing keeps byte offsets, so the match position indexes `line`.
+    let marker_at = line.to_ascii_lowercase().find(LISTENING_MARKER)?;
+    let url = line[marker_at + LISTENING_MARKER.len()..]
+        .split_whitespace()
+        .next()?;
+    port_from_url(url)
+}
+
+/// Port of an `http(s)` URL whose host is one of `ANNOUNCED_HOSTS`.
+fn port_from_url(text: &str) -> Option<u16> {
+    let url = url::Url::parse(text).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || !ANNOUNCED_HOSTS.contains(&url.host_str()?) {
+        return None;
+    }
+    url.port_or_known_default()
 }
 
 #[allow(dead_code)]
@@ -250,7 +248,8 @@ impl OpenCodeSidecar {
 ///
 /// `command` is the binary name or absolute path; `args` is passed verbatim.
 /// The first non-empty, non-`#`-prefixed line of stdout that parses as a
-/// port announcement is treated as the bound port.
+/// port announcement (see `OpenCodeAnnouncement`) is treated as the bound
+/// port, and `spawn` fails unless that port answers as this sidecar.
 pub async fn spawn(
     command: &str,
     args: &[String],
@@ -312,6 +311,20 @@ pub async fn spawn(
     // the sidecar never blocks (or gets EPIPE) writing further stdout.
     discard_in_background(stdout);
 
+    // The announcement is text from a process we do not control. Before any
+    // prompt is sent anywhere, check that the port answers to the password
+    // only this sidecar was given.
+    let verified = tokio::time::timeout(
+        VERIFY_TIMEOUT,
+        verify_sidecar(&http_client::Client::new_external(), &base_url, &password),
+    )
+    .await
+    .unwrap_or_else(|_elapsed| Err(format!("no answer within {VERIFY_TIMEOUT:?}")));
+    if let Err(reason) = verified {
+        let _ = process.kill();
+        return Err(OpenCodeError::PortNotVerified { port, reason });
+    }
+
     // Spawn the background task that owns the kill path.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let exited = Arc::new(AtomicBool::new(false));
@@ -326,6 +339,41 @@ pub async fn spawn(
             password,
         }),
     })
+}
+
+/// Check that `base_url` is the sidecar that was just spawned: it must accept
+/// the Basic-auth password generated for it and answer with an OpenCode
+/// session list. A stray listener on a misread port knows neither, and a
+/// catch-all web server fails the body check. Only a refused connection is
+/// retried, since that is what a sidecar that is not yet accepting looks like.
+async fn verify_sidecar(
+    client: &http_client::Client,
+    base_url: &str,
+    password: &str,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    for attempt in 0..VERIFY_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(VERIFY_RETRY_DELAY).await;
+        }
+        // `limit=1` keeps the reply small for a project with many sessions.
+        let request = client
+            .get(format!("{base_url}/api/session?limit=1"))
+            .basic_auth(SERVER_USERNAME, Some(password))
+            .timeout(VERIFY_REQUEST_TIMEOUT);
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                return response
+                    .json::<DataEnvelope<Vec<serde::de::IgnoredAny>>>()
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| format!("reply is not an OpenCode session list: {err}"));
+            }
+            Ok(response) => return Err(format!("{} from /api/session", response.status())),
+            Err(err) => last_error = err.to_string(),
+        }
+    }
+    Err(last_error)
 }
 
 /// Read `stdout` line by line until one parses as a port announcement.
@@ -757,21 +805,79 @@ mod tests {
     }
 
     #[test]
-    fn parses_loose_port_pattern() {
-        let ann = OpenCodeAnnouncement::from_line("listening on port=54321").unwrap();
-        assert_eq!(ann.port, 54321);
-    }
-
-    #[test]
-    fn parses_trailing_colon_pattern() {
-        let ann = OpenCodeAnnouncement::from_line("ready:43123").unwrap();
-        assert_eq!(ann.port, 43123);
-    }
-
-    #[test]
     fn rejects_zero_port() {
-        let err = OpenCodeAnnouncement::from_line("port=0");
-        assert!(err.is_err());
+        for line in [
+            r#"{"port":0}"#,
+            r#"{"url":"http://127.0.0.1:0"}"#,
+            "server listening on http://127.0.0.1:0",
+        ] {
+            assert!(
+                OpenCodeAnnouncement::from_line(line).is_err(),
+                "{line:?} must not parse as an announcement"
+            );
+        }
+    }
+
+    fn announced_port(line: &str) -> Option<u16> {
+        OpenCodeAnnouncement::from_line(line)
+            .ok()
+            .map(|ann| ann.port)
+    }
+
+    #[test]
+    fn only_the_listening_line_of_a_noisy_startup_is_an_announcement() {
+        // The lines from the bug report: each of the last four used to be read
+        // as a port (33, 33, 5, 443).
+        assert_eq!(
+            announced_port("opencode server listening on http://127.0.0.1:43123"),
+            Some(43123)
+        );
+        for line in [
+            "2026-10-31T11:22:33",
+            "INFO  starting at 11:22:33",
+            "ETA 00:05",
+            "see https://opencode.ai/docs:443 for help",
+        ] {
+            assert_eq!(announced_port(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn loose_port_forms_are_not_announcements() {
+        for line in [
+            "listening on port=54321",
+            "port=43123",
+            "ready:43123",
+            r#"{"msg":"started","detail":"\"port\":43123"}"#,
+            r#"{"port":"43123"}"#,
+            r#"{"port":70000}"#,
+            "{not json, port: 43123}",
+        ] {
+            assert_eq!(announced_port(line), None, "{line:?}");
+        }
+    }
+
+    #[test]
+    fn announcement_must_name_this_machine() {
+        for line in [
+            "server listening on http://example.com:8080",
+            "server listening on http://10.0.0.5:4096",
+            "server listening on ftp://127.0.0.1:4096",
+            "server listening on",
+            r#"{"url":"http://example.com:8080"}"#,
+        ] {
+            assert_eq!(announced_port(line), None, "{line:?}");
+        }
+        for (line, port) in [
+            ("server listening on http://[::1]:4096", 4096),
+            (
+                "INFO server listening on http://127.0.0.1:4096/ (pid 7)",
+                4096,
+            ),
+            (r#"{"url":"http://127.0.0.1:43123"}"#, 43123),
+        ] {
+            assert_eq!(announced_port(line), Some(port), "{line:?}");
+        }
     }
 
     #[test]
@@ -823,9 +929,13 @@ mod tests {
     async fn pool_replaces_exited_sidecar() {
         // `sh` announces a port and exits straight away, standing in for a
         // sidecar that crashes after becoming ready.
+        let server = raw_server(RawOptions::default()).await;
         let args = vec![
             "-c".to_string(),
-            "echo 'server listening on http://127.0.0.1:43123'".to_string(),
+            format!(
+                "echo 'server listening on http://127.0.0.1:{}'",
+                server.port
+            ),
         ];
         let pool = OpenCodeSidecarPool::new();
         let dir = std::env::temp_dir();
@@ -1062,19 +1172,22 @@ mod tests {
         }
     }
 
-    // Shell one-liners standing in for a sidecar: announce, then stay alive.
+    // Shell one-liners standing in for a sidecar: announce `port`, then stay
+    // alive. `spawn` checks the announced port, so it has to be a live
+    // `raw_server`'s.
     #[cfg(unix)]
-    fn announce_then_sleep(prelude: &str) -> Vec<String> {
+    fn announce_then_sleep(port: u16, prelude: &str) -> Vec<String> {
         vec![
             "-c".to_string(),
-            format!("{prelude} echo 'server listening on http://127.0.0.1:43123'; sleep 30"),
+            format!("{prelude} echo 'server listening on http://127.0.0.1:{port}'; sleep 30"),
         ]
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn pool_reuses_a_live_sidecar() {
-        let args = announce_then_sleep("");
+        let server = raw_server(RawOptions::default()).await;
+        let args = announce_then_sleep(server.port, "");
         let pool = OpenCodeSidecarPool::new();
         let dir = std::env::temp_dir();
 
@@ -1087,7 +1200,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn pool_does_not_keep_a_sidecar_spawned_before_clear() {
-        let args = announce_then_sleep("sleep 0.3;");
+        let server = raw_server(RawOptions::default()).await;
+        let args = announce_then_sleep(server.port, "sleep 0.3;");
         let pool = OpenCodeSidecarPool::new();
         let dir = std::env::temp_dir();
 
@@ -1109,7 +1223,8 @@ mod tests {
     async fn startup_survives_a_flood_of_stderr() {
         // 200 KB on stderr is well over a pipe buffer; if stderr is not
         // drained during startup the child blocks and never announces.
-        let args = announce_then_sleep("head -c 200000 /dev/zero >&2;");
+        let server = raw_server(RawOptions::default()).await;
+        let args = announce_then_sleep(server.port, "head -c 200000 /dev/zero >&2;");
         let dir = std::env::temp_dir();
 
         let spawned = tokio::time::timeout(Duration::from_secs(10), spawn("sh", &args, &dir))
@@ -1125,10 +1240,14 @@ mod tests {
         // OpenCode reads OPENCODE_PASSWORD before OPENCODE_SERVER_PASSWORD, so
         // setting only the second lets an inherited first one win.
         let out = std::env::temp_dir().join(format!("opencode-env-{}", uuid::Uuid::new_v4()));
-        let args = announce_then_sleep(&format!(
-            "printf '%s\\n%s' \"$OPENCODE_PASSWORD\" \"$OPENCODE_SERVER_PASSWORD\" > '{}';",
-            out.display()
-        ));
+        let server = raw_server(RawOptions::default()).await;
+        let args = announce_then_sleep(
+            server.port,
+            &format!(
+                "printf '%s\\n%s' \"$OPENCODE_PASSWORD\" \"$OPENCODE_SERVER_PASSWORD\" > '{}';",
+                out.display()
+            ),
+        );
 
         let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
 
@@ -1192,16 +1311,48 @@ mod tests {
     /// that never answers, and DELETEs that fail before one succeeds.
     struct RawServer {
         url: String,
+        port: u16,
         generate_started: Arc<tokio::sync::Notify>,
         deletes: Arc<std::sync::atomic::AtomicUsize>,
     }
 
-    async fn raw_server(hang_on_generate: bool, failing_deletes: usize) -> RawServer {
+    /// How the raw server answers `GET /api/session`, which `spawn` uses to
+    /// check that an announced port belongs to the sidecar.
+    #[derive(Clone, Copy, Default)]
+    enum ProbeReply {
+        /// A real sidecar: 401 without Basic auth, an empty session list with it.
+        #[default]
+        Sidecar,
+        /// Some other service that does not know our password.
+        Unauthorized,
+        /// A web server that answers every path with 200 and an HTML page.
+        CatchAll,
+    }
+
+    #[derive(Default)]
+    struct RawOptions {
+        hang_on_generate: bool,
+        failing_deletes: usize,
+        probe: ProbeReply,
+    }
+
+    async fn raw_server(options: RawOptions) -> RawServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        raw_server_on(listener, options)
+    }
+
+    fn raw_server_on(listener: tokio::net::TcpListener, options: RawOptions) -> RawServer {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let RawOptions {
+            hang_on_generate,
+            failing_deletes,
+            probe,
+        } = options;
+        let local_addr = listener.local_addr().unwrap();
         let server = RawServer {
-            url: format!("http://{}", listener.local_addr().unwrap()),
+            url: format!("http://{local_addr}"),
+            port: local_addr.port(),
             generate_started: Arc::default(),
             deletes: Arc::default(),
         };
@@ -1251,6 +1402,15 @@ mod tests {
                             std::future::pending::<()>().await;
                         }
                         (200, r#"{"data":{"text":"ls"}}"#)
+                    } else if request_line.starts_with("GET /api/session") {
+                        let authorized = text.to_lowercase().contains("\r\nauthorization: basic ");
+                        match probe {
+                            ProbeReply::Sidecar if authorized => (200, r#"{"data":[]}"#),
+                            ProbeReply::Sidecar | ProbeReply::Unauthorized => {
+                                (401, r#"{"message":"Authentication required"}"#)
+                            }
+                            ProbeReply::CatchAll => (200, "<!doctype html><html></html>"),
+                        }
                     } else if request_line.starts_with("DELETE ") {
                         let seen = deletes.fetch_add(1, Ordering::SeqCst);
                         if seen < failing_deletes {
@@ -1300,7 +1460,11 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_request_still_deletes_its_session() {
-        let server = raw_server(true, 0).await;
+        let server = raw_server(RawOptions {
+            hang_on_generate: true,
+            ..Default::default()
+        })
+        .await;
 
         // Drop the request once the generate call is in flight, as aborting a
         // superseded prediction does.
@@ -1316,7 +1480,11 @@ mod tests {
 
     #[tokio::test]
     async fn failed_delete_is_retried_once_in_the_background() {
-        let server = raw_server(false, 1).await;
+        let server = raw_server(RawOptions {
+            failing_deletes: 1,
+            ..Default::default()
+        })
+        .await;
 
         // The request succeeds even though its inline DELETE got a 500.
         assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
@@ -1328,11 +1496,79 @@ mod tests {
 
     #[tokio::test]
     async fn successful_delete_is_not_repeated() {
-        let server = raw_server(false, 0).await;
+        let server = raw_server(RawOptions::default()).await;
 
         assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
 
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(server.deletes.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn json_port_after_a_timestamped_log_line_is_the_one_used() {
+        // A sidecar whose first stdout line is a log line with a timestamp.
+        let server = raw_server(RawOptions::default()).await;
+        let args = vec![
+            "-c".to_string(),
+            format!(
+                "echo '2026-10-31T11:22:33 starting'; echo '{{\"port\": {}}}'; sleep 30",
+                server.port
+            ),
+        ];
+
+        let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
+
+        assert_eq!(sidecar.inner.base_url, server.url);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn announced_port_that_is_not_our_sidecar_is_refused() {
+        for (probe, expected) in [
+            (ProbeReply::Unauthorized, "401"),
+            (ProbeReply::CatchAll, "not an OpenCode session list"),
+        ] {
+            let server = raw_server(RawOptions {
+                probe,
+                ..Default::default()
+            })
+            .await;
+            let args = announce_then_sleep(server.port, "");
+
+            let Err(err) = spawn("sh", &args, &std::env::temp_dir()).await else {
+                panic!("a port that does not answer as the sidecar must be refused");
+            };
+
+            assert!(
+                matches!(
+                    &err,
+                    OpenCodeError::PortNotVerified { port, reason }
+                        if *port == server.port && reason.contains(expected)
+                ),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sidecar_that_starts_listening_late_is_still_accepted() {
+        // Announce a port nothing serves yet, and start serving half a second later.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let args = announce_then_sleep(port, "");
+
+        let dir = std::env::temp_dir();
+        let (spawned, ()) = tokio::join!(spawn("sh", &args, &dir), async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                .await
+                .unwrap();
+            raw_server_on(listener, RawOptions::default());
+        });
+
+        assert!(spawned.unwrap().is_alive());
     }
 }
