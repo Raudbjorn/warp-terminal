@@ -41,6 +41,7 @@ fn launcher_agent_markers_are_dropped_but_user_config_is_kept() {
         std::env::set_var("CLAUDECODE", "1");
         std::env::set_var("CLAUDE_PID", "123");
         std::env::set_var("CLAUDE_CONFIG_DIR", "/somewhere/.claude");
+        std::env::set_var("CLAUDE_CODE_USE_BEDROCK", "1");
         super::clear_launcher_agent_env();
     }
 
@@ -51,5 +52,10 @@ fn launcher_agent_markers_are_dropped_but_user_config_is_kept() {
         std::env::var_os("CLAUDE_CONFIG_DIR"),
         Some("/somewhere/.claude".into()),
         "the user's own configuration is not a session marker"
+    );
+    assert_eq!(
+        std::env::var_os("CLAUDE_CODE_USE_BEDROCK"),
+        Some("1".into()),
+        "a CLAUDE_CODE_ variable is not a session marker unless it is one of the named ones"
     );
 }

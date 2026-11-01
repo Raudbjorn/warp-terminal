@@ -6916,13 +6916,6 @@ fn render_detail_story_line(
         .finish()
 }
 
-/// The story so far for a pane's CLI agent session: what was asked, and either
-/// what it is doing now or what it came back with.
-///
-/// This is the tab list's share of Conn. The docked panel tells the whole story
-/// for the pane you are looking at; the card answers the single question you
-/// have about a pane you are not looking at, which is whether it is still on
-/// the thing you wanted.
 /// The lines the hover card shows for one turn.
 struct ConnStoryLines {
     prompt: String,

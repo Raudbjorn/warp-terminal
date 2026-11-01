@@ -8,8 +8,8 @@ use crate::terminal::cli_agent_sessions::event::{
     CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventSource, CLIAgentEventType,
 };
 use crate::terminal::cli_agent_sessions::{
-    CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext, CLIAgentSessionStatus,
-    CLIAgentSessionsModel,
+    BlockedSource, CLIAgentInputState, CLIAgentSession, CLIAgentSessionContext,
+    CLIAgentSessionStatus, CLIAgentSessionsModel,
 };
 
 fn event(event: CLIAgentEventType, payload: CLIAgentEventPayload) -> CLIAgentEvent {
@@ -604,7 +604,10 @@ fn warp_statuses_collapse_into_what_the_reader_acts_on() {
     let cases = [
         (CLIAgentSessionStatus::InProgress, ConnStatus::Working),
         (
-            CLIAgentSessionStatus::Blocked { message: None },
+            CLIAgentSessionStatus::Blocked {
+                message: None,
+                source: BlockedSource::PermissionRequest,
+            },
             ConnStatus::NeedsYou,
         ),
         (CLIAgentSessionStatus::Success, ConnStatus::Done),

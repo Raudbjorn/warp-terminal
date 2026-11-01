@@ -341,7 +341,9 @@ impl ConnModel {
         // is the last event that can bring the story up to date, plan included.
         let waiting = matches!(
             event.event,
-            CLIAgentEventType::PermissionRequest | CLIAgentEventType::QuestionAsked
+            CLIAgentEventType::PermissionRequest
+                | CLIAgentEventType::QuestionAsked
+                | CLIAgentEventType::NeedsInput
         );
         // The story covers what led up to the request. The request itself is told only by its
         // live entry, so the boundary stops just short of it.
@@ -569,9 +571,13 @@ fn entry_kind(event: &CLIAgentEvent) -> Option<ConnEntryKind> {
             target: payload.tool_input_preview.clone(),
         }),
         CLIAgentEventType::PermissionReplied => Some(ConnEntryKind::PermissionResolved),
-        CLIAgentEventType::QuestionAsked => Some(ConnEntryKind::QuestionAsked {
-            summary: payload.summary.clone(),
-        }),
+        // An agent that reports it needs input is waiting on the user the same
+        // way one that asks a question is, so the history tells it the same way.
+        CLIAgentEventType::QuestionAsked | CLIAgentEventType::NeedsInput => {
+            Some(ConnEntryKind::QuestionAsked {
+                summary: payload.summary.clone(),
+            })
+        }
         CLIAgentEventType::ToolComplete => Some(ConnEntryKind::ToolCompleted {
             tool_name: payload.tool_name.clone(),
             // Always `None` with the current Warp plugin, which sends no

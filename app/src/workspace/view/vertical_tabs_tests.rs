@@ -3,8 +3,8 @@ use std::iter::once;
 use std::path::PathBuf;
 
 use ::conn::story::{ConnStep, ConnStory, ConnTurn};
-use chrono::{DateTime, Utc};
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
+use chrono::{DateTime, Utc};
 use pathfinder_geometry::rect::RectF;
 use pathfinder_geometry::vector::Vector2F;
 use warpui::EntityId;
@@ -16,16 +16,16 @@ use super::{
     VerticalTabsDetailTargetKind, VerticalTabsSummaryBranchEntry, VerticalTabsSummaryData,
     VerticalTabsSummaryPrimaryLabel, branch_label_display, coalesce_summary_branch_entries,
     code_detail_kind_label, compact_branch_subtitle_display, conn_running_step, conn_story_lines,
-    detail_sidecar_width_and_bounds,
-    detail_target_for_hovered_row, group_display_name, group_name_highlight_indices,
-    matched_group_ids, merge_group_name_matches, non_terminal_search_text_fragments,
-    pane_ids_for_display_granularity, pane_search_text_fragments, preferred_agent_tab_titles,
-    push_normalized_unique_summary_label, resolve_compact_subtitle, search_fragments_contain_query,
-    select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
-    should_show_tab_group_header, shows_synced_inputs_indicator,
-    sort_summary_primary_labels_status_first, subtitle_options_for_primary, summary_overflow_count,
-    summary_search_text_fragments, tab_admitted_by_group_name, terminal_kind_badge_label,
-    terminal_primary_line_data, terminal_pull_request_badge_label, terminal_search_text_fragments,
+    detail_sidecar_width_and_bounds, detail_target_for_hovered_row, group_display_name,
+    group_name_highlight_indices, matched_group_ids, merge_group_name_matches,
+    non_terminal_search_text_fragments, pane_ids_for_display_granularity,
+    pane_search_text_fragments, preferred_agent_tab_titles, push_normalized_unique_summary_label,
+    resolve_compact_subtitle, search_fragments_contain_query, select_summary_pane_kind_icons,
+    should_keep_detail_sidecar_visible_for_mouse_position, should_show_tab_group_header,
+    shows_synced_inputs_indicator, sort_summary_primary_labels_status_first,
+    subtitle_options_for_primary, summary_overflow_count, summary_search_text_fragments,
+    tab_admitted_by_group_name, terminal_kind_badge_label, terminal_primary_line_data,
+    terminal_pull_request_badge_label, terminal_search_text_fragments,
     terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
     vtab_diff_stats_text,
 };
@@ -36,7 +36,7 @@ use crate::pane_group::{PaneId, TerminalPaneId};
 use crate::safe_triangle::SafeTriangle;
 use crate::tab::{ShortcutModifierKind, reveals_shortcut_hints};
 use crate::terminal::CLIAgent;
-use crate::terminal::cli_agent_sessions::CLIAgentSessionStatus;
+use crate::terminal::cli_agent_sessions::{BlockedSource, CLIAgentSessionStatus};
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 use crate::workspace::tab_settings::VerticalTabsDisplayGranularity;
 
@@ -1484,7 +1484,6 @@ fn group_name_highlights_match_untitled_fallback() {
     );
 }
 
-
 /// A turn built for the hover card's decision logic. Timestamps are irrelevant
 /// to it, so they are fixed rather than varied.
 fn conn_turn(prompt: &str, steps: &[&str], outcome: Option<&str>) -> ConnTurn {
@@ -1555,7 +1554,10 @@ fn an_idle_pane_keeps_its_usual_height() {
     for status in [
         CLIAgentSessionStatus::Success,
         CLIAgentSessionStatus::Cancelled,
-        CLIAgentSessionStatus::Blocked { message: None },
+        CLIAgentSessionStatus::Blocked {
+            message: None,
+            source: BlockedSource::PermissionRequest,
+        },
     ] {
         assert_eq!(
             conn_running_step(Some(&status), Some(&session)),

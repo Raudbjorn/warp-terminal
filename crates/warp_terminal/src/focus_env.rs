@@ -16,11 +16,18 @@ pub(crate) fn session_focus_url(session_uuid_hex: &str) -> String {
 /// Environment variables that identify the CLI agent session Warp itself was
 /// launched from, rather than anything about the shells it starts.
 ///
-/// Prefixes, not exact names, because the set changes with the agent.
-/// `CLAUDE_CONFIG_DIR` is deliberately not matched: it is the user's own
-/// configuration, not a session marker.
-const LAUNCHER_AGENT_ENV_PREFIXES: &[&str] =
-    &["CLAUDECODE", "CLAUDE_CODE_", "CLAUDE_PID", "AI_AGENT"];
+/// Exact names, not a `CLAUDE_CODE_` prefix: that prefix also covers the user's
+/// own configuration (`CLAUDE_CODE_USE_BEDROCK`, `CLAUDE_CODE_OAUTH_TOKEN`, ...),
+/// which every shell Warp starts should keep. `CLAUDE_CONFIG_DIR` is likewise
+/// the user's, not a session marker.
+const LAUNCHER_AGENT_ENV_VARS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+    "CLAUDE_PID",
+    "AI_AGENT",
+];
 
 /// Drops the launching agent session's markers from this process, so the
 /// shells Warp starts do not inherit them.
@@ -42,9 +49,7 @@ pub unsafe fn clear_launcher_agent_env() {
             let Some(name) = name.to_str() else {
                 return false;
             };
-            LAUNCHER_AGENT_ENV_PREFIXES
-                .iter()
-                .any(|prefix| name.starts_with(prefix))
+            LAUNCHER_AGENT_ENV_VARS.contains(&name)
         })
         .collect();
     for name in doomed {

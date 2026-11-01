@@ -5927,9 +5927,10 @@ impl Workspace {
                 ctx,
             );
         });
-        // Conn holds a strong handle to the pane group it reports on, so it has
-        // to be retargeted wherever the right panel is, or a closed tab's
-        // terminals stay alive behind it.
+        // Conn follows the active tab's pane group, so it has to be retargeted
+        // wherever the right panel is, or it keeps reporting on a stale tab.
+        // It holds the group weakly, so this is about showing the right pane,
+        // not about keeping a closed tab's terminals alive.
         let conn_active_pane_group = self.active_tab_pane_group().clone();
         self.conn_panel_view.update(ctx, |panel, ctx| {
             panel.set_active_pane_group(conn_active_pane_group, ctx);
