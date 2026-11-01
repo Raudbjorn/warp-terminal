@@ -547,6 +547,20 @@ mod tools {
             Err(AdapterError::UnknownTool(_))
         ));
     }
+
+    #[test]
+    fn regular_turns_reject_suggest_prompt_which_they_did_not_offer() {
+        let plan = plan_for(&simple_request());
+
+        assert!(matches!(
+            plan.tools.to_proto_tool_call(&ToolCallRequest {
+                id: "call_5".to_string(),
+                name: "suggest_prompt".to_string(),
+                arguments: json!({ "prompt": "Run the tests" }),
+            }),
+            Err(AdapterError::UnknownTool(_))
+        ));
+    }
 }
 
 mod mcp_tools {
@@ -1748,6 +1762,109 @@ mod event_mapping {
         ));
     }
 
+    /// Tool calls the registry refuses to map, each of which ends the turn.
+    fn unmappable_tool_calls() -> Vec<(&'static str, ToolCallRequest)> {
+        let call = |name: &str, arguments: serde_json::Value| ToolCallRequest {
+            id: "call_bad".to_string(),
+            name: name.to_string(),
+            arguments,
+        };
+        vec![
+            ("unknown tool", call("made_up_tool", json!({}))),
+            (
+                "bad arguments",
+                call("run_shell_command", json!({ "command": 7 })),
+            ),
+            (
+                "tool not offered",
+                call("suggest_prompt", json!({ "prompt": "x" })),
+            ),
+        ]
+    }
+
+    #[test]
+    fn tool_call_mapping_failure_ends_the_turn_exactly_once() {
+        for (what, call) in unmappable_tool_calls() {
+            let plan = first_turn_plan();
+            let mut mapper = EventMapper::new(&plan);
+            mapper.initial_events();
+            mapper.on_event(Ok(AgentEvent::TextDelta("partial".to_string())));
+
+            // The engine buffers tool calls until the response completes, so
+            // `Usage` and `Done` follow the call that could not be mapped.
+            let mut events = mapper.on_event(Ok(AgentEvent::ToolCall(call)));
+            events.extend(mapper.on_event(Ok(AgentEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            })));
+            events.extend(mapper.on_event(Ok(AgentEvent::Done)));
+
+            assert_eq!(
+                event_kinds(&events),
+                vec!["rollback_transaction", "finished"],
+                "{what}: one rollback and one Finished, no commit after the rollback"
+            );
+            assert!(mapper.is_terminated());
+        }
+    }
+
+    #[test]
+    fn nothing_is_emitted_after_a_terminal_event() {
+        let terminals: Vec<(&str, Box<dyn Fn() -> Result<AgentEvent, LocalAgentError>>)> = vec![
+            ("done", Box::new(|| Ok(AgentEvent::Done))),
+            (
+                "invalid api key",
+                Box::new(|| {
+                    Err(LocalAgentError::InvalidApiKey {
+                        model_slug: MODEL_SLUG.to_string(),
+                    })
+                }),
+            ),
+            (
+                "context window",
+                Box::new(|| {
+                    Err(LocalAgentError::ContextWindowExceeded {
+                        message: "too long".to_string(),
+                    })
+                }),
+            ),
+            (
+                "transport error",
+                Box::new(|| Err(LocalAgentError::Transport("connection reset".to_string()))),
+            ),
+        ];
+        let later: Vec<Box<dyn Fn() -> Result<AgentEvent, LocalAgentError>>> = vec![
+            Box::new(|| Ok(AgentEvent::TextDelta("late".to_string()))),
+            Box::new(|| Ok(AgentEvent::ReasoningDelta("late".to_string()))),
+            Box::new(|| Ok(AgentEvent::ReplayItem(json!({ "type": "reasoning" })))),
+            Box::new(|| {
+                Ok(AgentEvent::Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                })
+            }),
+            Box::new(|| Ok(AgentEvent::Done)),
+            Box::new(|| Err(LocalAgentError::Transport("again".to_string()))),
+        ];
+
+        for (what, terminal) in &terminals {
+            let plan = first_turn_plan();
+            let mut mapper = EventMapper::new(&plan);
+            mapper.initial_events();
+
+            assert!(
+                !mapper.on_event(terminal()).is_empty(),
+                "{what} is terminal"
+            );
+            for event in &later {
+                assert!(
+                    mapper.on_event(event()).is_empty(),
+                    "an event after {what} must be dropped"
+                );
+            }
+        }
+    }
+
     #[test]
     fn transport_errors_surface_as_stream_errors_for_retry() {
         let plan = first_turn_plan();
@@ -1853,8 +1970,13 @@ mod reasoning {
     /// Runs one first turn through the mapper and returns the task messages the
     /// next request's `task_context` would carry.
     fn persisted_messages(events: Vec<AgentEvent>) -> Vec<api::Message> {
+        persisted_messages_via(&route(), events)
+    }
+
+    /// [`persisted_messages`] for a turn served by `route`.
+    fn persisted_messages_via(route: &LocalRoute, events: Vec<AgentEvent>) -> Vec<api::Message> {
         let req = request(vec![], user_inputs(vec![user_query_input("hi")]), "");
-        let plan = plan_turn(&req, &route()).expect("plan");
+        let plan = plan_turn(&req, route).expect("plan");
         let mut mapper = EventMapper::new(&plan);
         let mut messages = Vec::new();
         apply_task_actions(&mut messages, &mapper.initial_events());
@@ -2318,7 +2440,10 @@ mod reasoning {
             // Our envelope, but the item is not an object.
             reasoning(
                 "m3",
-                &format!(r#"{{"config_key":"{CONFIG_KEY}","local_agent_replay_item":"oops"}}"#),
+                &format!(
+                    r#"{{"config_key":"{CONFIG_KEY}","model_fingerprint":"{}","local_agent_replay_item":"oops"}}"#,
+                    endpoint_fingerprint(&route().endpoint)
+                ),
             ),
             shell_tool_call_message("m4", CALL_ID, "ls"),
         ];
@@ -2330,6 +2455,203 @@ mod reasoning {
             ChatMessage::Assistant { replay_items, tool_calls, .. }
                 if replay_items.is_empty() && tool_calls.len() == 1
         ));
+    }
+
+    /// A route to the same custom model entry (`config_key`) as [`route`], with
+    /// the endpoint edited.
+    fn edited_route(edit: impl FnOnce(&mut LocalEndpointConfig)) -> LocalRoute {
+        let mut edited = route();
+        edit(&mut edited.endpoint);
+        edited
+    }
+
+    /// Whether the replay item survived into the transcript rebuilt for `route`.
+    fn replayed_to(messages: &[api::Message], route: &LocalRoute) -> bool {
+        let transcript = transcript_after(
+            messages.to_vec(),
+            shell_result_input(CALL_ID, "ok", 0),
+            route,
+        );
+        let ChatMessage::Assistant { replay_items, .. } = assistants(&transcript)[0] else {
+            unreachable!();
+        };
+        !replay_items.is_empty()
+    }
+
+    fn call_with_replay_item() -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::ReplayItem(replay_item()),
+            shell_call(CALL_ID),
+            AgentEvent::Done,
+        ]
+    }
+
+    #[test]
+    fn fnv1a_matches_the_published_test_vectors() {
+        assert_eq!(fnv1a_64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a_64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a_64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn endpoint_fingerprint_is_pinned() {
+        // Persisted in task trees: changing this value silently orphans every
+        // stored replay item. If the format has to change, do it on purpose.
+        assert_eq!(endpoint_fingerprint(&route().endpoint), "471cf8c9d520d9a6");
+        assert_eq!(
+            endpoint_fingerprint(
+                &edited_route(|e| e.schema = local_agent::EndpointSchema::Responses).endpoint
+            ),
+            "9a369eeb351c1cd2"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_with_schema_base_url_and_slug() {
+        let base = endpoint_fingerprint(&route().endpoint);
+        let edits: [(&str, fn(&mut LocalEndpointConfig)); 4] = [
+            ("schema", |e| {
+                e.schema = local_agent::EndpointSchema::Responses
+            }),
+            ("host", |e| {
+                e.base_url = "https://other.example.com/v1".to_string()
+            }),
+            ("path", |e| {
+                e.base_url = "https://llm.example.com/v2".to_string()
+            }),
+            ("slug", |e| e.model_slug = "llama-3.1-8b".to_string()),
+        ];
+        for (what, edit) in edits {
+            assert_ne!(
+                endpoint_fingerprint(&edited_route(edit).endpoint),
+                base,
+                "editing the {what} must change the fingerprint"
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_ignores_credentials_and_url_spelling() {
+        let base = endpoint_fingerprint(&route().endpoint);
+        let same_target: [fn(&mut LocalEndpointConfig); 7] = [
+            |e| e.api_key = "sk-rotated".to_string(),
+            |e| e.base_url = "https://user:hunter2@llm.example.com/v1".to_string(),
+            |e| e.base_url = "https://llm.example.com/v1?api-key=hunter2".to_string(),
+            |e| e.base_url = "https://llm.example.com/v1#frag".to_string(),
+            |e| e.base_url = "https://llm.example.com/v1/".to_string(),
+            |e| e.base_url = "  HTTPS://LLM.Example.com/v1  ".to_string(),
+            |e| e.model_slug = format!(" {MODEL_SLUG} "),
+        ];
+        for edit in same_target {
+            let edited = edited_route(edit);
+            assert_eq!(
+                endpoint_fingerprint(&edited.endpoint),
+                base,
+                "{:?} names the same target",
+                edited.endpoint
+            );
+        }
+    }
+
+    #[test]
+    fn persisted_payload_carries_nothing_derived_from_credentials() {
+        let credentialed = edited_route(|e| {
+            e.api_key = "sk-live-0123456789".to_string();
+            e.base_url = "https://user:hunter2@llm.example.com/v1?api-key=hunter2".to_string();
+        });
+
+        let messages = persisted_messages_via(&credentialed, call_with_replay_item());
+
+        let payloads: Vec<&str> = messages
+            .iter()
+            .map(|message| message.server_message_data.as_str())
+            .filter(|data| !data.is_empty())
+            .collect();
+        assert_eq!(payloads.len(), 1);
+        for secret in ["sk-live-0123456789", "hunter2", "user:", "api-key"] {
+            assert!(
+                !payloads[0].contains(secret),
+                "{secret:?} leaked into {}",
+                payloads[0]
+            );
+        }
+        // Same target as `route()`, so it replays there.
+        assert!(replayed_to(&messages, &route()));
+    }
+
+    #[test]
+    fn replay_items_are_not_handed_to_an_edited_endpoint_with_the_same_config_key() {
+        let messages = persisted_messages(call_with_replay_item());
+        assert!(replayed_to(&messages, &route()), "control: unedited");
+
+        let edits: [(&str, fn(&mut LocalEndpointConfig)); 4] = [
+            ("model slug", |e| e.model_slug = "llama-3.1-8b".to_string()),
+            ("base url", |e| {
+                e.base_url = "https://other.example.com/v1".to_string()
+            }),
+            ("host path", |e| {
+                e.base_url = "https://llm.example.com/proxy/v1".to_string()
+            }),
+            ("schema", |e| {
+                e.schema = local_agent::EndpointSchema::Responses
+            }),
+        ];
+        for (what, edit) in edits {
+            let edited = edited_route(edit);
+            assert_eq!(edited.config_key, route().config_key);
+            assert!(
+                !replayed_to(&messages, &edited),
+                "an edited {what} must not receive reasoning issued by the old target"
+            );
+        }
+        // Rotating the key keeps the target, so continuity is kept.
+        assert!(replayed_to(
+            &messages,
+            &edited_route(|e| e.api_key = "sk-rotated".to_string())
+        ));
+    }
+
+    #[test]
+    fn switching_targets_and_back_replays_only_to_the_issuing_target() {
+        // Responses -> Chat Completions -> Responses on the same model entry.
+        let responses = edited_route(|e| e.schema = local_agent::EndpointSchema::Responses);
+        let chat = route();
+        let first_turn = persisted_messages_via(&responses, call_with_replay_item());
+        assert!(replayed_to(&first_turn, &responses));
+
+        assert!(
+            !replayed_to(&first_turn, &chat),
+            "the Chat Completions turn must not see Responses reasoning"
+        );
+        assert!(
+            replayed_to(&first_turn, &responses),
+            "returning to the issuing target replays its own items again"
+        );
+    }
+
+    #[test]
+    fn replay_items_persisted_without_a_fingerprint_are_dropped() {
+        // The format before `model_fingerprint`: right model key, no target.
+        let legacy = format!(
+            r#"{{"config_key":"{CONFIG_KEY}","local_agent_replay_item":{}}}"#,
+            replay_item()
+        );
+        let messages = vec![
+            user_query_message("m1", "list files"),
+            api::Message {
+                server_message_data: legacy,
+                ..message(
+                    "m2",
+                    api::message::Message::AgentReasoning(api::message::AgentReasoning {
+                        reasoning: String::new(),
+                        finished_duration: None,
+                    }),
+                )
+            },
+            shell_tool_call_message("m3", CALL_ID, "ls"),
+        ];
+
+        assert!(!replayed_to(&messages, &route()));
     }
 }
 
@@ -2536,6 +2858,93 @@ mod cancellation {
         );
         drop(stream);
         assert!(dropped.load(Ordering::SeqCst));
+    }
+}
+
+/// The mapper's terminal events seen through [`response_stream`].
+mod terminal_events {
+    use futures::{FutureExt, StreamExt};
+
+    use super::*;
+
+    fn bad_call() -> Result<AgentEvent, LocalAgentError> {
+        Ok(AgentEvent::ToolCall(ToolCallRequest {
+            id: "call_bad".to_string(),
+            name: "made_up_tool".to_string(),
+            arguments: json!({}),
+        }))
+    }
+
+    fn stream_for(
+        engine: futures::stream::BoxStream<'static, Result<AgentEvent, LocalAgentError>>,
+    ) -> ResponseStream {
+        let req = request(vec![], user_inputs(vec![user_query_input("hi")]), "");
+        let plan = plan_turn(&req, &route()).expect("plan");
+        response_stream(EventMapper::new(&plan), engine)
+    }
+
+    /// Everything the stream yields, without waiting: `None` if it would block.
+    fn collect_ready(stream: ResponseStream) -> Option<Vec<Event>> {
+        stream.collect::<Vec<_>>().now_or_never()
+    }
+
+    #[test]
+    fn a_failed_tool_call_followed_by_usage_and_done_finishes_once_and_never_commits() {
+        let engine = futures::stream::iter(vec![
+            bad_call(),
+            Ok(AgentEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            }),
+            Ok(AgentEvent::Done),
+        ])
+        .boxed();
+
+        let events = collect_ready(stream_for(engine)).expect("stream must not block");
+
+        let kinds = event_kinds(&events);
+        assert_eq!(kinds.iter().filter(|kind| *kind == "finished").count(), 1);
+        assert!(
+            !kinds.contains(&"commit_transaction".to_string()),
+            "a rolled-back transaction must not be committed: {kinds:?}"
+        );
+        assert_eq!(
+            &kinds[kinds.len() - 2..],
+            ["rollback_transaction", "finished"],
+            "the rollback and Finished close the stream: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn the_engine_stream_is_released_at_the_terminal_event() {
+        // After the bad call the engine would stall forever; the response
+        // stream must end anyway, and must have dropped the engine.
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let flag = DropFlag(dropped.clone());
+        let engine = Box::pin(async_stream::stream! {
+            let _connection = flag;
+            yield bad_call();
+            futures::future::pending::<()>().await;
+            yield Ok(AgentEvent::Done);
+        });
+
+        let events =
+            collect_ready(stream_for(engine)).expect("stream must end at the terminal event");
+
+        assert_eq!(
+            event_kinds(&events)
+                .iter()
+                .filter(|kind| *kind == "finished")
+                .count(),
+            1
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
 
@@ -2836,6 +3245,48 @@ mod passive_suggestions {
         assert!(
             instruction.contains("suggest_prompt"),
             "the final instruction must point at the suggest_prompt tool: {instruction}"
+        );
+    }
+
+    #[test]
+    fn suggestion_turns_reject_calls_to_tools_they_did_not_offer() {
+        let plan = shell_trigger_plan();
+        let not_offered = [
+            (
+                "run_shell_command",
+                json!({ "command": "ls", "is_read_only": true }),
+            ),
+            (
+                "read_files",
+                json!({ "files": [{ "path": "src/main.rs" }] }),
+            ),
+            ("grep", json!({ "queries": ["todo"], "path": "." })),
+        ];
+
+        for (name, arguments) in not_offered {
+            let call = ToolCallRequest {
+                id: "call-1".to_string(),
+                name: name.to_string(),
+                arguments,
+            };
+            assert!(
+                matches!(
+                    plan.tools.to_proto_tool_call(&call),
+                    Err(AdapterError::UnknownTool(_))
+                ),
+                "a read-only suggestion turn must not honour a {name} call"
+            );
+        }
+        let mut mapper = EventMapper::new(&plan);
+        mapper.initial_events();
+        let events = mapper.on_event(Ok(AgentEvent::ToolCall(ToolCallRequest {
+            id: "call-2".to_string(),
+            name: "run_shell_command".to_string(),
+            arguments: json!({ "command": "ls", "is_read_only": true }),
+        })));
+        assert_eq!(
+            event_kinds(&events),
+            vec!["rollback_transaction", "finished"]
         );
     }
 
