@@ -92,8 +92,8 @@ ADDITIONAL_LICENSES=(
     "Material Icon Theme|MIT|app/assets/bundled/svg/material_icon_theme/LICENSE"
     "bash-preexec|MIT|app/assets/bundled/bootstrap/bash-preexec-LICENSE.md"
     "Claude API Skill|Apache-2.0|resources/bundled/skills/claude-api/LICENSE.txt"
-    "Windows Terminal|MIT|app/assets/windows/LICENSE-WINDOWS-TERMINAL"
     "GitHub Desktop|MIT|app/src/code_review/GITHUB-DESKTOP-LICENSE"
+    "Windows Terminal|MIT|app/assets/windows/LICENSE-WINDOWS-TERMINAL"
 )
 
 # Build the third-party licenses file unless the NO_LICENSES envvar is set.

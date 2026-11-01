@@ -339,7 +339,7 @@ where
 
         for i in 0..archive.len() {
             let mut file = archive.by_index(i).context("Failed to read zip entry")?;
-            let file_name = file.name().to_string();
+            let file_name = file.name().context("Zip entry has an invalid file name")?;
 
             if let Some(ref filter) = file_filter
                 && !filter(&file_name)
@@ -533,3 +533,7 @@ pub async fn fetch_npm_package_version(
         .map(|s| s.to_string())
         .with_context(|| format!("No version found for npm package {}", package_name))
 }
+
+#[cfg(all(test, feature = "local_fs", not(target_family = "wasm")))]
+#[path = "lib_tests.rs"]
+mod tests;
