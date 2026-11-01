@@ -371,3 +371,10 @@ fn test_ignore_spaces_single_word_query() {
     );
     assert_eq!(regular_result.score, space_ignoring_result.score);
 }
+
+#[test]
+fn test_case_sensitive_matching_respects_case() {
+    assert!(match_indices_case_sensitive("README.md", "README").is_some());
+    assert!(match_indices_case_sensitive("README.md", "readme").is_none());
+    assert!(match_indices_case_sensitive("readme.md", "README").is_none());
+}

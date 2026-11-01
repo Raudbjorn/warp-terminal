@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use futures::StreamExt as _;
 use instant::Instant;
 use num_traits::SaturatingSub;
-use regex::escape;
+use project_replace::engine::SearchSpec;
+use project_replace::scope::{Scope, ScopeGlobs};
 use remote_server::HostId;
 use remote_server::manager::{HostRequestError, RemoteServerManager, RipgrepSearchParams};
 use remote_server::proto::RipgrepSearchSuccess;
@@ -20,8 +23,10 @@ use warp_util::standardized_path::StandardizedPath;
 use warpui::r#async::SpawnedFutureHandle;
 use warpui::{Entity, ModelContext, ModelSpawner, SingletonEntity};
 
+use crate::workspace::view::global_search::name_match::NameMatcher;
+use crate::workspace::view::global_search::name_search::{resolve_roots, search_names};
 use crate::workspace::view::global_search::view::GlobalSearchEvent;
-use crate::workspace::view::global_search::{GlobalSearchMatch, SearchConfig};
+use crate::workspace::view::global_search::{GlobalSearchMatch, SearchConfig, SearchOptions};
 
 const START_BATCH_AFTER_COUNT: usize = 50;
 const MAX_BATCH_SIZE: usize = 512;
@@ -57,9 +62,20 @@ struct SourceResult {
     capped: bool,
 }
 
+/// The background task matching file and folder names for one search.
+struct NameSearchTask {
+    search_id: u32,
+    handle: SpawnedFutureHandle,
+    /// Stops the task between entries, since it never yields to the executor while it runs.
+    cancelled: Arc<AtomicBool>,
+}
+
 pub struct GlobalSearch {
     /// Spawned local/remote search tasks for the current search.
     search_handles: Vec<SpawnedFutureHandle>,
+    /// Name matching for the current search. It runs apart from the content sources, so neither
+    /// kind of result waits for the other.
+    name_search: Option<NameSearchTask>,
     /// Request ids of remote searches started for the current search, so
     /// they can be aborted daemon-side when the query changes. May contain
     /// ids of already-resolved requests; aborting those is a no-op.
@@ -96,6 +112,7 @@ impl GlobalSearch {
     pub fn new() -> Self {
         GlobalSearch {
             search_handles: Vec::new(),
+            name_search: None,
             in_flight_remote_requests: Vec::new(),
             active_search: None,
             next_search_id: 1,
@@ -103,6 +120,19 @@ impl GlobalSearch {
     }
 
     pub fn abort_search(&mut self, ctx: &mut ModelContext<Self>) {
+        self.abort_content_search(ctx);
+        self.abort_name_search();
+    }
+
+    fn abort_name_search(&mut self) {
+        if let Some(task) = self.name_search.take() {
+            task.cancelled.store(true, Ordering::Relaxed);
+            task.handle.abort();
+        }
+    }
+
+    /// Stops searching file contents, leaving name matching for the current search running.
+    pub fn abort_content_search(&mut self, ctx: &mut ModelContext<Self>) {
         for handle in self.search_handles.drain(..) {
             handle.abort();
         }
@@ -126,6 +156,7 @@ impl GlobalSearch {
         pattern: String,
         roots: Vec<LocalOrRemotePath>,
         search_config: SearchConfig,
+        options: SearchOptions,
         ctx: &mut ModelContext<Self>,
     ) {
         if !self.search_handles.is_empty() {
@@ -136,13 +167,40 @@ impl GlobalSearch {
         let search_id = self.next_search_id;
         self.next_search_id += 1;
 
-        let effective_pattern = if search_config.use_regex {
-            pattern
-        } else {
-            escape(&pattern)
+        let scope = match Scope::parse(&options.scope) {
+            Ok(scope) => Arc::new(scope),
+            Err(err) => {
+                ctx.emit(GlobalSearchEvent::Started {
+                    search_id,
+                    remote_host_count: 0,
+                    name_search_started: false,
+                });
+                ctx.emit(GlobalSearchEvent::Failed {
+                    search_id,
+                    error: err.to_string(),
+                });
+                return;
+            }
         };
-        let ignore_case = !search_config.use_case_sensitivity;
-        let multiline = effective_pattern.contains('\n');
+
+        let name_search_started = self.spawn_name_search(
+            search_id,
+            &pattern,
+            &roots,
+            &search_config,
+            scope.clone(),
+            ctx,
+        );
+
+        let spec = SearchSpec {
+            pattern,
+            use_regex: search_config.use_regex,
+            case_sensitive: search_config.use_case_sensitivity,
+            whole_word: options.whole_word,
+        };
+        let effective_pattern = spec.effective_pattern();
+        let ignore_case = spec.ignore_case();
+        let multiline = spec.is_multiline();
 
         // Split roots into the local filesystem source and one remote
         // source per host.
@@ -164,6 +222,7 @@ impl GlobalSearch {
         ctx.emit(GlobalSearchEvent::Started {
             search_id,
             remote_host_count,
+            name_search_started,
         });
         let source_count = usize::from(!local_roots.is_empty()) + remote_roots.len();
         if source_count == 0 {
@@ -194,6 +253,7 @@ impl GlobalSearch {
                 local_roots,
                 ignore_case,
                 multiline,
+                options.scope.clone(),
                 ctx,
             );
         }
@@ -206,10 +266,58 @@ impl GlobalSearch {
                 multiline,
                 max_matches: REMOTE_MAX_MATCH_COUNT,
             };
-            self.spawn_remote_search(search_id, host_id, params, ctx);
+            self.spawn_remote_search(search_id, host_id, params, scope.clone(), ctx);
         }
     }
 
+    /// Starts matching file and folder names below `roots`. Returns whether a task was started,
+    /// in which case a [`GlobalSearchEvent::NameMatches`] follows unless the search is aborted.
+    fn spawn_name_search(
+        &mut self,
+        search_id: u32,
+        pattern: &str,
+        roots: &[LocalOrRemotePath],
+        search_config: &SearchConfig,
+        scope: Arc<Scope>,
+        ctx: &mut ModelContext<Self>,
+    ) -> bool {
+        let Some(matcher) = NameMatcher::new(pattern, search_config) else {
+            return false;
+        };
+        let roots = resolve_roots(roots, ctx);
+        if roots.is_empty() {
+            return false;
+        }
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let handle = ctx.spawn(
+            {
+                let cancelled = cancelled.clone();
+                async move { search_names(&roots, &matcher, &scope, &cancelled) }
+            },
+            move |me, results, ctx| {
+                if me
+                    .name_search
+                    .as_ref()
+                    .is_none_or(|task| task.search_id != search_id)
+                {
+                    return;
+                }
+                me.name_search = None;
+                if let Some(results) = results {
+                    ctx.emit(GlobalSearchEvent::NameMatches { search_id, results });
+                }
+            },
+        );
+        self.name_search = Some(NameSearchTask {
+            search_id,
+            handle,
+            cancelled,
+        });
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn spawn_local_search(
         &mut self,
         search_id: u32,
@@ -217,6 +325,7 @@ impl GlobalSearch {
         roots: Vec<PathBuf>,
         ignore_case: bool,
         multiline: bool,
+        scope: ScopeGlobs,
         ctx: &mut ModelContext<Self>,
     ) {
         let spawner = ctx.spawner();
@@ -230,6 +339,7 @@ impl GlobalSearch {
                     roots,
                     ignore_case,
                     multiline,
+                    scope,
                     spawner,
                 )
                 .await;
@@ -255,8 +365,10 @@ impl GlobalSearch {
         search_id: u32,
         host_id: HostId,
         params: RipgrepSearchParams,
+        scope: Arc<Scope>,
         ctx: &mut ModelContext<Self>,
     ) {
+        let roots = params.roots.clone();
         let pending = RemoteServerManager::handle(ctx).update(ctx, |manager, _| {
             manager.start_ripgrep_search(&host_id, params)
         });
@@ -268,8 +380,19 @@ impl GlobalSearch {
             SearchSource::Remote,
             async move {
                 match pending.result().await {
-                    Ok(success) => {
+                    Ok(mut success) => {
                         let capped = success.capped;
+                        // The host searches whole folders, so the scope is applied to what it
+                        // found.
+                        if !scope.is_unrestricted() {
+                            success.matches.retain(|found| {
+                                let path = Path::new(&found.file_path);
+                                roots.iter().any(|root| {
+                                    let root = Path::new(root.as_str());
+                                    path.starts_with(root) && scope.includes(root, path)
+                                })
+                            });
+                        }
                         let mut items = Self::remote_matches_to_global(&host_id, success);
                         let match_count = items.len();
                         flush_batch(&spawner, search_id, &mut items).await;
@@ -409,6 +532,7 @@ impl GlobalSearch {
         roots: Vec<PathBuf>,
         ignore_case: bool,
         multiline: bool,
+        scope: ScopeGlobs,
         spawner: ModelSpawner<GlobalSearch>,
     ) -> Result<usize> {
         let roots_display: Vec<_> = roots.iter().map(|r| r.display().to_string()).collect();
@@ -418,8 +542,13 @@ impl GlobalSearch {
         );
 
         let patterns = &[pattern];
-        let stream =
-            warp_ripgrep::search::search_streaming(patterns, &roots, ignore_case, multiline)?;
+        let stream = warp_ripgrep::search::search_streaming(
+            patterns,
+            &roots,
+            ignore_case,
+            multiline,
+            &scope,
+        )?;
         futures::pin_mut!(stream);
 
         let mut total_match_count: usize = 0;

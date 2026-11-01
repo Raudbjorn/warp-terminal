@@ -1,19 +1,10 @@
-use std::ops::Not;
 use std::path::PathBuf;
 
 use anyhow::anyhow;
-use grep::printer::JSONBuilder;
-use grep::regex::RegexMatcherBuilder;
-use grep::searcher::{BinaryDetection, SearcherBuilder};
-use ignore::{WalkBuilder, WalkState};
+use project_replace::engine::build_matcher;
+use project_replace::scope::{Scope, ScopeGlobs};
+use project_replace::worker::search_roots;
 use string_offset::ByteOffset;
-
-/// Maximum line length (in bytes) the ripgrep searcher will tolerate.
-/// Files containing lines longer than this are skipped, preventing
-/// unbounded memory growth from minified or generated files.
-/// Only applied in single-line mode; multiline search needs the full file
-/// in memory so the limit would be per-file rather than per-line.
-const SEARCHER_LINE_HEAP_LIMIT: usize = 64 * 1024;
 
 /// A single submatch span within a matched line.
 #[derive(Clone, Debug)]
@@ -43,6 +34,7 @@ pub fn run_search_subprocess(
     paths: Vec<PathBuf>,
     ignore_case: bool,
     multiline: bool,
+    scope: &ScopeGlobs,
     #[cfg_attr(not(unix), allow(unused_variables))] parent_pid: Option<u32>,
 ) -> anyhow::Result<()> {
     #[cfg(unix)]
@@ -55,81 +47,10 @@ pub fn run_search_subprocess(
         return Err(anyhow!("No paths specified"));
     }
 
-    let mut matcher_builder = RegexMatcherBuilder::new();
-    matcher_builder.case_insensitive(ignore_case);
-    if multiline {
-        matcher_builder.line_terminator(None);
-    }
-    let matcher = matcher_builder.build_many(patterns)?;
-
+    let matcher = build_matcher(patterns, ignore_case, multiline)?;
+    let scope = Scope::parse(scope)?;
     let stdout = std::sync::Mutex::new(std::io::stdout());
-
-    let mut walker_builder = WalkBuilder::new(&paths[0]);
-    for path in paths.iter().skip(1) {
-        walker_builder.add(path);
-    }
-    let walker = walker_builder.build_parallel();
-
-    walker.run(|| {
-        let matcher = matcher.clone();
-        let stdout = &stdout;
-
-        // Allocate once per thread and reuse across entries.
-        let mut buf = Vec::new();
-        let mut searcher = SearcherBuilder::new()
-            .binary_detection(BinaryDetection::quit(b'\x00'))
-            .line_number(true)
-            .multi_line(multiline)
-            .heap_limit(multiline.not().then_some(SEARCHER_LINE_HEAP_LIMIT))
-            .build();
-
-        Box::new(move |entry| {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(err) => {
-                    log::warn!("ripgrep walk error: {err}");
-                    return WalkState::Continue;
-                }
-            };
-
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                return WalkState::Continue;
-            }
-
-            // Search into the thread-local buffer, then flush the
-            // complete JSON lines to stdout under a lock so that
-            // output from parallel threads never interleaves.
-            buf.clear();
-            let mut printer = JSONBuilder::new().build(std::io::Cursor::new(&mut buf));
-
-            if let Err(err) = searcher.search_path(
-                &matcher,
-                entry.path(),
-                printer.sink_with_path(&matcher, entry.path()),
-            ) {
-                log::warn!(
-                    "ripgrep search error for {}: {}",
-                    entry.path().display(),
-                    err
-                );
-            }
-
-            if !buf.is_empty() {
-                let Ok(mut out) = stdout.lock() else {
-                    // Mutex poisoned — another search thread panicked.
-                    return WalkState::Quit;
-                };
-                use std::io::Write;
-                if out.write_all(&buf).is_err() {
-                    // Stdout pipe is broken (parent likely cancelled the
-                    // search), so stop walking.
-                    return WalkState::Quit;
-                }
-            }
-
-            WalkState::Continue
-        })
-    });
+    search_roots(&matcher, multiline, &paths, &scope, &stdout);
 
     Ok(())
 }
@@ -142,6 +63,7 @@ mod process_impl {
     use futures::StreamExt as _;
     use futures::io::{AsyncBufReadExt as _, BufReader};
     use futures::stream::Stream;
+    use project_replace::scope::ScopeGlobs;
 
     use super::{Match, Submatch};
     use crate::types::RipgrepMessage;
@@ -158,7 +80,8 @@ mod process_impl {
         ignore_case: bool,
         multiline: bool,
     ) -> anyhow::Result<Vec<Match>> {
-        let stream = search_streaming(patterns, paths, ignore_case, multiline)?;
+        let scope = ScopeGlobs::default();
+        let stream = search_streaming(patterns, paths, ignore_case, multiline, &scope)?;
         Ok(stream.collect().await)
     }
 
@@ -172,8 +95,9 @@ mod process_impl {
         paths: &[PathBuf],
         ignore_case: bool,
         multiline: bool,
+        scope: &ScopeGlobs,
     ) -> anyhow::Result<impl Stream<Item = Match>> {
-        let child = spawn_search_process(patterns, paths, ignore_case, multiline)?;
+        let child = spawn_search_process(patterns, paths, ignore_case, multiline, scope)?;
         Ok(match_stream_from_child(child))
     }
 
@@ -183,6 +107,7 @@ mod process_impl {
         paths: &[PathBuf],
         ignore_case: bool,
         multiline: bool,
+        scope: &ScopeGlobs,
     ) -> Result<async_process::Child, std::io::Error> {
         let current_exe = std::env::current_exe()?;
         let mut cmd = command::r#async::Command::new(current_exe);
@@ -196,6 +121,14 @@ mod process_impl {
 
         if multiline {
             cmd.arg("--multiline");
+        }
+
+        // Joined with `=` so that a pattern starting with a dash is not read as an option.
+        if !scope.include.trim().is_empty() {
+            cmd.arg(format!("--include={}", scope.include));
+        }
+        if !scope.exclude.trim().is_empty() {
+            cmd.arg(format!("--exclude={}", scope.exclude));
         }
 
         for pattern in patterns {

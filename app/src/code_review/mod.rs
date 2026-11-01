@@ -12,6 +12,14 @@ pub mod git_repo_model;
 mod git_repo_models;
 pub mod github_repo_model;
 mod hidden_lines;
+#[cfg(feature = "local_fs")]
+mod nested_repo_actions;
+#[cfg(feature = "local_fs")]
+mod nested_repo_file_diff;
+#[cfg(feature = "local_fs")]
+pub(crate) mod nested_repos;
+#[cfg(feature = "local_fs")]
+pub(crate) mod nested_repos_view;
 pub mod telemetry_event;
 #[cfg_attr(not(feature = "local_fs"), allow(unused_imports))]
 pub use telemetry_event::CodeReviewTelemetryEvent;
@@ -106,6 +114,8 @@ pub fn init(app: &mut AppContext) {
     diff_menu::init(app);
     diff_selector::init(app);
     git_dialog::init(app);
+    #[cfg(feature = "local_fs")]
+    nested_repos_view::init(app);
 }
 
 /// Uses heuristics to determine if a file is auto-generated.

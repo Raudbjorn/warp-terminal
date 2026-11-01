@@ -35,6 +35,7 @@ pub fn create_native_platform_modal(dialog: AlertDialog) -> Retained<NSAlert> {
     let alert = NSAlert::new(mtm);
     alert.setInformativeText(&NSString::from_str(&dialog.info_text));
     alert.setMessageText(&NSString::from_str(&dialog.message_text));
+    alert.setShowsSuppressionButton(dialog.can_be_disabled);
     for title in dialog.buttons {
         alert.addButtonWithTitle(&NSString::from_str(&title));
     }

@@ -32,6 +32,59 @@ HTTP for local hosts, HTTPS for public ones). Until an endpoint is
 configured, the terminal works normally but agent/AI actions have nowhere to
 go.
 
+### Editor and source-control additions from Hako
+
+This fork selectively integrates the following features from
+[egehakan/hako](https://github.com/egehakan/hako), inspected at
+`fff676a033aeb7423b27cad3bfb3076b1a125edc`:
+
+- **Syntax highlighting:** Svelte (`.svelte`), SCSS (`.scss`), Prisma (`.prisma`),
+  and Typst (`.typ`), including their language names in fenced code blocks.
+- **Material file and folder icons:** full-color icons in the file tree, file
+  pickers, and global search. The bundled artwork retains its MIT license.
+- **Project-wide replace:** use **Replace in files** in the command palette, or
+  expand the replacement field in Global Search. Preview replacements, restrict
+  files with include/exclude patterns, and replace a match, a file, or all matches.
+  Regex captures, whole-word matching, and case preservation are supported.
+  **Undo last replace in files** restores the most recent replacement while
+  refusing to overwrite subsequent edits. Replacement operates on local files;
+  remote search remains available.
+- **Project formatters:** **Format document** (`Shift-Alt-F`) and format-on-save
+  use a formatter selected by the project, falling back to the existing language
+  server where applicable. Configure **Format on save** and **Use project
+  formatters** in **Settings → Code → Editor & Code Review**. Project formatting
+  runs installed tools; it does not download formatters. A failed or stale result
+  cannot replace newer editor text. Typing-triggered autosave skips formatting;
+  saves during tab closure flush immediately without waiting for a formatter.
+- **Multi-repository Git:** open source control from a terminal in a local folder
+  containing repositories or linked worktrees. Each repository has its own
+  changes, inline file diffs, commit/push/publish, fetch/sync, and discard actions.
+  Sync only fast-forwards or pushes; divergent histories are left for you to
+  reconcile. Push respects the branch's configured upstream. Discard requires
+  confirmation and removes untracked files as well as tracked changes.
+
+Replacement skips unsafe or unsupported files (including binary files and files
+over 16 MiB). Its undo journal stores copies under the app's local state directory,
+including unsaved buffer contents, and keeps up to five transactions within a
+512 MiB total budget. Unix journals use owner-only permissions; on Windows they
+inherit the state directory's ACL. Project replacement clears ordinary buffer
+undo history; use the replacement journal to undo it. Undo refuses files that
+have grown beyond its 256 MiB read limit.
+
+Repository discovery searches up to six levels, skips `node_modules` and symlinked
+directories, and avoids scanning the home directory or its ancestors. The overview
+is for native local sessions, not SSH or WSL sessions. Its refresh control can
+rescan the folder and reload all repository statuses. Git metadata changes outside
+the watched folder (for linked worktrees) are picked up within the next 30-second
+status refresh, subject to the bounded status-load queue.
+
+The feature ports retain their existing crate boundaries: `languages` and
+`syntax_tree` for highlighting, `project_replace` shared with `warp_ripgrep`,
+`code_formatters` for project formatting, and the application's `code_review`
+modules for multi-repository Git. Source commits include `16e680f6`, `9ae545c0`,
+`4294a071`, `5afec9a8`, `93b08676`, `f240fe03`, `1f772d13`, `455fbde5`, and
+`abad4863` through `8e2a9b7b` for the Git integration.
+
 ## Building and running this fork
 
 The build is driven by the scripts in [`script/`](script). This fork builds as

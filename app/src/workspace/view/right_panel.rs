@@ -1,3 +1,5 @@
+#[cfg(feature = "local_fs")]
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -34,6 +36,12 @@ use crate::code_review::code_review_view::{
     CodeReviewViewEvent, ReviewActionTargetProvider, render_file_navigation_button,
 };
 use crate::code_review::diff_state::DiffStateModel;
+#[cfg(feature = "local_fs")]
+use crate::code_review::nested_repos::{NestedReposEvent, NestedReposModel};
+#[cfg(feature = "local_fs")]
+use crate::code_review::nested_repos_view::{
+    COMFORTABLE_TWO_COLUMN_WIDTH, NestedReposView, NestedReposViewEvent,
+};
 use crate::code_review::telemetry_event::CodeReviewContextDestination;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
 use crate::pane_group::pane::view::header::PANE_HEADER_HEIGHT;
@@ -51,7 +59,9 @@ use crate::ui_components::buttons::icon_button_with_color;
 use crate::ui_components::icons;
 use crate::util::bindings::{CustomAction, keybinding_name_to_display_string};
 #[cfg(feature = "local_fs")]
-use crate::util::openable_file_type::FileTarget;
+use crate::util::file::external_editor::EditorSettings;
+#[cfg(feature = "local_fs")]
+use crate::util::openable_file_type::{FileTarget, resolve_file_target_with_editor_choice};
 use crate::util::path::{display_name_with_host, display_path_with_host};
 use crate::view_components::action_button::{ActionButton, PaneHeaderTheme};
 #[cfg(feature = "local_fs")]
@@ -192,6 +202,59 @@ struct CodeReviewState {
 struct CodeReviewSessionEnv {
     is_remote: bool,
     is_wsl: bool,
+}
+
+/// The source-control overview of one folder, shared by every tab whose terminal is in it.
+#[cfg(feature = "local_fs")]
+struct NestedReposOverview {
+    model: ModelHandle<NestedReposModel>,
+    view: ViewHandle<NestedReposView>,
+}
+
+/// Whether scanning `folder` would walk the user's entire home directory.
+#[cfg(feature = "local_fs")]
+fn contains_home_directory(folder: &Path) -> bool {
+    let resolved = canonicalize(folder);
+    let folder = resolved.as_deref().unwrap_or(folder);
+    dirs::home_dir().is_some_and(|home| {
+        canonicalize(&home)
+            .as_deref()
+            .unwrap_or(&home)
+            .starts_with(folder)
+    })
+}
+
+/// Whether `folder` is, or is inside, a git working tree. Repository detection is asynchronous,
+/// so a directory inside a repository is briefly tracked as if it were not.
+#[cfg(feature = "local_fs")]
+fn is_inside_git_working_tree(folder: &Path) -> bool {
+    let resolved = canonicalize(folder);
+    let folder = resolved.as_deref().unwrap_or(folder);
+    folder
+        .ancestors()
+        .any(|ancestor| ancestor.join(".git").exists())
+}
+
+#[cfg(all(test, unix, feature = "local_fs"))]
+mod overview_path_tests {
+    use super::*;
+
+    #[test]
+    fn aliases_cannot_bypass_scan_guards() {
+        let directory = tempfile::tempdir().unwrap();
+        if let Some(home) = dirs::home_dir() {
+            let alias = directory.path().join("home-alias");
+            std::os::unix::fs::symlink(&home, &alias).unwrap();
+            assert!(contains_home_directory(&alias));
+        }
+        let repo = directory.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("nested")).unwrap();
+        let alias = directory.path().join("repo-alias");
+        std::os::unix::fs::symlink(repo.join("nested"), &alias).unwrap();
+        assert!(is_inside_git_working_tree(&alias));
+        assert!(!is_inside_git_working_tree(directory.path()));
+    }
 }
 
 /// Resolve the repo-switcher dropdown's text color from the current theme.
@@ -434,6 +497,11 @@ pub struct RightPanelView {
     code_review_state: Option<CodeReviewState>,
     #[cfg(feature = "local_fs")]
     code_review_session_env: Option<CodeReviewSessionEnv>,
+    #[cfg(feature = "local_fs")]
+    nested_repos_overviews: HashMap<PathBuf, NestedReposOverview>,
+    /// Folder whose nested repositories the panel offers for the active pane group.
+    #[cfg(feature = "local_fs")]
+    overview_folder: Option<PathBuf>,
     is_agent_management_view_open: bool,
     panel_position: super::PanelPosition,
 }
@@ -521,6 +589,10 @@ impl RightPanelView {
             code_review_state,
             #[cfg(feature = "local_fs")]
             code_review_session_env: None,
+            #[cfg(feature = "local_fs")]
+            nested_repos_overviews: HashMap::new(),
+            #[cfg(feature = "local_fs")]
+            overview_folder: None,
             is_agent_management_view_open: false,
             panel_position: super::PanelPosition::Right,
         }
@@ -548,7 +620,173 @@ impl RightPanelView {
         ctx: &mut ViewContext<Self>,
     ) {
         self.code_review_session_env = Some(CodeReviewSessionEnv { is_remote, is_wsl });
+        self.sync_nested_repos_overview(ctx);
         ctx.notify();
+    }
+
+    /// Resolves the folder whose nested repositories the panel should offer: the focused
+    /// terminal's working directory, when the panel is open on a local session and that directory
+    /// is not inside a repository.
+    #[cfg(feature = "local_fs")]
+    fn resolve_overview_folder(&self, app: &AppContext) -> Option<PathBuf> {
+        let pane_group = self.active_pane_group.as_ref()?;
+        if !pane_group.as_ref(app).right_panel_open {
+            return None;
+        }
+        if self
+            .code_review_session_env
+            .as_ref()
+            .is_some_and(|env| env.is_remote || env.is_wsl)
+        {
+            return None;
+        }
+        let terminal = pane_group.read(app, |pane_group, app| {
+            pane_group
+                .focused_session_view(app)
+                .or_else(|| pane_group.active_session_view(app))
+        })?;
+        let folder = terminal
+            .as_ref(app)
+            .pwd_as_local_or_remote(app)?
+            .to_local_path()?
+            .to_path_buf();
+        if !self
+            .working_directories_model
+            .as_ref(app)
+            .is_non_repo_directory(pane_group.id(), &folder)
+        {
+            return None;
+        }
+        let is_scannable = self.nested_repos_overviews.contains_key(&folder)
+            || (!contains_home_directory(&folder) && !is_inside_git_working_tree(&folder));
+        is_scannable.then_some(folder)
+    }
+
+    /// Brings the cached overviews in line with the pane groups' directories: creates the one
+    /// for the active pane group's folder, and drops those whose folder no pane group is in.
+    #[cfg(feature = "local_fs")]
+    fn sync_nested_repos_overview(&mut self, ctx: &mut ViewContext<Self>) {
+        let folder = self.resolve_overview_folder(ctx);
+        if let Some(folder) = &folder
+            && !self.nested_repos_overviews.contains_key(folder)
+        {
+            let model = ctx.add_model(|ctx| NestedReposModel::new(folder.clone(), ctx));
+            ctx.subscribe_to_model(&model, |_, _, event, ctx| match event {
+                NestedReposEvent::Updated => ctx.notify(),
+            });
+            let view = ctx.add_typed_action_view(|ctx| NestedReposView::new(model.clone(), ctx));
+            ctx.subscribe_to_view(&view, |me, _, event, ctx| match event {
+                NestedReposViewEvent::FileDiffOpened => me.make_room_for_file_diff(ctx),
+                NestedReposViewEvent::OpenFile { path } => me.open_file_from_overview(path, ctx),
+            });
+            self.nested_repos_overviews
+                .insert(folder.clone(), NestedReposOverview { model, view });
+        }
+
+        let working_directories = self.working_directories_model.as_ref(ctx);
+        self.nested_repos_overviews.retain(|folder, _| {
+            working_directories.is_non_repo_directory_of_any_pane_group(folder)
+        });
+
+        if self.overview_folder != folder {
+            self.overview_folder = folder;
+            ctx.notify();
+        }
+    }
+
+    /// The overview to show in place of the "not a repository" state, unless its scan found no
+    /// repositories.
+    #[cfg(feature = "local_fs")]
+    fn visible_nested_repos_overview(&self, app: &AppContext) -> Option<&NestedReposOverview> {
+        let folder = self.overview_folder.as_deref()?;
+        let overview = self.nested_repos_overviews.get(folder)?;
+        let model = overview.model.as_ref(app);
+        let found_no_repos = model.has_completed_scan() && model.entries().is_empty();
+        (!found_no_repos).then_some(overview)
+    }
+
+    /// Widens the panel, within its bounds, when it is too narrow to show the overview's list and
+    /// a file's diff side by side.
+    #[cfg(feature = "local_fs")]
+    fn make_room_for_file_diff(&mut self, ctx: &mut ViewContext<Self>) {
+        if self.is_maximized(ctx) {
+            return;
+        }
+        if let Ok(mut state) = self.resizable_state_handle.lock()
+            && state.size() < COMFORTABLE_TWO_COLUMN_WIDTH
+        {
+            state.set_size(COMFORTABLE_TWO_COLUMN_WIDTH);
+            state.clamp_size();
+        }
+        ctx.notify();
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn open_file_from_overview(&mut self, path: &Path, ctx: &mut ViewContext<Self>) {
+        let settings = EditorSettings::as_ref(ctx);
+        let target = resolve_file_target_with_editor_choice(
+            path,
+            *settings.open_code_panels_file_editor,
+            *settings.prefer_markdown_viewer,
+            *settings.open_file_layout,
+            None,
+        );
+        ctx.emit(RightPanelEvent::OpenFileWithTarget {
+            path: path.to_path_buf(),
+            target,
+            line_col: None,
+        });
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn render_overview_header(
+        &self,
+        folder: &Path,
+        close_button: Box<dyn Element>,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let theme = appearance.theme();
+        let folder_path =
+            display_path_with_host(&LocalOrRemotePath::Local(folder.to_path_buf()), true, app);
+        Container::new(
+            ConstrainedBox::new(
+                Flex::row()
+                    .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_child(
+                        Clipped::new(
+                            Shrinkable::new(
+                                1.0,
+                                Flex::row()
+                                    .with_main_axis_size(MainAxisSize::Max)
+                                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                                    .with_child(
+                                        Text::new_inline(
+                                            folder_path,
+                                            appearance.ui_font_family(),
+                                            appearance.ui_font_size(),
+                                        )
+                                        .with_style(Properties::default().weight(Weight::Semibold))
+                                        .with_color(theme.sub_text_color(theme.background()).into())
+                                        .finish(),
+                                    )
+                                    .finish(),
+                            )
+                            .finish(),
+                        )
+                        .finish(),
+                    )
+                    .with_child(self.render_maximize_pane_button())
+                    .with_child(close_button)
+                    .finish(),
+            )
+            .with_height(PANE_HEADER_HEIGHT)
+            .finish(),
+        )
+        .with_padding_left(CONTENT_LEFT_MARGIN)
+        .with_padding_right(CONTENT_RIGHT_MARGIN)
+        .finish()
     }
 
     pub fn selected_repo_path(&self) -> Option<&LocalOrRemotePath> {
@@ -577,6 +815,11 @@ impl RightPanelView {
         event: &WorkingDirectoriesEvent,
         ctx: &mut ViewContext<Self>,
     ) {
+        // Every pane group's directories decide which overviews stay cached, so this runs for
+        // events about inactive pane groups too.
+        #[cfg(feature = "local_fs")]
+        self.sync_nested_repos_overview(ctx);
+
         match event {
             WorkingDirectoriesEvent::RepositoriesChanged {
                 pane_group_id,
@@ -692,6 +935,9 @@ impl RightPanelView {
         let is_maximized = self.is_maximized(ctx);
         self.set_maximized(is_maximized, ctx);
 
+        #[cfg(feature = "local_fs")]
+        self.sync_nested_repos_overview(ctx);
+
         ctx.notify();
     }
 
@@ -703,6 +949,9 @@ impl RightPanelView {
         diff_state_model: ModelHandle<DiffStateModel>,
         ctx: &mut ViewContext<Self>,
     ) {
+        #[cfg(feature = "local_fs")]
+        self.sync_nested_repos_overview(ctx);
+
         let Some(repo_dropdown_state) = &mut self.code_review_state else {
             return;
         };
@@ -779,6 +1028,8 @@ impl RightPanelView {
         if let Some(code_review_state) = &mut self.code_review_state {
             code_review_state.selected_repo_path = None;
         }
+        #[cfg(feature = "local_fs")]
+        self.sync_nested_repos_overview(ctx);
         ctx.notify();
     }
 
@@ -878,6 +1129,17 @@ impl RightPanelView {
         });
 
         let Some(selected_repo_path) = selected_repo_path else {
+            #[cfg(feature = "local_fs")]
+            if let Some(overview) = self.visible_nested_repos_overview(app) {
+                let folder = overview.model.as_ref(app).scan_root();
+                return Flex::column()
+                    .with_child(self.render_overview_header(folder, close_button, appearance, app))
+                    .with_child(
+                        Shrinkable::new(1.0, ChildView::new(&overview.view).finish()).finish(),
+                    )
+                    .finish();
+            }
+
             let simple_header = self.render_simple_header(close_button);
 
             #[cfg(feature = "local_fs")]

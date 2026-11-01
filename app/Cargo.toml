@@ -171,6 +171,7 @@ rand.workspace = true
 rangemap.workspace = true
 rayon.workspace = true
 regex-automata.workspace = true
+project_replace.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 rust-embed.workspace = true
@@ -312,6 +313,7 @@ async-io.workspace = true
 axum.workspace = true
 build_cache.workspace = true
 cloud_object_persistence.workspace = true
+code_formatters.workspace = true
 comfy-table = "7.1.4"
 inquire = "0.9.1"
 diesel = { workspace = true, features = ["sqlite", "chrono"] }

@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "local_fs"), allow(dead_code))]
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -299,6 +300,24 @@ impl GlobalBufferModelEvent {
             | GlobalBufferModelEvent::ServerLocalBufferUpdated { file_id, .. } => *file_id,
         }
     }
+}
+
+/// A local file whose content is loaded in a buffer.
+pub struct LoadedLocalBuffer {
+    pub path: PathBuf,
+    pub file_id: FileId,
+    pub buffer: ModelHandle<Buffer>,
+    /// Whether the buffer holds changes that were never saved to the file.
+    pub has_unsaved_changes: bool,
+}
+
+/// Why edits were not applied to the buffer of a file.
+#[derive(thiserror::Error, Debug)]
+pub enum BufferTextEditError {
+    #[error("the file is not loaded in a buffer")]
+    NotLoaded,
+    #[error("the buffer no longer holds the text the edits were made for")]
+    TextChanged,
 }
 
 /// A text edit using 1-indexed character offsets (matching `CharOffset`).
@@ -920,6 +939,78 @@ impl GlobalBufferModel {
         self.buffers
             .get(&file_id)
             .and_then(|state| state.base_content_version())
+    }
+
+    /// Every local file whose content is loaded in a buffer.
+    pub fn loaded_local_buffers(&self, ctx: &warpui::AppContext) -> Vec<LoadedLocalBuffer> {
+        self.location_to_id
+            .iter()
+            .filter_map(|(location, file_id)| {
+                let LocalOrRemotePath::Local(path) = location else {
+                    return None;
+                };
+                let state = self.buffers.get(file_id)?;
+                let base_content_version = match &state.source {
+                    BufferSource::Local {
+                        base_content_version,
+                        ..
+                    } => (*base_content_version)?,
+                    BufferSource::Remote { .. } | BufferSource::ServerLocal { .. } => return None,
+                };
+                let buffer = state.buffer.upgrade(ctx)?;
+                let has_unsaved_changes = !buffer.as_ref(ctx).version_match(&base_content_version);
+                Some(LoadedLocalBuffer {
+                    path: path.clone(),
+                    file_id: *file_id,
+                    buffer,
+                    has_unsaved_changes,
+                })
+            })
+            .collect()
+    }
+
+    /// Applies `edits` to the loaded buffer of a file, provided the buffer still holds
+    /// `expected_text`. Each edit pairs a byte range of that text with its replacement, and the
+    /// edits are in the order of the text and apart. With `save`, the result is then written to
+    /// the file; if that fails the edits stay in the buffer, unsaved. Returns the text of the
+    /// buffer after the edits.
+    ///
+    /// The edits go through the buffer so that every editor showing the file shows them, and so
+    /// that changes the buffer holds beyond what is on disk are kept. The undo history of the
+    /// buffer does not survive them.
+    #[cfg(feature = "local_fs")]
+    pub fn apply_text_edits(
+        &mut self,
+        file_id: FileId,
+        expected_text: &str,
+        edits: Vec<(Range<usize>, String)>,
+        save: bool,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<String, BufferTextEditError> {
+        let buffer = self
+            .buffer_handle_for_id(file_id, ctx)
+            .ok_or(BufferTextEditError::NotLoaded)?;
+        if buffer.as_ref(ctx).text().into_string() != expected_text {
+            return Err(BufferTextEditError::TextChanged);
+        }
+        if edits.is_empty() {
+            return Ok(expected_text.to_string());
+        }
+
+        let new_version = ContentVersion::new();
+        buffer.update(ctx, |buffer, ctx| {
+            let char_edits = TextDiff { edits }.to_char_offset_edits(buffer);
+            buffer.insert_at_char_offset_ranges(char_edits, new_version, ctx);
+        });
+
+        let text = buffer.as_ref(ctx).text().into_string();
+        if save {
+            let content = buffer.as_ref(ctx).text_with_line_ending().into_string();
+            if let Err(err) = self.save(file_id, content, new_version, ctx) {
+                log::warn!("could not save a buffer after applying edits to it: {err}");
+            }
+        }
+        Ok(text)
     }
 
     /// Discard any in progress changes and reload the buffer with the canonical version from the file system.

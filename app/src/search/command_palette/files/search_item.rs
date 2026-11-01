@@ -9,6 +9,7 @@ use warpui::fonts::{Properties, Weight};
 use warpui::{AppContext, Element, SingletonEntity};
 
 use crate::appearance::Appearance;
+use crate::code::icon_from_folder_path;
 use crate::search::command_palette::mixer::CommandPaletteItemAction;
 use crate::search::command_palette::styles;
 use crate::search::files::icon::icon_from_file_path;
@@ -35,11 +36,7 @@ impl SearchItem for FileSearchItem {
     ) -> Box<dyn Element> {
         Container::new(
             ConstrainedBox::new(if self.is_directory {
-                Icon::new(
-                    "bundled/svg/completion-folder.svg",
-                    highlight_state.icon_fill(appearance).into_solid(),
-                )
-                .finish()
+                icon_from_folder_path(&self.path.to_string_lossy(), false)
             } else {
                 icon_from_file_path(&self.path.to_string_lossy(), appearance, highlight_state)
             })

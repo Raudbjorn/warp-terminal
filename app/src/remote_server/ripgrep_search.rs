@@ -50,11 +50,13 @@ pub(super) fn validate_request(msg: RipgrepSearchRequest) -> Result<RipgrepSearc
 pub(super) async fn run_search(
     params: RipgrepSearchParams,
 ) -> anyhow::Result<RipgrepSearchSuccess> {
+    let scope = project_replace::scope::ScopeGlobs::default();
     let stream = warp_ripgrep::search::search_streaming(
         std::slice::from_ref(&params.pattern),
         &params.roots,
         params.ignore_case,
         params.multiline,
+        &scope,
     )?;
     futures::pin_mut!(stream);
 

@@ -982,14 +982,21 @@ fn run_worker_command(worker: &warp_cli::WorkerCommand) -> Result<()> {
             parent,
             ignore_case,
             multiline,
+            include,
+            exclude,
             pattern,
             paths,
         } => {
+            let scope = project_replace::scope::ScopeGlobs {
+                include: include.clone().unwrap_or_default(),
+                exclude: exclude.clone().unwrap_or_default(),
+            };
             warp_ripgrep::search::run_search_subprocess(
                 std::slice::from_ref(pattern),
                 paths.clone(),
                 *ignore_case,
                 *multiline,
+                &scope,
                 parent.pid,
             )
             .map_err(|err| anyhow!(err.to_string()))?;

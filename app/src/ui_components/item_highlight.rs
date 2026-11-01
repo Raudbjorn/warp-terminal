@@ -1,12 +1,10 @@
 use pathfinder_color::ColorU;
 use warp_core::ui::theme::Fill;
 use warp_core::ui::theme::color::internal_colors;
-use warpui::Element;
 use warpui::elements::{CornerRadius, MouseState, Radius};
 
 use crate::appearance::Appearance;
 use crate::ui_components::blended_colors;
-use crate::ui_components::icons::Icon;
 
 /// Shared item highlight state for left-panel style lists (file tree, global search results,
 /// warp drive rows, etc.).
@@ -56,9 +54,4 @@ impl ItemHighlightState {
             }
         }
     }
-}
-
-pub(crate) enum ImageOrIcon {
-    Icon(Icon),
-    Image(Box<dyn Element>),
 }
