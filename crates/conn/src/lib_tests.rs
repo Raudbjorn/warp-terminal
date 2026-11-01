@@ -349,3 +349,126 @@ fn a_re_read_at_the_same_boundary_replaces_the_story() {
         Some("No plan on main.")
     );
 }
+
+/// An unfinished turn's coverage is its last transcript activity, which can be
+/// earlier than the read that produced it. That must not become the ordering
+/// boundary, or an older read dispatched in between would pass the stale guard
+/// and rewind the story.
+#[test]
+fn an_unfinished_turn_does_not_let_an_older_read_replace_a_newer_one() {
+    let mut session = ConnSession::default();
+    let newer = story(vec![turn(10, Some(20), None), turn(21, None, None)]);
+    let older = story(vec![turn(10, Some(20), None)]);
+
+    assert!(session.adopt_story(newer, at(30)));
+    assert!(!session.adopt_story(older, at(25)));
+    assert_eq!(session.story().expect("story kept").turns.len(), 2);
+}
+
+/// The intentional equal-boundary reread still works after an unfinished turn.
+#[test]
+fn an_equal_boundary_reread_still_replaces_an_unfinished_story() {
+    let mut session = ConnSession::default();
+    assert!(session.adopt_story(story(vec![turn(10, Some(20), None)]), at(30)));
+    assert!(session.adopt_story(story(vec![turn(10, Some(28), Some("done"))]), at(30)));
+}
+
+/// A read that finds nothing has told nothing, so it hides nothing.
+#[test]
+fn an_empty_story_does_not_hide_live_entries() {
+    let mut session = ConnSession::default();
+    session.push(prompt("do the thing", 1));
+    session.push(tool(2));
+
+    assert!(session.adopt_story(story(vec![]), at(5)));
+    assert_eq!(session.in_flight().len(), 2);
+}
+
+/// A read triggered by a new prompt can land before the transcript has flushed
+/// it, leaving the previous answered turn as the story's latest. That story does
+/// not contain the prompt, so the prompt must stay visible; the previous turn's
+/// own hook entries stay covered.
+#[test]
+fn a_story_behind_a_newer_live_prompt_does_not_hide_it() {
+    let mut session = ConnSession::default();
+    session.push(prompt("first", 1));
+    session.push(responded("done", 9));
+    session.push(prompt("second", 10));
+    session.push(tool(11));
+
+    assert!(session.adopt_story(story(vec![turn(1, Some(5), Some("done"))]), at(11)));
+
+    let kinds: Vec<_> = session
+        .in_flight()
+        .iter()
+        .map(|entry| entry.kind.clone())
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![
+            ConnEntryKind::Prompt {
+                text: "second".to_owned()
+            },
+            tool(11).kind,
+        ]
+    );
+}
+
+/// Once the transcript catches up, the prompt is covered again.
+#[test]
+fn a_story_that_reaches_the_newer_prompt_covers_it() {
+    let mut session = ConnSession::default();
+    session.push(prompt("first", 1));
+    session.push(responded("done", 9));
+    session.push(prompt("second", 10));
+
+    assert!(session.adopt_story(
+        story(vec![
+            turn(1, Some(5), Some("done")),
+            turn(10, Some(10), None)
+        ]),
+        at(11)
+    ));
+    assert!(session.in_flight().is_empty());
+}
+
+/// While a new prompt has not reached the transcript, the story's latest turn
+/// is still the previous, finished one: its answer is unseen, not narration.
+#[test]
+fn the_previous_turn_counts_as_unseen_while_a_new_prompt_is_live_only() {
+    let mut session = ConnSession::default();
+    session.push(prompt("first", 1));
+    session.push(responded("done", 9));
+    session.push(prompt("second", 10));
+    session.status = super::ConnStatus::Working;
+    assert!(session.adopt_story(story(vec![turn(1, Some(5), Some("done"))]), at(11)));
+
+    assert_eq!(session.unseen_turns(), 1);
+    assert_eq!(
+        session.first_unseen_turn().map(|turn| turn.started_at),
+        Some(at(1))
+    );
+}
+
+/// Without a newer prompt a working session's last turn is still running.
+#[test]
+fn a_running_last_turn_is_still_not_counted_as_unseen() {
+    let mut session = ConnSession::default();
+    session.push(prompt("first", 1));
+    session.status = super::ConnStatus::Working;
+    assert!(session.adopt_story(story(vec![turn(1, Some(5), Some("narration"))]), at(6)));
+
+    assert_eq!(session.unseen_turns(), 0);
+}
+
+/// A transcript read some time after its dispatch can hold records later than
+/// the dispatch boundary; coverage still must not run past the boundary or panic.
+#[test]
+fn a_story_newer_than_its_dispatch_boundary_is_handled() {
+    let mut session = ConnSession::default();
+    session.push(prompt("first", 1));
+    session.push(responded("done", 4));
+
+    assert!(session.adopt_story(story(vec![turn(1, Some(9), Some("done"))]), at(4)));
+    assert!(session.in_flight().is_empty());
+}
