@@ -258,22 +258,32 @@ fn fetch_url(url: &str) -> Result<FetchResponse, String> {
         http_client::redirect_denial_from(&err).map_or_else(|| err.to_string(), |d| d.to_string())
     })?;
 
+    // A declared length over the limit is refused without reading any of the body.
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_FETCH_BODY_BYTES)
+    {
+        return Err(body_too_large());
+    }
     let status = response.status().as_u16();
-    // One byte past the limit tells "exactly at the limit" from "over it".
+    // A body with no declared length (or a wrong one) is capped as it is read. One byte past the
+    // limit tells "exactly at the limit" from "over it".
     let mut body = Vec::new();
     response
         .take(MAX_FETCH_BODY_BYTES + 1)
         .read_to_end(&mut body)
         .map_err(|err| format!("failed to read the response: {err}"))?;
     if body.len() as u64 > MAX_FETCH_BODY_BYTES {
-        return Err(format!(
-            "response body is larger than {MAX_FETCH_BODY_BYTES} bytes"
-        ));
+        return Err(body_too_large());
     }
     Ok(FetchResponse {
         status,
         body: String::from_utf8_lossy(&body).into_owned(),
     })
+}
+
+fn body_too_large() -> String {
+    format!("response body is larger than {MAX_FETCH_BODY_BYTES} bytes")
 }
 
 /// Returns the `warp.network` namespace (capability-gated; requires `network`).
