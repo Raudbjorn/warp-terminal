@@ -324,12 +324,20 @@ fn strict_is_off_for_keywords_strict_mode_may_reject() {
 }
 
 #[test]
-fn a_tool_without_parameters_is_not_strict() {
-    // `additionalProperties` is not ours to add: it would narrow the schema.
+fn a_tool_without_parameters_is_strict_only_with_an_explicit_empty_required_list() {
+    // Left non-strict: `additionalProperties` is not ours to add (it would
+    // narrow the schema), and strict mode wants `required` spelled out even
+    // when it is empty, so a missing key might be rejected.
     assert!(!strict_of(json!({ "type": "object", "properties": {} })));
+    assert!(!strict_of(json!({
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+    })));
     assert!(strict_of(json!({
         "type": "object",
         "properties": {},
+        "required": [],
         "additionalProperties": false,
     })));
 }

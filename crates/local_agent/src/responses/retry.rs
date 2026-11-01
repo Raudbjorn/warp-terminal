@@ -19,6 +19,9 @@ const JITTER_FRACTION: f32 = 0.3;
 /// HTTP statuses worth retrying: request timeout, rate limit, server errors.
 const TRANSIENT_STATUSES: [u16; 2] = [408, 429];
 
+/// Error code of a 429 that is about billing, not about request rate.
+const QUOTA_EXHAUSTED_MARKER: &str = "insufficient_quota";
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct RetryPolicy {
     pub(super) max_attempts: usize,
@@ -63,6 +66,8 @@ impl RetryPolicy {
 fn is_transient(error: &LocalAgentError) -> bool {
     match error {
         LocalAgentError::Transport(_) => true,
+        // A spent quota stays spent: waiting out a backoff cannot fix it.
+        LocalAgentError::ErrorStatus { body, .. } if body.contains(QUOTA_EXHAUSTED_MARKER) => false,
         LocalAgentError::ErrorStatus { status, .. } => {
             TRANSIENT_STATUSES.contains(status) || (500..=599).contains(status)
         }
