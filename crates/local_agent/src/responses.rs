@@ -20,7 +20,7 @@ mod tools;
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use reqwest_eventsource::{Event, EventSource};
+use reqwest_eventsource::Event;
 
 use crate::{
     AgentEvent, ChatMessage, LocalAgentError, LocalEndpointConfig, ToolDefinition, engine, openai,
@@ -83,18 +83,20 @@ fn attempt_events(
     request: &ResponsesRequest,
     config: &LocalEndpointConfig,
 ) -> BoxStream<'static, Result<AgentEvent, LocalAgentError>> {
-    let mut builder =
-        engine::authorized_post(&request::endpoint_url(&config.base_url), config).json(request);
-    if let Some(session_id) = request.session_id() {
-        builder = builder.header(request::SESSION_ID_HEADER, session_id);
-    }
+    // Retrying is `run_turn_with_policy`'s job, where it can be bounded and
+    // only happens before anything was yielded.
+    let session_header = request
+        .session_id()
+        .map(|session_id| (request::SESSION_ID_HEADER, session_id));
+    let source = engine::post_event_source(
+        &request::endpoint_url(&config.base_url),
+        request,
+        &config.api_key,
+        session_header.as_slice(),
+    );
     let config = config.clone();
     Box::pin(async_stream::try_stream! {
-        let mut source = EventSource::new(builder)
-            .map_err(|err| LocalAgentError::Transport(err.to_string()))?;
-        // Retrying is `run_turn_with_policy`'s job, where it can be bounded
-        // and only happens before anything was yielded.
-        source.set_retry_policy(Box::new(openai::NeverRetry));
+        let mut source = source?;
 
         let mut response = stream::ResponseStream::default();
         while let Some(event) = source.next().await {

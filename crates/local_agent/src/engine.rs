@@ -24,19 +24,40 @@ pub(crate) fn run_turn(
     }
 }
 
-/// A POST to `url` on the shared HTTP client, authenticated with the
-/// endpoint's API key when one is configured.
-pub(crate) fn authorized_post(url: &str, config: &LocalEndpointConfig) -> reqwest::RequestBuilder {
+/// The process-wide HTTP client, shared by every wire schema.
+///
+/// Policy seam: anything that must hold for all outbound requests (proxy and
+/// redirect rules, network policy) belongs in this one builder.
+fn client() -> &'static reqwest::Client {
     // Reuse a single `reqwest::Client` across turns so TCP and TLS
     // sessions are pooled across requests.
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    let client = CLIENT.get_or_init(reqwest::Client::new);
-    let builder = client.post(url);
-    if config.api_key.trim().is_empty() {
-        builder
-    } else {
-        builder.bearer_auth(config.api_key.trim())
+    CLIENT.get_or_init(reqwest::Client::new)
+}
+
+/// Opens the event stream for one JSON POST to `url`. Every wire schema's
+/// request goes through here, so the schema supplies only the URL, the body,
+/// and any extra headers.
+///
+/// Policy seam: a per-request URL check belongs at the top of this function.
+/// Retrying is left to the caller, so the SSE layer never reconnects itself.
+pub(crate) fn post_event_source(
+    url: &str,
+    body: &impl serde::Serialize,
+    api_key: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<EventSource, LocalAgentError> {
+    let mut builder = client().post(url).json(body);
+    if !api_key.trim().is_empty() {
+        builder = builder.bearer_auth(api_key.trim());
     }
+    for (name, value) in extra_headers {
+        builder = builder.header(*name, *value);
+    }
+    let mut source =
+        EventSource::new(builder).map_err(|err| LocalAgentError::Transport(err.to_string()))?;
+    source.set_retry_policy(Box::new(openai::NeverRetry));
+    Ok(source)
 }
 
 fn run_chat_turn(
@@ -46,11 +67,12 @@ fn run_chat_turn(
 ) -> BoxStream<'static, Result<AgentEvent, LocalAgentError>> {
     Box::pin(async_stream::try_stream! {
         let request = openai::build_request(&transcript, &tools, &config);
-        let builder = authorized_post(&openai::endpoint_url(&config.base_url), &config)
-            .json(&request);
-        let mut source = EventSource::new(builder)
-            .map_err(|err| LocalAgentError::Transport(err.to_string()))?;
-        source.set_retry_policy(Box::new(openai::NeverRetry));
+        let mut source = post_event_source(
+            &openai::endpoint_url(&config.base_url),
+            &request,
+            &config.api_key,
+            &[],
+        )?;
 
         let mut accumulator = openai::StreamAccumulator::default();
         // Dropping this stream drops `source`, aborting the connection — that
