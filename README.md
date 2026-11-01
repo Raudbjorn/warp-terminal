@@ -48,7 +48,7 @@ can be deleted from the panel. Pattern and multi-alias stanzas stay in the file
 but are not listed as editable profiles. Leave the hostname or port blank to
 inherit SSH configuration. Additional IdentityFile entries survive unrelated
 edits; change multi-key lists directly in the config file. Remove references to a
-saved jump host before renaming it. Profile metadata and recent-host history stay local.
+saved jump host before renaming or deleting it. Profile metadata and recent-host history stay local.
 Password authentication uses SSH's normal terminal prompt; identity files and
 SSH-agent authentication are supported. Automatic saved-password release is
 unavailable because the shell-launched connection cannot securely bind a helper
