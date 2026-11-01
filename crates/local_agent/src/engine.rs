@@ -1,15 +1,28 @@
-//! The streaming turn loop: one Chat Completions call per [`run_turn`],
-//! mapped onto neutral [`AgentEvent`]s. Continuation after tool execution is
-//! the host's job — it calls `run_turn` again with the tool results appended
-//! to the transcript, mirroring how the Warp server loop is driven.
+//! The streaming turn loop: one model call per [`run_turn`], dispatched on the
+//! endpoint's wire schema and mapped onto neutral [`AgentEvent`]s.
+//! Continuation after tool execution is the host's job — it calls `run_turn`
+//! again with the tool results appended to the transcript, mirroring how the
+//! Warp server loop is driven.
 
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use reqwest_eventsource::{Event, EventSource};
 
 use crate::{
-    AgentEvent, ChatMessage, LocalAgentError, LocalEndpointConfig, ToolDefinition, openai,
+    AgentEvent, ChatMessage, EndpointSchema, LocalAgentError, LocalEndpointConfig, ToolDefinition,
+    openai, responses,
 };
+
+pub(crate) fn run_turn(
+    transcript: Vec<ChatMessage>,
+    tools: Vec<ToolDefinition>,
+    config: LocalEndpointConfig,
+) -> BoxStream<'static, Result<AgentEvent, LocalAgentError>> {
+    match config.schema {
+        EndpointSchema::ChatCompletions => run_chat_turn(transcript, tools, config),
+        EndpointSchema::Responses => responses::run_turn(transcript, tools, config),
+    }
+}
 
 /// A POST to `url` on the shared HTTP client, authenticated with the
 /// endpoint's API key when one is configured.
@@ -26,7 +39,7 @@ pub(crate) fn authorized_post(url: &str, config: &LocalEndpointConfig) -> reqwes
     }
 }
 
-pub(crate) fn run_turn(
+fn run_chat_turn(
     transcript: Vec<ChatMessage>,
     tools: Vec<ToolDefinition>,
     config: LocalEndpointConfig,

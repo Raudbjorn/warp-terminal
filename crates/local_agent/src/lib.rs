@@ -14,6 +14,7 @@
 mod engine;
 mod openai;
 mod prompt;
+mod responses;
 
 use futures::stream::BoxStream;
 pub use prompt::{EnvironmentInfo, build_suggestion_system_prompt, build_system_prompt};
@@ -33,10 +34,14 @@ pub enum EndpointSchema {
 #[derive(Debug, Clone)]
 pub struct LocalEndpointConfig {
     /// Base URL of the endpoint, e.g. `https://api.example.com/v1`. A URL
-    /// already ending in `/chat/completions` is used as-is.
+    /// already ending in `/chat/completions` (or, for the Responses schema,
+    /// `/responses`) is used as-is.
     pub base_url: String,
     pub api_key: String,
-    /// Model name as the provider knows it (e.g. `llama-3.3-70b`).
+    /// Model name as the provider knows it (e.g. `llama-3.3-70b`). For the
+    /// Responses schema a recognized OpenAI reasoning model may carry a
+    /// reasoning-effort suffix (`gpt-5.3-codex-high`); see
+    /// `responses/model.rs` for the grammar.
     pub model_slug: String,
     pub schema: EndpointSchema,
 }
