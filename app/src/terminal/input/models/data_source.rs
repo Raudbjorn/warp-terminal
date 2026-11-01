@@ -31,9 +31,9 @@ use crate::ai::custom_model_routers::is_custom_router_id;
 use crate::ai::execution_profiles::model_menu_items::is_auto;
 use crate::ai::llms::{
     ByoKeySource, DisableReason, LLMId, LLMInfo, LLMPreferences, LLMProvider, LLMSpec,
-    ModelIconFlags, byo_key_source_for_model, is_model_allowed_for_scope, model_leading_icon,
-    should_show_bedrock_icon_for_model,
-    should_show_gemini_enterprise_agent_platform_icon_for_model, should_show_key_icon_for_model,
+    ModelIconFlags, byo_key_source_for_model, effective_disable_reason_for_model,
+    is_model_allowed_for_scope, model_leading_icon, should_show_bedrock_icon_for_model,
+    should_show_gemini_enterprise_agent_platform_icon_for_model,
 };
 use crate::features::FeatureFlag;
 use crate::search::data_source::{Query, QueryFilter, QueryResult};
@@ -191,13 +191,7 @@ pub fn query_model_picker_choices<'a>(
                 }
                 Some(result)
             };
-            let disable_reason = if llm.disable_reason == Some(DisableReason::RequiresUpgrade)
-                && should_show_key_icon_for_model(llm, conversation, scope, app)
-            {
-                None
-            } else {
-                llm.disable_reason.clone()
-            };
+            let disable_reason = effective_disable_reason_for_model(llm, conversation, scope, app);
             Some(ModelPickerChoice {
                 llm: llm.clone(),
                 disable_reason,

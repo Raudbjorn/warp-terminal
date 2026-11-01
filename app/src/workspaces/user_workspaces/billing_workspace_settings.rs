@@ -3,7 +3,6 @@
 //! [`crate::workspaces::user_workspaces::team_workspace_settings`] for the workspace-vs-team
 //! two-layer model and the team-scoped policies that layer on top.
 
-use warp_core::features::FeatureFlag;
 use warpui::{AppContext, SingletonEntity};
 
 use super::UserWorkspaces;
@@ -162,42 +161,41 @@ impl UserWorkspaces {
                 })
     }
 
-    /// Whether BYO API key is enabled for the current user, based on the active policies.
-    /// Note that the value may be incorrect if called before the team's billing metadata has been fetched.
-    /// For solo users (no workspace), this is controlled by the `SoloUserByok` feature flag.
-    /// Anonymous or logged-out users are not allowed to use BYO API keys.
+    /// Whether BYO API keys are enabled for the current user.
+    ///
+    /// Unconditional for any signed-in user: neither the workspace's `byo_api_key_policy` plan
+    /// entitlement nor the `SoloUserByok` flag is consulted. This build runs the agent loop
+    /// locally and never sends a provider key to the Warp API server, so there is no
+    /// server-side billing relationship for the entitlement to protect. The team admin's managed
+    /// BYOK policy is a separate governance control and still applies through
+    /// [`Self::are_member_byo_keys_allowed`].
+    ///
+    /// Anonymous or logged-out users are still not allowed to use BYO API keys.
     pub fn is_byo_api_key_enabled(&self, app: &AppContext) -> bool {
         if ChannelState::is_local_only() {
             return true;
         }
-        if AuthStateProvider::as_ref(app)
+        !AuthStateProvider::as_ref(app)
             .get()
             .is_anonymous_or_logged_out()
-        {
-            return false;
-        }
-        self.current_workspace()
-            .map(|workspace| workspace.billing_metadata.is_byo_api_key_enabled())
-            .unwrap_or(FeatureFlag::SoloUserByok.is_enabled())
     }
 
     /// Whether custom inference endpoints are enabled for the current user.
-    /// Anonymous or logged-out users are not allowed to use custom inference.
-    /// Controlled by the BYO_ENDPOINT billing policy.
+    ///
+    /// Unconditional for any signed-in user, for the same reason as
+    /// [`Self::is_byo_api_key_enabled`]: the workspace's `byo_endpoint_policy` plan entitlement is
+    /// not consulted. This is also what keeps custom endpoint models, the only ones the local
+    /// agent loop can serve, in the model pickers and in outgoing request settings. The team
+    /// admin's managed BYOE policy still applies through [`Self::are_member_byo_endpoints_allowed`].
+    ///
+    /// Anonymous or logged-out users are still not allowed to use custom inference.
     pub fn is_byo_endpoint_enabled(&self, app: &AppContext) -> bool {
         if ChannelState::is_local_only() {
             return true;
         }
-        if AuthStateProvider::as_ref(app)
+        !AuthStateProvider::as_ref(app)
             .get()
             .is_anonymous_or_logged_out()
-        {
-            return false;
-        }
-
-        self.current_workspace()
-            .map(|workspace| workspace.billing_metadata.is_byo_endpoint_enabled())
-            .unwrap_or(true)
     }
 
     /// Whether the current workspace's plan manages BYOK/BYOE centrally.
