@@ -269,10 +269,10 @@ fn is_strict_object(node: &Map<String, Value>, depth: usize, properties_seen: &m
     if *properties_seen > MAX_STRICT_PROPERTIES {
         return false;
     }
-    let required = match node.get("required") {
-        Some(Value::Array(names)) => names.as_slice(),
-        None => &[],
-        Some(_) => return false,
+    // Strict mode wants an explicit `required` list even when it is empty;
+    // a schema without one is left non-strict rather than risk a rejection.
+    let Some(required) = node.get("required").and_then(Value::as_array) else {
+        return false;
     };
     required.len() == properties.len()
         && properties

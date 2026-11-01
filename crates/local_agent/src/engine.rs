@@ -54,10 +54,41 @@ pub(crate) fn post_event_source(
     for (name, value) in extra_headers {
         builder = builder.header(*name, *value);
     }
-    let mut source =
-        EventSource::new(builder).map_err(|err| LocalAgentError::Transport(err.to_string()))?;
+    let mut source = EventSource::new(buildable(builder)?)
+        .map_err(|err| LocalAgentError::Transport(err.to_string()))?;
     source.set_retry_policy(Box::new(openai::NeverRetry));
     Ok(source)
+}
+
+/// Surfaces a misconfigured request (a URL without a scheme, a key that is not
+/// a valid header value) as the permanent error it is. A builder holding such
+/// an error cannot be cloned, which `EventSource::new` would report as an
+/// opaque, seemingly transient transport failure.
+///
+/// The text deliberately omits the request URL (it may carry credentials in
+/// its query) and everything about the key.
+fn buildable(builder: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder, LocalAgentError> {
+    let (client, request) = builder.build_split();
+    let request = request.map_err(|err| {
+        LocalAgentError::Parse(format!(
+            "the request could not be built; check the base URL and API key: {}",
+            error_chain(&err.without_url())
+        ))
+    })?;
+    Ok(reqwest::RequestBuilder::from_parts(client, request))
+}
+
+/// An error with its causes appended (`reqwest`'s own text is just "builder
+/// error"; the useful part is the source).
+fn error_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
 }
 
 fn run_chat_turn(

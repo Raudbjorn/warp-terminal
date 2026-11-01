@@ -21,31 +21,37 @@ const PROMPT_CACHE_KEY_PREFIX: &str = "warp-local-";
 const FNV64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// Resolves the Responses URL for an endpoint. Users configure a base URL
-/// (`https://host`, `https://host/v1`, `https://host/openai/v4`), the full
-/// `/responses` URL, or a Chat Completions URL left over from another schema.
-/// A missing version segment defaults to `/v1`.
+/// Resolves the Responses URL for an endpoint. Users configure a base URL,
+/// the full `/responses` URL, or a Chat Completions URL left over from
+/// another schema. As with the Chat engine, `/responses` is appended to the
+/// base path as given: `https://host/v1` and `https://host/openai/v1` gain
+/// only `/responses`, and a gateway path such as
+/// `https://gateway.example/v1/acct/openai` is never rewritten. Only a bare
+/// host (`https://host`) gets the `/v1` that OpenAI-style servers expect.
+/// A query string or fragment (e.g. Azure's `?api-version=...`) rides along
+/// after the path untouched.
 pub(crate) fn endpoint_url(base_url: &str) -> String {
-    let trimmed = base_url.trim().trim_end_matches('/');
-    if trimmed.ends_with("/responses") {
-        return trimmed.to_string();
-    }
-    if let Some(base) = trimmed.strip_suffix("/chat/completions") {
-        return format!("{base}/responses");
-    }
-    if has_version_suffix(trimmed) {
-        format!("{trimmed}/responses")
+    let base_url = base_url.trim();
+    let (location, suffix) = base_url.split_at(base_url.find(['?', '#']).unwrap_or(base_url.len()));
+    let (origin, path) = split_origin(location.trim_end_matches('/'));
+    if let Some(chat_base) = path.strip_suffix("/chat/completions") {
+        format!("{origin}{chat_base}/responses{suffix}")
+    } else if path.is_empty() {
+        format!("{origin}/v1/responses{suffix}")
+    } else if path.ends_with("/responses") {
+        format!("{origin}{path}{suffix}")
     } else {
-        format!("{trimmed}/v1/responses")
+        format!("{origin}{path}/responses{suffix}")
     }
 }
 
-/// Whether the last path segment is a version like `v1` or `v4`.
-fn has_version_suffix(url: &str) -> bool {
-    url.rsplit('/')
-        .next()
-        .and_then(|segment| segment.strip_prefix('v'))
-        .is_some_and(|version| !version.is_empty() && version.chars().all(|c| c.is_ascii_digit()))
+/// Splits `scheme://authority` from the path that follows it.
+fn split_origin(url: &str) -> (&str, &str) {
+    let authority_start = url.find("://").map_or(0, |scheme_end| scheme_end + 3);
+    match url[authority_start..].find('/') {
+        Some(path_start) => url.split_at(authority_start + path_start),
+        None => (url, ""),
+    }
 }
 
 #[derive(Serialize)]

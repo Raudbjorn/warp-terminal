@@ -542,13 +542,35 @@ fn error_events_are_read_from_the_top_level_or_a_nested_error() {
 }
 
 #[test]
-fn a_failure_without_a_message_reports_the_raw_event() {
+fn a_failure_without_details_reports_a_short_excerpt_of_the_event() {
     let result = run(vec![
-        json!({ "type": "response.failed", "response": { "status": "failed" } }),
+        json!({ "type": "response.failed", "response": { "status": "failed", "error": null } }),
     ]);
 
     assert!(
-        matches!(&result, Err(LocalAgentError::ErrorStatus { body, .. }) if body.contains("response.failed")),
+        matches!(&result, Err(LocalAgentError::ErrorStatus { body, .. })
+            if body.starts_with("the provider reported a failure without details")
+                && body.contains("response.failed")
+                && !body.ends_with("...")),
         "{result:?}"
+    );
+}
+
+#[test]
+fn a_failure_without_details_never_echoes_a_large_payload() {
+    let bulky_output = "x".repeat(10_000);
+    let result = run(vec![json!({
+        "type": "response.failed",
+        "response": { "status": "failed", "error": null, "output": [{ "text": bulky_output }] },
+    })]);
+
+    let Err(LocalAgentError::ErrorStatus { body, .. }) = result else {
+        panic!("expected ErrorStatus, got {result:?}");
+    };
+    assert!(body.ends_with("..."), "{body}");
+    assert!(
+        body.len() < 2 * MAX_FAILURE_EXCERPT_CHARS,
+        "excerpt was not bounded: {} bytes",
+        body.len()
     );
 }

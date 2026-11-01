@@ -46,6 +46,23 @@ fn does_not_retry_permanent_failures() {
 }
 
 #[test]
+fn a_rate_limit_is_retried_but_an_exhausted_quota_is_not() {
+    let rate_limited = LocalAgentError::ErrorStatus {
+        status: 429,
+        body: r#"{"error":{"message":"Rate limit reached","code":"rate_limit_exceeded"}}"#
+            .to_string(),
+    };
+    let no_quota = LocalAgentError::ErrorStatus {
+        status: 429,
+        body: r#"{"error":{"message":"You exceeded your current quota","type":"insufficient_quota","code":"insufficient_quota"}}"#
+            .to_string(),
+    };
+
+    assert!(policy().should_retry(1, &rate_limited));
+    assert!(!policy().should_retry(1, &no_quota));
+}
+
+#[test]
 fn stops_after_the_last_attempt() {
     let error = status(503);
 

@@ -37,7 +37,7 @@ fn simple_transcript() -> Vec<ChatMessage> {
 }
 
 #[test]
-fn endpoint_url_handles_base_urls_with_and_without_a_version() {
+fn endpoint_url_adds_v1_only_to_a_bare_host() {
     for (base, expected) in [
         (
             "https://api.openai.com",
@@ -47,6 +47,22 @@ fn endpoint_url_handles_base_urls_with_and_without_a_version() {
             "https://api.openai.com/",
             "https://api.openai.com/v1/responses",
         ),
+        (
+            "http://localhost:11434",
+            "http://localhost:11434/v1/responses",
+        ),
+        (
+            "  https://api.openai.com  ",
+            "https://api.openai.com/v1/responses",
+        ),
+    ] {
+        assert_eq!(endpoint_url(base), expected, "base {base:?}");
+    }
+}
+
+#[test]
+fn endpoint_url_appends_to_the_given_path_like_the_chat_engine() {
+    for (base, expected) in [
         ("https://example.com/v1", "https://example.com/v1/responses"),
         (
             "https://example.com/v1/",
@@ -58,15 +74,15 @@ fn endpoint_url_handles_base_urls_with_and_without_a_version() {
         ),
         (
             "https://example.com/openai",
-            "https://example.com/openai/v1/responses",
+            "https://example.com/openai/responses",
         ),
         (
             "https://example.com/openai/v1",
             "https://example.com/openai/v1/responses",
         ),
         (
-            "  https://example.com/v1  ",
-            "https://example.com/v1/responses",
+            "https://gateway.ai.cloudflare.com/v1/ACCT/GW/openai",
+            "https://gateway.ai.cloudflare.com/v1/ACCT/GW/openai/responses",
         ),
     ] {
         assert_eq!(endpoint_url(base), expected, "base {base:?}");
@@ -91,6 +107,38 @@ fn endpoint_url_keeps_a_full_responses_url_and_converts_a_chat_url() {
         (
             "https://example.com/v1/chat/completions",
             "https://example.com/v1/responses",
+        ),
+        (
+            "https://example.com/chat/completions",
+            "https://example.com/responses",
+        ),
+    ] {
+        assert_eq!(endpoint_url(base), expected, "base {base:?}");
+    }
+}
+
+#[test]
+fn endpoint_url_leaves_the_query_and_fragment_after_the_path() {
+    for (base, expected) in [
+        (
+            "https://x.openai.azure.com/openai/responses?api-version=2025-03-01-preview",
+            "https://x.openai.azure.com/openai/responses?api-version=2025-03-01-preview",
+        ),
+        (
+            "https://x.openai.azure.com/openai/v1?api-version=preview",
+            "https://x.openai.azure.com/openai/v1/responses?api-version=preview",
+        ),
+        (
+            "https://x.openai.azure.com/openai/v1/?api-version=preview",
+            "https://x.openai.azure.com/openai/v1/responses?api-version=preview",
+        ),
+        (
+            "https://example.com?tenant=a",
+            "https://example.com/v1/responses?tenant=a",
+        ),
+        (
+            "https://example.com/v1/chat/completions?x=1#frag",
+            "https://example.com/v1/responses?x=1#frag",
         ),
     ] {
         assert_eq!(endpoint_url(base), expected, "base {base:?}");
