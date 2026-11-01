@@ -192,6 +192,7 @@ settings_value = { workspace = true, features = ["derive"] }
 sha2.workspace = true
 shellexpand.workspace = true
 shell-words = "1.1.0"
+zeroize = "1.8"
 shlex = "1.3.0"
 siphasher = "0.3.11"
 similar.workspace = true

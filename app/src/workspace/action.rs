@@ -389,6 +389,7 @@ pub enum WorkspaceAction {
     /// Toggles the vertical tabs panel. This happens as an explicit action from the user.
     ToggleVerticalTabsPanel,
     OpenVerticalTabsPanel,
+    SshManager(crate::ssh_manager::SshManagerAction),
     ToggleVerticalTabsSettingsPopup,
     SetVerticalTabsDisplayGranularity(VerticalTabsDisplayGranularity),
     SetVerticalTabsTabItemMode(VerticalTabsTabItemMode),
@@ -934,6 +935,7 @@ impl WorkspaceAction {
         match self {
             // oh-my-warp: running a plugin command shouldn't trigger app-state saves.
             RunPluginCommand(_) => false,
+            SshManager(action) => action.should_save_app_state_on_action(),
             #[cfg(not(target_family = "wasm"))]
             ContinueConversationLocally { .. } => true,
             #[cfg(not(target_family = "wasm"))]

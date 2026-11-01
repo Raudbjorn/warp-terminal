@@ -438,6 +438,9 @@ pub struct TerminalModel {
     /// cleared at the next precmd, because it is only relevant for the block where it was set.
     ignore_bootstrapping_messages: bool,
 
+    /// Cleared in `command_finished`.
+    ignore_bootstrapping_messages_until_command_finished: bool,
+
     // This session's startup directory path. If None, the startup directory is treated as default
     // (the user's home directory).
     session_startup_path: Option<PathBuf>,
@@ -1101,6 +1104,7 @@ impl TerminalModel {
             active_shell_launch_data: None,
             pending_session_info: None,
             ignore_bootstrapping_messages: false,
+            ignore_bootstrapping_messages_until_command_finished: false,
             session_startup_path,
             is_receiving_in_band_command_output: IsReceivingInBandCommandOutput::No,
             #[cfg(windows)]
@@ -1498,6 +1502,16 @@ impl TerminalModel {
 
     pub fn ignore_bootstrapping_messages(&mut self) {
         self.ignore_bootstrapping_messages = true;
+    }
+
+    /// Suppresses bootstrapping hooks until the next `command_finished`.
+    pub fn ignore_bootstrapping_messages_until_command_finished(&mut self) {
+        self.ignore_bootstrapping_messages_until_command_finished = true;
+    }
+
+    fn should_ignore_bootstrapping_messages(&self) -> bool {
+        self.ignore_bootstrapping_messages
+            || self.ignore_bootstrapping_messages_until_command_finished
     }
 
     /// Reacts to the PTY going away. For a shared ambient agent session with shell respawn
@@ -3069,6 +3083,8 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn command_finished(&mut self, data: CommandFinishedValue) {
+        self.ignore_bootstrapping_messages_until_command_finished = false;
+
         let disposition = self
             .block_list
             .classify_next_block_id(&data.completion_metadata.next_block_id);
@@ -3166,6 +3182,11 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn bootstrapped(&mut self, value: BootstrappedValue) {
+        if self.should_ignore_bootstrapping_messages() {
+            log::info!("Ignoring Bootstrapped hook while bootstrapping messages are suppressed");
+            return;
+        }
+
         self.block_list.bootstrapped(value.clone());
 
         let pending_session_info = match self.pending_session_info.take() {
@@ -3211,7 +3232,7 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn ssh(&mut self, value: SSHValue) {
-        if !self.ignore_bootstrapping_messages {
+        if !self.should_ignore_bootstrapping_messages() {
             let remote_shell = value.remote_shell.clone();
             let Some(remote_session_id) = value.remote_session_id.map(SessionId::from) else {
                 log::warn!("Rejected SSH hook without remote_session_id");
@@ -3233,6 +3254,8 @@ impl ansi::Handler for TerminalModel {
             }
             self.pending_ssh_wrapper_session = Some(value);
             self.event_proxy.send_app_event(Event::SSH(remote_shell));
+        } else {
+            log::info!("Ignoring SSH hook while bootstrapping messages are suppressed");
         }
     }
 
@@ -3247,7 +3270,7 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn init_shell(&mut self, data: InitShellValue) {
-        if !self.ignore_bootstrapping_messages {
+        if !self.should_ignore_bootstrapping_messages() {
             let hook_session_id = Some(data.session_id.as_u64());
             let transition = self.plan_lifecycle_transition(
                 LifecycleInput::InitShell,
@@ -3300,6 +3323,8 @@ impl ansi::Handler for TerminalModel {
                 pending_session_info: Box::new(pending_session_info),
             });
             self.commit_lifecycle_transition(&transition);
+        } else {
+            log::info!("Ignoring InitShell hook while bootstrapping messages are suppressed");
         }
     }
 
@@ -3317,6 +3342,11 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn init_subshell(&mut self, data: InitSubshellValue) {
+        if self.should_ignore_bootstrapping_messages() {
+            log::info!("Ignoring InitSubshell hook while bootstrapping messages are suppressed");
+            return;
+        }
+
         match ShellType::from_name(data.shell.as_str()) {
             Some(shell_type) => {
                 self.event_proxy
@@ -3333,6 +3363,11 @@ impl ansi::Handler for TerminalModel {
     }
 
     fn sourced_rc_file(&mut self, data: SourcedRcFileForWarpValue) {
+        if self.should_ignore_bootstrapping_messages() {
+            log::info!("Ignoring SourcedRcFile hook while bootstrapping messages are suppressed");
+            return;
+        }
+
         // If the blocklist is already bootstrapped, the user's RC file must be sourced in a
         // subshell.
         if self.block_list.is_bootstrapped() {
