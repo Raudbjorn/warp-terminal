@@ -948,6 +948,7 @@ impl AppContext {
             message_text: alert_data.message_text,
             info_text: alert_data.info_text,
             buttons: button_titles,
+            can_be_disabled: alert_data.can_be_disabled,
         };
 
         let response_data = PlatformModalResponseData {

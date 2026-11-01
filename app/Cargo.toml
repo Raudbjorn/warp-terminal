@@ -106,6 +106,7 @@ enum-iterator.workspace = true
 event-listener.workspace = true
 field_mask.workspace = true
 float-cmp.workspace = true
+file_write_guard.workspace = true
 futures-lite.workspace = true
 futures-util.workspace = true
 futures.workspace = true
@@ -163,6 +164,7 @@ persistence.workspace = true
 pin-project.workspace = true
 plist = "1"
 pprof = { workspace = true, optional = true, features = ["protobuf-codec"] }
+project_replace.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 qrcode.workspace = true
@@ -312,6 +314,7 @@ async-io.workspace = true
 axum.workspace = true
 build_cache.workspace = true
 cloud_object_persistence.workspace = true
+code_formatters.workspace = true
 comfy-table = "7.1.4"
 inquire = "0.9.1"
 diesel = { workspace = true, features = ["sqlite", "chrono"] }

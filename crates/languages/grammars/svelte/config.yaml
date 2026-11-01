@@ -1,0 +1,12 @@
+display_name: "Svelte"
+indent_unit:
+  space: 2
+brackets:
+  - start: "{"
+    end: "}"
+  - start: "["
+    end: "]"
+  - start: "("
+    end: ")"
+  - start: "<"
+    end: ">"

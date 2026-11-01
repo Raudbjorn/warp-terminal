@@ -687,6 +687,12 @@ pub enum WorkerCommand {
         ignore_case: bool,
         #[clap(long = "multiline")]
         multiline: bool,
+        /// Comma-separated patterns of the files to search. Every file when left out.
+        #[clap(long = "include")]
+        include: Option<String>,
+        /// Comma-separated patterns of the files to leave out.
+        #[clap(long = "exclude")]
+        exclude: Option<String>,
         /// Search pattern.
         pattern: String,
         /// Paths to search.

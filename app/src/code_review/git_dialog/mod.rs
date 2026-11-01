@@ -125,9 +125,15 @@ fn should_send_git_ops_ai_request(app: &AppContext) -> bool {
 /// Maps a raw git error string to a user-friendly toast message. Known
 /// failure modes get dedicated copy; anything else falls back to a generic
 /// message (the raw error is always logged separately at the call site).
-fn user_facing_git_error(raw: &str) -> &'static str {
+pub(crate) fn user_facing_git_error(raw: &str) -> &'static str {
     let lower = raw.to_lowercase();
-    if lower.contains("no changes added to commit") {
+    if lower.contains("not possible to fast-forward") || lower.contains("diverging branches") {
+        "Branch has diverged from its upstream. Rebase or merge in a terminal."
+    } else if lower.contains("would be overwritten by") {
+        "Pull would overwrite uncommitted changes. Commit or stash them first."
+    } else if lower.contains("no tracking information") {
+        "No upstream branch. Publish the branch first."
+    } else if lower.contains("no changes added to commit") {
         // Distinct from a clean tree: changes exist but nothing is staged
         // (e.g. "include unstaged" off with an empty index).
         "No staged changes to commit."

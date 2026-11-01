@@ -18,7 +18,7 @@ lazy_static! {
     static ref LANGUAGE_REGISTRY: LanguageRegistry = LanguageRegistry::new();
 }
 
-pub const SUPPORTED_LANGUAGES: [&str; 35] = [
+pub const SUPPORTED_LANGUAGES: [&str; 39] = [
     "rust",
     "golang",
     "yaml",
@@ -54,6 +54,10 @@ pub const SUPPORTED_LANGUAGES: [&str; 35] = [
     "dockerfile",
     "nix",
     "markdown",
+    "scss",
+    "svelte",
+    "typst",
+    "prisma",
 ];
 
 /// Registry that holds all of the supported languages.
@@ -118,6 +122,7 @@ fn normalize_language_name(name: &str) -> &str {
         "kt" => "kotlin",
         "docker" | "containerfile" => "dockerfile",
         "md" => "markdown",
+        "typ" => "typst",
         other => other,
     }
 }
@@ -175,6 +180,10 @@ fn language_by_filename_parts(
         "cs" => language_by_name("csharp"),
         "html" | "htm" => language_by_name("html"),
         "css" => language_by_name("css"),
+        "scss" => language_by_name("scss"),
+        "svelte" => language_by_name("svelte"),
+        "typ" => language_by_name("typst"),
+        "prisma" => language_by_name("prisma"),
         "c" => language_by_name("c"),
         "json" => language_by_name("json"),
         "jq" => language_by_name("jq"),
@@ -257,7 +266,7 @@ fn to_arborium_name(lang: &str) -> &str {
 }
 
 /// Get the bundled highlight query from arborium for a given language.
-fn get_arborium_highlight_query(lang: &str) -> Option<&str> {
+fn get_arborium_highlight_query(lang: &str) -> Option<&'static str> {
     match lang {
         "rust" => Some(arborium::lang_rust::HIGHLIGHTS_QUERY),
         "golang" => Some(arborium::lang_go::HIGHLIGHTS_QUERY),
@@ -294,13 +303,32 @@ fn get_arborium_highlight_query(lang: &str) -> Option<&str> {
         "vue" => Some(&arborium::lang_vue::HIGHLIGHTS_QUERY),
         "dockerfile" => Some(arborium::lang_dockerfile::HIGHLIGHTS_QUERY),
         "markdown" => Some(arborium::lang_markdown::HIGHLIGHTS_QUERY),
+        "scss" => Some(&arborium::lang_scss::HIGHLIGHTS_QUERY),
+        "svelte" => Some(&arborium::lang_svelte::HIGHLIGHTS_QUERY),
+        "typst" => Some(arborium::lang_typst::HIGHLIGHTS_QUERY),
         _ => None,
     }
 }
 
+/// Returns the highlight query source for a language: arborium's bundled query followed by the
+/// language's optional `highlights.scm`, whose patterns take precedence because the editor
+/// applies captures in pattern order.
+fn highlight_query_source(lang: &str) -> Option<Cow<'static, str>> {
+    let bundled = get_arborium_highlight_query(lang);
+    let local = load_text(&[lang, "highlights.scm"].join("\\"));
+    match (bundled, local) {
+        (Some(bundled), Some(local)) => Some(Cow::Owned(format!("{bundled}\n{local}"))),
+        (Some(bundled), None) => Some(Cow::Borrowed(bundled)),
+        (None, Some(local)) => Some(local),
+        (None, None) => None,
+    }
+}
+
 fn load_language(lang: &str) -> Option<Language> {
-    let arborium_name = to_arborium_name(lang);
-    let grammar = arborium::get_language(arborium_name)?;
+    let grammar = match lang {
+        "prisma" => tree_sitter_prisma_io::LANGUAGE.into(),
+        _ => arborium::get_language(to_arborium_name(lang))?,
+    };
 
     let config_path = [lang, "config.yaml"].join("\\");
     let config = load_yaml(&config_path);
@@ -316,9 +344,9 @@ fn load_language(lang: &str) -> Option<Language> {
         })
         .collect();
 
-    let highlight_query_str = get_arborium_highlight_query(lang)?;
-    let highlight_query = Query::new(&grammar, highlight_query_str)
-        .expect("arborium highlight query should be valid");
+    let highlight_query_str = highlight_query_source(lang)?;
+    let highlight_query = Query::new(&grammar, &highlight_query_str)
+        .unwrap_or_else(|err| panic!("highlight query for {lang} should be valid: {err}"));
 
     let indents_query_path = [lang, "indents.scm"].join("\\");
     let indents_query = load_query(&indents_query_path, &grammar);
@@ -351,12 +379,16 @@ fn load_yaml(path: &str) -> LanguageConfig {
     }
 }
 
-fn load_query(path: &str, grammar: &ParserGrammar) -> Option<Query> {
+fn load_text(path: &str) -> Option<Cow<'static, str>> {
     let file = <Grammars as RustEmbed>::get(path)?;
-    let query_content = match file.data {
+    Some(match file.data {
         Cow::Borrowed(inner) => Cow::Borrowed(std::str::from_utf8(inner).unwrap()),
         Cow::Owned(inner) => Cow::Owned(String::from_utf8(inner).unwrap()),
-    };
+    })
+}
+
+fn load_query(path: &str, grammar: &ParserGrammar) -> Option<Query> {
+    let query_content = load_text(path)?;
 
     Some(
         Query::new(grammar, &query_content)

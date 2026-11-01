@@ -88,6 +88,7 @@ impl EditorAndCodeReviewPageView {
             Box::new(GlobalSearchToggleWidget::default()),
             Box::new(ShowHiddenFilesToggleWidget::default()),
             Box::new(FormatOnSaveToggleWidget::default()),
+            Box::new(UseProjectFormattersToggleWidget::default()),
             Box::new(AutoSaveToggleWidget::default()),
         ]);
 
@@ -154,6 +155,7 @@ pub enum EditorAndCodeReviewPageAction {
     ToggleGlobalSearch,
     ToggleShowHiddenFiles,
     ToggleFormatOnSave,
+    ToggleUseProjectFormatters,
     ToggleAutoSave,
     SetCodeEditorLineNumberMode(CodeEditorLineNumberMode),
 }
@@ -200,6 +202,12 @@ impl TypedActionView for EditorAndCodeReviewPageView {
             EditorAndCodeReviewPageAction::ToggleFormatOnSave => {
                 CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
                     report_if_error!(settings.format_on_save.toggle_and_save_value(ctx));
+                });
+                ctx.notify();
+            }
+            EditorAndCodeReviewPageAction::ToggleUseProjectFormatters => {
+                CodeSettings::handle(ctx).update(ctx, |settings, ctx| {
+                    report_if_error!(settings.use_project_formatters.toggle_and_save_value(ctx));
                 });
                 ctx.notify();
             }
@@ -333,6 +341,14 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
                 )),
                 context,
                 flags::SHOW_HIDDEN_FILES,
+            ),
+            ToggleSettingActionPair::new(
+                "project formatters (Prettier, Ruff, …)",
+                builder(SettingsAction::EditorAndCodeReview(
+                    EditorAndCodeReviewPageAction::ToggleUseProjectFormatters,
+                )),
+                context,
+                flags::USE_PROJECT_FORMATTERS,
             ),
         ],
         app,
@@ -624,7 +640,7 @@ impl SettingsWidget for FormatOnSaveToggleWidget {
     type View = EditorAndCodeReviewPageView;
 
     fn search_terms(&self) -> &str {
-        "format on save lsp language server formatting reformat editor"
+        "format on save lsp language server formatting reformat editor prettier formatter"
     }
 
     fn render(
@@ -636,7 +652,7 @@ impl SettingsWidget for FormatOnSaveToggleWidget {
         let code_settings = CodeSettings::as_ref(app);
 
         render_body_item::<EditorAndCodeReviewPageAction>(
-            "Format on save (requires an active language server)".into(),
+            "Format on save".into(),
             None,
             LocalOnlyIconState::Hidden,
             ToggleState::Enabled,
@@ -651,7 +667,52 @@ impl SettingsWidget for FormatOnSaveToggleWidget {
                 })
                 .finish(),
             Some(
-                "Only applies when a language server is active for the file. Automatically formats the file with the language server on save; other LSP features (hover, go-to-definition, references, diagnostics) are unaffected."
+                "Automatically formats the file on save, with the project's formatter when one is set up and otherwise with the file's language server if one is active. Other LSP features (hover, go-to-definition, references, diagnostics) are unaffected."
+                    .into(),
+            ),
+        )
+    }
+}
+
+#[derive(Default)]
+struct UseProjectFormattersToggleWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for UseProjectFormattersToggleWidget {
+    type View = EditorAndCodeReviewPageView;
+
+    fn search_terms(&self) -> &str {
+        "use project formatters prettier biome ruff black rustfmt gofmt shfmt terraform formatter format document"
+    }
+
+    fn render(
+        &self,
+        _view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let code_settings = CodeSettings::as_ref(app);
+
+        render_body_item::<EditorAndCodeReviewPageAction>(
+            "Use project formatters (Prettier, Ruff, …)".into(),
+            None,
+            LocalOnlyIconState::Hidden,
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*code_settings.use_project_formatters)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(
+                        EditorAndCodeReviewPageAction::ToggleUseProjectFormatters,
+                    );
+                })
+                .finish(),
+            Some(
+                "Formats with the tool a project is set up with, such as Prettier, Biome, Ruff, Black, rustfmt or gofmt, when that tool is installed and the project is configured for it. Project code runs only after you use Format document and approve that project for the current application session. Enabling this switch does not grant approval. Other files keep using the language server. Choose a formatter per language under code.editor.formatters in the settings file."
                     .into(),
             ),
         )

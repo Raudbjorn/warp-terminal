@@ -18,7 +18,135 @@ use std::path::Path;
 use crate::ai::generate_code_review_content::api::{GenerateCodeReviewContentRequest, OutputType};
 use crate::code_review::diff_state::CommitChainMode;
 use crate::server::server_api::ai::AIClient;
+#[cfg(feature = "local_fs")]
+use crate::util::git::TrackingCounts;
 use crate::util::git::{self, Commit, PrInfo, get_branch_commit_messages, get_diff_for_pr};
+
+#[cfg(all(test, feature = "local_fs"))]
+#[path = "git_actions_tests.rs"]
+mod tests;
+
+/// What bringing a branch level with its upstream takes, decided after a fetch.
+#[cfg(feature = "local_fs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncPlan {
+    /// Another git operation is under way in the working tree.
+    Blocked,
+    NoUpstream,
+    UpToDate,
+    /// Both sides have commits the other lacks. Reconciling them takes a merge or a rebase,
+    /// which can stop on conflicts, so it is left to the user.
+    Diverged {
+        ahead: usize,
+        behind: usize,
+    },
+    /// Fast-forward to the upstream's commits.
+    Pull {
+        behind: usize,
+    },
+    /// Send the local commits upstream.
+    Push {
+        ahead: usize,
+    },
+}
+
+/// Chooses how to sync a branch whose remote was just fetched.
+#[cfg(feature = "local_fs")]
+pub fn sync_plan(tracking: Option<TrackingCounts>, operation_in_progress: bool) -> SyncPlan {
+    if operation_in_progress {
+        return SyncPlan::Blocked;
+    }
+    match tracking {
+        None => SyncPlan::NoUpstream,
+        Some(TrackingCounts {
+            ahead: 0,
+            behind: 0,
+        }) => SyncPlan::UpToDate,
+        Some(TrackingCounts { ahead, behind: 0 }) => SyncPlan::Push { ahead },
+        Some(TrackingCounts { ahead: 0, behind }) => SyncPlan::Pull { behind },
+        Some(TrackingCounts { ahead, behind }) => SyncPlan::Diverged { ahead, behind },
+    }
+}
+
+/// Why a sync stopped without changing anything.
+#[cfg(feature = "local_fs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncRefusal {
+    OperationInProgress,
+    NoUpstream,
+    Diverged { ahead: usize, behind: usize },
+}
+
+/// Result of a sync that ran to the end.
+#[cfg(feature = "local_fs")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SyncOutcome {
+    Refused(SyncRefusal),
+    Completed {
+        /// Upstream commits the branch was fast-forwarded over.
+        pulled: usize,
+        /// Local commits sent upstream.
+        pushed: usize,
+    },
+}
+
+/// Fetches, then fast-forwards `branch` to its upstream or pushes its new commits there.
+///
+/// Never merges or rebases: a branch that has diverged from its upstream is left untouched and
+/// reported as refused.
+#[cfg(feature = "local_fs")]
+pub async fn run_sync(
+    repo_path: &Path,
+    branch: &str,
+    path_env: Option<&str>,
+) -> anyhow::Result<SyncOutcome> {
+    if git::detect_current_branch(repo_path).await? != branch {
+        anyhow::bail!("The checked-out branch changed; refresh source control before syncing.");
+    }
+    if git::git_operation_in_progress(repo_path) {
+        return Ok(SyncOutcome::Refused(SyncRefusal::OperationInProgress));
+    }
+    if git::push_destination(repo_path, branch).await.is_none()
+        || git::tracking_counts(repo_path).await?.is_none()
+    {
+        return Ok(SyncOutcome::Refused(SyncRefusal::NoUpstream));
+    }
+    git::run_fetch(repo_path, path_env).await?;
+    if git::detect_current_branch(repo_path).await? != branch {
+        anyhow::bail!(
+            "The checked-out branch changed during fetch; refresh source control before syncing."
+        );
+    }
+
+    let tracking = git::tracking_counts(repo_path).await?;
+    let plan = sync_plan(tracking, git::git_operation_in_progress(repo_path));
+    match plan {
+        SyncPlan::Blocked => Ok(SyncOutcome::Refused(SyncRefusal::OperationInProgress)),
+        SyncPlan::NoUpstream => Ok(SyncOutcome::Refused(SyncRefusal::NoUpstream)),
+        SyncPlan::Diverged { ahead, behind } => Ok(SyncOutcome::Refused(SyncRefusal::Diverged {
+            ahead,
+            behind,
+        })),
+        SyncPlan::UpToDate => Ok(SyncOutcome::Completed {
+            pulled: 0,
+            pushed: 0,
+        }),
+        SyncPlan::Pull { behind } => {
+            git::run_pull_ff_only(repo_path, path_env).await?;
+            Ok(SyncOutcome::Completed {
+                pulled: behind,
+                pushed: 0,
+            })
+        }
+        SyncPlan::Push { ahead } => {
+            git::run_push(repo_path, branch, path_env).await?;
+            Ok(SyncOutcome::Completed {
+                pulled: 0,
+                pushed: ahead,
+            })
+        }
+    }
+}
 
 /// Runs the commit chain — always commits, then optionally pushes, then
 /// optionally creates a PR per `mode` — and returns the post-chain delta

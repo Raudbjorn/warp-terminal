@@ -458,6 +458,15 @@ impl DiffStateModel {
         Self::Local(local)
     }
 
+    /// Creates a local-backed model that only runs git operations in `path`, for callers that
+    /// show no diffs and must not have the repository detected, watched or indexed.
+    #[cfg(feature = "local_fs")]
+    pub fn new_local_for_git_ops(path: PathBuf, ctx: &mut ModelContext<Self>) -> Self {
+        let local = ctx.add_model(|ctx| LocalDiffStateModel::new_for_git_ops(path, ctx));
+        ctx.subscribe_to_model(&local, |me, _, event, ctx| me.forward_event(event, ctx));
+        Self::Local(local)
+    }
+
     /// Creates a new remote-backed `DiffStateModel`. The model is keyed by
     /// `(host_id, repo, mode)` and shared across sessions viewing the same
     /// repo. `preferred_session` is the session that opened this review (when

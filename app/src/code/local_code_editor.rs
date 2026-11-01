@@ -48,8 +48,8 @@ use warpui::elements::{
     MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement, ParentOffsetBounds, Radius,
     Rect, Shrinkable, Stack, Text,
 };
-use warpui::keymap::FixedBinding;
 use warpui::keymap::macros::*;
+use warpui::keymap::{EditableBinding, FixedBinding};
 use warpui::platform::SaveFilePickerConfiguration;
 use warpui::text::point::Point;
 use warpui::ui_components::button::ButtonVariant;
@@ -70,6 +70,8 @@ use crate::code_review::comments::CommentId;
 use crate::menu::{Event, Menu, MenuItem, MenuItemFields};
 use crate::settings::{AISettings, CodeSettings};
 use crate::terminal::TerminalView;
+use crate::view_components::DismissibleToast;
+use crate::workspace::ToastStack;
 
 const DROP_SHADOW_COLOR: ColorU = ColorU {
     r: 0,
@@ -103,6 +105,21 @@ pub fn init(app: &mut AppContext) {
         LocalCodeEditorAction::InsertSelectedTextToInput,
         id!("LocalCodeEditorView") & !id!("IMEOpen"),
     )]);
+    app.register_editable_bindings([EditableBinding::new(
+        "code_editor:format_document",
+        "Format document",
+        LocalCodeEditorAction::FormatDocument,
+    )
+    .with_context_predicate(id!("LocalCodeEditorView") & !id!("IMEOpen"))
+    .with_key_binding("shift-alt-F")]);
+}
+
+const NO_FORMATTER_NOTICE: &str = "No formatter is available for this file.";
+
+#[derive(Debug, Clone, Copy)]
+enum FormatTrigger {
+    Save(FileId),
+    Command,
 }
 
 pub enum LocalCodeEditorEvent {
@@ -190,6 +207,7 @@ struct SelectionAsContextTooltip {
 pub enum LocalCodeEditorAction {
     InsertSelectedTextToInput,
     SaveFile,
+    FormatDocument,
     DiscardUnsavedChanges,
     NavigateToTarget(FileLocation),
     GotoDefinition,
@@ -303,6 +321,9 @@ pub struct LocalCodeEditorView {
     /// resulting `FileSaved` event can be marked as an auto-save and suppress
     /// the success toast.
     auto_save_in_flight: bool,
+    /// Set when the next save is a flush made on the way to closing this editor.
+    next_save_is_flush: bool,
+    format_in_flight: bool,
     /// State for the LSP hover tooltip.
     pub(super) lsp_hover_state: LspHoverState,
     /// Pending scroll position to apply after the file is loaded. This is used when
@@ -532,6 +553,8 @@ impl LocalCodeEditorView {
             hover_debounce_tx,
             auto_save_debounce_tx,
             auto_save_in_flight: false,
+            next_save_is_flush: false,
+            format_in_flight: false,
             lsp_hover_state: LspHoverState::None,
             pending_scroll_on_load: None,
             processed_diagnostics: Vec::new(),
@@ -1034,27 +1057,96 @@ impl LocalCodeEditorView {
             .unwrap_or(false)
     }
 
-    fn format_and_save(&mut self, file_id: FileId, ctx: &mut ViewContext<Self>) {
+    fn format_and_save(&mut self, file_id: FileId, is_flush: bool, ctx: &mut ViewContext<Self>) {
         // Respect the user's format-on-save setting. When disabled, save without
-        // requesting LSP document formatting; all other LSP features (hover,
-        // go-to-definition, references, diagnostics) are unaffected.
+        // formatting; all other LSP features (hover, go-to-definition, references,
+        // diagnostics) are unaffected.
         if !*CodeSettings::as_ref(ctx).format_on_save {
             self.perform_save(file_id, ctx);
             return;
         }
 
-        let Some(lsp_server) = &self.lsp_server else {
+        // A closing editor cannot wait for a formatter before starting its final write.
+        if is_flush {
             self.perform_save(file_id, ctx);
+            return;
+        }
+        self.format_buffer(FormatTrigger::Save(file_id), ctx);
+    }
+
+    /// Formats the buffer on request, whether or not format on save is enabled.
+    fn format_document(&mut self, ctx: &mut ViewContext<Self>) {
+        // A pending diff is a proposal to accept or reject, not text to rewrite.
+        if self.diff_type.is_some() {
+            return;
+        }
+        self.format_buffer(FormatTrigger::Command, ctx);
+    }
+
+    /// Formats the buffer with its project's formatter when one applies, and with the language
+    /// server otherwise.
+    fn format_buffer(&mut self, trigger: FormatTrigger, ctx: &mut ViewContext<Self>) {
+        // Repeated saves must not start an unbounded number of formatter processes.
+        if self.format_in_flight {
+            match trigger {
+                FormatTrigger::Save(file_id) => self.perform_save(file_id, ctx),
+                FormatTrigger::Command => {
+                    self.show_format_notice("Formatting is already running.".to_owned(), ctx)
+                }
+            }
+            return;
+        }
+        self.format_in_flight = true;
+        #[cfg(feature = "local_fs")]
+        {
+            if self.format_with_project_formatter(trigger, ctx) {
+                return;
+            }
+        }
+        self.format_with_language_server(trigger, ctx);
+    }
+
+    /// Completes a formatting request. A save goes ahead whether or not formatting worked, while
+    /// an explicit request is told about `problem`.
+    fn finish_format(
+        &mut self,
+        trigger: FormatTrigger,
+        problem: Option<String>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        self.format_in_flight = false;
+        match trigger {
+            FormatTrigger::Save(file_id) => self.perform_save(file_id, ctx),
+            FormatTrigger::Command => {
+                if let Some(problem) = problem {
+                    self.show_format_notice(problem, ctx);
+                }
+            }
+        }
+    }
+
+    fn show_format_notice(&self, message: String, ctx: &mut ViewContext<Self>) {
+        let window_id = ctx.window_id();
+        ToastStack::handle(ctx).update(ctx, |toast_stack, ctx| {
+            let toast = DismissibleToast::default(message)
+                .with_object_id("format_document_notice".to_string());
+            toast_stack.add_ephemeral_toast(toast, window_id, ctx);
+        });
+    }
+
+    fn format_with_language_server(&mut self, trigger: FormatTrigger, ctx: &mut ViewContext<Self>) {
+        let Some(lsp_server) = &self.lsp_server else {
+            self.finish_format(trigger, Some(NO_FORMATTER_NOTICE.to_owned()), ctx);
             return;
         };
 
         let Some(file_path) = self.file_path() else {
-            self.perform_save(file_id, ctx);
+            self.finish_format(trigger, Some(NO_FORMATTER_NOTICE.to_owned()), ctx);
             return;
         };
 
         if !lsp_server.as_ref(ctx).is_ready_for_requests() {
-            self.perform_save(file_id, ctx);
+            self.finish_format(trigger, Some(NO_FORMATTER_NOTICE.to_owned()), ctx);
             return;
         };
 
@@ -1062,7 +1154,7 @@ impl LocalCodeEditorView {
 
         // Now proceed with formatting
         let Some(lsp_server) = &self.lsp_server else {
-            self.perform_save(file_id, ctx);
+            self.finish_format(trigger, Some(NO_FORMATTER_NOTICE.to_owned()), ctx);
             return;
         };
 
@@ -1089,13 +1181,24 @@ impl LocalCodeEditorView {
             Ok(future) => future,
             Err(e) => {
                 log::warn!("Failed to request document formatting: {e}");
-                self.perform_save(file_id, ctx);
+                self.finish_format(
+                    trigger,
+                    Some(format!("Could not format with the language server: {e}")),
+                    ctx,
+                );
                 return;
             }
         };
 
+        let version = self.editor.as_ref(ctx).version(ctx);
+        let keep_alive = ctx.handle().upgrade(ctx);
         ctx.spawn(format_future, move |me, result, ctx| {
-            match result {
+            drop(keep_alive);
+            if !me.editor.as_ref(ctx).version_match(&version, ctx) {
+                me.finish_format(trigger, Some("The file changed while it was being formatted.".to_owned()), ctx);
+                return;
+            }
+            let problem = match result {
                 Ok(Some(text_edits)) => {
                     me.editor.update(ctx, |editor, ctx| {
                         if text_edits.is_empty() {
@@ -1127,16 +1230,19 @@ impl LocalCodeEditorView {
                             editor.apply_edits(edits, ctx);
                         }
                     });
+                    None
                 }
                 Ok(None) => {
                     log::debug!("LSP server doesn't support formatting for this document");
+                    Some("The language server cannot format this file.".to_owned())
                 }
                 Err(e) => {
                     log::warn!("Document formatting failed: {e}");
+                    Some(format!("Could not format with the language server: {e}"))
                 }
-            }
+            };
             // After formatting (or if formatting failed), proceed with save
-            me.perform_save(file_id, ctx);
+            me.finish_format(trigger, problem, ctx);
         });
     }
 
@@ -1275,6 +1381,12 @@ impl LocalCodeEditorView {
     /// is enabled, so closing a file flushes edits silently.
     pub fn mark_next_save_as_auto_save(&mut self) {
         self.auto_save_in_flight = true;
+        self.next_save_is_flush = true;
+    }
+
+    /// Writes the next save immediately because the editor is about to close.
+    pub fn mark_next_save_as_flush(&mut self) {
+        self.next_save_is_flush = true;
     }
 
     pub fn is_new_file(&self) -> bool {
@@ -1385,6 +1497,11 @@ impl LocalCodeEditorView {
                 let version = editor.buffer_version(ctx);
                 editor.set_pending_scroll(ScrollTrigger::new(position, version));
             });
+        }
+
+        #[cfg(feature = "local_fs")]
+        {
+            self.warm_up_project_formatter(ctx);
         }
     }
 
@@ -1757,6 +1874,9 @@ impl LocalCodeEditorView {
     /// This will only return an error immediately if there is a failure in the sync part of the call.
     /// Other errors could be returned asynchronously via the FileModelEvent::FailedToSave event.
     pub fn save_local(&mut self, ctx: &mut ViewContext<Self>) -> Result<(), ImmediateSaveError> {
+        // Consumed up front so that a save which cannot start does not leave the next one marked.
+        let is_flush = std::mem::take(&mut self.next_save_is_flush);
+
         if self.is_remote_disconnected(ctx) {
             return Err(ImmediateSaveError::RemoteDisconnected);
         }
@@ -1765,8 +1885,8 @@ impl LocalCodeEditorView {
             return Err(ImmediateSaveError::NoFileId);
         };
 
-        // Always attempt to format before saving if LSP is available
-        self.format_and_save(file_id, ctx);
+        // Always attempt to format before saving if a formatter is available
+        self.format_and_save(file_id, is_flush, ctx);
         Ok(())
     }
 
@@ -2411,6 +2531,7 @@ impl TypedActionView for LocalCodeEditorView {
                     });
                 };
             }
+            LocalCodeEditorAction::FormatDocument => self.format_document(ctx),
             LocalCodeEditorAction::DiscardUnsavedChanges => {
                 if let Some(path) = self.file_path().map(Path::to_path_buf) {
                     self.base_content_version = Some(self.editor().as_ref(ctx).version(ctx));
@@ -2703,3 +2824,7 @@ impl ShowFindReferencesCardProvider for ShowFindReferencesCard {
         upper_right_in || lower_left_in
     }
 }
+
+#[cfg(feature = "local_fs")]
+#[path = "project_format.rs"]
+mod project_format;

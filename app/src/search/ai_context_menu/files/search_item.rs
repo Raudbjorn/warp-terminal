@@ -3,10 +3,11 @@ use std::path::PathBuf;
 
 use fuzzy_match::FuzzyMatchResult;
 use ordered_float::OrderedFloat;
-use warpui::elements::{ConstrainedBox, Container, Icon};
+use warpui::elements::{ConstrainedBox, Container};
 use warpui::{AppContext, Element};
 
 use crate::appearance::Appearance;
+use crate::code::icon_from_folder_path;
 use crate::search::ai_context_menu::mixer::AIContextMenuSearchableAction;
 use crate::search::ai_context_menu::styles;
 use crate::search::files::icon::icon_from_file_path;
@@ -31,11 +32,7 @@ impl SearchItem for FileSearchItem {
     ) -> Box<dyn Element> {
         Container::new(
             ConstrainedBox::new(if self.is_directory {
-                Icon::new(
-                    "bundled/svg/completion-folder.svg",
-                    highlight_state.icon_fill(appearance).into_solid(),
-                )
-                .finish()
+                icon_from_folder_path(&self.path.to_string_lossy(), false)
             } else {
                 icon_from_file_path(&self.path.to_string_lossy(), appearance, highlight_state)
             })

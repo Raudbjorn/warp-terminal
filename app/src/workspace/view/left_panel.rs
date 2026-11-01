@@ -978,45 +978,65 @@ impl LeftPanelView {
                     line_num: *line_number as usize,
                     column_num: *column_num,
                 };
-
-                let settings = EditorSettings::as_ref(ctx);
-                let target = match location {
-                    LocalOrRemotePath::Local(path) => resolve_file_target_with_editor_choice(
-                        path,
-                        *settings.open_code_panels_file_editor,
-                        *settings.prefer_markdown_viewer,
-                        *settings.open_file_layout,
-                        None,
-                    ),
-                    // Local-fs-based target resolution can't inspect remote
-                    // files; mirror the file tree's remote handling (code
-                    // editor, or markdown viewer by extension + preference).
-                    LocalOrRemotePath::Remote(remote) => {
-                        let is_markdown =
-                            is_markdown_file(std::path::Path::new(remote.path.as_str()));
-                        if is_markdown && *settings.prefer_markdown_viewer {
-                            FileTarget::MarkdownViewer(EditorLayout::SplitPane)
-                        } else {
-                            FileTarget::CodeEditor(EditorLayout::SplitPane)
-                        }
-                    }
-                };
-
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::CodePanelsFileOpened {
-                        entrypoint: CodePanelsFileOpenEntrypoint::GlobalSearch,
-                        target: target.clone(),
-                    },
-                    ctx
-                );
-
-                ctx.emit(LeftPanelEvent::OpenFileWithTarget {
-                    location: location.clone(),
-                    target,
-                    line_col: Some(line_col),
-                });
+                self.open_global_search_result(location, Some(line_col), ctx);
+            }
+            GlobalSearchViewEvent::OpenFile { location } => {
+                self.open_global_search_result(location, None, ctx);
+            }
+            GlobalSearchViewEvent::RevealFolder { location } => {
+                if let Some(tree) = self.active_file_tree_view(ctx) {
+                    active_view_state::set(self, ToolPanelView::ProjectExplorer, ctx);
+                    tree.update(ctx, |view, ctx| {
+                        view.reveal_directory(&location.path_component(), ctx)
+                    });
+                    ctx.focus(&tree);
+                }
             }
         }
+    }
+
+    #[cfg(feature = "local_fs")]
+    fn open_global_search_result(
+        &mut self,
+        location: &LocalOrRemotePath,
+        line_col: Option<LineAndColumnArg>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let settings = EditorSettings::as_ref(ctx);
+        let target = match location {
+            LocalOrRemotePath::Local(path) => resolve_file_target_with_editor_choice(
+                path,
+                *settings.open_code_panels_file_editor,
+                *settings.prefer_markdown_viewer,
+                *settings.open_file_layout,
+                None,
+            ),
+            // Local-fs-based target resolution can't inspect remote
+            // files; mirror the file tree's remote handling (code
+            // editor, or markdown viewer by extension + preference).
+            LocalOrRemotePath::Remote(remote) => {
+                let is_markdown = is_markdown_file(std::path::Path::new(remote.path.as_str()));
+                if is_markdown && *settings.prefer_markdown_viewer {
+                    FileTarget::MarkdownViewer(EditorLayout::SplitPane)
+                } else {
+                    FileTarget::CodeEditor(EditorLayout::SplitPane)
+                }
+            }
+        };
+
+        send_telemetry_from_ctx!(
+            TelemetryEvent::CodePanelsFileOpened {
+                entrypoint: CodePanelsFileOpenEntrypoint::GlobalSearch,
+                target: target.clone(),
+            },
+            ctx
+        );
+
+        ctx.emit(LeftPanelEvent::OpenFileWithTarget {
+            location: location.clone(),
+            target,
+            line_col,
+        });
     }
 
     #[cfg(feature = "local_fs")]
@@ -1058,6 +1078,25 @@ impl LeftPanelView {
                 ctx.emit(LeftPanelEvent::FileTree(
                     pane_group::Event::OpenDirectoryInNewTab { path: path.clone() },
                 ));
+            }
+            FileTreeEvent::SearchInFolder { path, replace } => {
+                let Some(global_search_view) = self.active_global_search_view(ctx) else {
+                    return;
+                };
+                global_search_view.update(ctx, |view, ctx| {
+                    view.search_in_folder(path, ctx);
+                    if *replace {
+                        view.show_replace(ctx);
+                    }
+                });
+                self.handle_action_with_force_open(
+                    &LeftPanelAction::GlobalSearch {
+                        entry_focus: GlobalSearchEntryFocus::QueryEditor,
+                    },
+                    false,
+                    ctx,
+                );
+                self.focus_active_view_on_entry(ctx);
             }
         }
     }

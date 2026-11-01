@@ -89,6 +89,13 @@ pub fn match_indices_case_insensitive(text: &str, query: &str) -> Option<FuzzyMa
     match_internal(text, query, SkimMatcherV2::default().ignore_case())
 }
 
+/// Performs a case sensitive fuzzy matching algorithm on text and query strings.
+/// Returns struct that contains the score of the match and a vector
+/// of matching char indices.
+pub fn match_indices_case_sensitive(text: &str, query: &str) -> Option<FuzzyMatchResult> {
+    match_internal(text, query, SkimMatcherV2::default().respect_case())
+}
+
 /// Performs a case insensitive fuzzy matching algorithm on text and query strings,
 /// ignoring spaces in the query. This is useful for symbol name matching where
 /// spaces in the search query should be ignored.

@@ -84,7 +84,14 @@ fn convert_capture_name_to_color(name: &str, color_map: &ColorMap) -> Option<Col
         "text.literal" => return Some(color_map.string_color),
         "text.uri" => return Some(color_map.function_color),
         "text.reference" => return Some(color_map.property_color),
+        "constant.numeric" => return Some(color_map.number_color),
         _ => {}
+    }
+    if name.starts_with("markup.heading") {
+        return Some(color_map.keyword_color);
+    }
+    if name.starts_with("markup.raw") {
+        return Some(color_map.string_color);
     }
     match name.split('.').next() {
         Some("keyword") => Some(color_map.keyword_color),
@@ -96,6 +103,13 @@ fn convert_capture_name_to_color(name: &str, color_map: &ColorMap) -> Option<Col
         Some("property") => Some(color_map.property_color),
         Some("tag") => Some(color_map.tag_color),
         Some("punctuation") => Some(color_map.comment_color),
+        // Older capture names that several bundled queries still use for these token classes.
+        Some("conditional" | "repeat" | "include" | "exception" | "storageclass") => {
+            Some(color_map.keyword_color)
+        }
+        Some("boolean" | "float") => Some(color_map.number_color),
+        Some("method") => Some(color_map.function_color),
+        Some("field" | "attribute") => Some(color_map.property_color),
         _ => None,
     }
 }
@@ -138,3 +152,7 @@ impl<'a> TextProvider<&'a [u8]> for TextBuffer<'a> {
         )
     }
 }
+
+#[cfg(test)]
+#[path = "highlight_query_tests.rs"]
+mod tests;

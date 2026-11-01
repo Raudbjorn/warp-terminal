@@ -542,14 +542,17 @@ dependencies = [
  "arborium-ruby",
  "arborium-rust",
  "arborium-scala",
+ "arborium-scss",
  "arborium-sql",
  "arborium-starlark",
+ "arborium-svelte",
  "arborium-swift",
  "arborium-theme",
  "arborium-toml",
  "arborium-tree-sitter",
  "arborium-tsx",
  "arborium-typescript",
+ "arborium-typst",
  "arborium-vue",
  "arborium-xml",
  "arborium-yaml",
@@ -884,6 +887,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "arborium-svelte"
+version = "2.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5aebeb34cc9d7cd8dd57337df0a3d44deaa0a085382ba08b133ebd26964ef54b"
+dependencies = [
+ "arborium-css",
+ "arborium-html",
+ "arborium-javascript",
+ "arborium-scss",
+ "arborium-sysroot",
+ "arborium-typescript",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "arborium-swift"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -954,6 +973,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bc62ebc9766afcda0699641c368cf1df9f3f0d4537768cb1e0dd53d13f17537c"
 dependencies = [
  "arborium-javascript",
+ "arborium-sysroot",
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "arborium-typst"
+version = "2.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ed6e1cdac55e7664886865a052beb47917e2594f7afd8e5827fc6af528813df"
+dependencies = [
  "arborium-sysroot",
  "cc",
  "tree-sitter-language",
@@ -3040,6 +3070,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "code_formatters"
+version = "0.1.0"
+dependencies = [
+ "async-channel",
+ "command",
+ "futures-lite 1.13.0",
+ "instant",
+ "libc",
+ "log",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "win32job",
+]
+
+[[package]]
 name = "codesnake"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4961,6 +5007,13 @@ version = "0.2.2"
 source = "git+https://github.com/warpdotdev/notify?rev=91b719849bc04ef251bcb2cc61076b099204e970#91b719849bc04ef251bcb2cc61076b099204e970"
 dependencies = [
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "file_write_guard"
+version = "0.1.0"
+dependencies = [
+ "dunce",
 ]
 
 [[package]]
@@ -7559,6 +7612,7 @@ dependencies = [
  "rust-embed 8.7.2",
  "serde",
  "serde_yaml 0.8.26",
+ "tree-sitter-prisma-io",
  "warp_editor",
  "warp_util",
 ]
@@ -10559,6 +10613,24 @@ checksum = "52717f9a02b6965224f95ca2a81e2e0c5c43baacd28ca057577988930b6c3d5b"
 dependencies = [
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "project_replace"
+version = "0.1.0"
+dependencies = [
+ "file_write_guard",
+ "grep",
+ "hex",
+ "ignore",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.17",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -14472,6 +14544,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e8ddffe35a0e5eeeadf13ff7350af564c6e73993a24db62caee1822b185c2600"
 
 [[package]]
+name = "tree-sitter-prisma-io"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c35912d65a6adb07f781db46d843bf0464935e267da6ed192705516adafc7c24"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree_magic_mini"
 version = "3.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -15172,6 +15254,7 @@ dependencies = [
  "cloud_object_persistence",
  "cloud_objects",
  "cocoa 0.26.0",
+ "code_formatters",
  "comfy-table",
  "command",
  "command-corrections",
@@ -15203,6 +15286,7 @@ dependencies = [
  "env_logger",
  "event-listener",
  "field_mask",
+ "file_write_guard",
  "firebase",
  "float-cmp",
  "freedesktop-desktop-entry",
@@ -15291,6 +15375,7 @@ dependencies = [
  "pin-project",
  "plist",
  "pprof",
+ "project_replace",
  "prost 0.14.3",
  "prost-build 0.14.3",
  "prost-types 0.14.3",
@@ -15699,6 +15784,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "async-fs",
+ "file_write_guard",
  "futures",
  "log",
  "notify-debouncer-full",
@@ -15876,11 +15962,11 @@ dependencies = [
  "command",
  "futures",
  "getrandom 0.2.16",
- "grep",
  "ignore",
  "instant",
  "log",
  "nix 0.26.4",
+ "project_replace",
  "serde",
  "serde_json",
  "string-offset",

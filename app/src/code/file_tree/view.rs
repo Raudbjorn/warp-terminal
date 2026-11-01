@@ -50,7 +50,7 @@ use crate::server::telemetry::TelemetryEvent;
 use crate::terminal::input::InputDropTargetData;
 use crate::terminal::view::{TerminalDropTargetData, TerminalView};
 use crate::ui_components::icons::Icon;
-use crate::ui_components::item_highlight::{ImageOrIcon, ItemHighlightState};
+use crate::ui_components::item_highlight::ItemHighlightState;
 #[cfg(feature = "local_fs")]
 use crate::util::file::external_editor::EditorSettings;
 use crate::util::openable_file_type::{
@@ -129,6 +129,12 @@ pub enum FileTreeAction {
     },
     CDToDirectory {
         id: FileTreeIdentifier,
+    },
+    /// Opens global search limited to the folder at `id`, with its replacement field when
+    /// `replace` is set.
+    SearchInFolder {
+        id: FileTreeIdentifier,
+        replace: bool,
     },
     DismissEditor,
     ItemDroppedOnInput {
@@ -820,6 +826,13 @@ impl FileTreeView {
                 index,
             };
             self.select_id(&id, ctx);
+        }
+    }
+
+    pub fn reveal_directory(&mut self, path: &StandardizedPath, ctx: &mut ViewContext<Self>) {
+        if let Some(root) = self.find_deepest_root_for_file(path) {
+            self.scroll_to_file(&root, path, ctx);
+            ctx.notify();
         }
     }
 
@@ -1855,14 +1868,9 @@ impl FileTreeView {
         );
 
         // Add the icon for the item.
-        let icon_color = item_highlight_state.text_and_icon_color(appearance);
-        let icon = match render_state.icon {
-            ImageOrIcon::Icon(icon) => icon.to_warpui_icon(icon_color.into()).finish(),
-            ImageOrIcon::Image(image) => image,
-        };
         header_row.add_child(
             Container::new(
-                ConstrainedBox::new(icon)
+                ConstrainedBox::new(render_state.icon)
                     .with_width(FOLDER_INDENT)
                     .with_height(FOLDER_INDENT)
                     .finish(),
@@ -2328,6 +2336,7 @@ impl FileTreeView {
         &self,
         item: &FileTreeItem,
         id: &FileTreeIdentifier,
+        can_search_in_folder: bool,
     ) -> Vec<MenuItem<FileTreeAction>> {
         let is_remote = self.is_remote_item(id);
 
@@ -2388,6 +2397,22 @@ impl FileTreeView {
                             .with_on_select_action(FileTreeAction::OpenInNewTab { id: id.clone() })
                             .into_item(),
                     );
+                    if can_search_in_folder {
+                        items.extend([
+                            MenuItemFields::new("Search in folder")
+                                .with_on_select_action(FileTreeAction::SearchInFolder {
+                                    id: id.clone(),
+                                    replace: false,
+                                })
+                                .into_item(),
+                            MenuItemFields::new("Replace in folder")
+                                .with_on_select_action(FileTreeAction::SearchInFolder {
+                                    id: id.clone(),
+                                    replace: true,
+                                })
+                                .into_item(),
+                        ]);
+                    }
                 }
             };
 
@@ -2552,6 +2577,23 @@ impl FileTreeView {
         }
 
         ctx.emit(FileTreeEvent::CDToDirectory { path });
+    }
+
+    fn search_in_folder(
+        &mut self,
+        id: &FileTreeIdentifier,
+        replace: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(item) = self
+            .root_directories
+            .get(&id.root)
+            .and_then(|root_dir| root_dir.items.get(id.index))
+        else {
+            return;
+        };
+        let path = item.path().to_local_path_lossy();
+        ctx.emit(FileTreeEvent::SearchInFolder { path, replace });
     }
 
     fn rename_item(&mut self, id: &FileTreeIdentifier, ctx: &mut ViewContext<Self>) {
@@ -2931,6 +2973,9 @@ pub enum FileTreeEvent {
     CDToDirectory { path: PathBuf },
     #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
     OpenDirectoryInNewTab { path: PathBuf },
+    /// Search the folder at `path`, with the replacement field showing when `replace` is set.
+    #[cfg_attr(not(feature = "local_fs"), allow(dead_code))]
+    SearchInFolder { path: PathBuf, replace: bool },
 }
 
 impl Entity for FileTreeView {
@@ -3078,7 +3123,9 @@ impl TypedActionView for FileTreeView {
                 self.context_menu_state = Some(ContextMenuState {
                     position: *position,
                 });
-                let menu_items = self.context_menu_items(item, id);
+                let can_search_in_folder = FeatureFlag::GlobalSearch.is_enabled()
+                    && *CodeSettings::as_ref(ctx).show_global_search;
+                let menu_items = self.context_menu_items(item, id, can_search_in_folder);
                 self.context_menu.update(ctx, move |menu, ctx| {
                     menu.set_items(menu_items, ctx);
                     ctx.notify();
@@ -3115,6 +3162,12 @@ impl TypedActionView for FileTreeView {
             FileTreeAction::CDToDirectory { id } => {
                 if !self.is_remote_item(id) {
                     self.cd_to_directory(id, ctx);
+                }
+                self.context_menu_state.take();
+            }
+            FileTreeAction::SearchInFolder { id, replace } => {
+                if !self.is_remote_item(id) {
+                    self.search_in_folder(id, *replace, ctx);
                 }
                 self.context_menu_state.take();
             }

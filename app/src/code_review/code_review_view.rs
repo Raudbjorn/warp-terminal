@@ -324,9 +324,6 @@ pub enum CodeReviewAction {
     FileSelected(usize),
     ToggleMaximize,
     SaveAllUnsavedFiles,
-    SaveAllFiles {
-        paths: Vec<String>,
-    },
     RefreshGitState,
     UndoRevert,
     Close,
@@ -6290,21 +6287,32 @@ impl CodeReviewView {
     /// auto-save is enabled so closing the review doesn't prompt.
     pub fn auto_save_all_unsaved_files(&mut self, ctx: &mut ViewContext<Self>) {
         let paths = self.get_unsaved_file_paths(ctx);
-        let editors: Vec<_> = if let CodeReviewViewState::Loaded(state) = self.state() {
-            paths
-                .iter()
-                .filter_map(|path| state.file_states.get(path))
-                .filter_map(|file_state| {
-                    file_state.editor_state.as_ref().map(|s| s.editor().clone())
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        for editor in editors {
+        for editor in self.loaded_editors(&paths) {
             editor.update(ctx, |editor, _| editor.mark_next_save_as_auto_save());
         }
         self.save_files(&paths, ctx);
+    }
+
+    /// Saves the files at `paths` on the way to closing the review, without waiting on a formatter
+    /// whose result would arrive after the editors are gone.
+    fn flush_files(&mut self, paths: &[String], ctx: &mut ViewContext<Self>) {
+        for editor in self.loaded_editors(paths) {
+            editor.update(ctx, |editor, _| editor.mark_next_save_as_flush());
+        }
+        self.save_files(paths, ctx);
+    }
+
+    /// The editors of those files at `paths` that the review has loaded.
+    fn loaded_editors(&self, paths: &[String]) -> Vec<ViewHandle<LocalCodeEditorView>> {
+        let CodeReviewViewState::Loaded(state) = self.state() else {
+            return Vec::new();
+        };
+        paths
+            .iter()
+            .filter_map(|path| state.file_states.get(path))
+            .filter_map(|file_state| file_state.editor_state.as_ref())
+            .map(|editor_state| editor_state.editor().clone())
+            .collect()
     }
 
     fn save_file(&mut self, repo_relative_path: &str, ctx: &mut ViewContext<CodeReviewView>) {
@@ -7321,9 +7329,6 @@ impl TypedActionView for CodeReviewView {
 
                 ctx.emit(CodeReviewViewEvent::Pane(PaneEvent::ToggleMaximized));
             }
-            CodeReviewAction::SaveAllFiles { paths } => {
-                self.save_files(paths, ctx);
-            }
             CodeReviewAction::SaveAllUnsavedFiles => {
                 let unsaved_files = self.get_unsaved_file_paths(ctx);
                 self.save_files(unsaved_files.as_slice(), ctx);
@@ -7645,12 +7650,7 @@ impl BackingView for CodeReviewView {
                     if let Some(view) = handle.upgrade(ctx) {
                         view.update(ctx, |view, ctx| match intent {
                             PendingSaveIntent::Save => {
-                                view.handle_action(
-                                    &CodeReviewAction::SaveAllFiles {
-                                        paths: paths_to_save,
-                                    },
-                                    ctx,
-                                );
+                                view.flush_files(&paths_to_save, ctx);
                                 ctx.emit(CodeReviewViewEvent::Pane(PaneEvent::Close));
                             }
                             PendingSaveIntent::Discard => {

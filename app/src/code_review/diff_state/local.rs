@@ -197,6 +197,10 @@ impl PendingFileUpdate {
 pub struct LocalDiffStateModel {
     #[cfg(feature = "local_fs")]
     repository: Option<ModelHandle<Repository>>,
+    /// Working tree that git operations run in when no repository is attached, which lets a
+    /// model run them without the repository being detected, watched or indexed.
+    #[cfg(feature = "local_fs")]
+    git_ops_root: Option<PathBuf>,
     #[cfg(feature = "local_fs")]
     subscriber_id: Option<SubscriberId>,
     state: InternalDiffState,
@@ -278,6 +282,7 @@ impl LocalDiffStateModel {
 
         let model = Self {
             repository: None,
+            git_ops_root: None,
             state: if repo_path.is_some() {
                 InternalDiffState::Detecting
             } else {
@@ -459,11 +464,19 @@ impl LocalDiffStateModel {
 
     #[cfg(feature = "local_fs")]
     fn active_repository_path(&self, app: &AppContext) -> Option<PathBuf> {
-        self.repository
-            .as_ref()?
-            .as_ref(app)
-            .root_dir()
-            .to_local_path()
+        match &self.repository {
+            Some(repository) => repository.as_ref(app).root_dir().to_local_path(),
+            None => self.git_ops_root.clone(),
+        }
+    }
+
+    /// Creates a model that runs git operations in `repo_root` and does nothing else: it never
+    /// detects, watches or indexes the repository, and never loads diffs.
+    #[cfg(feature = "local_fs")]
+    pub fn new_for_git_ops(repo_root: PathBuf, ctx: &mut ModelContext<Self>) -> Self {
+        let mut model = Self::new(None, BackendOrigin::ClientLocal, ctx);
+        model.git_ops_root = Some(repo_root);
+        model
     }
 
     #[cfg(not(feature = "local_fs"))]
@@ -3007,6 +3020,8 @@ impl LocalDiffStateModel {
         Self {
             #[cfg(feature = "local_fs")]
             repository: None,
+            #[cfg(feature = "local_fs")]
+            git_ops_root: None,
             state: InternalDiffState::default(),
             #[cfg(feature = "local_fs")]
             subscriber_id: None,
