@@ -18,6 +18,8 @@ use warp_multi_agent_api as api;
 const ANTHROPIC_MESSAGES_UNSUPPORTED: &str = "the selected model's endpoint uses the Anthropic \
      Messages schema, which the local agent loop does not support yet (switch the endpoint to \
      OpenAI Chat Completions or OpenAI Responses)";
+const RESUME_UNSUPPORTED: &str = "the local agent loop cannot resume an interrupted request yet \
+     (send your message again)";
 const UNRECOGNIZED_SCHEMA: &str =
     "the selected model's endpoint uses an API schema this build does not recognize";
 
@@ -62,12 +64,19 @@ pub(crate) fn route_request(request: &api::Request) -> RequestDisposition {
 /// [`resolve_local_route`] returned `None`, so exactly one of the preconditions
 /// failed.
 fn block_reason(request: &api::Request) -> &'static str {
-    let input_supported = request
+    let input_type = request
         .input
         .as_ref()
-        .and_then(|input| input.r#type.as_ref())
-        .is_some_and(is_supported_input);
-    if !input_supported {
+        .and_then(|input| input.r#type.as_ref());
+    // The host sends this after a failed request. The failed attempt's task
+    // messages were rolled back, so there is nothing to continue from.
+    if matches!(
+        input_type,
+        Some(api::request::input::Type::ResumeConversation(_))
+    ) {
+        return RESUME_UNSUPPORTED;
+    }
+    if !input_type.is_some_and(is_supported_input) {
         return "the local agent loop does not support this kind of request";
     }
     match find_custom_model(request) {

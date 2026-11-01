@@ -347,3 +347,19 @@ fn block_reason_distinguishes_unsupported_input_unknown_model_and_schema() {
     assert!(reasons[1].contains("not a custom endpoint model"));
     assert!(reasons[2].contains("Anthropic Messages"));
 }
+
+#[test]
+fn resuming_an_interrupted_request_is_blocked_with_a_specific_reason() {
+    let request = request_for_model(
+        "cfg-123",
+        Some(custom_providers()),
+        api::request::input::Type::ResumeConversation(api::request::input::ResumeConversation {}),
+    );
+
+    assert!(resolve_local_route(&request).is_none());
+    let reason = block_reason_of(&request);
+    assert!(
+        reason.contains("resume") && reason.contains("send your message again"),
+        "{reason}"
+    );
+}

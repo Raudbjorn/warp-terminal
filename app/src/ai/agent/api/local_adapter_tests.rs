@@ -1775,14 +1775,13 @@ mod reasoning {
     fn replay_item() -> serde_json::Value {
         json!({
             "type": "reasoning",
-            "id": "rs_1",
             "summary": [{ "type": "summary_text", "text": "Plan: list the files \u{1F4C1}" }],
             "encrypted_content": "gAAAAABo+/=="
         })
     }
 
     fn second_replay_item() -> serde_json::Value {
-        json!({ "type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "gAAAAACp//==" })
+        json!({ "type": "reasoning", "summary": [], "encrypted_content": "gAAAAACp//==" })
     }
 
     fn shell_call(id: &str) -> AgentEvent {
@@ -2119,6 +2118,44 @@ mod reasoning {
     }
 
     #[test]
+    fn engine_event_order_with_preamble_text_keeps_replay_items_first() {
+        // The Responses engine streams reasoning and text live and releases a
+        // turn's tool calls only at `response.completed`, so the order is:
+        // reasoning, replay item, text, tool call, usage, done.
+        let messages = persisted_messages(vec![
+            AgentEvent::ReasoningDelta("Plan".to_string()),
+            AgentEvent::ReasoningDelta("\n\n".to_string()),
+            AgentEvent::ReasoningDelta("then act".to_string()),
+            AgentEvent::ReplayItem(replay_item()),
+            AgentEvent::TextDelta("Checking the directory.".to_string()),
+            shell_call(CALL_ID),
+            AgentEvent::Usage {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+            AgentEvent::Done,
+        ]);
+
+        let reasoning = reasoning_messages(&messages);
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0].1.reasoning, "Plan\n\nthen act");
+
+        let transcript = tool_result_follow_up(messages);
+
+        let ChatMessage::Assistant {
+            text,
+            tool_calls,
+            replay_items,
+        } = assistants(&transcript)[0]
+        else {
+            unreachable!();
+        };
+        assert_eq!(text, "Checking the directory.");
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(replay_items, &vec![replay_item()]);
+    }
+
+    #[test]
     fn parallel_tool_calls_share_one_assistant_message_that_adopts_the_replay_items() {
         let messages = persisted_messages(vec![
             AgentEvent::ReplayItem(replay_item()),
@@ -2190,7 +2227,6 @@ mod reasoning {
     fn replay_items_round_trip_losslessly() {
         let item = json!({
             "type": "reasoning",
-            "id": "rs_\u{1F9E0}",
             "summary": [
                 { "type": "summary_text", "text": "line one\nline \"two\" \\ \t" },
                 { "type": "summary_text", "text": "" }
