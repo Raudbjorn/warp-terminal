@@ -32,6 +32,35 @@ HTTP for local hosts, HTTPS for public ones). Until an endpoint is
 configured, the terminal works normally but agent/AI actions have nowhere to
 go.
 
+### SSH profiles
+
+Open **Connect to SSH host** with **Ctrl+Shift+H** (macOS: **Cmd+Shift+H**), or
+choose **Toggle SSH profiles panel** from the command palette. The SSH Profiles
+panel lets you add and edit hosts, identity files, jump hosts, and tags; pin hosts;
+and open saved or recent connections. The launcher also accepts
+`user@host:port` for a quick connection. Existing toolbar customizations are
+preserved when opening the panel.
+
+Profiles are read from `~/.ssh/config`. Saving a profile updates its host stanza,
+preserves unrecognized directives, and keeps a backup at `~/.ssh/config.warp.bak`.
+Hand-written stanzas are imported for use and editing; only Warp-managed stanzas
+can be deleted from the panel. Profile metadata and recent-host history stay local.
+Optional saved passwords require an explicit username and are bound to the
+profile’s host, username, and port. They use the platform secure store, with an owner-only file
+fallback where supported. On Unix, SSH requests saved passwords through an
+askpass helper; host-key confirmations and other prompts remain interactive.
+
+The manager is adapted from [Changroro/warp](https://github.com/Changroro/warp),
+with its implementation in `app/src/ssh_manager/` and small integration modules in
+`app/src/terminal/view/ssh_manager.rs` and
+`app/src/workspace/view/ssh_manager.rs`. The source snapshot is
+[`f25058b7`](https://github.com/Changroro/warp/commit/f25058b7d3bbae94bc5a3b6f051d6edf50b74251);
+remote-session reopening and the workspace adapter use
+[`92b8e4cf`](https://github.com/Changroro/warp/commit/92b8e4cf)
+to keep this integration independent of the sibling's session archive and agent
+logo features. The pre-existing `warp_ssh_manager` database crate is unchanged;
+this UI uses SSH config profiles and does not migrate that crate's database rows.
+
 ## Building and running this fork
 
 The build is driven by the scripts in [`script/`](script). This fork builds as

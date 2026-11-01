@@ -135,6 +135,7 @@ pub mod root_view;
 pub mod search;
 pub mod settings;
 pub mod settings_view;
+mod ssh_manager;
 pub mod tab_configs;
 pub mod terminal;
 pub mod themes;
@@ -789,6 +790,12 @@ fn detect_system_ui_locale() -> Option<String> {
 /// parser and therefore do not require a separate mode flag.
 #[::tracing::instrument(skip_all, fields(tags.cloud_agent = true))]
 pub fn run() -> Result<()> {
+    // All GUI binaries can be invoked by SSH as the saved-profile password helper.
+    #[cfg(unix)]
+    if let Some(exit_code) = ssh_manager::askpass::run_if_requested() {
+        std::process::exit(exit_code);
+    }
+
     // POSIX locale fallback: When LANG/LC_* are all unset, provide C/Rust libraries
     // (chrono number formatting, libc strftime, etc.) with a reasonable UTF-8 default.
     // Intentionally skipped on Windows — Windows API (`GetUserPreferredUILanguages`) is
