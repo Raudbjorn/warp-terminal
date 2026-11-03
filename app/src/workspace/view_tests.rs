@@ -163,6 +163,11 @@ pub(crate) fn initialize_app_with_team_client(app: &mut App, team_client: Arc<dy
     app.add_singleton_model(crate::ai::blocklist::QueuedQueryModel::new);
     app.add_singleton_model(|ctx| OrchestrationPillBarModel::new(Default::default(), ctx));
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // Workspace::new reads both oh-my-warp plugin stores; lib.rs registers them unconditionally.
+    app.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
+    app.add_singleton_model(|_| {
+        crate::workspace::plugin_status_items::PluginStatusItemsModel::new()
+    });
     // ConnPanelView reads this on construction, so a harness that builds a
     // Workspace needs it registered as production does.
     app.add_singleton_model(crate::conn::ConnModel::new);
