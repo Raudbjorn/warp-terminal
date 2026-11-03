@@ -90,7 +90,6 @@ ADDITIONAL_LICENSES=(
     "Hack Font|MIT|app/assets/bundled/fonts/hack/LICENSE.md"
     "Roboto Font|SIL Open Font License|app/assets/bundled/fonts/roboto/LICENSE.txt"
     "Material Icon Theme|MIT|app/assets/bundled/svg/material_icon_theme/LICENSE"
-    "Hugeicons|MIT|app/assets/bundled/svg/hugeicons/LICENSE"
     "Phosphor Icons|MIT|app/assets/bundled/svg/phosphor/LICENSE"
     "bash-preexec|MIT|app/assets/bundled/bootstrap/bash-preexec-LICENSE.md"
     "Claude API Skill|Apache-2.0|resources/bundled/skills/claude-api/LICENSE.txt"
