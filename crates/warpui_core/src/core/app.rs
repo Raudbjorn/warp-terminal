@@ -2405,6 +2405,11 @@ impl AppContext {
         self.platform_delegate.get_cursor_shape()
     }
 
+    /// Takes back a desktop notification sent with an identifier.
+    pub fn remove_desktop_notification(&self, identifier: &str) {
+        self.platform_delegate.remove_desktop_notification(identifier);
+    }
+
     /// Delegates to the OS to send a desktop notification.
     pub(super) fn send_desktop_notification<F, T>(
         &mut self,
@@ -3651,6 +3656,7 @@ impl AppContext {
         crate::windowing::EventDispatchResult {
             handled,
             soft_keyboard_requested: result.soft_keyboard_requested,
+            window_drag_requested: result.window_drag_requested,
         }
     }
 
@@ -3994,6 +4000,7 @@ impl AppContext {
         crate::windowing::EventDispatchResult {
             handled: dispatch_result.handled,
             soft_keyboard_requested: dispatch_result.soft_keyboard_requested,
+            window_drag_requested: dispatch_result.window_drag_requested,
         }
     }
 

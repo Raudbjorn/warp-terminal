@@ -1106,6 +1106,9 @@ fn entry_kind(event: &CLIAgentEvent) -> Option<ConnEntryKind> {
         // The agent sitting at its prompt is already implied by the turn that
         // preceded it, so it would only pad the history.
         CLIAgentEventType::IdlePrompt => None,
+        // Running subagents or shells after a turn are the row's status, not something the
+        // agent said or did, so they add nothing to the history.
+        CLIAgentEventType::BackgroundTasks { .. } => None,
         // A newer plugin than this build understands. Dropping it keeps
         // unknown events out of the history rather than guessing at them.
         CLIAgentEventType::Unknown(_) => None,

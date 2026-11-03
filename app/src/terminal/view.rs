@@ -402,7 +402,7 @@ use crate::terminal::block_list_viewport::{
 use crate::terminal::bootstrap::init_subshell_command;
 use crate::terminal::cli_agent_sessions::event::{
     CLI_AGENT_NOTIFICATION_SENTINEL, CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventSource,
-    CLIAgentEventType, parse_event,
+    CLIAgentEventType, TitleState, parse_event, title_state,
 };
 use crate::terminal::cli_agent_sessions::listener::{CLIAgentSessionListener, is_agent_supported};
 #[cfg(not(target_family = "wasm"))]
@@ -12295,6 +12295,7 @@ impl TerminalView {
             }
             ModelEvent::Title(title) => {
                 self.terminal_title = title.to_owned();
+                self.update_cli_agent_status_from_title(ctx);
                 if self.ignore_next_set_title_event {
                     self.ignore_next_set_title_event = false;
                 } else {
@@ -13941,6 +13942,14 @@ impl TerminalView {
         let remote_host = self.active_session_remote_host(ctx);
         let should_auto_toggle_input = agent.supports_cli_agent_footer()
             && *AISettings::as_ref(ctx).auto_open_rich_input_on_cli_agent_start;
+        // WarpOss: only a finished tool says a turn is under way (the agent was mid-turn when
+        // this terminal started listening); anything else leaves the session idle until an
+        // event says otherwise.
+        let initial_status = if notification.event == CLIAgentEventType::ToolComplete {
+            CLIAgentSessionStatus::InProgress
+        } else {
+            CLIAgentSessionStatus::Success
+        };
         // Seed context from the event that caused registration before the
         // listener subscribes to future events.
         CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
@@ -13953,11 +13962,55 @@ impl TerminalView {
                 notification.payload.plugin_version.clone(),
                 remote_host,
                 should_auto_toggle_input,
+                initial_status,
                 listener,
                 ctx,
             );
         });
         true
+    }
+
+    /// Harp: an agent without a status plugin (started outside a Harp shell, a Claude Code too old
+    /// for `CLAUDE_CODE_PLUGIN_DIRS`, Codex without Warp's plugin) still shows working and done,
+    /// read from the title it sets. Only changes are sent, and a session a plugin reports for
+    /// ignores them (`CLIAgentEventSource::TerminalTitle`).
+    fn update_cli_agent_status_from_title(&mut self, ctx: &mut ViewContext<Self>) {
+        let Some(session) = CLIAgentSessionsModel::as_ref(ctx).session(self.view_id) else {
+            return;
+        };
+        if session.has_status_plugin() {
+            return;
+        }
+        let Some(state) = title_state(session.agent, &self.terminal_title) else {
+            return;
+        };
+        let working = session.status == CLIAgentSessionStatus::InProgress;
+        let blocked = matches!(session.status, CLIAgentSessionStatus::Blocked { .. });
+        let had_activity = session.session_context.had_activity;
+        let event = match state {
+            TitleState::NeedsYou if !blocked => CLIAgentEventType::PermissionRequest,
+            TitleState::Working if !(working && had_activity) => CLIAgentEventType::PromptSubmit,
+            // Idle before any turn: the agent is there and waits for its first prompt.
+            TitleState::Idle if !had_activity && !session.session_context.status_from_title => {
+                CLIAgentEventType::SessionStart
+            }
+            TitleState::Idle if (working || blocked) && had_activity => CLIAgentEventType::Stop,
+            _ => return,
+        };
+        let event = CLIAgentEvent {
+            v: 1,
+            agent: session.agent,
+            event,
+            session_id: None,
+            cwd: None,
+            project: None,
+            payload: CLIAgentEventPayload::default(),
+            source: CLIAgentEventSource::TerminalTitle,
+        };
+        let view_id = self.view_id;
+        CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
+            sessions_model.update_from_event(view_id, &event, ctx);
+        });
     }
 
     /// Creates and registers a listener for flows without a `SessionStart` event.
@@ -14122,6 +14175,7 @@ impl TerminalView {
             agent,
             status,
             session_context,
+            announce,
             ..
         } = event
         else {
@@ -14181,9 +14235,18 @@ impl TerminalView {
             }
         }
 
-        // Desktop notifications — only when navigated away and not in-progress.
-        if !self.is_navigated_away_from_window(ctx)
-            || matches!(status, CLIAgentSessionStatus::InProgress)
+        // Desktop notifications: only when navigated away, and only for a change the sidebar
+        // shows (WarpOss: repeats and turns ending under running background work stay silent).
+        if !*announce || !self.is_navigated_away_from_window(ctx) {
+            return;
+        }
+
+        // Harp: a waiting Claude Code gets the workspace's dialog notification instead, with
+        // Allow, Deny and Open chat (`claude_waits::notify`), under the same settings.
+        if cfg!(not(target_family = "wasm"))
+            && matches!(status, CLIAgentSessionStatus::Blocked { .. })
+            && matches!(agent, CLIAgent::Claude)
+            && SessionSettings::as_ref(ctx).notifications.mode == NotificationsMode::Enabled
         {
             return;
         }

@@ -246,6 +246,35 @@ fn ignores_events_that_carry_no_history() {
     });
 }
 
+/// A background-tasks report is the row's status (work still running after a turn), not
+/// something the agent said or did, so it adds no history line.
+#[test]
+fn background_tasks_report_adds_no_history() {
+    with_session(|app, view_id| {
+        send(
+            app,
+            view_id,
+            event(
+                CLIAgentEventType::BackgroundTasks {
+                    count: 2,
+                    only_subagents: false,
+                    shells: 1,
+                    started_ms: Some(1),
+                },
+                Default::default(),
+            ),
+        );
+
+        let model = ConnModel::handle(&*app);
+        let entries = model.read(app, |me, _| {
+            me.session(view_id)
+                .map(|session| session.entries().len())
+                .unwrap_or(0)
+        });
+        assert_eq!(entries, 0, "a background-tasks report is not history");
+    });
+}
+
 /// An empty prompt would render as a blank line in the spine, which reads as a
 /// bug rather than as an empty instruction.
 #[test]
