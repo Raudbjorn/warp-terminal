@@ -1328,6 +1328,22 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn verification_ends_with_the_generated_password() {
+        use base64::Engine as _;
+        let server = raw_server(RawOptions::default()).await;
+        let args = announce_then_sleep(server.port, "");
+
+        let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
+
+        let expected = base64::engine::general_purpose::STANDARD
+            .encode(format!("{SERVER_USERNAME}:{}", sidecar.inner.password));
+        let seen = server.credentials_seen.lock().unwrap();
+        assert_eq!(seen.first(), Some(&wrong_password_credentials()));
+        assert_eq!(seen.last(), Some(&expected), "{seen:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn sidecar_password_is_set_under_both_env_names() {
         // OpenCode reads OPENCODE_PASSWORD before OPENCODE_SERVER_PASSWORD, so
         // setting only the second lets an inherited first one win.
