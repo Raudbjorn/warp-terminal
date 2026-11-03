@@ -851,11 +851,7 @@ fn split_run_options(
             });
 
     let mut env_vars = build_secret_env_vars(&secrets, &environment_variables)?;
-    env_vars.extend(
-        environment_variables
-            .into_iter()
-            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
-    );
+    merge_runtime_env(&mut env_vars, environment_variables);
 
     // Inject cloud provider env vars.
     cloud_provider::collect_env_vars(&cloud_providers, &mut env_vars)?;
@@ -4942,6 +4938,24 @@ pub(super) fn build_secret_env_vars(
     }
 
     Ok(env_vars)
+}
+
+/// Applies the terminal's runtime environment on top of the secret-derived `env_vars`.
+///
+/// [`build_secret_env_vars`] treats an empty runtime value as unset, so a secret is not skipped
+/// for it. The merge must agree: an empty value does not blank one a secret supplied, which would
+/// otherwise leave a key without the endpoint stored beside it.
+fn merge_runtime_env(
+    env_vars: &mut HashMap<OsString, OsString>,
+    runtime_env: HashMap<String, String>,
+) {
+    for (name, value) in runtime_env {
+        let name = OsString::from(name);
+        if value.is_empty() && env_vars.contains_key(&name) {
+            continue;
+        }
+        env_vars.insert(name, OsString::from(value));
+    }
 }
 
 /// The env-var names that any typed auth secret in `secrets` will populate.
