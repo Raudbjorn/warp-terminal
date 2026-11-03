@@ -44,8 +44,17 @@ these notes were written on).
 
 **Verified** on that host: in a directory containing a `rust-toolchain.toml` that
 pins 1.92.0, `cargo rustc -- --version` reported rustc 1.99.1 (the distribution
-compiler), i.e. the pin was ignored. Check what your own build uses the same way,
-not with a bare `rustc --version`.
+compiler), i.e. the pin was ignored. Check what your own setup uses the same way,
+not with a bare `rustc --version`. Do it in a scratch crate, not at this
+workspace root: there it fails ("virtual manifest"), and
+`cargo rustc -p <crate> -- --version` would first compile that crate's whole
+dependency tree.
+
+```bash
+d=$(mktemp -d) && cd "$d" && cargo init -q --vcs none --name tc .
+cp /path/to/this/checkout/rust-toolchain.toml .
+cargo rustc -- --version     # prints the compiler Cargo really invokes
+```
 
 That compiler also links with `-fuse-ld=lld` by default (**verified** via
 `rustc --print link-args`), so a custom linker such as mold is rarely worth a hard
