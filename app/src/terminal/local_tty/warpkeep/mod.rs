@@ -19,9 +19,11 @@
 #![cfg(unix)]
 
 use std::os::fd::RawFd;
+use std::time::Duration;
 
 mod attach;
 mod master;
+mod pump;
 
 pub use attach::run_attach;
 pub use master::run_master;
@@ -30,6 +32,58 @@ pub use master::run_master;
 /// direction is the raw PTY byte stream (preceded once by the replay block).
 pub(crate) const TAG_DATA: u8 = b'd';
 pub(crate) const TAG_WINCH: u8 = b'w';
+
+/// Bytes in a client→master packet header: `[tag:u8][len:u32]`.
+pub(crate) const FRAME_HEADER_BYTES: usize = 5;
+
+/// Bytes in an encoded window size `[rows:u16][cols:u16]`: the attach
+/// handshake header and the payload of a `TAG_WINCH` packet.
+pub(crate) const WINSIZE_BYTES: usize = 4;
+
+/// Bytes in the replay block's length prefix (`[len:u32]`).
+pub(crate) const REPLAY_LEN_BYTES: usize = 4;
+
+/// Attach side: how long a single handshake read (replay length or a chunk
+/// of the replay) may wait on the master before the attach gives up, so a
+/// wedged master can't hang a new tab forever before relaying starts.
+pub(crate) const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub(crate) fn encode_winsize(rows: u16, cols: u16) -> [u8; WINSIZE_BYTES] {
+    let mut out = [0u8; WINSIZE_BYTES];
+    out[..2].copy_from_slice(&rows.to_ne_bytes());
+    out[2..].copy_from_slice(&cols.to_ne_bytes());
+    out
+}
+
+/// Decode `[rows:u16][cols:u16]`; `None` unless exactly `WINSIZE_BYTES` long.
+pub(crate) fn decode_winsize(bytes: &[u8]) -> Option<(u16, u16)> {
+    let bytes: &[u8; WINSIZE_BYTES] = bytes.try_into().ok()?;
+    Some((
+        u16::from_ne_bytes([bytes[0], bytes[1]]),
+        u16::from_ne_bytes([bytes[2], bytes[3]]),
+    ))
+}
+
+/// Largest payload a well-formed client packet carries: one stdin read. A
+/// larger length field means a corrupt stream; the master drops the client
+/// instead of buffering up to 4 GiB waiting for the rest of the "packet".
+pub(crate) const MAX_PACKET_PAYLOAD_BYTES: usize = READ_CHUNK;
+
+/// Backpressure threshold for each relay direction's pending-write buffer.
+/// While a destination's buffer holds at least this many bytes, the relay
+/// stops reading the source that feeds it (see `pump`), so per-direction
+/// memory stays under `PENDING_WRITE_CAP_BYTES + READ_CHUNK + FRAME_HEADER_BYTES`.
+/// Four reads' worth absorbs a bootstrap-sized burst without stalling the
+/// source on every chunk.
+pub(crate) const PENDING_WRITE_CAP_BYTES: usize = 4 * READ_CHUNK;
+
+/// On shutdown (shell exited / master hung up), how long to keep trying to
+/// deliver already-read output before exiting anyway.
+pub(crate) const FINAL_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often the master wakes with nothing to do, to notice the shell having
+/// exited while a background job still holds the PTY open.
+pub(crate) const MASTER_POLL_INTERVAL_MS: libc::c_int = 1000;
 
 /// Size of the per-session replay ring buffer. Replayed to a client on attach so
 /// the screen repaints (this is what fixes dtach's "press ctrl-l after reattach"
