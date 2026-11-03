@@ -72,8 +72,11 @@ Every plugin gets these, whatever its permissions:
 
 `contributes.keybindings` binds a key sequence to a command id. The binding is applied before
 `activate` runs and is resolved when the key is pressed, so it works whether or not `activate` has
-registered the command by then. `warp.keymap.bind` does the same at run time. Keybindings in the
-user's `keybindings.yaml` override both.
+registered the command by then. `warp.keymap.bind` does the same at run time. A user override in
+`keybindings.yaml` applies to a plugin binding only while that binding is the effective one. A later
+`warp.keymap.bind` registers a new binding that takes precedence over an earlier user override, so
+`keybindings.yaml` does not unconditionally win. The startup order of user overrides and contributed
+bindings is not guaranteed.
 
 ## 7. Permissions
 
@@ -105,7 +108,12 @@ To use more than §5, a plugin needs a `plugin.json` that declares the permissio
 
 ## 8. API reference
 
-Calls that fail throw a JavaScript exception that the plugin can catch.
+Error handling depends on the API. `warp.fs.readFile`, `warp.fs.readDir`, `warp.fs.writeFile`,
+`warp.process.exec`, and `warp.network.fetch` throw a JavaScript exception that the plugin can
+catch. Registration calls (`warp.commands.register`, `warp.terminal.onCommandStart`,
+`warp.terminal.onCommandFinished`, and `warp.ai.registerTool`) log a failure and return normally
+instead of throwing. Queued app requests (`warp.ui.*`, `warp.prompt.*`, and `warp.keymap.bind`) are
+fire-and-forget and cannot report a delivery failure to the plugin.
 
 ### 8.1 `warp.commands` (`commands`)
 

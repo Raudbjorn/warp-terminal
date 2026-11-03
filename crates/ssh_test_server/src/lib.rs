@@ -55,6 +55,8 @@ pub struct LocalSshd {
     child: Child,
     port: u16,
     identity: PathBuf,
+    /// The user the client logs in as, the only one the server accepts.
+    user: String,
     /// Held so the keys and config live as long as the server.
     _dir: TempDir,
 }
@@ -66,6 +68,7 @@ impl LocalSshd {
         let ssh_keygen = find_program("ssh-keygen")?;
         // Every user of the fixture runs the client too, so a machine without it skips as well.
         find_program("ssh")?;
+        let user = current_user(&find_program("id")?)?;
 
         let dir = tempfile::Builder::new()
             .prefix("ssh-test-server-")
@@ -104,6 +107,7 @@ impl LocalSshd {
                         child,
                         port,
                         identity,
+                        user,
                         _dir: dir,
                     });
                 }
@@ -150,14 +154,23 @@ impl LocalSshd {
     }
 
     /// Arguments for `ssh` that connect to this server without prompting: the port, the key (and
-    /// no other), no host-key checking, and the host. No user is named, so `ssh` uses the current
-    /// one, the only one the server accepts. Append the remote command, if any.
+    /// no other), no host-key checking, and the host. Append the remote command, if any.
+    ///
+    /// The client reads no configuration file at all (`-F none`, understood since OpenSSH 6.3,
+    /// which is older than the ed25519 keys this fixture already needs), so a `User`, `ProxyJump`
+    /// or `IdentityFile` in the caller's `~/.ssh/config` or in `/etc/ssh/ssh_config` cannot change
+    /// the connection. The login user is named explicitly (`-l`) because the server accepts only
+    /// the user running the test.
     pub fn ssh_args(&self) -> Vec<String> {
         let mut args = vec![
             "-p".to_string(),
             self.port.to_string(),
+            "-l".to_string(),
+            self.user.clone(),
             "-i".to_string(),
             self.identity.display().to_string(),
+            "-F".to_string(),
+            "none".to_string(),
         ];
         for option in [
             "IdentitiesOnly=yes",
@@ -268,4 +281,29 @@ fn find_program(name: &'static str) -> Result<PathBuf, StartError> {
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
         .ok_or(StartError::MissingProgram(name))
+}
+
+/// The name of the user the test runs as, which is the only one the server accepts.
+///
+/// `id -un` asks the system user database for it, the same source `ssh` itself uses to pick the
+/// user to log in as. `USER` and `LOGNAME` are not used: they are unset in some environments and
+/// stale in others.
+fn current_user(id: &Path) -> Result<String, StartError> {
+    let output = Command::new(id)
+        .arg("-un")
+        .output()
+        .map_err(|err| StartError::failed("running id", err))?;
+    if !output.status.success() {
+        return Err(StartError::Failed(format!(
+            "id -un failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let user = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if user.is_empty() {
+        return Err(StartError::Failed(
+            "id -un printed no user name".to_string(),
+        ));
+    }
+    Ok(user)
 }

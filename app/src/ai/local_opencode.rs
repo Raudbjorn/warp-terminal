@@ -33,13 +33,13 @@
 //! drain task prevents the child from blocking on a full pipe and owns the
 //! kill path so the `Drop` impl stays non-blocking.
 
-use futures::io::{AsyncBufReadExt, BufReader};
 use futures::AsyncReadExt;
+use futures::io::{AsyncBufReadExt, BufReader};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 /// Default binary name resolved from `$PATH` when the user does not pin one.
@@ -341,24 +341,49 @@ pub async fn spawn(
     })
 }
 
-/// Check that `base_url` is the sidecar that was just spawned: it must accept
-/// the Basic-auth password generated for it and answer with an OpenCode
-/// session list. A stray listener on a misread port knows neither, and a
-/// catch-all web server fails the body check. Only a refused connection is
-/// retried, since that is what a sidecar that is not yet accepting looks like.
+/// Check that `base_url` is the sidecar that was just spawned: it must reject
+/// unauthenticated requests, accept the Basic-auth password generated for it,
+/// and answer with an OpenCode session list. A stray listener on a misread
+/// port cannot satisfy all three checks. Only a refused connection is retried,
+/// since that is what a sidecar that is not yet accepting looks like.
 async fn verify_sidecar(
     client: &http_client::Client,
     base_url: &str,
     password: &str,
 ) -> Result<(), String> {
     let mut last_error = String::new();
+    // `limit=1` keeps the reply small for a project with many sessions.
+    let endpoint = format!("{base_url}/api/session?limit=1");
     for attempt in 0..VERIFY_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(VERIFY_RETRY_DELAY).await;
         }
-        // `limit=1` keeps the reply small for a project with many sessions.
+        let probe = client.get(&endpoint).timeout(VERIFY_REQUEST_TIMEOUT);
+        match probe.send().await {
+            Ok(response) if response.status().is_success() => {
+                return Err(
+                    "/api/session accepted an unauthenticated request; the endpoint does not enforce the password"
+                        .to_string(),
+                );
+            }
+            Ok(response)
+                if response.status() != http_client::StatusCode::UNAUTHORIZED
+                    && response.status() != http_client::StatusCode::FORBIDDEN =>
+            {
+                return Err(format!(
+                    "{} from unauthenticated /api/session",
+                    response.status()
+                ));
+            }
+            Ok(_) => {}
+            Err(err) => {
+                last_error = err.to_string();
+                continue;
+            }
+        }
+
         let request = client
-            .get(format!("{base_url}/api/session?limit=1"))
+            .get(&endpoint)
             .basic_auth(SERVER_USERNAME, Some(password))
             .timeout(VERIFY_REQUEST_TIMEOUT);
         match request.send().await {
@@ -1325,6 +1350,10 @@ mod tests {
         Sidecar,
         /// Some other service that does not know our password.
         Unauthorized,
+        /// A listener that ignores authentication and returns a valid session list.
+        IgnoresAuth,
+        /// A server that requires authentication but answers with a malformed session list.
+        InvalidSessionList,
         /// A web server that answers every path with 200 and an HTML page.
         CatchAll,
     }
@@ -1407,6 +1436,13 @@ mod tests {
                         match probe {
                             ProbeReply::Sidecar if authorized => (200, r#"{"data":[]}"#),
                             ProbeReply::Sidecar | ProbeReply::Unauthorized => {
+                                (401, r#"{"message":"Authentication required"}"#)
+                            }
+                            ProbeReply::IgnoresAuth => (200, r#"{"data":[]}"#),
+                            ProbeReply::InvalidSessionList if authorized => {
+                                (200, "<!doctype html><html></html>")
+                            }
+                            ProbeReply::InvalidSessionList => {
                                 (401, r#"{"message":"Authentication required"}"#)
                             }
                             ProbeReply::CatchAll => (200, "<!doctype html><html></html>"),
@@ -1527,7 +1563,11 @@ mod tests {
     async fn announced_port_that_is_not_our_sidecar_is_refused() {
         for (probe, expected) in [
             (ProbeReply::Unauthorized, "401"),
-            (ProbeReply::CatchAll, "not an OpenCode session list"),
+            (
+                ProbeReply::InvalidSessionList,
+                "not an OpenCode session list",
+            ),
+            (ProbeReply::CatchAll, "does not enforce the password"),
         ] {
             let server = raw_server(RawOptions {
                 probe,
@@ -1549,6 +1589,30 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sidecar_that_ignores_authentication_is_refused() {
+        let server = raw_server(RawOptions {
+            probe: ProbeReply::IgnoresAuth,
+            ..Default::default()
+        })
+        .await;
+        let args = announce_then_sleep(server.port, "");
+
+        let Err(err) = spawn("sh", &args, &std::env::temp_dir()).await else {
+            panic!("a port that accepts unauthenticated requests must be refused");
+        };
+
+        assert!(
+            matches!(
+                &err,
+                OpenCodeError::PortNotVerified { port, reason }
+                    if *port == server.port && reason.contains("does not enforce the password")
+            ),
+            "{err:?}"
+        );
     }
 
     #[cfg(unix)]
