@@ -335,7 +335,6 @@ fn test_show_needs_sso_link_view_blocks_pre_terminal_onboarding_states() {
         let (_, harness) = app.add_window(WindowStyle::NotStealFocus, |ctx| {
             let login_slide_view = ctx.add_typed_action_view(|ctx| {
                 LoginSlideView::new(
-                    true,
                     false,
                     "Dark",
                     false,

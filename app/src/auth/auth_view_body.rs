@@ -8,23 +8,22 @@ use warpui::accessibility::{AccessibilityContent, WarpA11yRole};
 use warpui::clipboard::ClipboardContent;
 use warpui::color::ColorU;
 use warpui::elements::{
-    Align, Border, Container, CornerRadius, CrossAxisAlignment, Dismiss, Fill, Flex,
-    MainAxisAlignment, MainAxisSize, MouseStateHandle, ParentElement, Radius, Stack,
+    Border, Container, CornerRadius, CrossAxisAlignment, Dismiss, Fill, Flex, MainAxisAlignment,
+    MainAxisSize, MouseStateHandle, ParentElement, Radius, Stack,
 };
 use warpui::fonts::Weight;
 use warpui::keymap::FixedBinding;
 use warpui::ui_components::components::{Coords, UiComponent, UiComponentStyles};
 use warpui::{
-    AppContext, Element, Entity, FocusContext, SingletonEntity, TypedActionView, UpdateModel, View,
-    ViewContext, ViewHandle,
+    AppContext, Element, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
+    ViewHandle,
 };
 
 use super::AuthStateProvider;
 use super::auth_manager::AuthManager;
 use super::auth_view_modal::AuthViewVariant;
 use super::auth_view_shared_helpers::{
-    PrivacySettingsActions, PrivacySettingsHandles, action_button_color_and_variant,
-    render_offline_info_overlay_body, render_overlay, render_privacy_settings_overlay_body,
+    action_button_color_and_variant, render_offline_info_overlay_body, render_overlay,
     render_square_logo,
 };
 use crate::appearance::Appearance;
@@ -36,7 +35,6 @@ use crate::experiments::{AuthFlowInstructions, Experiment};
 use crate::modal::MODAL_CORNER_RADIUS;
 use crate::network::NetworkStatus;
 use crate::server::telemetry::{AnonymousUserSignupEntrypoint, LoginEventSource};
-use crate::settings::{AISettings, PrivacySettings};
 use crate::themes::theme::Fill as ThemeFill;
 use crate::util::color::{darken, lighten};
 
@@ -85,20 +83,18 @@ struct MouseStateHandles {
     tos_mouse_state_handle: MouseStateHandle,
     sign_up_mouse_state_handle: MouseStateHandle,
     learn_more_mouse_state_handle: MouseStateHandle,
-    privacy_settings_mouse_state_handle: MouseStateHandle,
     close_button_mouse_state_handle: MouseStateHandle,
+    offline_info_close_button_mouse_state_handle: MouseStateHandle,
 }
 
 #[derive(Copy, Clone, Debug)]
 pub enum AuthViewOverlay {
-    PrivacySettings,
     OfflineInfo,
 }
 
 pub struct AuthViewBody {
     variant: AuthViewVariant,
     mouse_state_handles: MouseStateHandles,
-    privacy_settings_handles: PrivacySettingsHandles,
     active_overlay: Option<AuthViewOverlay>,
     auth_token_input: ViewHandle<EditorView>,
     show_auth_token_input: bool,
@@ -132,8 +128,6 @@ pub enum AuthViewBodyAction {
     SignupAnonymousUser,
     ShowOverlay(AuthViewOverlay),
     HideOverlay,
-    ToggleCrashReporting,
-    ToggleCloudConversationStorage,
     Close,
 }
 
@@ -190,7 +184,6 @@ impl AuthViewBody {
         AuthViewBody {
             variant,
             mouse_state_handles: Default::default(),
-            privacy_settings_handles: Default::default(),
             active_overlay: None,
             auth_token_input,
             show_auth_token_input: false,
@@ -238,14 +231,6 @@ impl AuthViewBody {
     fn emit_token_entered(&self, ctx: &mut ViewContext<Self>) {
         let text = self.auth_token_input.as_ref(ctx).buffer_text(ctx);
         ctx.emit(AuthViewBodyEvent::AuthTokenEntered(text));
-    }
-
-    fn privacy_settings_actions(&self) -> PrivacySettingsActions<AuthViewBodyAction> {
-        PrivacySettingsActions {
-            toggle_crash_reporting: AuthViewBodyAction::ToggleCrashReporting,
-            toggle_cloud_conversation_storage: AuthViewBodyAction::ToggleCloudConversationStorage,
-            hide_overlay: AuthViewBodyAction::HideOverlay,
-        }
     }
 
     fn render_auth_token_suggest(&self, ui_builder: &UiBuilder) -> Box<dyn Element> {
@@ -301,11 +286,11 @@ impl AuthViewBody {
         )
     }
 
-    fn render_privacy_information(
+    fn render_terms_of_service_disclaimer(
         &self,
         appearance: &Appearance,
         ui_builder: &UiBuilder,
-    ) -> Vec<Box<dyn Element>> {
+    ) -> Box<dyn Element> {
         let disclaimer_color = appearance
             .theme()
             .sub_text_color(appearance.theme().background())
@@ -322,7 +307,7 @@ impl AuthViewBody {
             ..Default::default()
         };
 
-        let disclaimer_line_1 = Container::new(
+        Container::new(
             Flex::row()
                 .with_child(
                     ui_builder
@@ -348,32 +333,7 @@ impl AuthViewBody {
         )
         .with_margin_top(AUTH_MODAL_GAP)
         .with_margin_bottom(8.)
-        .finish();
-
-        let disclaimer_line_2 = {
-            Align::new(
-                ui_builder
-                    .link(
-                        "Privacy Settings".into(),
-                        None,
-                        Some(Box::new(|ctx| {
-                            ctx.dispatch_typed_action(AuthViewBodyAction::ShowOverlay(
-                                AuthViewOverlay::PrivacySettings,
-                            ));
-                        })),
-                        self.mouse_state_handles
-                            .privacy_settings_mouse_state_handle
-                            .clone(),
-                    )
-                    .soft_wrap(false)
-                    .build()
-                    .finish(),
-            )
-            .left()
-            .finish()
-        };
-
-        vec![disclaimer_line_1, disclaimer_line_2]
+        .finish()
     }
 
     fn render_sign_up_button(
@@ -680,7 +640,7 @@ impl AuthViewBody {
                         vec![logo, header, sign_up_button, sign_in_row]
                     };
 
-                    contents.append(&mut self.render_privacy_information(appearance, ui_builder));
+                    contents.push(self.render_terms_of_service_disclaimer(appearance, ui_builder));
                     contents
                 } else {
                     vec![]
@@ -882,26 +842,6 @@ impl TypedActionView for AuthViewBody {
                 self.active_overlay = None;
                 ctx.notify();
             }
-            AuthViewBodyAction::ToggleCrashReporting => {
-                let privacy_settings_handle = PrivacySettings::handle(ctx);
-                ctx.update_model(&privacy_settings_handle, |privacy_settings, ctx| {
-                    privacy_settings.set_is_crash_reporting_enabled(
-                        !privacy_settings.is_crash_reporting_enabled,
-                        ctx,
-                    );
-                });
-                ctx.notify();
-            }
-            AuthViewBodyAction::ToggleCloudConversationStorage => {
-                let privacy_settings_handle = PrivacySettings::handle(ctx);
-                ctx.update_model(&privacy_settings_handle, |privacy_settings, ctx| {
-                    privacy_settings.set_is_cloud_conversation_storage_enabled(
-                        !privacy_settings.is_cloud_conversation_storage_enabled,
-                        ctx,
-                    );
-                });
-                ctx.notify();
-            }
             AuthViewBodyAction::Close => {
                 ctx.emit(AuthViewBodyEvent::Close);
             }
@@ -965,34 +905,14 @@ impl View for AuthViewBody {
 
         if let Some(overlay) = &self.active_overlay {
             match overlay {
-                AuthViewOverlay::PrivacySettings => {
-                    // The `is_any_ai_enabled` helper also accounts for login /
-                    // remote-session gating, so the cloud-conversation toggle
-                    // hides whenever AI isn't effectively available.
-                    let is_ai_enabled = AISettings::as_ref(app).is_any_ai_enabled(app);
-                    stack.add_child(
-                        Dismiss::new(render_overlay(
-                            render_privacy_settings_overlay_body(
-                                appearance,
-                                app,
-                                &self.privacy_settings_handles,
-                                &self.privacy_settings_actions(),
-                                is_ai_enabled,
-                            ),
-                            appearance,
-                        ))
-                        .on_dismiss(|ctx, _app| {
-                            ctx.dispatch_typed_action(AuthViewBodyAction::HideOverlay)
-                        })
-                        .finish(),
-                    );
-                }
                 AuthViewOverlay::OfflineInfo => {
                     stack.add_child(
                         Dismiss::new(render_overlay(
                             render_offline_info_overlay_body(
                                 appearance,
-                                self.privacy_settings_handles.close_button_mouse.clone(),
+                                self.mouse_state_handles
+                                    .offline_info_close_button_mouse_state_handle
+                                    .clone(),
                                 AuthViewBodyAction::HideOverlay,
                             ),
                             appearance,

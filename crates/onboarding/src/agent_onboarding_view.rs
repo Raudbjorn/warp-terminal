@@ -56,12 +56,6 @@ pub enum AgentOnboardingEvent {
     OnboardingCompleted(SelectedSettings),
     OnboardingSkipped,
     LoginFromWelcomeRequested,
-    /// Emitted when the user clicks the "Privacy Settings" link on the terminal
-    /// intention theme slide. The variant name encodes that the event is only
-    /// emitted from the terminal-intention theme slide; consumers (e.g. a
-    /// `LoginSlideView` with `LoginSlideSource::PrivacySettingsFromTerminalIntentionTheme`)
-    /// rely on that to select the right visual / back-routing behavior.
-    PrivacySettingsFromTerminalThemeSlideRequested,
     UpgradeRequested,
     UpgradeCopyUrlRequested,
     UpgradePasteTokenFromClipboardRequested,
@@ -394,17 +388,6 @@ impl AgentOnboardingView {
         ctx.notify();
     }
 
-    /// The current `use_vertical_tabs` value on the onboarding UI customization.
-    /// This reflects the intention's default (agent = vertical, terminal = horizontal)
-    /// and any change the user made on the customize slide, and is what the
-    /// theme slide uses to pick its right-panel image.
-    pub fn use_vertical_tabs(&self, ctx: &AppContext) -> bool {
-        self.onboarding_state
-            .as_ref(ctx)
-            .ui_customization()
-            .use_vertical_tabs
-    }
-
     pub fn start_onboarding(&self, ctx: &mut ViewContext<Self>) {
         // Focus the onboarding view so key bindings (Enter, arrow keys, etc.) are routed here
         // instead of to other views (e.g. the editor).
@@ -639,9 +622,6 @@ impl AgentOnboardingView {
             }
             ThemePickerSlideEvent::SyncWithOsToggled { enabled } => {
                 ctx.emit(AgentOnboardingEvent::SyncWithOsToggled { enabled: *enabled });
-            }
-            ThemePickerSlideEvent::PrivacySettingsRequested => {
-                ctx.emit(AgentOnboardingEvent::PrivacySettingsFromTerminalThemeSlideRequested);
             }
         }
     }
