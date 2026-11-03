@@ -11442,9 +11442,9 @@ pub(in crate::workspace::view) mod working_rings {
 ///
 /// - Codex logs a `rate_limits` object with each model response into its session files
 ///   (`<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-*.jsonl`).
-/// - Claude Code hands its plan limits only to its status line (no hook gets them). Harp's status
-///   line command stores that input in `~/.harp/claude-statusline.json`
-///   ([`CLAUDE_STATUS_LINE_COMMAND`]).
+/// - Claude Code hands its plan limits only to its status line (no hook gets them). In Harp mode
+///   the app sets a status line command ([`claude_status_line_command`]) that stores that input
+///   in the app's state dir (`warp_core::paths::state_dir()`, e.g. `~/.local/state/warp-oss`).
 ///
 /// How this can go wrong, and the test that pins each case:
 /// 1. Codex' 5 hours and week land in the wrong ring (its `primary` slot was the week for a
@@ -11452,6 +11452,8 @@ pub(in crate::workspace::view) mod working_rings {
 /// 2. An older Codex reading hides the newest one: `the_newest_codex_reading_wins`.
 /// 3. A status line input without limits (API key, before the first response) becomes a ring of
 ///    dashes: `claude_without_limits_has_no_ring`.
+/// 4. Claude Code is pointed at a relative path and writes into whatever directory it runs in:
+///    `a_relative_state_dir_gives_no_status_line_command`.
 pub(in crate::workspace::view) mod limit_sources {
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
@@ -11460,16 +11462,45 @@ pub(in crate::workspace::view) mod limit_sources {
 
     /// How many of the newest Codex session files are read for a reading.
     const CODEX_FILES: usize = 3;
+    /// Claude Code's status line input, as the status line command stores it in the state dir.
+    const CLAUDE_STATUS_FILE_NAME: &str = "claude-statusline.json";
+    /// In the state dir: the app set Claude Code's status line once, so a status line the user
+    /// took out again stays out.
+    const STATUS_LINE_MARKER_NAME: &str = "claude-statusline.installed";
+    /// Written next to Claude Code's settings and renamed over them, so Claude Code never reads
+    /// a half-written file.
+    const SETTINGS_TEMP_NAME: &str = "settings.json.harp-tmp";
 
-    /// Where Harp's status line command leaves Claude Code's status line input.
-    pub(in crate::workspace::view) fn claude_status_file(home: &Path) -> PathBuf {
-        home.join(".harp").join("claude-statusline.json")
+    /// Where the status line command leaves Claude Code's status line input.
+    pub(in crate::workspace::view) fn claude_status_file(state_dir: &Path) -> PathBuf {
+        state_dir.join(CLAUDE_STATUS_FILE_NAME)
     }
 
-    /// The status line command Harp sets for Claude Code: it stores the input and prints nothing,
-    /// so the status line stays empty. It writes through a per-process temp file, so a reader
-    /// never sees half a file while several Claude Code sessions update at once.
-    pub(in crate::workspace::view) const CLAUDE_STATUS_LINE_COMMAND: &str = r#"mkdir -p "$HOME/.harp" && cat > "$HOME/.harp/claude-statusline.json.$$" && mv -f "$HOME/.harp/claude-statusline.json.$$" "$HOME/.harp/claude-statusline.json""#;
+    /// The status line command set for Claude Code: it stores the input in `state_dir` and prints
+    /// nothing, so the status line stays empty. It writes through a per-process temp file
+    /// (`.$$`), so a reader never sees half a file while several Claude Code sessions update at
+    /// once. Paths are absolute and shell-quoted, because Claude Code runs the command through a
+    /// shell in the session's working directory. `None` when `state_dir` is not absolute (the
+    /// platform gave no state dir) or is not UTF-8, which cannot be put in the settings' JSON.
+    pub(in crate::workspace::view) fn claude_status_line_command(
+        state_dir: &Path,
+    ) -> Option<String> {
+        if !state_dir.is_absolute() {
+            return None;
+        }
+        let quote = |path: &Path| {
+            shlex::try_quote(path.to_str()?)
+                .ok()
+                .map(|quoted| quoted.into_owned())
+        };
+        let dir = quote(state_dir)?;
+        let file = quote(&claude_status_file(state_dir))?;
+        // A quoted word followed by `.$$` is still one word to the shell, so the temp file is
+        // `<file>.<pid>` next to the final file and `mv` within one directory is a rename.
+        Some(format!(
+            "mkdir -p {dir} && cat > {file}.$$ && mv -f {file}.$$ {file}"
+        ))
+    }
 
     /// What was read last, so unchanged files are not parsed again on every refresh.
     #[derive(Default)]
@@ -11478,18 +11509,19 @@ pub(in crate::workspace::view) mod limit_sources {
         claude: Option<(SystemTime, Option<Value>)>,
     }
 
-    /// The providers Harp reads itself, keyed like the cache file's entries.
+    /// The providers the app reads itself, keyed like the cache file's entries. Claude's reading
+    /// comes from `claude_state_dir` (see [`claude_status_file`]), Codex' from its sessions.
     // ponytail: a reading counts as fresh until its window resets (`_ts` is now), though it is
     // only as new as the agent's last response. Used shares only grow within a window, so an old
     // number can be low, never high. Upgrade path: the reading's age in the hover card.
     pub(in crate::workspace::view) fn providers(
-        home: &Path,
+        claude_state_dir: Option<&Path>,
         codex_sessions: Option<&Path>,
         cache: &mut Cache,
         now: f64,
     ) -> Map<String, Value> {
         let mut providers = Map::new();
-        if let Some(entry) = claude(home, cache, now) {
+        if let Some(entry) = claude_state_dir.and_then(|dir| claude(dir, cache, now)) {
             providers.insert("claude".to_owned(), entry);
         }
         if let Some(entry) = codex_sessions.and_then(|sessions| codex(sessions, cache, now)) {
@@ -11502,43 +11534,85 @@ pub(in crate::workspace::view) mod limit_sources {
         std::fs::metadata(path).ok()?.modified().ok()
     }
 
-    /// Marks that Harp set Claude Code's status line once, so a status line the user took out
-    /// again stays out.
-    fn status_line_marker(home: &Path) -> PathBuf {
-        home.join(".harp").join("claude-statusline.installed")
+    /// What [`ensure_claude_status_line`] did.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(in crate::workspace::view) enum StatusLineInstall {
+        /// The status line was added to `~/.claude/settings.json` and the marker written.
+        Installed,
+        /// There is no `~/.claude`, so Claude Code is not set up; nothing was written.
+        NoClaudeSetup,
+        /// The marker says it was set before; the settings were not looked at.
+        AlreadyInstalled,
+        /// The settings have a status line of their own, or do not parse as a JSON object.
+        KeptExisting,
+        /// The state dir cannot go in a status line command (see [`claude_status_line_command`]).
+        UnusableStateDir,
     }
 
-    /// Sets Harp's status line in Claude Code's user settings, once, when Claude Code is set up
-    /// and has no status line of its own. A status line the user has, a settings file that does
-    /// not parse, and a missing `~/.claude` are left alone. Inserts the entry as text, so the
-    /// rest of the file keeps its order and formatting.
-    pub(in crate::workspace::view) fn ensure_claude_status_line(home: &Path) {
+    /// Sets the app's status line in Claude Code's user settings (`<home>/.claude/settings.json`),
+    /// once, when Claude Code is set up and has no status line of its own. A status line the user
+    /// has is never replaced; a settings file that does not parse and a missing `~/.claude` are
+    /// left alone. Inserts the entry as text, so the rest of the file keeps its order and
+    /// formatting, and writes a temp file that is renamed over the settings (over the file a
+    /// symlinked `settings.json` points at, keeping the link and the file's permissions). The
+    /// marker goes in `state_dir`, never under `home`.
+    pub(in crate::workspace::view) fn ensure_claude_status_line(
+        home: &Path,
+        state_dir: &Path,
+    ) -> std::io::Result<StatusLineInstall> {
         let claude = home.join(".claude");
-        let marker = status_line_marker(home);
-        if !claude.is_dir() || marker.exists() {
-            return;
+        if !claude.is_dir() {
+            return Ok(StatusLineInstall::NoClaudeSetup);
         }
-        let settings = claude.join("settings.json");
-        let current = match std::fs::read_to_string(&settings) {
-            Ok(text) => Some(text),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(_) => return,
+        // Checked before the marker, so a relative state dir never makes this look in the
+        // working directory.
+        let Some(command) = claude_status_line_command(state_dir) else {
+            return Ok(StatusLineInstall::UnusableStateDir);
         };
-        let Some(updated) = with_status_line(current.as_deref()) else {
-            return;
-        };
-        let temp = claude.join("settings.json.harp-tmp");
-        if std::fs::write(&temp, updated).is_ok() && std::fs::rename(&temp, &settings).is_ok() {
-            let _ = std::fs::create_dir_all(home.join(".harp"));
-            let _ = std::fs::write(&marker, "");
-            log::info!("Set Claude Code's status line so the limit rings can read Claude's limits");
+        let marker = state_dir.join(STATUS_LINE_MARKER_NAME);
+        if marker.exists() {
+            return Ok(StatusLineInstall::AlreadyInstalled);
         }
+        let link = claude.join("settings.json");
+        let settings = std::fs::canonicalize(&link).unwrap_or(link);
+        let (current, permissions) = match std::fs::read_to_string(&settings) {
+            Ok(text) => (
+                Some(text),
+                std::fs::metadata(&settings).ok().map(|meta| meta.permissions()),
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+            Err(error) => return Err(error),
+        };
+        let Some(updated) = with_status_line(current.as_deref(), &command) else {
+            return Ok(StatusLineInstall::KeptExisting);
+        };
+        // The marker goes first: once the settings carry the status line, the marker must exist,
+        // or a status line the user removes would come back on the next start.
+        std::fs::create_dir_all(state_dir)?;
+        std::fs::write(&marker, "")?;
+        let temp = settings.with_file_name(SETTINGS_TEMP_NAME);
+        let written = std::fs::write(&temp, updated)
+            .and_then(|()| match permissions {
+                Some(permissions) => std::fs::set_permissions(&temp, permissions),
+                None => Ok(()),
+            })
+            .and_then(|()| std::fs::rename(&temp, &settings));
+        if let Err(error) = written {
+            // Best effort: a leftover temp file or marker is harmless; the error gets reported.
+            let _ = std::fs::remove_file(&temp);
+            let _ = std::fs::remove_file(&marker);
+            return Err(error);
+        }
+        Ok(StatusLineInstall::Installed)
     }
 
-    /// `settings` with Harp's status line added, or `None` when it must stay as it is: it does
-    /// not parse, is not an object, or already has a status line.
-    pub(in crate::workspace::view) fn with_status_line(settings: Option<&str>) -> Option<String> {
-        let entry = json!({"type": "command", "command": CLAUDE_STATUS_LINE_COMMAND});
+    /// `settings` with a status line running `command` added, or `None` when it must stay as it
+    /// is: it does not parse, is not an object, or already has a status line.
+    pub(in crate::workspace::view) fn with_status_line(
+        settings: Option<&str>,
+        command: &str,
+    ) -> Option<String> {
+        let entry = json!({"type": "command", "command": command});
         let Some(text) = settings.filter(|text| !text.trim().is_empty()) else {
             return Some(format!("{{\n  \"statusLine\": {entry}\n}}\n"));
         };
@@ -11558,8 +11632,8 @@ pub(in crate::workspace::view) mod limit_sources {
         Some(updated)
     }
 
-    fn claude(home: &Path, cache: &mut Cache, now: f64) -> Option<Value> {
-        let path = claude_status_file(home);
+    fn claude(state_dir: &Path, cache: &mut Cache, now: f64) -> Option<Value> {
+        let path = claude_status_file(state_dir);
         let modified = modified(&path)?;
         if cache
             .claude
@@ -11722,126 +11796,8 @@ pub(in crate::workspace::view) mod limit_sources {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        fn codex_line(primary: (f64, f64, i64), secondary: Option<(f64, f64, i64)>) -> String {
-            let window = |(minutes, used, reset): (f64, f64, i64)| json!({"used_percent": used, "window_minutes": minutes, "resets_at": reset});
-            let mut limits =
-                json!({"limit_id": "codex", "primary": window(primary), "plan_type": "plus"});
-            if let Some(secondary) = secondary {
-                limits["secondary"] = window(secondary);
-            }
-            json!({"type": "event_msg", "payload": {"type": "token_count", "rate_limits": limits}})
-                .to_string()
-        }
-
-        #[test]
-        fn codex_windows_are_placed_by_their_length() {
-            // As logged on 21.10.2026: primary is the 5 hours, secondary the week.
-            let entry =
-                codex_entry(&[codex_line((300., 12., 1000), Some((10080., 19., 2000)))]).unwrap();
-            assert_eq!(
-                (entry["used5h"].as_f64(), entry["usedWeek"].as_f64()),
-                (Some(12.), Some(19.))
-            );
-            // Mid 2026 the week came as primary and there was no 5 hour window.
-            let entry = codex_entry(&[codex_line((10080., 40., 2000), None)]).unwrap();
-            assert_eq!(entry["usedWeek"].as_f64(), Some(40.));
-            assert!(entry.get("used5h").is_none());
-            assert_eq!(entry["tier"], "plus");
-        }
-
-        #[test]
-        fn the_newest_codex_reading_wins() {
-            let lines = [
-                codex_line((300., 50., 1000), Some((10080., 30., 2000))),
-                "not json".to_owned(),
-                codex_line((300., 60., 1000), None),
-            ];
-            let entry = codex_entry(&lines).unwrap();
-            assert_eq!(entry["used5h"].as_f64(), Some(60.));
-            // A window the newest line leaves out keeps its older value.
-            assert_eq!(entry["usedWeek"].as_f64(), Some(30.));
-            assert_eq!(codex_entry(&["{}".to_owned()]), None);
-        }
-
-        #[test]
-        fn claude_reads_its_status_line_limits() {
-            let input = r#"{"session_id":"s","model":{"id":"x"},"rate_limits":{"five_hour":{"used_percentage":4.0,"resets_at":1792590000},"seven_day":{"used_percentage":72,"resets_at":1792980000}}}"#;
-            let entry = claude_entry(input).unwrap();
-            assert_eq!(entry["name"], "Claude");
-            assert_eq!(
-                (entry["used5h"].as_f64(), entry["resetWeek"].as_f64()),
-                (Some(4.), Some(1_792_980_000.))
-            );
-        }
-
-        #[test]
-        fn claude_without_limits_has_no_ring() {
-            assert_eq!(
-                claude_entry(r#"{"session_id":"s","model":{"id":"x"}}"#),
-                None
-            );
-            assert_eq!(claude_entry(r#"{"rate_limits":{}}"#), None);
-            assert_eq!(claude_entry("not json"), None);
-        }
-
-        #[test]
-        fn the_status_line_goes_in_without_touching_the_rest() {
-            let settings = "{\n  \"model\": \"opus\",\n  \"hooks\": {}\n}\n";
-            let updated = with_status_line(Some(settings)).unwrap();
-            let parsed: Value = serde_json::from_str(&updated).unwrap();
-            assert_eq!(parsed["statusLine"]["command"], CLAUDE_STATUS_LINE_COMMAND);
-            assert_eq!(parsed["model"], "opus");
-            assert!(updated.ends_with("  \"model\": \"opus\",\n  \"hooks\": {}\n}\n"));
-            // Empty object, no file, an empty file.
-            for settings in [Some("{}"), None, Some("")] {
-                let updated = with_status_line(settings).unwrap();
-                let parsed: Value = serde_json::from_str(&updated).unwrap();
-                assert_eq!(parsed["statusLine"]["type"], "command");
-            }
-        }
-
-        #[test]
-        fn a_status_line_of_the_user_and_broken_settings_stay_as_they_are() {
-            assert_eq!(
-                with_status_line(Some(
-                    r#"{"statusLine": {"type": "command", "command": "x"}}"#
-                )),
-                None
-            );
-            assert_eq!(with_status_line(Some("{ not json")), None);
-            assert_eq!(with_status_line(Some("[]")), None);
-        }
-
-        #[test]
-        fn newest_rollouts_walk_the_date_folders() {
-            let dir = std::env::temp_dir().join(format!("harp-rollouts-{}", std::process::id()));
-            for (day, name) in [
-                ("2026/09/30", "rollout-2026-09-30T10-00-00-a.jsonl"),
-                ("2026/10/21", "rollout-2026-10-21T07-00-00-b.jsonl"),
-                ("2026/10/21", "rollout-2026-10-21T09-00-00-c.jsonl"),
-                ("2026/10/21", "notes.txt"),
-            ] {
-                std::fs::create_dir_all(dir.join(day)).unwrap();
-                std::fs::write(dir.join(day).join(name), "").unwrap();
-            }
-            let names: Vec<String> = newest_rollouts(&dir, 3)
-                .iter()
-                .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
-                .collect();
-            std::fs::remove_dir_all(&dir).unwrap();
-            assert_eq!(
-                names,
-                [
-                    "rollout-2026-09-30T10-00-00-a.jsonl",
-                    "rollout-2026-10-21T07-00-00-b.jsonl",
-                    "rollout-2026-10-21T09-00-00-c.jsonl"
-                ]
-            );
-        }
-    }
+    #[path = "limit_sources_tests.rs"]
+    mod tests;
 }
 
 /// The limit rings in the sidebar footer, an optional integration (off by default, see
@@ -11856,7 +11812,7 @@ pub(in crate::workspace::view) mod limit_sources {
 /// no ring uses any more when the set passes a few hundred.
 pub(in crate::workspace::view) mod limit_rings {
     use std::collections::HashSet;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
     use chrono::{Local, TimeZone};
@@ -11879,6 +11835,29 @@ pub(in crate::workspace::view) mod limit_rings {
 
     fn enabled(ctx: &AppContext) -> bool {
         *TabSettings::as_ref(ctx).limit_rings_enabled.value()
+    }
+
+    /// Whether the app may set Claude Code's status line. Editing `~/.claude/settings.json` is a
+    /// write outside the app's own files, so it needs Harp mode (`modes.harp.enabled`) as well
+    /// as the limit rings; with the mode off the app must behave like upstream and never touch it.
+    pub(in crate::workspace::view) fn should_install_status_line(
+        harp_mode: bool,
+        limit_rings_enabled: bool,
+    ) -> bool {
+        harp_mode && limit_rings_enabled
+    }
+
+    /// Sets Claude Code's status line (see `limit_sources::ensure_claude_status_line`) when
+    /// [`should_install_status_line`] allows it; `None` when it does not, and nothing was read
+    /// or written.
+    pub(in crate::workspace::view) fn check_status_line(
+        harp_mode: bool,
+        limit_rings_enabled: bool,
+        home: &Path,
+        state_dir: &Path,
+    ) -> Option<std::io::Result<limit_sources::StatusLineInstall>> {
+        should_install_status_line(harp_mode, limit_rings_enabled)
+            .then(|| limit_sources::ensure_claude_status_line(home, state_dir))
     }
 
     /// The file to read, or `None` while the integration is off or no file is set.
@@ -12041,7 +12020,7 @@ pub(in crate::workspace::view) mod limit_rings {
             })
             .collect();
         // serde_json's map order depends on a crate feature; sorting keeps the footer stable.
-        providers.sort_by(|(a, _), (b, _)| a.cmp(b));
+        providers.sort_by_key(|(key, _)| *key);
         providers
             .into_iter()
             .map(|(key, entry)| {
@@ -12154,14 +12133,16 @@ pub(in crate::workspace::view) mod limit_rings {
         pub card: Morph<Card>,
         registered: HashSet<String>,
         sources: limit_sources::Cache,
-        /// Claude Code's status line was looked at in this app run.
+        /// Claude Code's status line was looked at in this app run. Stays false while Harp mode
+        /// or the rings are off, so turning both on later still sets it.
         status_line_checked: bool,
     }
 
     impl State {
-        /// Re-reads the cache file if it changed and Harp's own sources (`limit_sources`), sets
-        /// Claude Code's status line on the first call, re-judges staleness for the current time and
-        /// registers any ring picture not yet in the asset cache. Returns whether the rings changed.
+        /// Re-reads the cache file if it changed and the app's own sources (`limit_sources`),
+        /// sets Claude Code's status line on the first call in Harp mode, re-judges staleness for
+        /// the current time and registers any ring picture not yet in the asset cache. Returns
+        /// whether the rings changed.
         pub fn refresh(&mut self, ctx: &mut AppContext) -> bool {
             let path = path(ctx);
             let modified = path
@@ -12177,21 +12158,39 @@ pub(in crate::workspace::view) mod limit_rings {
             let now = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0., |since| since.as_secs_f64());
-            if enabled(ctx) && !self.status_line_checked {
+            let state_dir = warp_core::paths::state_dir();
+            if !self.status_line_checked
+                && let Some(home) = dirs::home_dir()
+                && let Some(result) = check_status_line(
+                    crate::tab::harp_mode_enabled(ctx),
+                    enabled(ctx),
+                    &home,
+                    &state_dir,
+                )
+            {
                 self.status_line_checked = true;
-                if let Some(home) = dirs::home_dir() {
-                    limit_sources::ensure_claude_status_line(&home);
+                match result {
+                    Ok(limit_sources::StatusLineInstall::Installed) => log::info!(
+                        "Set Claude Code's status line so the limit rings can read Claude's limits"
+                    ),
+                    Ok(outcome) => log::debug!("Claude Code's status line left as is: {outcome:?}"),
+                    Err(error) => log::warn!(
+                        "Could not set Claude Code's status line in {}: {error}",
+                        home.join(".claude").display()
+                    ),
                 }
             }
-            // Harp's own readings first; an entry of the file under the same key replaces one.
-            let mut providers = match (enabled(ctx), dirs::home_dir()) {
-                (true, Some(home)) => limit_sources::providers(
-                    &home,
+            // The app's own readings first; an entry of the file under the same key replaces one.
+            // An empty (relative) state dir would read from the working directory, so it is skipped.
+            let mut providers = if enabled(ctx) {
+                limit_sources::providers(
+                    Some(state_dir.as_path()).filter(|dir| dir.is_absolute()),
                     codex_sessions_root().ok().as_deref(),
                     &mut self.sources,
                     now,
-                ),
-                _ => serde_json::Map::new(),
+                )
+            } else {
+                serde_json::Map::new()
             };
             if let Some(Value::Object(file)) = self
                 .json
@@ -12223,118 +12222,6 @@ pub(in crate::workspace::view) mod limit_rings {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        const NOW: f64 = 1_800_000_000.;
-
-        fn cache(claude: &str) -> String {
-            format!(
-                r#"{{"claude": {claude},
-                   "codex": {{"ok": true, "used5h": 90, "reset5h": {soon}, "usedWeek": 57.0, "resetWeek": {soon}, "_ts": {fresh}}},
-                   "other": {{"ok": true, "used5h": 10, "reset5h": {soon}, "usedWeek": 20, "resetWeek": {soon}, "_ts": {old}}}}}"#,
-                soon = NOW + 3600.,
-                fresh = NOW - 60.,
-                old = NOW - 16. * 60.,
-            )
-        }
-
-        #[test]
-        fn card_counts_between_known_numbers_and_snaps_to_a_dash() {
-            let json = cache(&format!(
-                r#"{{"ok": true, "used5h": 30, "reset5h": {soon}, "usedWeek": 6, "resetWeek": {past}, "_ts": {fresh}}}"#,
-                past = NOW - 1.,
-                soon = NOW + 3600.,
-                fresh = NOW - 60.,
-            ));
-            let rings = rings(&json, NOW).unwrap();
-            let (claude, codex) = (rings[0].card(), rings[1].card());
-            let half = claude.mix(&codex, 0.5);
-            // 5 hours: 30 % to Codex's hot 90 %.
-            assert_eq!(half.windows[0].percent, Some(60.));
-            assert!((half.windows[0].fill - 0.6).abs() < 1e-6);
-            assert_eq!(half.windows[0].hot, 0.5);
-            // Week: unknown to 57 %; the bar grows from empty, the dash gives way to the number.
-            assert_eq!(claude.windows[1].percent, None);
-            assert!((half.windows[1].fill - 0.285).abs() < 1e-6);
-            assert_eq!(claude.mix(&codex, 0.4).windows[1].percent, None);
-            assert_eq!(half.windows[1].percent, Some(57.));
-            assert_eq!(claude.mix(&codex, 1.), codex);
-        }
-
-        #[test]
-        fn passed_reset_makes_only_that_window_unknown() {
-            let json = cache(&format!(
-                r#"{{"ok": true, "tier": "max", "used5h": 23.0, "reset5h": {past}, "usedWeek": 6, "resetWeek": {soon}, "_ts": {fresh}}}"#,
-                past = NOW - 1.,
-                soon = NOW + 3600.,
-                fresh = NOW - 60.,
-            ));
-            let rings = rings(&json, NOW).unwrap();
-            assert_eq!(rings[0].five_hours, None);
-            assert_eq!(rings[0].week.map(|w| w.used), Some(6));
-            assert!(!rings[0].stale);
-            // Codex: 90 % in 5 hours is hot, not full.
-            assert!(rings[1].hot() && !rings[1].full());
-            // The third provider: read 16 minutes ago, so nothing is shown.
-            assert!(rings[2].stale && rings[2].five_hours.is_none() && rings[2].week.is_none());
-        }
-
-        #[test]
-        fn providers_come_from_the_file_in_key_order() {
-            let json = format!(
-                r#"{{"zeta": {{"ok": true, "name": "Zeta CLI", "used5h": 5, "reset5h": {soon}, "_ts": {now}}},
-                    "alpha": {{"ok": true, "used5h": 7, "reset5h": {soon}, "_ts": {now}}},
-                    "_version": 2}}"#,
-                soon = NOW + 3600.,
-                now = NOW,
-            );
-            let parsed = rings(&json, NOW).unwrap();
-            let names: Vec<&str> = parsed.iter().map(|ring| ring.name.as_str()).collect();
-            // A non-object value is not a provider; without a "name" the key is shown.
-            assert_eq!(names, ["alpha", "Zeta CLI"]);
-            assert_eq!(parsed[1].five_hours.map(|w| w.used), Some(5));
-            assert!(rings(r#"{}"#, NOW).unwrap().is_empty());
-            assert!(rings("[]", NOW).is_none());
-        }
-
-        /// The shape one real writer (a menu bar app) produces, values made up: metadata next
-        /// to the providers must not become rings, and the labels come from "name".
-        #[test]
-        fn a_real_writer_shape_keeps_labels_and_order() {
-            let json = format!(
-                r#"{{"_written": {now}, "_meta": {{"version": 3}}, "settings": {{"theme": "dark"}},
-                    "muse": {{"id": "muse", "name": "Muse", "ok": true, "used5h": 3, "reset5h": {soon}, "usedWeek": 9, "resetWeek": {soon}, "tier": null, "_ts": {now}}},
-                    "codex": {{"id": "codex", "name": "Codex", "ok": true, "used5h": 1.5, "reset5h": {soon}, "usedWeek": 2.0, "resetWeek": {soon}, "tier": "plus", "ageSec": 30, "stale": false, "_ts": {now}}},
-                    "claude": {{"id": "claude", "name": "Claude", "ok": true, "tier": "max", "used5h": 12.0, "reset5h": {soon}, "usedWeek": 40.0, "resetWeek": {soon}, "scoped": [], "_ts": {now}}}}}"#,
-                now = NOW,
-                soon = NOW + 3600.,
-            );
-            let parsed = rings(&json, NOW).unwrap();
-            let names: Vec<&str> = parsed.iter().map(|ring| ring.name.as_str()).collect();
-            assert_eq!(names, ["Claude", "Codex", "Muse"]);
-            assert!(parsed.iter().all(|ring| !ring.stale && ring.week.is_some()));
-            assert_eq!(parsed[0].tier.as_deref(), Some("max"));
-            assert_eq!(parsed[2].tier, None);
-        }
-
-        #[test]
-        fn not_ok_or_flagged_stale_shows_nothing() {
-            for claude in [
-                format!(
-                    r#"{{"ok": false, "used5h": 5, "reset5h": {}, "_ts": {}}}"#,
-                    NOW + 60.,
-                    NOW
-                ),
-                format!(
-                    r#"{{"ok": true, "stale": true, "used5h": 5, "reset5h": {}, "_ts": {}}}"#,
-                    NOW + 60.,
-                    NOW
-                ),
-            ] {
-                let rings = rings(&cache(&claude), NOW).unwrap();
-                assert!(rings[0].stale && rings[0].five_hours.is_none());
-            }
-        }
-    }
+    #[path = "limit_rings_tests.rs"]
+    mod tests;
 }
