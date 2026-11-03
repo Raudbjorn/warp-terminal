@@ -1014,6 +1014,56 @@ fn local_only_mode_still_allows_everything_else() {
 }
 
 #[test]
+fn local_only_mode_refuses_the_commands_that_manage_online_accounts() {
+    // `api-key` and `runner` talk to Warp's servers; they were once gated by their feature flags
+    // alone, which are not turned off by local-only mode.
+    for name in ["api-key", "runner"] {
+        assert!(
+            LOCAL_ONLY_DISABLED_SUBCOMMANDS.contains(&name),
+            "`{name}` is allowed in local-only mode"
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn every_subcommand_hidden_for_a_feature_flag_is_also_refused() {
+    // `--help` hides a subcommand whose flag is off; the pre-parse scan has to refuse it as well,
+    // or `warp <name> --help` still prints help for it. Subcommands hidden in the derive itself
+    // are not the flags' doing and are left out.
+    let hidden_by_derive: Vec<String> = real_command()
+        .get_subcommands()
+        .filter(|subcommand| subcommand.is_hide_set())
+        .map(|subcommand| subcommand.get_name().to_string())
+        .collect();
+    let refused = disabled_subcommands();
+
+    let command = Args::clap_command();
+    for subcommand in command.get_subcommands() {
+        let name = subcommand.get_name();
+        if subcommand.is_hide_set() && !hidden_by_derive.iter().any(|hidden| hidden == name) {
+            assert!(
+                refused.contains(&name),
+                "`{name}` is hidden from --help by a feature flag but not refused"
+            );
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn harness_support_is_refused_unless_its_flag_is_on() {
+    // It is hidden in the derive whatever the flag says, so the generic check above cannot see
+    // it; without the flag, `warp harness-support --help` would print help for a command the
+    // dispatcher then rejects.
+    assert!(!FeatureFlag::AgentHarness.is_enabled());
+    assert!(disabled_subcommands().contains(&"harness-support"));
+
+    let _enabled = FeatureFlag::AgentHarness.override_enabled(true);
+    assert!(!disabled_subcommands().contains(&"harness-support"));
+}
+
+#[test]
 fn local_only_disabled_subcommands_are_canonical_names_and_get_hidden() {
     // `Command::mut_subcommand` panics on an alias, so a name that is only an alias fails here
     // rather than at startup.

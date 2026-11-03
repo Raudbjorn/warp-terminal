@@ -7,14 +7,10 @@ use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-use ssh_test_server::LocalSshd;
+use ssh_test_server::{LocalSshd, SSH_COMMAND_TIMEOUT, output_within};
 
 fn ssh(server: &LocalSshd, remote_command: &str) -> Output {
-    Command::new("ssh")
-        .args(server.ssh_args())
-        .arg(remote_command)
-        .output()
-        .expect("ssh should run")
+    server.run_ssh(remote_command).expect("ssh should run")
 }
 
 #[test]
@@ -52,11 +48,9 @@ fn client_with_another_key_is_refused() {
     let mut args = server.ssh_args();
     let identity = args.iter().position(|arg| arg == "-i").unwrap() + 1;
     args[identity] = other_key.display().to_string();
-    let output = Command::new("ssh")
-        .args(args)
-        .arg("echo should not run")
-        .output()
-        .unwrap();
+    let mut command = Command::new("ssh");
+    command.args(args).arg("echo should not run");
+    let output = output_within(command, SSH_COMMAND_TIMEOUT).unwrap();
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);

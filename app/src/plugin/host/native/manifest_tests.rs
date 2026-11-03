@@ -104,3 +104,31 @@ fn engine_range_is_checked_against_the_api_version() {
             .is_err()
     );
 }
+
+#[test]
+fn contributed_keybindings_need_the_commands_permission() {
+    let keybindings =
+        r#""contributes": { "keybindings": [{ "command": "hello", "key": "ctrl-b g" }] }"#;
+    let manifest = |permissions: &str| {
+        let dir = plugin_dir(Some(&format!(
+            r#"{{ "permissions": {permissions}, {keybindings} }}"#
+        )));
+        Manifest::load(dir.path())
+    };
+
+    let granted = manifest(r#"["commands"]"#);
+    let [binding] = granted.permitted_keybindings() else {
+        panic!("one binding declared and permitted");
+    };
+    assert_eq!(
+        (binding.command.as_str(), binding.key.as_str()),
+        ("hello", "ctrl-b g")
+    );
+
+    // The same bindings without `commands`, with other permissions, and with no manifest at all.
+    for denied in [manifest("[]"), manifest(r#"["ui", "fs:read"]"#)] {
+        assert_eq!(denied.contributes.keybindings.len(), 1);
+        assert!(denied.permitted_keybindings().is_empty());
+    }
+    assert!(Manifest::default().permitted_keybindings().is_empty());
+}
