@@ -346,3 +346,18 @@ fn distinct_calls_with_one_description_still_count_separately() {
         }]
     );
 }
+
+/// A blank title written after a real one does not erase it.
+#[test]
+fn a_blank_title_does_not_replace_an_earlier_one() {
+    let jsonl = transcript(&[
+        &typed("2026-09-20T10:00:00Z", "build it"),
+        r#"{"type":"ai-title","aiTitle":"Wiring the ADRs"}"#,
+        r#"{"type":"ai-title","aiTitle":"   "}"#,
+    ]);
+
+    assert_eq!(
+        parse_transcript(&jsonl).title.as_deref(),
+        Some("Wiring the ADRs")
+    );
+}

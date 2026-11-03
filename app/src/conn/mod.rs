@@ -425,6 +425,11 @@ impl ConnModel {
 
         // The plugin only sends the path on `stop`, so it is kept once known.
         if let Some(path) = event.payload.transcript_path.as_deref() {
+            // A length remembered for another file says nothing about this one, and a new
+            // transcript that happens to be the same size would read as unchanged.
+            if session.transcript_path.as_deref() != Some(path) {
+                self.transcript_lengths.remove(&terminal_view_id);
+            }
             session.transcript_path = Some(path.to_owned());
         }
 
@@ -1065,9 +1070,11 @@ fn entry_kind(event: &CLIAgentEvent) -> Option<ConnEntryKind> {
             .as_deref()
             .map(str::trim)
             .filter(|query| !query.is_empty() && !is_harness_prompt(query))
-            .map(|query| ConnEntryKind::Prompt {
-                text: tidy_prompt(query),
-            }),
+            // A prompt that was only a pasted-content tag is empty once tidied, and an empty
+            // line in the spine is what the filter above is there to prevent.
+            .map(|query| tidy_prompt(query).trim().to_owned())
+            .filter(|text| !text.is_empty())
+            .map(|text| ConnEntryKind::Prompt { text }),
         CLIAgentEventType::PermissionRequest => Some(ConnEntryKind::PermissionRequested {
             summary: payload.summary.clone(),
             tool_name: payload.tool_name.clone(),

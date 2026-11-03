@@ -12,6 +12,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use ::conn::overview::{OverviewItem, ProjectGroup, group_by_project, project_label};
@@ -92,6 +93,9 @@ pub struct ConnPanelView {
     /// The plan path each pane is having looked at, so a model update does not start the same
     /// look again while it is still out.
     checking_plans: HashMap<EntityId, PathBuf>,
+    /// The plan path each pane last found it could not open, so the panel says so instead of
+    /// offering a link that does nothing. Cleared when the path becomes openable or changes.
+    unopenable_plans: HashMap<EntityId, PathBuf>,
     show_plan_link: MouseStateHandle,
     show_story_link: MouseStateHandle,
     open_in_pane_link: MouseStateHandle,
@@ -186,6 +190,7 @@ impl ConnPanelView {
             answer_link: HighlightedHyperlink::default(),
             plans: HashMap::new(),
             checking_plans: HashMap::new(),
+            unopenable_plans: HashMap::new(),
             show_plan_link: MouseStateHandle::default(),
             show_story_link: MouseStateHandle::default(),
             open_in_pane_link: MouseStateHandle::default(),
@@ -213,6 +218,8 @@ impl ConnPanelView {
     /// that are gone or no longer have one.
     fn sync_plans(&mut self, ctx: &mut ViewContext<Self>) {
         let model = ConnModel::as_ref(ctx);
+        self.unopenable_plans
+            .retain(|pane, _| model.session(*pane).is_some());
         let current: Vec<(EntityId, Option<PathBuf>)> = self
             .plans
             .keys()
@@ -358,6 +365,11 @@ impl ConnPanelView {
             .and_then(|story| story.plan_file.clone());
         if current.as_ref() != Some(&path) {
             return;
+        }
+        if openable {
+            self.unopenable_plans.remove(&pane);
+        } else {
+            self.unopenable_plans.insert(pane, path.clone());
         }
         match (openable, self.plans.get_mut(&pane)) {
             (true, Some(open)) => {
@@ -688,13 +700,29 @@ impl ConnPanelView {
                     ))
                     .finish(),
             );
-        } else if self.plan_file(app).is_some() {
-            column = column.with_child(self.render_link(
-                "Open plan",
-                &self.show_plan_link,
-                ConnPanelAction::ShowPlan,
-                app,
-            ));
+        } else if let Some(plan) = self.plan_file(app) {
+            let unopenable = self
+                .focused_terminal_id(app)
+                .and_then(|pane| self.unopenable_plans.get(&pane))
+                == Some(&plan);
+            if unopenable {
+                column = column.with_child(
+                    Text::new_inline(
+                        "The plan file can't be opened here",
+                        appearance.ui_font_family(),
+                        appearance.ui_font_size() - 1.,
+                    )
+                    .with_color(theme.nonactive_ui_text_color().into())
+                    .finish(),
+                );
+            } else {
+                column = column.with_child(self.render_link(
+                    "Open plan",
+                    &self.show_plan_link,
+                    ConnPanelAction::ShowPlan,
+                    app,
+                ));
+            }
         }
 
         Container::new(column.finish())
@@ -1416,13 +1444,50 @@ fn plan_is_openable_blocking(path: &Path) -> bool {
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_PLAN_BYTES)
 }
 
+/// How many plan probes may be running at once. Giving up on a probe does not stop its thread: one
+/// stuck on a dead mount stays stuck, so without a bound each retry would leave another thread
+/// behind in the blocking pool.
+const MAX_OUTSTANDING_PLAN_PROBES: usize = 4;
+
+/// Probes whose thread has not returned yet, whether or not anyone is still waiting on them.
+static OUTSTANDING_PLAN_PROBES: AtomicUsize = AtomicUsize::new(0);
+
+/// Holds one of the [`MAX_OUTSTANDING_PLAN_PROBES`] places until the probe's thread returns.
+struct ProbeSlot;
+
+impl ProbeSlot {
+    fn take() -> Option<Self> {
+        // Claim first and hand it back if that went over, rather than `fetch_update`, which the
+        // toolchain this builds with and the newer one it is developed on disagree about.
+        if OUTSTANDING_PLAN_PROBES.fetch_add(1, Ordering::AcqRel) < MAX_OUTSTANDING_PLAN_PROBES {
+            return Some(Self);
+        }
+        OUTSTANDING_PLAN_PROBES.fetch_sub(1, Ordering::AcqRel);
+        None
+    }
+}
+
+impl Drop for ProbeSlot {
+    fn drop(&mut self) {
+        OUTSTANDING_PLAN_PROBES.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// [`plan_is_openable_blocking`] on a thread of its own, given up on after
-/// [`PLAN_PROBE_TIMEOUT`]. A plan that cannot be looked at in time is not opened.
+/// [`PLAN_PROBE_TIMEOUT`]. A plan that cannot be looked at in time, or while
+/// [`MAX_OUTSTANDING_PLAN_PROBES`] earlier looks are still stuck, is not opened.
 async fn plan_is_openable(path: PathBuf) -> bool {
     if !plan_path_is_plausible(&path) {
         return false;
     }
-    let probe = tokio::task::spawn_blocking(move || plan_is_openable_blocking(&path));
+    let Some(slot) = ProbeSlot::take() else {
+        return false;
+    };
+    let probe = tokio::task::spawn_blocking(move || {
+        // The slot goes back when the thread does, not when the wait is given up on.
+        let _slot = slot;
+        plan_is_openable_blocking(&path)
+    });
     matches!(probe.with_timeout(PLAN_PROBE_TIMEOUT).await, Ok(Ok(true)))
 }
 

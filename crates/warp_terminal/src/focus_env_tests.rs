@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
 use warp_core::channel::ChannelState;
 
@@ -32,31 +32,34 @@ fn focus_env_vars_point_at_session_deeplink() {
 /// Launching Warp from inside a Claude Code session used to make every
 /// terminal in it a child of that session, which turns transcript saving off.
 /// The markers describe whatever started Warp, never the shells Warp starts.
+///
+/// Tested on names rather than on the process environment, which parallel tests share.
 #[test]
-fn launcher_agent_markers_are_dropped_but_user_config_is_kept() {
-    // SAFETY: this test owns the variables it sets and runs before any thread
-    // it spawns; nextest gives each test its own process.
-    unsafe {
-        std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
-        std::env::set_var("CLAUDECODE", "1");
+fn launcher_agent_markers_are_told_from_user_config() {
+    for marker in [
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
         // A launcher marker may arrive in a different case on a platform that folds it.
-        std::env::set_var("claude_pid", "123");
-        std::env::set_var("CLAUDE_CONFIG_DIR", "/somewhere/.claude");
-        std::env::set_var("CLAUDE_CODE_USE_BEDROCK", "1");
-        super::clear_launcher_agent_env();
+        "claude_pid",
+        "AI_AGENT",
+    ] {
+        assert!(
+            super::is_launcher_agent_marker(OsStr::new(marker)),
+            "{marker} is a marker"
+        );
     }
-
-    assert!(std::env::var_os("CLAUDE_CODE_CHILD_SESSION").is_none());
-    assert!(std::env::var_os("CLAUDECODE").is_none());
-    assert!(std::env::var_os("claude_pid").is_none());
-    assert_eq!(
-        std::env::var_os("CLAUDE_CONFIG_DIR"),
-        Some("/somewhere/.claude".into()),
-        "the user's own configuration is not a session marker"
-    );
-    assert_eq!(
-        std::env::var_os("CLAUDE_CODE_USE_BEDROCK"),
-        Some("1".into()),
-        "a CLAUDE_CODE_ variable is not a session marker unless it is one of the named ones"
-    );
+    for kept in [
+        // The user's own configuration is not a session marker.
+        "CLAUDE_CONFIG_DIR",
+        // A CLAUDE_CODE_ variable is not a marker unless it is one of the named ones.
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "PATH",
+    ] {
+        assert!(
+            !super::is_launcher_agent_marker(OsStr::new(kept)),
+            "{kept} is the user's"
+        );
+    }
 }

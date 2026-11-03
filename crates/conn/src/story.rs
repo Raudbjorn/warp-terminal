@@ -84,8 +84,9 @@ pub fn parse_transcript(jsonl: &str) -> ConnStory {
     let title = records
         .iter()
         .rev()
-        .find_map(|record| record.ai_title.clone())
-        .filter(|title| !title.trim().is_empty());
+        .filter_map(|record| record.ai_title.as_deref())
+        .find(|title| !title.trim().is_empty())
+        .map(str::to_owned);
 
     // Subagent records (`isSidechain`) are a different thread of work, and
     // `isMeta` records are injected by the harness. Neither is part of the

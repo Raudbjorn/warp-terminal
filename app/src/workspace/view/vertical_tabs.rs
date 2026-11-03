@@ -6991,7 +6991,14 @@ fn conn_session_story_lines(session: &ConnSession, is_running: bool) -> Option<C
         });
     }
     if let Some(turn) = session.story().and_then(ConnStory::latest_turn) {
-        return conn_story_lines(turn, is_running);
+        let mut lines = conn_story_lines(turn, is_running)?;
+        // A tool that finished after the story was read is a step the story does not hold, so
+        // its last one is no longer what the pane is doing. The row says nothing in that case,
+        // and the card follows it rather than naming a step the pane has moved past.
+        if is_running && conn_story_is_behind(session) {
+            lines.progress = None;
+        }
+        return Some(lines);
     }
     let prompt = conn_preview::head(session.prompts().last()?, DETAIL_SIDECAR_PROMPT_CHARS);
     if prompt.is_empty() {
@@ -7060,6 +7067,17 @@ fn render_conn_story_section(
 /// keeps a runaway description from being built at all.
 const ROW_STEP_CHARS: usize = 100;
 
+/// Whether the hooks have reported something the story has not caught up to: a new prompt, or a
+/// tool that finished since it was read. Either way the story's last step is out of date.
+fn conn_story_is_behind(session: &ConnSession) -> bool {
+    session.in_flight().iter().any(|entry| {
+        matches!(
+            entry.kind,
+            ConnEntryKind::Prompt { .. } | ConnEntryKind::ToolCompleted { .. }
+        )
+    })
+}
+
 /// What a pane is doing right this second, or `None` if it is not mid-turn.
 ///
 /// Whether a turn is running is the hooks' answer, not the story's. A turn's
@@ -7078,12 +7096,7 @@ fn conn_running_step(
         return None;
     }
     let session = session?;
-    if session.in_flight().iter().any(|entry| {
-        matches!(
-            entry.kind,
-            ConnEntryKind::Prompt { .. } | ConnEntryKind::ToolCompleted { .. }
-        )
-    }) {
+    if conn_story_is_behind(session) {
         return None;
     }
     let turn = session.story()?.latest_turn()?;

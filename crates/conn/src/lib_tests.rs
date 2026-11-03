@@ -772,3 +772,21 @@ fn the_cutoff_keeps_the_request_itself_in_flight() {
 
     assert_eq!(session.in_flight().len(), 1);
 }
+
+/// The hook truncates, so it can be shorter than the transcript's prompt. It is never longer, so a
+/// live prompt that only begins with an answered one's words is another instruction.
+#[test]
+fn a_longer_live_prompt_does_not_match_a_shorter_turn() {
+    let mut session = ConnSession::default();
+    session.push(prompt("yes please do the whole thing", 10));
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(10, Some(12), Some("Ok."), "yes")]),
+        at(13)
+    ));
+
+    assert_eq!(
+        session.in_flight().len(),
+        1,
+        "the live prompt is not the turn that only said yes"
+    );
+}

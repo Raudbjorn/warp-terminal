@@ -1561,6 +1561,33 @@ fn a_live_tool_completion_hides_the_stale_story_step() {
 }
 
 #[test]
+fn the_hover_card_hides_a_stale_step_as_the_row_does() {
+    let mut session = conn_session(conn_turn("elevate this repo", &["Read README"], None));
+    let running = conn_session_story_lines(&session, true).expect("the turn is told");
+    assert_eq!(
+        running.progress,
+        Some(("now", "Read README".to_owned())),
+        "with nothing newer the card names the step"
+    );
+
+    session.push(ConnEntry::new(
+        ConnEntryKind::ToolCompleted {
+            tool_name: Some("Bash".to_owned()),
+            target: None,
+            runs: 1,
+        },
+        Utc::now(),
+    ));
+
+    let behind = conn_session_story_lines(&session, true).expect("the prompt is still told");
+    assert_eq!(behind.prompt, "elevate this repo");
+    assert_eq!(
+        behind.progress, None,
+        "a tool finished after the story was read, so its last step is not what the pane is doing"
+    );
+}
+
+#[test]
 fn a_running_pane_says_what_it_is_doing() {
     let session = conn_session(conn_turn(
         "elevate this repo",

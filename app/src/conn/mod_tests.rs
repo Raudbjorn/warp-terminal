@@ -263,6 +263,22 @@ fn skips_blank_prompts() {
     });
 }
 
+/// A prompt that was only a pasted-content tag is empty once the tag is stripped, and an empty
+/// line in the spine is exactly what the blank-prompt filter is there to keep out.
+#[test]
+fn skips_prompts_that_are_empty_once_tidied() {
+    with_session(|app, view_id| {
+        send(app, view_id, prompt("<pasted_content id=\"0e44\">"));
+
+        let entries = ConnModel::handle(&*app).read(app, |me, _| {
+            me.session(view_id)
+                .map(|session| session.entries().len())
+                .unwrap_or(0)
+        });
+        assert_eq!(entries, 0);
+    });
+}
+
 fn stop(response: &str, transcript_path: Option<&str>) -> CLIAgentEvent {
     event(
         CLIAgentEventType::Stop,
@@ -952,19 +968,14 @@ fn the_first_read_to_land_does_not_clear_the_one_still_coming() {
         // Long enough for the immediate read to land, far short of the grace period.
         Timer::after(Duration::from_millis(300)).await;
 
-        let (adopted, in_flight) = ConnModel::handle(&app).read(&app, |me, _| {
-            (
-                me.session(view_id).is_some_and(|s| s.story().is_some()),
-                me.read_in_flight(view_id),
-            )
-        });
-        if adopted {
-            assert_eq!(
-                in_flight,
-                Some(delayed),
-                "the immediate read landed and the delayed one is still tracked"
-            );
-        }
+        // Whether or not the immediate read has landed by now, the one tracked is the read still
+        // to come, so this holds on a slow machine too and is not gated on how fast this one is.
+        let in_flight = ConnModel::handle(&app).read(&app, |me, _| me.read_in_flight(view_id));
+        assert_eq!(
+            in_flight,
+            Some(delayed),
+            "the delayed read is still tracked while the grace period runs"
+        );
         let awaiting =
             ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(delayed));
         awaiting.await;

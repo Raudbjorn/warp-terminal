@@ -485,10 +485,12 @@ fn arrived_with(prompt_at: DateTime<Utc>, turn_started_at: DateTime<Utc>) -> boo
     (prompt_at - turn_started_at).num_seconds() <= PROMPT_ARRIVAL_SLACK_SECONDS
 }
 
+/// Whether a hook's prompt is the transcript's. The hook truncates what it reports, so it may be a
+/// prefix of the transcript's, which has the whole instruction. The other way round it is not a
+/// match: a longer live prompt that merely begins with a short answered one is a different
+/// instruction.
 fn prompt_matches(hook: &str, transcript: &str) -> bool {
-    !hook.is_empty()
-        && !transcript.is_empty()
-        && (hook == transcript || transcript.starts_with(hook) || hook.starts_with(transcript))
+    !hook.is_empty() && !transcript.is_empty() && transcript.starts_with(hook)
 }
 
 #[cfg(test)]

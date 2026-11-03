@@ -5883,10 +5883,18 @@ impl Workspace {
 
     /// Shows the right panel content the focused terminal pane was last left with.
     fn restore_right_panel_for_focused_pane(&mut self, ctx: &mut ViewContext<Self>) {
-        let Some(wanted) = self
+        let remembered = self
             .focused_terminal_id(ctx)
-            .and_then(|pane| self.right_panel_by_pane.get(&pane).copied())
-        else {
+            .and_then(|pane| self.right_panel_by_pane.get(&pane).copied());
+        // A pane with nothing remembered, or no terminal pane focused at all, follows what its
+        // tab already has open. Without that, the window's own selector would close a Code
+        // Review that a restored or transferred tab arrived with.
+        let Some(wanted) = remembered.or_else(|| {
+            self.active_tab_pane_group()
+                .as_ref(ctx)
+                .right_panel_open
+                .then_some(Some(RightPanelContent::CodeReview))
+        }) else {
             return;
         };
         if wanted == self.right_panel_content {

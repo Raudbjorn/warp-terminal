@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
 use warp_core::channel::ChannelState;
 
@@ -45,19 +45,23 @@ const LAUNCHER_AGENT_ENV_VARS: &[&str] = &[
 pub unsafe fn clear_launcher_agent_env() {
     let doomed: Vec<OsString> = std::env::vars_os()
         .map(|(name, _)| name)
-        .filter(|name| {
-            let Some(name) = name.to_str() else {
-                return false;
-            };
-            LAUNCHER_AGENT_ENV_VARS
-                .iter()
-                .any(|marker| name.eq_ignore_ascii_case(marker))
-        })
+        .filter(|name| is_launcher_agent_marker(name))
         .collect();
     for name in doomed {
         // SAFETY: the caller promises this runs before any other thread exists.
         unsafe { std::env::remove_var(name) };
     }
+}
+
+/// Whether an environment variable's name is one of the launching agent session's markers. A
+/// platform that folds the case of names may deliver one in either, so case is not compared.
+fn is_launcher_agent_marker(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    LAUNCHER_AGENT_ENV_VARS
+        .iter()
+        .any(|marker| name.eq_ignore_ascii_case(marker))
 }
 
 pub fn add_session_focus_env_vars(env_vars: &mut HashMap<OsString, OsString>, session_uuid: &[u8]) {
