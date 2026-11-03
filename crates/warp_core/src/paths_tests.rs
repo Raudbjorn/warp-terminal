@@ -221,3 +221,73 @@ fn test_project_path_for_oss_app_id() {
         }
     }
 }
+
+/// A fresh directory under the system temp dir, removed on drop. (`tempfile` is only a macOS
+/// dependency of this crate, so the Linux-only tests below use this instead.)
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+struct ScratchDir(PathBuf);
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl ScratchDir {
+    fn new(name: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("warp-paths-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create scratch dir");
+        Self(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+// `WARP_RESOURCES_DIR` lets a dev build (`./script/run` does not stage `resources/`) point at the
+// checkout's `resources/`; only an existing directory counts, so a stale value falls back to the
+// directory next to the executable.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[test]
+fn resources_dir_override_accepts_only_an_existing_dir() {
+    let dir = ScratchDir::new("override");
+    let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize temp dir");
+
+    assert_eq!(
+        resources_dir_override(Some(dir.path().as_os_str().to_owned())),
+        Some(canonical)
+    );
+    assert_eq!(resources_dir_override(None), None);
+    assert_eq!(
+        resources_dir_override(Some(std::ffi::OsString::new())),
+        None
+    );
+    assert_eq!(
+        resources_dir_override(Some(dir.path().join("missing").into_os_string())),
+        None
+    );
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, b"").expect("write temp file");
+    assert_eq!(resources_dir_override(Some(file.into_os_string())), None);
+}
+
+// The env var wins over the directory next to the executable. This is the only test that mutates
+// the process env, and nextest (the repo's runner) gives each test its own process.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+#[test]
+fn bundled_resources_dir_prefers_the_env_override() {
+    let dir = ScratchDir::new("env");
+    // SAFETY: no other thread in this test process reads or writes the environment.
+    unsafe { std::env::set_var(RESOURCES_DIR_ENV, dir.path()) };
+
+    assert_eq!(
+        bundled_resources_dir(),
+        Some(std::fs::canonicalize(dir.path()).expect("canonicalize temp dir"))
+    );
+    // SAFETY: as above; leaves no override behind for later code in this process.
+    unsafe { std::env::remove_var(RESOURCES_DIR_ENV) };
+}

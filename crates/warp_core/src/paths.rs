@@ -424,6 +424,23 @@ pub fn app_group_container_path() -> Option<PathBuf> {
     LazyLock::force(&CONTAINER_PATH).clone()
 }
 
+/// Env var that overrides [`bundled_resources_dir`] on Linux and FreeBSD.
+///
+/// Packaged builds stage `resources/` next to the executable, but a dev build run from the target
+/// dir (e.g. `./script/run`) does not, so bundled resources such as Harp mode's Claude Code plugin
+/// are missing. Pointing this at the checkout's `resources/` makes them available. Ignored unless
+/// it names an existing directory, so a stale value falls back to the normal location.
+pub const RESOURCES_DIR_ENV: &str = "WARP_RESOURCES_DIR";
+
+/// The [`RESOURCES_DIR_ENV`] override, canonicalized: `None` when unset, empty, or not an existing
+/// directory. Canonicalized so callers that hand the path to child processes (with their own
+/// cwd) always get an absolute path.
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+fn resources_dir_override(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let value = value.filter(|value| !value.is_empty())?;
+    std::fs::canonicalize(value).ok().filter(|dir| dir.is_dir())
+}
+
 /// Returns the path to resources included in the Warp distribution.
 ///
 /// Unlike [`warpui_core::AssetProvider`] assets, which are generally embedded in the binary, these are
@@ -439,6 +456,8 @@ pub fn app_group_container_path() -> Option<PathBuf> {
 /// ## Linux
 /// The resources directory is `$INSTALL_DIR/resources`, where `$INSTALL_DIR` depends on the
 /// specific package manager. For example, on Ubuntu this might be `/opt/warpdotdev/warp-terminal/resources`.
+/// [`RESOURCES_DIR_ENV`] (`WARP_RESOURCES_DIR`), when it names an existing directory, takes
+/// precedence (Linux and FreeBSD only).
 ///
 /// ## Windows
 /// The resources directory is `$INSTALL_DIR/resources`, where `$INSTALL_DIR` is the directory
@@ -461,10 +480,12 @@ pub fn bundled_resources_dir() -> Option<PathBuf> {
                     .map(|bundle_path| PathBuf::from(bundle_path).join("Contents").join("Resources"))
             }
         } else if #[cfg(any(target_os = "linux", target_os = "freebsd"))] {
-            std::env::current_exe()
-                .ok()
-                .and_then(|executable| std::fs::canonicalize(executable).ok())
-                .and_then(|executable| executable.parent().map(|parent| parent.join("resources")))
+            resources_dir_override(std::env::var_os(RESOURCES_DIR_ENV)).or_else(|| {
+                std::env::current_exe()
+                    .ok()
+                    .and_then(|executable| std::fs::canonicalize(executable).ok())
+                    .and_then(|executable| executable.parent().map(|parent| parent.join("resources")))
+            })
         } else if #[cfg(target_os = "windows")] {
             std::env::current_exe()
                 .ok()
