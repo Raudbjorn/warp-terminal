@@ -2382,9 +2382,12 @@ impl EventMapper {
             }
         };
         if self.open_reasoning.is_some() {
+            // The payload now sits on this message, so a later replay item
+            // needs a carrier of its own instead of overwriting it.
+            self.last_reasoning_message_id = None;
             return self.close_reasoning(Some(payload)).into_iter().collect();
         }
-        if let Some(message_id) = self.last_reasoning_message_id.clone() {
+        if let Some(message_id) = self.last_reasoning_message_id.take() {
             self.streaming_message_id = None;
             return vec![client_actions(vec![
                 api::client_action::Action::UpdateTaskMessage(
