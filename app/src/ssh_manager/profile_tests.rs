@@ -26,6 +26,10 @@ fn proxy_command_value(command: &str) -> String {
 }
 
 /// Applies the OpenSSH `%` expansion that runs before the ProxyCommand value reaches `/bin/sh -c`.
+///
+/// `%h` and `%p` are the tokens a hop's `ssh` replaces with its effective (alias-resolved) host and
+/// port. They are rendered as `<host>`/`<port>` placeholders so tests can assert that the chain
+/// forwards to the next hop's resolved endpoint; every other token is a bug.
 fn expand_openssh_percent(value: &str) -> String {
     let mut expanded = String::new();
     let mut chars = value.chars();
@@ -36,6 +40,8 @@ fn expand_openssh_percent(value: &str) -> String {
         }
         match chars.next() {
             Some('%') => expanded.push('%'),
+            Some('h') => expanded.push_str("<host>"),
+            Some('p') => expanded.push_str("<port>"),
             Some(token) => panic!("unescaped OpenSSH token %{token} in {value}"),
             None => panic!("dangling % in {value}"),
         }
@@ -121,7 +127,11 @@ fn ssh_profile_command_renders_proxy_chain_when_a_jump_host_has_identity_file() 
     assert!(proxy_command.starts_with("ProxyCommand=ssh "));
     assert!(proxy_command.contains("-i ~/.ssh/edge"));
     assert!(proxy_command.contains("-p 2200"));
-    assert!(proxy_command.contains("-W inner.example.com:2222"));
+    // The intermediate hop forwards to the next hop's effective endpoint, resolved by that hop's
+    // own SSH process (`-p 2222` below), not to a stored literal that could ignore an alias's
+    // `HostName`/`Port`. The `%` is doubled because this runs inside a nested ProxyCommand.
+    assert!(proxy_command.contains("[%%h]:%%p"));
+    assert!(!proxy_command.contains("-W inner.example.com:2222"));
     assert!(proxy_command.contains("-- edge@edge.example.com"));
     assert!(proxy_command.contains("-p 2222"));
     assert!(proxy_command.contains("-W 10.0.0.5:22"));
@@ -334,7 +344,9 @@ fn nested_proxy_command_escapes_percent_tokens_for_each_expansion() {
             "-i",
             "/keys/id_%d",
             "-W",
-            "inner.example.com:22",
+            // Forwards to the next hop's effective endpoint, resolved by that hop's own ssh, so an
+            // alias's `HostName`/`Port` is honoured; previously a stored literal was used.
+            "[<host>]:<port>",
             "--",
             "edge.example.com",
         ]
@@ -371,7 +383,9 @@ fn proxy_command_brackets_ipv6_destinations() {
 
     assert_eq!(
         inner_argv,
-        vec!["ssh", "-i", "/k", "-W", "[2001:db8::5]:2200", "--", "::1"]
+        // The next hop's endpoint is resolved by its own ssh (`%h`/`%p`), which also brackets an
+        // IPv6 host through the `[%h]:%p` form, instead of a stored `[2001:db8::5]:2200`.
+        vec!["ssh", "-i", "/k", "-W", "[<host>]:<port>", "--", "::1"]
     );
     assert!(
         shell_words::split(&expand_openssh_percent(&outer))
@@ -633,12 +647,35 @@ fn a_renamed_quick_connect_alias_still_connects_to_the_requested_host() {
     assert_eq!(profile.user.as_deref(), Some("alice"));
     assert_eq!(profile.port, 2222);
     assert!(profile.port_is_explicit);
-    // OpenSSH resolves the alias through the `HostName` directive the profile writes.
+    // OpenSSH resolves the alias through the `HostName` directive the profile writes. The saved
+    // command targets the alias, prefixed by the user because this profile has one
+    // (`ssh_target` emits `user@alias`), so the expected target is `alice@db.example.com-2`.
     assert!(
         profile
             .to_saved_ssh_command()
-            .contains("-- db.example.com-2")
+            .contains("-- alice@db.example.com-2")
     );
+}
+
+#[test]
+fn a_renamed_quick_connect_alias_inherits_the_existing_aliases_endpoint() {
+    let destination = QuickConnectDestination::parse("bob@work").unwrap();
+    let mut alias = SshHostProfile::new("work".into(), "work.internal".into());
+    alias.host_is_explicit = true;
+    alias.port = 2222;
+    alias.port_is_explicit = true;
+    alias.identity_file = Some("~/.ssh/work".into());
+
+    let profile = profile_for_destination(&destination, &[alias]);
+
+    // `ssh bob@work` resolves through the `work` stanza, so the renamed copy must reach
+    // `work.internal:2222` with the same key, not the literal DNS name `work`.
+    assert_eq!(profile.name, "work-2");
+    assert_eq!(profile.host, "work.internal");
+    assert!(profile.host_is_explicit);
+    assert_eq!(profile.user.as_deref(), Some("bob"));
+    assert_eq!((profile.port, profile.port_is_explicit), (2222, true));
+    assert_eq!(profile.identity_file.as_deref(), Some("~/.ssh/work"));
 }
 
 #[test]
