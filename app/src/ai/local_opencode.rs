@@ -78,6 +78,10 @@ const SERVER_USERNAME_ENV: &str = "OPENCODE_SERVER_USERNAME";
 const SERVER_PASSWORD_ENVS: [&str; 2] = ["OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD"];
 const SERVER_USERNAME: &str = "opencode";
 
+/// A password no sidecar was given. `verify_sidecar` sends it before the real one, to find out
+/// whether the listener checks the password at all.
+const WRONG_PASSWORD_PROBE: &str = "not-the-password-of-this-sidecar";
+
 /// Longest slice of an unparseable error body we echo into an error message.
 const ERROR_BODY_PREVIEW_CHARS: usize = 200;
 
@@ -112,11 +116,20 @@ pub enum OpenCodeError {
 /// Hosts an announcement may name. `spawn` always connects to `127.0.0.1`
 /// whatever host the sidecar prints, so the host only has to say that the
 /// listener is on this machine: a line about some other address is not ours.
-const ANNOUNCED_HOSTS: [&str; 5] = ["127.0.0.1", "localhost", "[::1]", "0.0.0.0", "[::]"];
+///
+/// `[::1]` is left out on purpose. A listener that is only on the IPv6 loopback does not
+/// answer on `127.0.0.1`, so accepting its announcement would just fail the verification of
+/// an address the sidecar never claimed.
+const ANNOUNCED_HOSTS: [&str; 4] = ["127.0.0.1", "localhost", "0.0.0.0", "[::]"];
 
 /// Text that precedes the address in OpenCode's own startup line,
 /// `server listening on http://127.0.0.1:43123`.
 const LISTENING_MARKER: &str = "listening on ";
+
+/// The word that has to come right before [`LISTENING_MARKER`] unless the marker starts the
+/// line. OpenCode prints `opencode server listening on <url>`, and a log prefix such as a level
+/// or a timestamp may come before that.
+const LISTENING_SUBJECT: &str = "server";
 
 /// The port a sidecar announced on stdout.
 ///
@@ -160,13 +173,26 @@ fn port_from_json(line: &str) -> Option<u16> {
         .find_map(|key| port_from_url(object.get(key)?.as_str()?))
 }
 
+/// The port of OpenCode's `server listening on <url>` line. The marker only counts when it starts
+/// the line or follows the word `server`, so `not listening on http://127.0.0.1:43123` is some
+/// other process's log line and not an announcement.
 fn port_from_listening_line(line: &str) -> Option<u16> {
-    // ASCII lowercasing keeps byte offsets, so the match position indexes `line`.
-    let marker_at = line.to_ascii_lowercase().find(LISTENING_MARKER)?;
-    let url = line[marker_at + LISTENING_MARKER.len()..]
-        .split_whitespace()
-        .next()?;
-    port_from_url(url)
+    // ASCII lowercasing keeps byte offsets, so a match position indexes `line`.
+    let lowered = line.to_ascii_lowercase();
+    lowered
+        .match_indices(LISTENING_MARKER)
+        .filter(|(marker_at, _)| {
+            lowered[..*marker_at]
+                .split_whitespace()
+                .next_back()
+                .is_none_or(|word| word == LISTENING_SUBJECT)
+        })
+        .find_map(|(marker_at, _)| {
+            let url = line[marker_at + LISTENING_MARKER.len()..]
+                .split_whitespace()
+                .next()?;
+            port_from_url(url)
+        })
 }
 
 /// Port of an `http(s)` URL whose host is one of `ANNOUNCED_HOSTS`.
@@ -314,9 +340,16 @@ pub async fn spawn(
     // The announcement is text from a process we do not control. Before any
     // prompt is sent anywhere, check that the port answers to the password
     // only this sidecar was given.
+    //
+    // The probe goes straight to loopback: through an ambient `HTTP_PROXY` it would either fail a
+    // healthy sidecar or hand the proxy the Basic-auth password.
     let verified = tokio::time::timeout(
         VERIFY_TIMEOUT,
-        verify_sidecar(&http_client::Client::new_external(), &base_url, &password),
+        verify_sidecar(
+            &http_client::Client::new_external_without_proxy(),
+            &base_url,
+            &password,
+        ),
     )
     .await
     .unwrap_or_else(|_elapsed| Err(format!("no answer within {VERIFY_TIMEOUT:?}")));
@@ -342,10 +375,12 @@ pub async fn spawn(
 }
 
 /// Check that `base_url` is the sidecar that was just spawned: it must reject
-/// unauthenticated requests, accept the Basic-auth password generated for it,
-/// and answer with an OpenCode session list. A stray listener on a misread
-/// port cannot satisfy all three checks. Only a refused connection is retried,
-/// since that is what a sidecar that is not yet accepting looks like.
+/// unauthenticated requests and a wrong password, accept the Basic-auth password
+/// generated for it, and answer with an OpenCode session list. A stray listener on
+/// a misread port cannot satisfy all of these. The generated password is sent only
+/// after the listener has refused both, so a listener that accepts any credential
+/// never sees it. Only a refused connection is retried, since that is what a
+/// sidecar that is not yet accepting looks like.
 async fn verify_sidecar(
     client: &http_client::Client,
     base_url: &str,
@@ -354,31 +389,35 @@ async fn verify_sidecar(
     let mut last_error = String::new();
     // `limit=1` keeps the reply small for a project with many sessions.
     let endpoint = format!("{base_url}/api/session?limit=1");
-    for attempt in 0..VERIFY_ATTEMPTS {
+    'attempts: for attempt in 0..VERIFY_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(VERIFY_RETRY_DELAY).await;
         }
-        let probe = client.get(&endpoint).timeout(VERIFY_REQUEST_TIMEOUT);
-        match probe.send().await {
-            Ok(response) if response.status().is_success() => {
-                return Err(
-                    "/api/session accepted an unauthenticated request; the endpoint does not enforce the password"
-                        .to_string(),
-                );
+        for (credentials, what) in [
+            (None, "an unauthenticated request"),
+            (Some(WRONG_PASSWORD_PROBE), "a wrong password"),
+        ] {
+            let mut probe = client.get(&endpoint).timeout(VERIFY_REQUEST_TIMEOUT);
+            if let Some(wrong_password) = credentials {
+                probe = probe.basic_auth(SERVER_USERNAME, Some(wrong_password));
             }
-            Ok(response)
-                if response.status() != http_client::StatusCode::UNAUTHORIZED
-                    && response.status() != http_client::StatusCode::FORBIDDEN =>
-            {
-                return Err(format!(
-                    "{} from unauthenticated /api/session",
-                    response.status()
-                ));
-            }
-            Ok(_) => {}
-            Err(err) => {
-                last_error = err.to_string();
-                continue;
+            match probe.send().await {
+                Ok(response) if response.status().is_success() => {
+                    return Err(format!(
+                        "/api/session accepted {what}; the endpoint does not enforce the password"
+                    ));
+                }
+                Ok(response)
+                    if response.status() != http_client::StatusCode::UNAUTHORIZED
+                        && response.status() != http_client::StatusCode::FORBIDDEN =>
+                {
+                    return Err(format!("{} from /api/session for {what}", response.status()));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    last_error = err.to_string();
+                    continue 'attempts;
+                }
             }
         }
 
@@ -883,18 +922,43 @@ mod tests {
     }
 
     #[test]
+    fn listening_marker_only_counts_in_the_announcement_form() {
+        // Text before the marker that is not the word `server` makes it some other line.
+        for line in [
+            "not listening on http://127.0.0.1:43123",
+            "proxy listening on http://127.0.0.1:43123",
+            "observer listening on http://127.0.0.1:43123",
+            "INFO not listening on http://127.0.0.1:43123",
+            "server not listening on http://127.0.0.1:43123",
+        ] {
+            assert_eq!(announced_port(line), None, "{line:?}");
+        }
+        for line in [
+            "listening on http://127.0.0.1:43123",
+            "server listening on http://127.0.0.1:43123",
+            "Opencode Server Listening On http://127.0.0.1:43123",
+            "2026-11-03T04:04:00 INFO server listening on http://127.0.0.1:43123",
+        ] {
+            assert_eq!(announced_port(line), Some(43123), "{line:?}");
+        }
+    }
+
+    #[test]
     fn announcement_must_name_this_machine() {
         for line in [
             "server listening on http://example.com:8080",
             "server listening on http://10.0.0.5:4096",
             "server listening on ftp://127.0.0.1:4096",
             "server listening on",
+            // `spawn` connects to 127.0.0.1, which a listener on the IPv6 loopback alone
+            // does not answer on.
+            "server listening on http://[::1]:4096",
+            r#"{"url":"http://[::1]:4096"}"#,
             r#"{"url":"http://example.com:8080"}"#,
         ] {
             assert_eq!(announced_port(line), None, "{line:?}");
         }
         for (line, port) in [
-            ("server listening on http://[::1]:4096", 4096),
             (
                 "INFO server listening on http://127.0.0.1:4096/ (pid 7)",
                 4096,
@@ -1339,6 +1403,8 @@ mod tests {
         port: u16,
         generate_started: Arc<tokio::sync::Notify>,
         deletes: Arc<std::sync::atomic::AtomicUsize>,
+        /// The Basic credentials (base64, as sent) of every `GET /api/session`, in order.
+        credentials_seen: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     /// How the raw server answers `GET /api/session`, which `spawn` uses to
@@ -1352,6 +1418,8 @@ mod tests {
         Unauthorized,
         /// A listener that ignores authentication and returns a valid session list.
         IgnoresAuth,
+        /// A listener that wants some Basic credential but accepts any password.
+        AcceptsAnyPassword,
         /// A server that requires authentication but answers with a malformed session list.
         InvalidSessionList,
         /// A web server that answers every path with 200 and an HTML page.
@@ -1363,6 +1431,28 @@ mod tests {
         hang_on_generate: bool,
         failing_deletes: usize,
         probe: ProbeReply,
+    }
+
+    /// The base64 `user:password` of a request's `Authorization: Basic` header, if it has one.
+    fn basic_credentials(request: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if !name.eq_ignore_ascii_case("authorization") {
+                return None;
+            }
+            let value = value.trim();
+            let (scheme, credentials) = value.split_once(' ')?;
+            scheme
+                .eq_ignore_ascii_case("basic")
+                .then(|| credentials.to_string())
+        })
+    }
+
+    /// `basic_credentials` of the request `verify_sidecar` sends with a wrong password.
+    fn wrong_password_credentials() -> String {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{SERVER_USERNAME}:{WRONG_PASSWORD_PROBE}"))
     }
 
     async fn raw_server(options: RawOptions) -> RawServer {
@@ -1384,9 +1474,11 @@ mod tests {
             port: local_addr.port(),
             generate_started: Arc::default(),
             deletes: Arc::default(),
+            credentials_seen: Arc::default(),
         };
         let started = Arc::clone(&server.generate_started);
         let deletes = Arc::clone(&server.deletes);
+        let credentials_seen = Arc::clone(&server.credentials_seen);
         tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -1394,6 +1486,7 @@ mod tests {
                 };
                 let started = Arc::clone(&started);
                 let deletes = Arc::clone(&deletes);
+                let credentials_seen = Arc::clone(&credentials_seen);
                 tokio::spawn(async move {
                     // Read the headers, then the body they announce, so closing
                     // the socket never resets a request that is still arriving.
@@ -1432,13 +1525,27 @@ mod tests {
                         }
                         (200, r#"{"data":{"text":"ls"}}"#)
                     } else if request_line.starts_with("GET /api/session") {
-                        let authorized = text.to_lowercase().contains("\r\nauthorization: basic ");
+                        let credentials = basic_credentials(&text);
+                        if let Some(credentials) = &credentials {
+                            credentials_seen.lock().unwrap().push(credentials.clone());
+                        }
+                        // The password `spawn` generated is not known here, but the one it
+                        // probes with first is: refuse that one, accept any other.
+                        let authorized = credentials
+                            .as_ref()
+                            .is_some_and(|sent| *sent != wrong_password_credentials());
                         match probe {
                             ProbeReply::Sidecar if authorized => (200, r#"{"data":[]}"#),
                             ProbeReply::Sidecar | ProbeReply::Unauthorized => {
                                 (401, r#"{"message":"Authentication required"}"#)
                             }
                             ProbeReply::IgnoresAuth => (200, r#"{"data":[]}"#),
+                            ProbeReply::AcceptsAnyPassword if credentials.is_some() => {
+                                (200, r#"{"data":[]}"#)
+                            }
+                            ProbeReply::AcceptsAnyPassword => {
+                                (401, r#"{"message":"Authentication required"}"#)
+                            }
                             ProbeReply::InvalidSessionList if authorized => {
                                 (200, "<!doctype html><html></html>")
                             }
@@ -1617,19 +1724,65 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn listener_that_accepts_any_password_never_sees_the_generated_one() {
+        let server = raw_server(RawOptions {
+            probe: ProbeReply::AcceptsAnyPassword,
+            ..Default::default()
+        })
+        .await;
+        let args = announce_then_sleep(server.port, "");
+
+        let Err(err) = spawn("sh", &args, &std::env::temp_dir()).await else {
+            panic!("a listener that accepts any password must be refused");
+        };
+
+        assert!(
+            matches!(
+                &err,
+                OpenCodeError::PortNotVerified { port, reason }
+                    if *port == server.port && reason.contains("accepted a wrong password")
+            ),
+            "{err:?}"
+        );
+        // Every credential it was sent was the throwaway one.
+        let seen = server.credentials_seen.lock().unwrap();
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|sent| *sent == wrong_password_credentials()),
+            "the generated password reached the listener: {seen:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listening_line_of_another_process_before_the_announcement_is_ignored() {
+        let server = raw_server(RawOptions::default()).await;
+        // A port nothing answers on, named by a line that is not the sidecar's announcement.
+        let args = announce_then_sleep(
+            server.port,
+            "echo 'not listening on http://127.0.0.1:1';",
+        );
+
+        let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
+
+        assert_eq!(sidecar.inner.base_url, server.url);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn sidecar_that_starts_listening_late_is_still_accepted() {
-        // Announce a port nothing serves yet, and start serving half a second later.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // Announce a port nothing serves yet, and start serving half a second later. The socket
+        // is bound but not listening, so the port stays ours in between and connections to it
+        // are refused (which is what the retry in `verify_sidecar` is for) until `listen`.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
         let args = announce_then_sleep(port, "");
 
         let dir = std::env::temp_dir();
         let (spawned, ()) = tokio::join!(spawn("sh", &args, &dir), async {
             tokio::time::sleep(Duration::from_millis(500)).await;
-            let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
-                .await
-                .unwrap();
+            let listener = socket.listen(1024).unwrap();
             raw_server_on(listener, RawOptions::default());
         });
 
