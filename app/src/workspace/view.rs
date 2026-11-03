@@ -23756,10 +23756,6 @@ impl Workspace {
             context.set.insert(flags::CLOUD_CONVERSATION_STORAGE_FLAG);
         }
 
-        if privacy_settings.is_crash_reporting_enabled {
-            context.set.insert(flags::CRASH_REPORTING_FLAG);
-        }
-
         if editor_settings.cursor_blink.value() == &CursorBlink::Enabled {
             context.set.insert(flags::CURSOR_BLINK_CONTEXT_FLAG);
         }
