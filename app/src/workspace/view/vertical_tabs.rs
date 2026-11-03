@@ -9358,63 +9358,8 @@ pub(in crate::workspace::view) mod morph {
     }
 
     #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        const HALF: Duration = Duration::from_millis(110);
-
-        #[test]
-        fn first_value_rises_in_and_hiding_forgets_it() {
-            let morph = Morph::<f32>::default();
-            let now = Instant::now();
-            morph.sync_at(Some(40.), now);
-            let (frame, animating) = morph.frame_at(now).unwrap();
-            assert_eq!((frame.from, frame.to, frame.t), (40., 40., 1.));
-            assert_eq!((frame.appear, frame.count), (0., 0.));
-            assert!(animating);
-            let (frame, animating) = morph.frame_at(now + COUNT_UP).unwrap();
-            assert_eq!((frame.appear, frame.count), (1., 1.));
-            assert!(!animating);
-            morph.sync_at(None, now + COUNT_UP);
-            assert!(morph.frame_at(now + COUNT_UP).is_none());
-            morph.sync_at(Some(90.), now + COUNT_UP);
-            let (frame, animating) = morph.frame_at(now + COUNT_UP).unwrap();
-            assert_eq!((frame.to, frame.appear), (90., 0.));
-            assert!(animating);
-        }
-
-        #[test]
-        fn change_eases_from_old_to_new_value() {
-            let morph = Morph::<f32>::default();
-            let now = Instant::now();
-            morph.sync_at(Some(20.), now);
-            morph.sync_at(Some(80.), now);
-            let shown = |at| {
-                let (frame, _) = morph.frame_at(at).unwrap();
-                frame.from.mix(&frame.to, frame.t)
-            };
-            assert_eq!(shown(now), 20.);
-            // Eased out: past the linear midpoint halfway through.
-            let half = shown(now + HALF);
-            assert!(half > 50. && half < 80., "{half}");
-            assert_eq!(shown(now + MORPH), 80.);
-            assert!(!morph.frame_at(now + COUNT_UP).unwrap().1);
-        }
-
-        #[test]
-        fn turning_mid_morph_starts_from_what_is_shown() {
-            let morph = Morph::<f32>::default();
-            let now = Instant::now();
-            morph.sync_at(Some(0.), now);
-            morph.sync_at(Some(100.), now);
-            let (frame, _) = morph.frame_at(now + HALF).unwrap();
-            let on_screen = frame.from.mix(&frame.to, frame.t);
-            morph.sync_at(Some(10.), now + HALF);
-            let (frame, animating) = morph.frame_at(now + HALF).unwrap();
-            assert_eq!((frame.from, frame.to, frame.t), (on_screen, 10., 0.));
-            assert!(animating);
-        }
-    }
+    #[path = "morph_tests.rs"]
+    mod tests;
 }
 
 /// The framed sidebar's look: rows, section headers, the footer, the header
@@ -10903,45 +10848,8 @@ pub(super) mod sidebar {
         }
 
         #[cfg(test)]
-        mod tests {
-            use super::*;
-
-            /// Named row 232 wide, bare 96 (two rings): the names stay at a 272 sidebar (inner
-            /// 232), the bare rings below it, the last row when nothing fits.
-            #[test]
-            fn footer_fit_keeps_the_first_row_that_fits() {
-                let rows = [232., 96.];
-                assert_eq!(choose(rows, 340.), 0);
-                assert_eq!(choose(rows, 232.), 0);
-                assert_eq!(choose(rows, 160.), 1);
-                assert_eq!(choose(rows, 50.), 1);
-            }
-
-            /// Flicker at the edge: a row exactly as wide as the room fits, every time.
-            #[test]
-            fn footer_fit_a_row_as_wide_as_the_room_fits() {
-                assert_eq!(choose([232., 96.], 232.), 0);
-                assert_eq!(choose([232., 96.], 232.), 0);
-                assert_eq!(choose([232.5, 96.], 232.), 1);
-            }
-
-            /// Lazy: a row after the first fit is never laid out.
-            #[test]
-            fn footer_fit_stops_at_the_first_fit() {
-                let mut asked = 0;
-                let widths = [100., 90.].into_iter().inspect(|_| asked += 1);
-                assert_eq!(choose(widths, 150.), 0);
-                assert_eq!(asked, 1);
-            }
-
-            /// The sidebar widening: whatever the child measures, the footer reports at most the
-            /// max width it got (its height stays).
-            #[test]
-            fn footer_fit_never_reports_wider_than_it_was_given() {
-                assert_eq!(reported(vec2f(328., 20.), 232.), vec2f(232., 20.));
-                assert_eq!(reported(vec2f(96., 20.), 160.), vec2f(96., 20.));
-            }
-        }
+        #[path = "footer_fit_tests.rs"]
+        mod tests;
     }
 
     /// How far the limit card rises while it fades in when it turns up.
