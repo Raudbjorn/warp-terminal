@@ -457,6 +457,7 @@ impl TabData {
             self.pin_menu_items(index),
             self.tab_group_menu_items(index, tab_groups, is_only_member_of_group),
             self.session_sharing_menu_items(index, ctx),
+            self.session_capture_menu_items(index, ctx),
             self.copy_metadata_menu_items(pane_name_target, ctx),
             self.modify_tab_menu_items(index, can_move_left, can_move_right, pane_name_target, ctx),
             self.close_tab_menu_items(index, tabs_len, ctx),
@@ -476,6 +477,49 @@ impl TabData {
             }
             menu_items.extend(section_items);
         }
+        menu_items
+    }
+
+    /// Session capture items for the tab's right-click menu.
+    ///
+    /// Deliberately outside `session_sharing_menu_items`: that whole block is
+    /// gated on the session-sharing feature flags, and file capture must be
+    /// available regardless of them.
+    fn session_capture_menu_items(
+        &self,
+        index: usize,
+        ctx: &AppContext,
+    ) -> Vec<MenuItem<WorkspaceAction>> {
+        if !cfg!(feature = "local_fs")
+            || self
+                .pane_group
+                .as_ref(ctx)
+                .focused_session_view(ctx)
+                .is_none()
+        {
+            return vec![];
+        }
+        let mut menu_items = vec![];
+
+        // Nothing to save until the session has run something. Streaming can be
+        // armed on an empty session, so it is always offered.
+        if self.pane_group.as_ref(ctx).session_has_content(ctx) {
+            menu_items.push(
+                MenuItemFields::new("Save session to file...")
+                    .with_on_select_action(WorkspaceAction::SaveSessionToFileFromTab {
+                        tab_index: index,
+                    })
+                    .into_item(),
+            );
+        }
+        menu_items.push(
+            MenuItemFields::new("Stream session to file...")
+                .with_on_select_action(WorkspaceAction::StreamSessionToFileFromTab {
+                    tab_index: index,
+                })
+                .into_item(),
+        );
+
         menu_items
     }
 
@@ -507,12 +551,6 @@ impl TabData {
                             .with_on_select_action(WorkspaceAction::StopSharingSessionFromTabMenu {
                                 terminal_view_id: focused_session_view.id(),
                             })
-                            .into_item(),
-                    );
-                } else {
-                    menu_items.push(
-                        MenuItemFields::new("Share session")
-                            .with_on_select_action(WorkspaceAction::OpenShareSessionModal(index))
                             .into_item(),
                     );
                 }

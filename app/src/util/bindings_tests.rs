@@ -95,6 +95,25 @@ fn test_orchestration_cycle_bindings_are_editable() {
 }
 
 #[test]
+fn file_capture_shortcuts_register_with_shifted_uppercase_keys() {
+    App::test((), |mut app| async move {
+        app.update(terminal::init);
+        app.update(|ctx| {
+            for (name, expected) in [
+                ("terminal:save_output_to_file", "cmdorctrl-shift-S"),
+                ("terminal:stream_output_to_file", "ctrl-alt-shift-S"),
+            ] {
+                let actual = ctx
+                    .editable_bindings()
+                    .find(|binding| binding.name == name)
+                    .and_then(|binding| trigger_to_keystroke(binding.trigger));
+                assert_eq!(actual, Some(Keystroke::parse(expected).unwrap()), "{name}");
+            }
+        });
+    });
+}
+
+#[test]
 fn test_toggle_maximize_pane_binding_is_editable() {
     App::test((), |mut app| async move {
         app.update(crate::pane_group::init);

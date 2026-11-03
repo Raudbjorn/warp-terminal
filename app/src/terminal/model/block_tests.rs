@@ -973,6 +973,35 @@ fn test_command_and_output_to_string_excludes_warp_prompt() {
     );
 }
 
+#[test]
+fn file_capture_preserves_command_secrets_without_changing_clipboard_masking() {
+    let secret = format!("ghp_{}", "x".repeat(36));
+    let command = format!("echo {secret}");
+    let mut command_grid = mock_blockgrid(&command);
+    command_grid.maybe_enable_secret_obfuscation(ObfuscateSecrets::Yes);
+    command_grid.scan_full_grid_for_secrets();
+    command_grid.finish();
+    let mut output_grid = mock_blockgrid(&secret);
+    output_grid.maybe_enable_secret_obfuscation(ObfuscateSecrets::Yes);
+    output_grid.scan_full_grid_for_secrets();
+    output_grid.finish();
+    let block = create_test_block_with_grids(
+        BlockIndex::zero(),
+        command_grid,
+        mock_blockgrid(""),
+        output_grid,
+        false,
+    );
+
+    assert!(!block.command_to_string().contains(&secret));
+    assert!(!block.command_and_output_to_string().contains(&secret));
+    assert_eq!(block.command_line_with_pwd(), command);
+    assert_eq!(
+        block.command_and_output_with_secrets_unobfuscated(),
+        format!("{command}\n{secret}")
+    );
+}
+
 /// Tests the single line lprompt, with trailing newline, and command case for text selection across grids.
 #[test]
 fn test_selection_bounds_all_grids_single_line_lprompt_trailing_newline_command() {
