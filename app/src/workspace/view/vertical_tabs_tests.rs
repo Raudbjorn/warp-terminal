@@ -1894,3 +1894,38 @@ fn agent_title_glyph_goes_and_the_rest_of_the_title_stays() {
     assert_eq!(strip(Codex, "◐ notes"), "◐ notes");
     assert_eq!(strip(Gemini, "◐ notes"), "◐ notes");
 }
+
+/// Harp mode off must look like upstream: the tab wrapper keeps its hover fill and kebab/close
+/// belt in every view. Only the framed sidebar's single tab rows paint their own fill and carry
+/// their own close X, so the wrapper steps back there.
+#[test]
+fn tab_wrapper_keeps_its_chrome_outside_the_framed_sidebar() {
+    use super::tab_wrapper_owns_row_chrome;
+    for granularity in [
+        VerticalTabsDisplayGranularity::Panes,
+        VerticalTabsDisplayGranularity::Tabs,
+    ] {
+        assert!(
+            tab_wrapper_owns_row_chrome(false, granularity),
+            "{granularity:?}"
+        );
+    }
+    assert!(tab_wrapper_owns_row_chrome(
+        true,
+        VerticalTabsDisplayGranularity::Panes
+    ));
+    assert!(!tab_wrapper_owns_row_chrome(
+        true,
+        VerticalTabsDisplayGranularity::Tabs
+    ));
+}
+
+/// Upstream's rows, group containers and drag ghosts are 4 px round; the framed sidebar's 10 px
+/// must not leak into them.
+#[test]
+fn row_corner_radius_is_upstreams_unless_framed() {
+    use super::{FRAMED_ROW_CORNER_RADIUS, ROW_CORNER_RADIUS, row_corner_radius};
+    assert_eq!(ROW_CORNER_RADIUS, 4.);
+    assert_eq!(row_corner_radius(false), ROW_CORNER_RADIUS);
+    assert_eq!(row_corner_radius(true), FRAMED_ROW_CORNER_RADIUS);
+}

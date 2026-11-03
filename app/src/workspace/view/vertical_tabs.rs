@@ -2,8 +2,6 @@ pub mod telemetry;
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-
-use chrono::Local;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -22,7 +20,7 @@ use warp_core::ui::color::coloru_with_opacity;
 use warp_core::ui::theme::color::internal_colors;
 use warp_core::ui::theme::{AnsiColorIdentifier, Fill as WarpThemeFill, WarpTheme};
 use warpui::elements::{
-    Border, ChildAnchor, Rect, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
+    Border, ChildAnchor, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
     Container, CornerRadius, CrossAxisAlignment, DispatchEventResult, DragAxis, DragBarSide,
     Draggable, DropShadow, DropTarget, Element, Empty, EventHandler, Expanded, Fill as ElementFill,
     Flex, Highlight, Hoverable, MainAxisAlignment, MainAxisSize, MouseStateHandle,
@@ -94,6 +92,7 @@ use crate::workspace::{
     VerticalTabsPaneDropTargetData, Workspace,
 };
 
+const PANEL_WIDTH: f32 = 248.;
 const MIN_PANEL_WIDTH: f32 = 200.;
 const MAX_PANEL_WIDTH_RATIO: f32 = 0.5;
 const DETAIL_SIDECAR_SECTION_PADDING: f32 = 12.;
@@ -109,8 +108,9 @@ const PIN_INDICATOR_ICON_SIZE: f32 = 16.;
 const PIN_INDICATOR_CORNER_INSET: f32 = 6.;
 const GROUP_ACTION_BUTTON_PADDING: f32 = 2.;
 const GROUP_ACTION_BUTTON_GAP: f32 = 2.;
-/// One radius for every row surface in the sidebar (hover, selected, tints, headers).
-const ROW_CORNER_RADIUS: f32 = 10.;
+const ROW_CORNER_RADIUS: f32 = 4.;
+/// Harp: the framed sidebar's rounder row-sized surfaces (see `row_corner_radius`).
+const FRAMED_ROW_CORNER_RADIUS: f32 = 10.;
 const TAB_GROUP_MEMBER_INDENT: f32 = 12.;
 const TAB_GROUP_ICON_SIZE: f32 = 16.;
 const TAB_GROUP_CONTENT_INSET: f32 = 4.;
@@ -122,9 +122,7 @@ const DETAIL_SIDECAR_CORNER_RADIUS: f32 = 4.;
 /// so the row doesn't resize when badges are toggled.
 const METADATA_ROW_HEIGHT: f32 = BADGE_ICON_SIZE + 2.;
 const TAB_COLOR_OPACITY: Opacity = 15;
-/// Hover/selected strength of a colored row; kept close to the idle wash so a needs-you row does
-/// not flare up under the pointer.
-const TAB_COLOR_HOVER_OPACITY: Opacity = 20;
+const TAB_COLOR_HOVER_OPACITY: Opacity = 50;
 /// Opacity for a colored row that is part of a multi-selection.
 const TAB_COLOR_MULTI_SELECT_OPACITY: Opacity = 30;
 
@@ -172,10 +170,8 @@ fn terminal_title_fallback_font(agent_text: &TerminalAgentText) -> TerminalPrima
     }
 }
 
-// Hovering a row shows nothing in this fork: the detail card stacked on top of the row's own
-// tooltip, and the row already carries title, status and subline.
-fn supports_vertical_tabs_detail_sidecar(_typed: &TypedPane<'_>) -> bool {
-    false
+fn supports_vertical_tabs_detail_sidecar(typed: &TypedPane<'_>) -> bool {
+    typed.supports_vertical_tabs_detail_sidecar()
 }
 
 fn detail_target_for_hovered_row(
@@ -353,30 +349,6 @@ impl PaneRowStackPosition {
     }
 }
 
-/// The hover control of a tab row: a bare X, no button surface, a step darker under the pointer.
-fn render_row_close_button(
-    tab_index: usize,
-    close_mouse_state: MouseStateHandle,
-    theme: &WarpTheme,
-) -> Box<dyn Element> {
-    Hoverable::new(close_mouse_state, move |button_state| {
-        let color = if button_state.is_hovered() {
-            theme.main_text_color(theme.background())
-        } else {
-            theme.sub_text_color(theme.background())
-        };
-        ConstrainedBox::new(WarpIcon::HugeCancel01.to_warpui_icon(color).finish())
-            .with_width(12.)
-            .with_height(12.)
-            .finish()
-    })
-    .with_cursor(Cursor::PointingHand)
-    .on_click(move |ctx, _, _| {
-        ctx.dispatch_typed_action(WorkspaceAction::CloseTab(tab_index));
-    })
-    .finish()
-}
-
 fn pane_row_background(
     pane_color: Option<ThemeFill>,
     is_selected: bool,
@@ -414,7 +386,11 @@ fn render_pane_row_element(
     content: Box<dyn Element>,
     theme: &WarpTheme,
 ) -> Box<dyn Element> {
-    let detail_target = supports_vertical_tabs_detail_sidecar(&props.typed).then(|| {
+    // Framed rows (`sidebar_surface` set) never open the detail card: the row already carries
+    // title, status and subline, and the card stacked on top of the row's own tooltip.
+    let detail_target = (props.sidebar_surface.is_none()
+        && supports_vertical_tabs_detail_sidecar(&props.typed))
+    .then(|| {
         detail_target_for_hovered_row(
             props.pane_group_id,
             props.pane_id,
@@ -456,7 +432,7 @@ fn render_pane_row_element(
         is_inactive: _,
         group_name: _,
         group_badge: _,
-        row_close,
+        row_close: _,
         sidebar_surface,
     } = props;
     let is_selected = is_active_tab && is_focused;
@@ -501,28 +477,19 @@ fn render_pane_row_element(
             container = container.with_background(background);
         }
 
-        // Selection is carried by the fill alone; an outline made the rounded rows read as boxes.
-        let mut pane: Box<dyn Element> = container.finish();
-        if let Some((tab_index, close_mouse_state)) = row_close.filter(|_| state.is_hovered()) {
-            // A plain child, not an overlay: an overlay layer counts as covering the row, so the
-            // pointer on the X un-hovered the row, which removed the X, and the sidebar flickered.
-            let mut stack = Stack::new().with_child(pane);
-            stack.add_positioned_child(
-                render_row_close_button(tab_index, close_mouse_state, theme),
-                OffsetPositioning::offset_from_parent(
-                    vec2f(-10., 0.),
-                    ParentOffsetBounds::ParentByPosition,
-                    ParentAnchor::MiddleRight,
-                    ChildAnchor::MiddleRight,
-                ),
-            );
-            pane = stack.finish();
-        }
+        let pane: Box<dyn Element> = container
+            .with_border(Border::all(1.).with_border_fill(if is_selected {
+                internal_colors::fg_overlay_3(theme).into()
+            } else {
+                ElementFill::None
+            }))
+            .finish();
+
         // Pin indicator anchored at the visible pane's top-right corner. Pin
         // is visible when the container is not hovered.
         if show_pin {
             let pin_icon = ConstrainedBox::new(
-                WarpIcon::PhPushPinFill
+                WarpIcon::PinFilledDiagonal
                     .to_warpui_icon(theme.sub_text_color(theme.background()))
                     .finish(),
             )
@@ -821,7 +788,7 @@ impl Default for VerticalTabsPanelState {
     fn default() -> Self {
         Self {
             scroll_state: ClippedScrollStateHandle::default(),
-            resizable_state: resizable_state_handle(sidebar::SIDEBAR_WIDTH),
+            resizable_state: resizable_state_handle(PANEL_WIDTH),
             group_mouse_states: RefCell::default(),
             tab_group_mouse_states: RefCell::default(),
             pane_row_mouse_states: RefCell::default(),
@@ -1168,26 +1135,16 @@ fn normalize_summary_text(text: &str) -> Option<String> {
 /// pill prefix in Summary mode. Mirrors the status sources used by `render_detail_status_pill`
 /// in the detail sidecar — CLI agent sessions with rich status, Warp Agent conversations, or
 /// ambient agent sessions. Returns `None` for plain terminals or conversations without status.
-pub(super) fn summary_conversation_status_for_terminal(
+fn summary_conversation_status_for_terminal(
     terminal_view: &TerminalView,
     app: &AppContext,
 ) -> Option<ConversationStatus> {
     let cli_agent_session = CLIAgentSessionsModel::as_ref(app).session(terminal_view.id());
     if let Some(session) = cli_agent_session
-        .filter(|s| s.shows_status())
+        .filter(|s| s.supports_rich_status())
         .filter(|s| !matches!(s.agent, CLIAgent::Unknown))
     {
-        // Harp: an agent that has only started has no turn to call done; the row shows it as
-        // waiting for its first report (`agent_waiting_for_first_turn`).
-        if !session.session_context.had_activity {
-            return None;
-        }
-        return Some(
-            session
-                .status
-                .displayed(session.session_context.running_background_tasks().is_some())
-                .to_conversation_status(),
-        );
+        return Some(session.status.to_conversation_status());
     }
 
     let is_ambient = terminal_view.is_ambient_agent_session(app);
@@ -1197,6 +1154,36 @@ pub(super) fn summary_conversation_status_for_terminal(
     (has_conversation || is_ambient)
         .then(|| terminal_view.selected_conversation_status_for_display(app))
         .flatten()
+}
+
+/// Harp's reading of [`summary_conversation_status_for_terminal`] for the framed sidebar and its
+/// notifications: it also trusts statuses parsed from the terminal title, shows a finished turn
+/// with background work as still running, and gives an agent that has only started no status.
+/// Tab rows outside the framed layout keep upstream's reading.
+pub(super) fn framed_summary_conversation_status_for_terminal(
+    terminal_view: &TerminalView,
+    app: &AppContext,
+) -> Option<ConversationStatus> {
+    let cli_agent_session = CLIAgentSessionsModel::as_ref(app).session(terminal_view.id());
+    let Some(session) = cli_agent_session
+        .filter(|s| s.shows_status())
+        .filter(|s| !matches!(s.agent, CLIAgent::Unknown))
+    else {
+        // `shows_status` covers `supports_rich_status`, so upstream's reading reaches the same
+        // Warp Agent / ambient fallback here.
+        return summary_conversation_status_for_terminal(terminal_view, app);
+    };
+    // Harp: an agent that has only started has no turn to call done; the row shows it as
+    // waiting for its first report (`agent_waiting_for_first_turn`).
+    if !session.session_context.had_activity {
+        return None;
+    }
+    Some(
+        session
+            .status
+            .displayed(session.session_context.running_background_tasks().is_some())
+            .to_conversation_status(),
+    )
 }
 
 /// Harp: the terminal runs an agent whose plugin reported its start but nothing since, such as a
@@ -1209,22 +1196,6 @@ pub(super) fn agent_waiting_for_first_turn(terminal_view: &TerminalView, app: &A
                 && !matches!(session.agent, CLIAgent::Unknown)
                 && !session.session_context.had_activity
         })
-}
-
-/// Section titles (tab group names and "other") read as quiet grey labels, like Finder's sidebar.
-fn section_title_text(text: String, appearance: &Appearance) -> Text {
-    let theme = appearance.theme();
-    Text::new_inline(text, appearance.ui_font_family(), 11.)
-        .with_style(Properties::default().weight(Weight::Semibold))
-        .with_clip(ClipConfig::ellipsis())
-        .with_color(theme.sub_text_color(theme.background()).into())
-}
-
-/// Spacing above a section title is what separates one section from the next.
-fn section_title_padding() -> Padding {
-    Padding::uniform(GROUP_HORIZONTAL_PADDING)
-        .with_top(14.)
-        .with_bottom(4.)
 }
 
 /// "atlas-api" in the group "atlas" reads as "app": the section title already names the project.
@@ -1355,7 +1326,7 @@ fn tab_needs_attention(pane_group: &PaneGroup, app: &AppContext) -> bool {
         };
         let terminal_view = terminal_pane.terminal_view(app);
         matches!(
-            summary_conversation_status_for_terminal(terminal_view.as_ref(app), app),
+            framed_summary_conversation_status_for_terminal(terminal_view.as_ref(app), app),
             Some(ConversationStatus::Blocked { .. })
         )
     })
@@ -1589,7 +1560,9 @@ fn render_ghost_vertical_tab_slot(workspace: &Workspace, app: &AppContext) -> Bo
     ConstrainedBox::new(
         Container::new(Empty::new().finish())
             .with_background(internal_colors::fg_overlay_1(theme))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(row_corner_radius(
+                workspace.uses_framed_sidebar_layout(app),
+            ))))
             .finish(),
     )
     .with_height(height)
@@ -1689,7 +1662,7 @@ fn render_control_bar(
     let theme = appearance.theme();
     let sub_text = theme.sub_text_color(theme.background());
 
-    let search_icon = ConstrainedBox::new(WarpIcon::PhMagnifyingGlassFill.to_warpui_icon(sub_text).finish())
+    let search_icon = ConstrainedBox::new(WarpIcon::Search.to_warpui_icon(sub_text).finish())
         .with_width(SEARCH_ICON_SIZE)
         .with_height(SEARCH_ICON_SIZE)
         .finish();
@@ -1805,7 +1778,7 @@ fn render_settings_button(
         state.settings_button_mouse_state.clone(),
         move |hover_state| {
             let icon = ConstrainedBox::new(
-                WarpIcon::PhSlidersHorizontalFill
+                WarpIcon::Settings
                     .to_warpui_icon(if is_popup_open { main_text } else { sub_text })
                     .finish(),
             )
@@ -1883,7 +1856,7 @@ fn render_new_tab_button(
     Hoverable::new(state.new_tab_hover_state.clone(), move |hover_state| {
         let plus_button = combo_inner_button(
             appearance,
-            UiIcon::HugeAdd01,
+            UiIcon::Plus,
             is_active,
             state.new_tab_button_state.clone(),
         )
@@ -2962,33 +2935,37 @@ fn render_tab_group_internal(
                     is_pane_being_renamed.then_some(workspace.pane_rename_editor.clone()),
                     tab.pinned,
                     group_state.is_hovered(),
-                    // One hint per tab: in panes mode only its first row names it.
-                    (row_idx == 0)
+                    // Framed: one hint per tab, so in panes mode only its first row names it.
+                    (!framed || row_idx == 0)
                         .then(|| sidebar::shortcut_binding_name(workspace, tab_index, app))
                         .flatten(),
                     app,
                 ) else {
                     continue;
                 };
-                pane_props.is_marked_unread = tab.marked_unread;
-                pane_props.is_inactive = tab.inactive;
-                if matches!(display_granularity, VerticalTabsDisplayGranularity::Tabs) {
-                    pane_props.row_close = Some((tab_index, close_mouse_state.clone()));
-                }
-                pane_props.group_name = tab
-                    .group_id
-                    .and_then(|group_id| workspace.tab_groups.get(&group_id))
-                    .and_then(|group| group.name.clone());
-                if framed && workspace.sidebar_pin(tab).is_some() {
-                    pane_props.group_badge = pane_props
-                        .group_name
-                        .as_deref()
-                        .map(sidebar::display_group_name);
-                }
-                if let TypedPane::Terminal(terminal_pane) = &pane_props.typed {
-                    pane_props.hosts_tmux_agent = workspace
-                        .tmux_agent_terminals
-                        .contains(&terminal_pane.terminal_view(app).id());
+                // Only the framed sidebar's rows (`sidebar::row_content`) read these; upstream's
+                // rows render as if they were unset.
+                if framed {
+                    pane_props.is_marked_unread = tab.marked_unread;
+                    pane_props.is_inactive = tab.inactive;
+                    if matches!(display_granularity, VerticalTabsDisplayGranularity::Tabs) {
+                        pane_props.row_close = Some((tab_index, close_mouse_state.clone()));
+                    }
+                    pane_props.group_name = tab
+                        .group_id
+                        .and_then(|group_id| workspace.tab_groups.get(&group_id))
+                        .and_then(|group| group.name.clone());
+                    if workspace.sidebar_pin(tab).is_some() {
+                        pane_props.group_badge = pane_props
+                            .group_name
+                            .as_deref()
+                            .map(sidebar::display_group_name);
+                    }
+                    if let TypedPane::Terminal(terminal_pane) = &pane_props.typed {
+                        pane_props.hosts_tmux_agent = workspace
+                            .tmux_agent_terminals
+                            .contains(&terminal_pane.terminal_view(app).id());
+                    }
                 }
                 if stack_panes_flush {
                     pane_props.stack_position = PaneRowStackPosition::Flush {
@@ -3103,10 +3080,8 @@ fn render_tab_group_internal(
             // hover/active state for the whole group, so suppress the
             // per-tab background here and let each row show its own
             // selected/hovered state.
-            // In Tabs mode the single row paints its own rounded hover/selected fill; a wrapper
-            // fill on top of it doubled the shade and showed square corners.
             let allow_per_tab_highlight = (!in_tab_group || FeatureFlag::GroupedTabs.is_enabled())
-                && matches!(display_granularity, VerticalTabsDisplayGranularity::Panes);
+                && tab_wrapper_owns_row_chrome(framed, display_granularity);
             let background = if is_drag_target {
                 internal_colors::fg_overlay_2(theme)
             } else if allow_per_tab_highlight && (is_active || group_state.is_hovered()) {
@@ -3123,9 +3098,15 @@ fn render_tab_group_internal(
             } else {
                 GROUP_BODY_BOTTOM_PADDING
             };
-            let mut container = Container::new(build_rows())
-                .with_background(background)
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
+            let mut container = Container::new(build_rows()).with_background(background);
+            if framed {
+                container = container.with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                    row_corner_radius(framed),
+                )));
+            } else if FeatureFlag::GroupedTabs.is_enabled() && stack_panes_flush {
+                container = container
+                    .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
+            }
             if needs_action_button_band {
                 container = container.with_margin_top(action_button_band);
             }
@@ -3141,9 +3122,8 @@ fn render_tab_group_internal(
         // are hovered, following the pattern from AgentManagementView.
         // This prevents flickering when the mouse moves from the group
         // to the overlay buttons (which may sit outside the group bounds).
-        // Tab rows carry their own plain close X; the kebab belt stays for pane rows only.
         let should_show_action_buttons = !drag_state.is_any_pane_dragging
-            && matches!(display_granularity, VerticalTabsDisplayGranularity::Panes)
+            && tab_wrapper_owns_row_chrome(framed, display_granularity)
             && (group_state.is_hovered() || action_buttons_mouse_over || is_menu_open_for_tab);
 
         let action_buttons = if should_show_action_buttons {
@@ -3477,44 +3457,63 @@ fn render_tab_group_header_icon_button(
     .finish()
 }
 
-/// Renders a tab group's header as a quiet section title, Finder-sidebar style: the name, the
-/// "needs you" count, and on hover the kebab, close and collapse controls (the chevron also stays
-/// while collapsed, so hidden members are discoverable). Single-clicking outside the per-button
-/// regions toggles collapse; double-clicking opens the inline rename editor.
+/// Renders the header row for a tab group: leading icon (chevron when expanded,
+/// member icon collage when collapsed), title + "N tabs", and (on hover) kebab
+/// + close buttons. Single-clicking outside the per-button regions toggles
+/// collapse; double-clicking opens the inline rename editor.
+///
+/// `collapsed_member_kinds` is the deduped list of pane kinds used to build the
+/// icon collage shown in place of the chevron when the group is collapsed.
+/// Pass `None` when the group is expanded; the chevron is rendered instead.
 #[allow(clippy::too_many_arguments)]
 fn render_grouped_tabs_header(
     group: &TabGroup,
     search_query: &str,
-    needs_attention_count: usize,
+    member_count: usize,
     mouse_states: &TabGroupMouseStates,
     is_collapsed: bool,
     is_header_selected: bool,
+    show_action_buttons: bool,
     is_being_renamed: bool,
     rename_editor: Option<&ViewHandle<EditorView>>,
+    collapsed_member_kinds: Option<&[SummaryPaneKind]>,
     ctx: &AppContext,
 ) -> Box<dyn Element> {
     let appearance = Appearance::as_ref(ctx);
     let theme = appearance.theme();
     let font_family = appearance.ui_font_family();
+    let main_text_color = theme.main_text_color(theme.background());
     let sub_text_color = theme.sub_text_color(theme.background());
     let group_id = group.id;
 
-    // No hover controls on a section title: the group menu is the right-click, and a chevron that
-    // only appears on hover made the header grow under the pointer. It stays as a collapsed marker.
-    let chevron_button = is_collapsed.then(|| {
-        render_tab_group_header_icon_button(
-            if is_collapsed {
-                WarpIcon::HugeArrowRight01
-            } else {
-                WarpIcon::HugeArrowDown01
-            },
+    // Collapsed groups show the icon collage (same component as horizontal tab
+    // groups) in place of the chevron, sized to VERTICAL_TABS_ICON_SIZE so
+    // the 2-icon variant matches the tab Summary Pair layout exactly.
+    let tab_group_icon = if is_collapsed {
+        let kinds = collapsed_member_kinds.unwrap_or(&[]);
+        render_group_member_icon_collage(kinds, VERTICAL_TABS_ICON_SIZE, appearance)
+    } else {
+        let chevron_button = render_tab_group_header_icon_button(
+            WarpIcon::ChevronDown,
             TAB_GROUP_ICON_SIZE,
-            sub_text_color,
+            main_text_color,
             internal_colors::fg_overlay_2(theme),
             mouse_states.chevron.clone(),
             Some(WorkspaceAction::ToggleTabGroupCollapsed(group_id)),
-        )
-    });
+        );
+        // Center the chevron in a `VERTICAL_TABS_ICON_SIZE` slot so the
+        // title aligns with member rows.
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Max)
+            .with_main_axis_alignment(MainAxisAlignment::Center)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_child(chevron_button)
+            .finish()
+    };
+    let tab_group_icon = ConstrainedBox::new(tab_group_icon)
+        .with_width(VERTICAL_TABS_ICON_SIZE)
+        .with_height(VERTICAL_TABS_ICON_SIZE)
+        .finish();
 
     let title_element: Box<dyn Element> =
         if let Some(editor) = rename_editor.filter(|_| is_being_renamed) {
@@ -3522,59 +3521,123 @@ fn render_grouped_tabs_header(
         } else {
             let title_text = group_display_name(group);
             let highlight_indices = group_name_highlight_indices(&title_text, search_query);
-            section_title_text(title_text, appearance)
+            Text::new_inline(title_text, font_family, 12.)
+                .with_clip(ClipConfig::ellipsis())
+                .with_color(main_text_color.into())
                 .with_single_highlight(
                     Highlight::new().with_properties(Properties::default().weight(Weight::Bold)),
                     highlight_indices,
                 )
                 .finish()
         };
+    let subtitle_text = if member_count == 1 {
+        "1 tab".to_string()
+    } else {
+        format!("{member_count} tabs")
+    };
+    let subtitle = Text::new_inline(subtitle_text, font_family, 10.)
+        .with_clip(ClipConfig::ellipsis())
+        .with_color(sub_text_color.into())
+        .finish();
+    let text_column: Box<dyn Element> = Flex::column()
+        .with_main_axis_size(MainAxisSize::Min)
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_spacing(1.)
+        .with_child(title_element)
+        .with_child(subtitle)
+        .finish();
+
+    let action_buttons = if show_action_buttons {
+        let kebab_button = SavePosition::new(
+            render_tab_group_header_icon_button(
+                WarpIcon::DotsVertical,
+                TAB_GROUP_HEADER_ACTION_ICON_SIZE,
+                sub_text_color,
+                internal_colors::fg_overlay_2(theme),
+                mouse_states.kebab.clone(),
+                Some(WorkspaceAction::ToggleTabGroupRightClickMenu {
+                    group_id,
+                    anchor: TabContextMenuAnchor::VerticalTabsKebab,
+                }),
+            ),
+            &vtab_group_kebab_position_id(group_id),
+        )
+        .finish();
+        let close_button = render_tab_group_header_icon_button(
+            WarpIcon::X,
+            TAB_GROUP_HEADER_ACTION_ICON_SIZE,
+            sub_text_color,
+            internal_colors::fg_overlay_3(theme),
+            mouse_states.close.clone(),
+            Some(WorkspaceAction::CloseTabGroup(group_id)),
+        );
+        Flex::row()
+            .with_main_axis_size(MainAxisSize::Min)
+            .with_cross_axis_alignment(CrossAxisAlignment::Center)
+            .with_spacing(GROUP_ACTION_BUTTON_GAP)
+            .with_child(kebab_button)
+            .with_child(close_button)
+            .finish()
+    } else {
+        Empty::new().finish()
+    };
 
     let group_pinned = FeatureFlag::PinnedTabs.is_enabled() && group.pinned;
-    let mut trailing = Flex::row()
-        .with_main_axis_size(MainAxisSize::Min)
-        .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_spacing(ICON_WITH_STATUS_GAP);
-    if needs_attention_count > 0 {
-        trailing.add_child(
-            Text::new_inline(
-                sidebar::needs_label(needs_attention_count),
-                font_family,
-                11.,
-            )
-            .with_color(needs_you_color())
-            .finish(),
-        );
-    }
-    if let Some(chevron_button) = chevron_button {
-        trailing.add_child(chevron_button);
-    }
-    // The name keeps its natural width and only shrinks when the header is truly out of room.
     let row = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
         .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_spacing(ICON_WITH_STATUS_GAP)
-        .with_child(Shrinkable::new(1., title_element).finish())
-        .with_child(trailing.finish())
+        .with_child(
+            Shrinkable::new(
+                1.,
+                Flex::row()
+                    .with_main_axis_size(MainAxisSize::Max)
+                    .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                    .with_spacing(ICON_WITH_STATUS_GAP)
+                    .with_child(tab_group_icon)
+                    .with_child(Shrinkable::new(1., text_column).finish())
+                    .finish(),
+            )
+            .finish(),
+        )
+        .with_child(action_buttons)
         .finish();
 
-    let mut hoverable = Hoverable::new(mouse_states.header.clone(), move |_| {
-        // A section title never lights up on hover; spacing above it is what separates sections.
-        // A collapsed group holding the active tab gets the selected fill, never an outline.
-        let mut header = Container::new(row)
-            .with_padding(section_title_padding())
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
-        if is_header_selected {
-            header = header.with_background(internal_colors::fg_overlay_2(theme));
+    // Resolve the group's color so the header tints to match its member tabs.
+    let group_color_fill: Option<ThemeFill> = group
+        .color
+        .resolve(None)
+        .map(|c| c.to_ansi_color(&theme.terminal_colors().normal).into());
+
+    let mut hoverable = Hoverable::new(mouse_states.header.clone(), move |state| {
+        let border_fill = if is_header_selected {
+            internal_colors::fg_overlay_3(theme)
+        } else {
+            WarpThemeFill::Solid(ColorU::transparent_black())
+        };
+        let mut container = Container::new(row)
+            .with_padding(Padding::uniform(GROUP_HORIZONTAL_PADDING))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)))
+            .with_border(Border::all(1.).with_border_fill(border_fill));
+        if let Some(color) = group_color_fill {
+            // Colored group: the group container paints the idle color behind the
+            // header, so only tint on hover/selected. Painting the idle color
+            // here too would double-tint and make the header look a shade lighter
+            // than the container.
+            if is_header_selected || state.is_hovered() {
+                container = container.with_background(color.with_opacity(TAB_COLOR_HOVER_OPACITY));
+            }
+        } else if is_header_selected || state.is_hovered() {
+            container = container.with_background(internal_colors::fg_overlay_2(theme));
         }
-        let header = header.finish();
+        let header = container.finish();
 
         // Pin indicator anchored at the visible top-right corner, matching
-        // the per-tab pin placement.
-        if group_pinned {
+        // the per-tab pin placement. Hidden whenever the action buttons
+        // are visible so the two never overlap.
+        if group_pinned && !show_action_buttons {
             let pin_icon = ConstrainedBox::new(
-                WarpIcon::PhPushPinFill
+                WarpIcon::PinFilledDiagonal
                     .to_warpui_icon(sub_text_color)
                     .finish(),
             )
@@ -3857,16 +3920,9 @@ fn render_grouped_tab_container(
         .or_default()
         .clone();
 
+    let member_count = members.len();
     let framed = workspace.uses_framed_sidebar_layout(app);
-    let needs_attention_count = members
-        .iter()
-        .filter(|(tab_index, _)| {
-            workspace
-                .tabs
-                .get(*tab_index)
-                .is_some_and(|tab| tab_needs_attention(tab.pane_group.as_ref(app), app))
-        })
-        .count();
+    let group_corner_radius = row_corner_radius(framed);
     let group_id = group.id;
     let group = group.clone();
     let any_member_active = members
@@ -3905,9 +3961,18 @@ fn render_grouped_tab_container(
             .is_tab_group_being_renamed(group.id);
         let rename_editor = is_being_renamed.then(|| workspace.tab_group_rename_editor.clone());
         let header = if framed {
+            let needs_attention_count = members
+                .iter()
+                .filter(|(tab_index, _)| {
+                    workspace
+                        .tabs
+                        .get(*tab_index)
+                        .is_some_and(|tab| tab_needs_attention(tab.pane_group.as_ref(app), app))
+                })
+                .count();
             render_framed_group_header(
                 &group,
-                members.len(),
+                member_count,
                 needs_attention_count,
                 &mouse_states,
                 is_collapsed,
@@ -3916,15 +3981,21 @@ fn render_grouped_tab_container(
                 app,
             )
         } else {
+            // Compute member kinds only when collapsed — the collage is only
+            // rendered then, so this skips the per-tab pane walk when expanded.
+            let collapsed_member_kinds =
+                is_collapsed.then(|| workspace.compute_group_member_kinds(group.id, app));
             render_grouped_tabs_header(
                 &group,
-                effective_search_query(state, workspace, app),
-                needs_attention_count,
+                &state.search_query,
+                member_count,
                 &mouse_states,
                 is_collapsed,
                 is_header_selected,
+                hover_state.is_hovered(),
                 is_being_renamed,
                 rename_editor.as_ref(),
+                collapsed_member_kinds.as_deref(),
                 app,
             )
         };
@@ -4077,7 +4148,7 @@ fn render_grouped_tab_container(
             );
         } else {
             container = container
-                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)));
+                .with_corner_radius(CornerRadius::with_all(Radius::Pixels(group_corner_radius)));
         }
         let container = container.finish();
         // Before-group indicator: above the header when an ungrouped pane is
@@ -4148,7 +4219,7 @@ fn render_grouped_tab_container(
     let positioned_container: Box<dyn Element> = if is_this_group_dragging {
         Container::new(positioned_container)
             .with_background(internal_colors::fg_overlay_1(theme))
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(ROW_CORNER_RADIUS)))
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(group_corner_radius)))
             .finish()
     } else {
         positioned_container
@@ -4247,7 +4318,7 @@ fn resolve_icon_with_status_variant(
                 _ => {
                     // Plain terminal: use foreground color per design spec
                     IconWithStatusVariant::Neutral {
-                        icon: WarpIcon::HugeCommandLine,
+                        icon: WarpIcon::Terminal,
                         icon_color: main_text,
                     }
                 }
@@ -4298,22 +4369,10 @@ fn resolve_icon_with_status_variant(
     }
 }
 
-/// The unread dot only adds information once the agent has stopped: "needs you" and "working"
-/// already say that something is going on.
-/// One unread rule for every row style: a manual mark always shows; Warp's own unread activity
-/// only once the agent is not working or waiting, which the status icon already says.
-fn row_shows_unread_dot(props: &PaneProps<'_>, app: &AppContext) -> bool {
-    if props.is_inactive {
-        return false;
-    }
-    let status = terminal_row_status(&props.typed, app);
-    props.is_marked_unread
-        || (status_leaves_room_for_unread_dot(status.as_ref().map(|(_, status)| status))
-            && has_unread_activity(&props.typed, app))
-}
-
-/// [`row_shows_unread_dot`] for a framed sidebar row, read off the pane its status icon comes
-/// from, so the bold title and the filled done icon always agree with that icon.
+/// Whether a framed sidebar row reads as unread: a manual mark always shows; Warp's own unread
+/// activity only once the agent is not working or waiting, which the status icon already says.
+/// Read off the pane its status icon comes from, so the bold title and the filled done icon
+/// always agree with that icon.
 fn sidebar_row_unread(
     inactive: bool,
     marked_unread: bool,
@@ -4332,21 +4391,6 @@ fn sidebar_row_unread(
                     .is_some_and(|id| has_unread_activity_for_terminal_view(id, app))))
 }
 
-fn status_leaves_room_for_unread_dot(status: Option<&ConversationStatus>) -> bool {
-    match status {
-        None => true,
-        Some(
-            ConversationStatus::Success | ConversationStatus::Error | ConversationStatus::Cancelled,
-        ) => true,
-        Some(
-            ConversationStatus::InProgress
-            | ConversationStatus::TransientError
-            | ConversationStatus::Blocked { .. }
-            | ConversationStatus::WaitingForEvents,
-        ) => false,
-    }
-}
-
 fn has_unread_activity(typed: &TypedPane<'_>, app: &AppContext) -> bool {
     let TypedPane::Terminal(terminal_pane) = typed else {
         return false;
@@ -4361,13 +4405,12 @@ fn has_unread_activity_for_terminal_view(terminal_view_id: EntityId, app: &AppCo
         .has_unread_for_terminal_view(terminal_view_id)
 }
 
-const INDICATOR_DOT_SIZE: f32 = 7.;
+const INDICATOR_DOT_SIZE: f32 = 8.;
 
 fn render_title_indicator(theme: &WarpTheme) -> Box<dyn Element> {
     ConstrainedBox::new(
-        Rect::new()
-            .with_background(theme.accent())
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(INDICATOR_DOT_SIZE / 2.)))
+        WarpIcon::CircleFilled
+            .to_warpui_icon(theme.accent())
             .finish(),
     )
     .with_width(INDICATOR_DOT_SIZE)
@@ -4400,7 +4443,7 @@ fn row_shows_synced_inputs_indicator(props: &PaneProps<'_>, app: &AppContext) ->
 /// same icon and color as the horizontal tab bar's `Indicator::Synced`.
 fn render_synced_inputs_indicator() -> Box<dyn Element> {
     ConstrainedBox::new(
-        UiIcon::HugeLink01
+        UiIcon::LinkHorizontal
             .to_warpui_icon(ColorU::from_u32(TAB_INDICATOR_SYNCED_COLOR).into())
             .finish(),
     )
@@ -4430,145 +4473,6 @@ fn render_shortcut_hint(label: &str, appearance: &Appearance) -> Box<dyn Element
 /// Row title line with its trailing indicators — the synchronized-inputs link
 /// icon followed by the unread-activity dot — pinned to the right edge. Returns
 /// `title` untouched when the row has no indicator to show.
-fn terminal_row_status(
-    typed: &TypedPane<'_>,
-    app: &AppContext,
-) -> Option<(EntityId, ConversationStatus)> {
-    let TypedPane::Terminal(terminal_pane) = typed else {
-        return None;
-    };
-    let terminal_view = terminal_pane.terminal_view(app);
-    let terminal_view = terminal_view.as_ref(app);
-    summary_conversation_status_for_terminal(terminal_view, app)
-        .map(|status| (terminal_view.id(), status))
-}
-
-/// The row's time: how long a session has waited on the user, or when it finished. Working rows
-/// get none, since "working since" says nothing useful. The bool marks a waiting label.
-fn row_time_label(
-    terminal_view_id: EntityId,
-    status: &ConversationStatus,
-    app: &AppContext,
-) -> Option<(String, bool)> {
-    let changed_at = CLIAgentSessionsModel::as_ref(app).status_changed_at(terminal_view_id)?;
-    let now = Local::now();
-    match status {
-        ConversationStatus::InProgress
-        | ConversationStatus::TransientError
-        | ConversationStatus::WaitingForEvents => None,
-        ConversationStatus::Blocked { .. } => {
-            let minutes = (now - changed_at).num_minutes().max(0);
-            let label = match minutes {
-                0 => "waiting".to_owned(),
-                1..=59 => format!("waiting {minutes}m"),
-                _ => format!("waiting {}h", minutes / 60),
-            };
-            Some((label, true))
-        }
-        ConversationStatus::Success | ConversationStatus::Error | ConversationStatus::Cancelled => {
-            let label = if changed_at.date_naive() == now.date_naive() {
-                changed_at.format("%H:%M").to_string()
-            } else {
-                changed_at.format("%b %-d").to_string()
-            };
-            Some((label, false))
-        }
-    }
-}
-
-/// The sidebar's own status glyphs (Hugeicons); the rest of the app keeps Warp's.
-fn row_status_icon(status: &ConversationStatus) -> WarpIcon {
-    match status {
-        ConversationStatus::InProgress
-        | ConversationStatus::TransientError
-        | ConversationStatus::WaitingForEvents => WarpIcon::WarpyLoadingCircle,
-        ConversationStatus::Success => WarpIcon::PhCheckCircleFill,
-        ConversationStatus::Blocked { .. } => WarpIcon::PhHandPalmFill,
-        ConversationStatus::Error => WarpIcon::PhWarningFill,
-        ConversationStatus::Cancelled => WarpIcon::PhStopCircleFill,
-    }
-}
-
-/// Fixed instead of the theme's ANSI yellow, which several themes tint so green that "needs you"
-/// reads like "done".
-fn needs_you_color() -> ColorU {
-    ColorU::new(0xE8, 0xA3, 0x3D, 0xFF)
-}
-
-/// Stands in for the status icon of an agent row that has not reported a status yet.
-fn render_row_inactive_icon(appearance: &Appearance) -> Box<dyn Element> {
-    let theme = appearance.theme();
-    ConstrainedBox::new(
-        Align::new(
-            ConstrainedBox::new(
-                WarpIcon::HugeMoon02
-                    .to_warpui_icon(WarpThemeFill::Solid(
-                        theme.sub_text_color(theme.background()).into(),
-                    ))
-                    .finish(),
-            )
-            .with_width(16.)
-            .with_height(16.)
-            .finish(),
-        )
-        .finish(),
-    )
-    .with_width(VERTICAL_TABS_ICON_SIZE)
-    .with_height(VERTICAL_TABS_ICON_SIZE)
-    .finish()
-}
-
-fn render_row_status_placeholder(appearance: &Appearance) -> Box<dyn Element> {
-    let theme = appearance.theme();
-    let dot = ConstrainedBox::new(
-        Rect::new()
-            .with_background_color(theme.sub_text_color(theme.background()).into())
-            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.5)))
-            .finish(),
-    )
-    .with_width(7.)
-    .with_height(7.)
-    .finish();
-    ConstrainedBox::new(Align::new(dot).finish())
-        .with_width(VERTICAL_TABS_ICON_SIZE)
-        .with_height(VERTICAL_TABS_ICON_SIZE)
-        .finish()
-}
-
-fn render_row_status_icon(
-    status: &ConversationStatus,
-    appearance: &Appearance,
-) -> Box<dyn Element> {
-    let theme = appearance.theme();
-    let color = match status {
-        ConversationStatus::Blocked { .. } => needs_you_color(),
-        // Work in progress is the normal state and should not pull focus.
-        ConversationStatus::InProgress
-        | ConversationStatus::TransientError
-        | ConversationStatus::WaitingForEvents => theme.sub_text_color(theme.background()).into(),
-        ConversationStatus::Success | ConversationStatus::Error | ConversationStatus::Cancelled => {
-            status
-                .status_icon_and_color(theme, StatusColorStyle::Standard)
-                .1
-        }
-    };
-    let glyph = row_status_icon(status)
-        .to_warpui_icon(WarpThemeFill::Solid(color))
-        .finish();
-    ConstrainedBox::new(
-        Align::new(
-            ConstrainedBox::new(glyph)
-                .with_width(16.)
-                .with_height(16.)
-                .finish(),
-        )
-        .finish(),
-    )
-    .with_width(VERTICAL_TABS_ICON_SIZE)
-    .with_height(VERTICAL_TABS_ICON_SIZE)
-    .finish()
-}
-
 fn render_row_title_line(
     title: Box<dyn Element>,
     shows_synced_inputs: bool,
@@ -4580,29 +4484,31 @@ fn render_row_title_line(
         return title;
     }
 
-    // The dot and the synced-inputs link sit right after the title: pinned to the right edge they
-    // collided with the close X a hovered row shows there.
-    let mut title_with_marks = Flex::row()
+    let mut indicators = Flex::row()
         .with_main_axis_size(MainAxisSize::Min)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_spacing(4.)
-        .with_child(Shrinkable::new(1., title).finish());
+        .with_spacing(4.);
     if shows_synced_inputs {
-        title_with_marks.add_child(render_synced_inputs_indicator());
+        indicators.add_child(render_synced_inputs_indicator());
     }
     if shows_activity_indicator {
-        title_with_marks.add_child(render_title_indicator(theme));
+        indicators.add_child(render_title_indicator(theme));
+    }
+    if let Some(hint) = shortcut_hint {
+        indicators.add_child(hint);
     }
 
-    let mut line = Flex::row()
+    Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
         .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
         .with_cross_axis_alignment(CrossAxisAlignment::Center)
-        .with_child(Shrinkable::new(1., title_with_marks.finish()).finish());
-    if let Some(hint) = shortcut_hint {
-        line.add_child(Container::new(hint).with_margin_left(4.).finish());
-    }
-    line.finish()
+        .with_child(Shrinkable::new(1., title).finish())
+        .with_child(
+            Container::new(indicators.finish())
+                .with_margin_left(4.)
+                .finish(),
+        )
+        .finish()
 }
 
 fn render_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
@@ -4633,7 +4539,8 @@ fn render_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
             app,
         )
     } else {
-        let has_indicator = props.typed.badge(app).is_some() || row_shows_unread_dot(&props, app);
+        let has_indicator =
+            props.typed.badge(app).is_some() || has_unread_activity(&props.typed, app);
         let mut title_row = Flex::row()
             .with_main_axis_size(MainAxisSize::Max)
             .with_main_axis_alignment(MainAxisAlignment::SpaceBetween)
@@ -5087,7 +4994,10 @@ impl<'a> PaneProps<'a> {
     }
 
     fn displayed_title(&self) -> &str {
-        self.custom_row_name().unwrap_or(self.title.as_str())
+        self.custom_vertical_tabs_title
+            .as_deref()
+            .or(self.display_title_override.as_deref())
+            .unwrap_or(self.title.as_str())
     }
 
     /// The name the row shows instead of what the terminal reports, if any.
@@ -5148,6 +5058,27 @@ fn pane_matches_query(props: &PaneProps<'_>, query_lower: &str, app: &AppContext
 /// Panes view must not hide it.
 fn row_custom_name<'a>(tab_name: Option<&'a str>, pane_name: Option<&'a str>) -> Option<&'a str> {
     tab_name.or(pane_name)
+}
+
+/// Whether a tab's wrapper paints the per-tab hover/active fill and shows the kebab/close belt.
+/// Upstream's always does. A framed sidebar row in Tabs view paints its own rounded fill and
+/// carries its own close X: a wrapper fill on top of it doubled the shade and showed square
+/// corners, and the belt duplicated the X.
+fn tab_wrapper_owns_row_chrome(
+    framed: bool,
+    display_granularity: VerticalTabsDisplayGranularity,
+) -> bool {
+    !framed || matches!(display_granularity, VerticalTabsDisplayGranularity::Panes)
+}
+
+/// Corner radius of row-sized surfaces (tab wrapper, group container, drag ghosts): upstream's
+/// 4 px, or the framed sidebar's rounder 10 px.
+fn row_corner_radius(framed: bool) -> f32 {
+    if framed {
+        FRAMED_ROW_CORNER_RADIUS
+    } else {
+        ROW_CORNER_RADIUS
+    }
 }
 
 fn uses_outer_group_container(display_granularity: VerticalTabsDisplayGranularity) -> bool {
@@ -5750,7 +5681,7 @@ fn render_terminal_row_content(
     let first_line_element = render_row_title_line(
         first_line,
         row_shows_synced_inputs_indicator(props, app),
-        row_shows_unread_dot(props, app),
+        has_unread_activity(&props.typed, app),
         shortcut_hint_label(props, app).map(|label| render_shortcut_hint(&label, appearance)),
         theme,
     );
@@ -5897,10 +5828,11 @@ fn render_title_override(
     }
 
     props
-        .custom_row_name()
+        .custom_vertical_tabs_title
+        .as_ref()
+        .or(props.display_title_override.as_ref())
         .map(|title| {
-            let title = strip_group_prefix(title, props.group_name.as_deref());
-            Text::new_inline(title.to_owned(), appearance.ui_font_family(), font_size)
+            Text::new_inline(title.clone(), appearance.ui_font_family(), font_size)
                 .with_clip(clip)
                 .with_color(text_color.into())
                 .finish()
@@ -8602,6 +8534,13 @@ pub(super) fn render_detail_sidecar(
     side: super::PanelPosition,
     app: &AppContext,
 ) -> Option<DetailSidecarOverlay> {
+    // The framed sidebar shows no detail card (see `render_pane_row_element`); this also covers
+    // its Summary rows, which carry no `sidebar_surface`. The hovered target stays as it is:
+    // clearing it here would let the row's hover handler set it again and notify on every
+    // mouse move.
+    if workspace.uses_framed_sidebar_layout(app) {
+        return None;
+    }
     if !*TabSettings::as_ref(app)
         .vertical_tabs_show_details_on_hover
         .value()
@@ -8758,29 +8697,30 @@ pub(super) fn render_detail_sidecar(
 }
 
 fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn Element> {
+    let effective_subtitle = props.subtitle.clone();
     let appearance = Appearance::as_ref(app);
     let theme = appearance.theme();
     let main_text_color = theme.main_text_color(theme.background());
     let sub_text_color = theme.sub_text_color(theme.background());
     let font_family = appearance.ui_font_family();
-    let row_status = terminal_row_status(&props.typed, app);
-    let has_indicator = props.typed.badge(app).is_some() || row_shows_unread_dot(&props, app);
-    // Every agent row would show the same agent logo, so a known status takes the icon's place.
-    let icon = match &row_status {
-        _ if props.is_inactive => render_row_inactive_icon(appearance),
-        Some((_, status)) => render_row_status_icon(status, appearance),
-        None if props.hosts_tmux_agent => render_row_status_placeholder(appearance),
-        None => render_pane_icon_with_status(
-            resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app),
-            theme,
-        ),
-    };
+    let has_indicator = props.typed.badge(app).is_some() || has_unread_activity(&props.typed, app);
+
+    let icon = render_pane_icon_with_status(
+        resolve_icon_with_status_variant(&props.typed, &props.title, appearance, app),
+        theme,
+    );
 
     let primary_info = *TabSettings::as_ref(app).vertical_tabs_primary_info.value();
+    let compact_subtitle = resolve_compact_subtitle(
+        primary_info,
+        *TabSettings::as_ref(app)
+            .vertical_tabs_compact_subtitle
+            .value(),
+    );
 
-    // One line per row: the title from "Pane title as". The second line
-    // (branch, folder or agent activity) added nothing in the sidebar.
-    let title_element: Box<dyn Element> =
+    // Build title (line 1) based on "Pane title as" and subtitle (line 2) based on
+    // "Additional metadata" setting.
+    let (title_element, subtitle_element): (Box<dyn Element>, Option<Box<dyn Element>>) =
         if let TypedPane::Terminal(terminal_pane) = &props.typed {
             let terminal_view = terminal_pane.terminal_view(app).as_ref(app);
             let terminal_title = terminal_view.terminal_title_from_shell();
@@ -8825,7 +8765,51 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
                 app,
             );
 
-            title
+            // Subtitle based on "Additional metadata"
+            let subtitle: Option<Box<dyn Element>> = match compact_subtitle {
+                VerticalTabsCompactSubtitle::Branch => compact_branch_subtitle_display(
+                    git_branch.as_deref(),
+                    working_directory.as_deref(),
+                )
+                .map(|(text, show_branch_icon)| {
+                    if show_branch_icon {
+                        render_git_branch_text(&text, sub_text_color, 10., appearance)
+                    } else {
+                        Text::new_inline(text, font_family, 10.)
+                            .with_clip(ClipConfig::start())
+                            .with_color(sub_text_color.into())
+                            .finish()
+                    }
+                }),
+                VerticalTabsCompactSubtitle::WorkingDirectory => working_directory.map(|wd| {
+                    Text::new_inline(wd, font_family, 10.)
+                        .with_clip(ClipConfig::start())
+                        .with_color(sub_text_color.into())
+                        .finish()
+                }),
+                VerticalTabsCompactSubtitle::Command => {
+                    let agent_text = terminal_agent_text(terminal_view, app);
+                    let (conv_title, cli_title) =
+                        preferred_agent_tab_titles(&agent_text, agent_tab_text_preference(app));
+                    let line_data = terminal_primary_line_data(
+                        terminal_view.is_long_running_and_user_controlled(),
+                        conv_title,
+                        cli_title,
+                        terminal_title.as_str(),
+                        working_directory_text.as_str(),
+                        terminal_title_fallback_font(&agent_text),
+                        terminal_view.last_completed_command_text(),
+                    );
+                    Some(
+                        Text::new_inline(line_data.text().to_string(), font_family, 10.)
+                            .with_clip(ClipConfig::ellipsis())
+                            .with_color(sub_text_color.into())
+                            .finish(),
+                    )
+                }
+            };
+
+            (title, subtitle)
         } else {
             let title = render_pane_title_slot(
                 &props,
@@ -8846,19 +8830,23 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
                 appearance,
                 app,
             );
-            title
+            let subtitle = if effective_subtitle.is_empty() {
+                None
+            } else {
+                let subtitle_clip = if matches!(props.typed, TypedPane::Code(_)) {
+                    ClipConfig::start()
+                } else {
+                    ClipConfig::ellipsis()
+                };
+                Some(
+                    Text::new_inline(effective_subtitle, font_family, 10.)
+                        .with_clip(subtitle_clip)
+                        .with_color(sub_text_color.into())
+                        .finish(),
+                )
+            };
+            (title, subtitle)
         };
-
-    // A sleeping tab reads as its muted name, nothing live.
-    let title_element = if props.is_inactive {
-        let title = strip_group_prefix(props.displayed_title(), props.group_name.as_deref());
-        Text::new_inline(title.to_owned(), font_family, 12.)
-            .with_clip(ClipConfig::ellipsis())
-            .with_color(sub_text_color.into())
-            .finish()
-    } else {
-        title_element
-    };
 
     // Title row with optional indicators
     let title_row = render_row_title_line(
@@ -8881,7 +8869,9 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
         _ => None,
     };
 
-    let icon_alignment = if step_element.is_some() {
+    // Assemble text column: title + optional subtitle
+    // Top-align the icon when there are two lines of content; center for single-line rows.
+    let icon_alignment = if subtitle_element.is_some() || step_element.is_some() {
         CrossAxisAlignment::Start
     } else {
         CrossAxisAlignment::Center
@@ -8889,49 +8879,27 @@ fn render_compact_pane_row(props: PaneProps<'_>, app: &AppContext) -> Box<dyn El
 
     let mut text_col = Flex::column()
         .with_main_axis_size(MainAxisSize::Min)
-        .with_cross_axis_alignment(CrossAxisAlignment::Start);
+        .with_cross_axis_alignment(CrossAxisAlignment::Start)
+        .with_spacing(1.);
     text_col.add_child(title_row);
+
+    if let Some(subtitle) = subtitle_element {
+        text_col.add_child(subtitle);
+    }
 
     if let Some(step) = step_element {
         text_col.add_child(step);
     }
 
-    let mut content = Flex::row()
+    let content = Flex::row()
         .with_main_axis_size(MainAxisSize::Max)
         .with_cross_axis_alignment(icon_alignment)
         .with_spacing(ICON_WITH_STATUS_GAP)
         .with_child(icon)
-        .with_child(Expanded::new(1., text_col.finish()).finish());
-    // While hovered, a tab row shows its close X in this spot instead of the time.
-    let shows_close_x = props.row_close.is_some()
-        && props
-            .mouse_state
-            .lock()
-            .map(|state| state.is_hovered())
-            .unwrap_or(false);
-    if let Some((label, waiting)) = row_status
-        .as_ref()
-        .filter(|_| !props.is_inactive && !shows_close_x)
-        .and_then(|(terminal_view_id, status)| row_time_label(*terminal_view_id, status, app))
-    {
-        let color = if waiting {
-            needs_you_color()
-        } else {
-            sub_text_color.into()
-        };
-        content.add_child(
-            Text::new_inline(label, font_family, 10.)
-                .with_color(color)
-                .finish(),
-        );
-    }
+        .with_child(Shrinkable::new(1., text_col.finish()).finish())
+        .finish();
 
-    let mut props = props;
-    if !props.is_inactive && matches!(row_status, Some((_, ConversationStatus::Blocked { .. }))) {
-        // A faint wash puts the eye on the row that waits, not only on its group header.
-        props.pane_color = Some(ThemeFill::Solid(needs_you_color()));
-    }
-    render_pane_row_element(props, Padding::uniform(8.), true, content.finish(), theme)
+    render_pane_row_element(props, Padding::uniform(8.), true, content, theme)
 }
 
 impl Workspace {
@@ -9393,12 +9361,11 @@ pub(super) mod sidebar {
     use warpui::{AppContext, EntityId, SingletonEntity};
 
     use super::{
-        PaneProps, TypedPane, agent_tab_text_preference, preferred_agent_tab_titles,
-        agent_waiting_for_first_turn, render_inline_tab_rename_editor,
-        resolved_terminal_working_directory, strip_agent_title_glyph,
-        strip_group_prefix,
-        summary_conversation_status_for_terminal, terminal_agent_text, terminal_primary_line_data,
-        terminal_title_fallback_font,
+        PaneProps, TypedPane, agent_tab_text_preference, agent_waiting_for_first_turn,
+        framed_summary_conversation_status_for_terminal, preferred_agent_tab_titles,
+        render_inline_tab_rename_editor, resolved_terminal_working_directory,
+        strip_agent_title_glyph, strip_group_prefix, terminal_agent_text,
+        terminal_primary_line_data, terminal_title_fallback_font,
     };
     use crate::ai::agent::conversation::ConversationStatus;
     use crate::appearance::Appearance;
@@ -9638,7 +9605,7 @@ pub(super) mod sidebar {
             let terminal_view = terminal_pane.terminal_view(app);
             let terminal_view = terminal_view.as_ref(app);
             let id = terminal_view.id();
-            let status = match summary_conversation_status_for_terminal(terminal_view, app) {
+            let status = match framed_summary_conversation_status_for_terminal(terminal_view, app) {
                 Some(status) => status_from_conversation(&status),
                 None if tmux_agent_terminals.contains(&id)
                     || agent_waiting_for_first_turn(terminal_view, app) =>
@@ -9670,7 +9637,7 @@ pub(super) mod sidebar {
         };
         let terminal_view = terminal_pane.terminal_view(app);
         let terminal_view = terminal_view.as_ref(app);
-        let status = match summary_conversation_status_for_terminal(terminal_view, app) {
+        let status = match framed_summary_conversation_status_for_terminal(terminal_view, app) {
             _ if props.is_inactive => RowStatus::Idle,
             Some(status) => status_from_conversation(&status),
             None if props.hosts_tmux_agent

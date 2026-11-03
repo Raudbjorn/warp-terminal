@@ -1732,7 +1732,7 @@ fn claude_needs_you(view: &crate::terminal::TerminalView, ctx: &warpui::AppConte
         .is_some_and(|session| matches!(session.agent, crate::terminal::CLIAgent::Claude));
     claude
         && matches!(
-            super::vertical_tabs::summary_conversation_status_for_terminal(view, ctx),
+            super::vertical_tabs::framed_summary_conversation_status_for_terminal(view, ctx),
             Some(ConversationStatus::Blocked { .. })
         )
 }
