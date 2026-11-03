@@ -665,6 +665,27 @@ async fn local_only_mode_refuses_a_public_endpoint_before_any_request() {
 }
 
 #[tokio::test]
+async fn a_refused_endpoint_is_reported_without_its_url() {
+    let _local_only = LocalOnlyGuard::enter();
+    let config = LocalEndpointConfig {
+        base_url: "https://user:hunter2@api.example.com/v1?token=hunter2".to_string(),
+        api_key: "secret".to_string(),
+        model_slug: "test-model".to_string(),
+    };
+
+    let result = complete_text(user_only_transcript(), config).await;
+
+    // Still the deterministic-refusal variant, so the host does not retry it.
+    let Err(error @ LocalAgentError::NetworkPolicyDenied(_)) = result else {
+        panic!("unexpected result: {result:?}");
+    };
+    let message = error.to_string();
+    assert!(!message.contains("hunter2"), "{message}");
+    assert!(!message.contains("api.example.com"), "{message}");
+    assert!(message.contains("local agent request"), "{message}");
+}
+
+#[tokio::test]
 async fn local_only_mode_refuses_a_redirect_to_a_public_host() {
     let _local_only = LocalOnlyGuard::enter();
     let mut server = Server::new_async().await;
@@ -685,10 +706,11 @@ async fn local_only_mode_refuses_a_redirect_to_a_public_host() {
     .expect("the redirect should be refused without waiting on the public host");
 
     redirect.assert_async().await;
-    assert!(
-        matches!(result, Err(LocalAgentError::NetworkPolicyDenied(_))),
-        "unexpected result: {result:?}"
-    );
+    let Err(error @ LocalAgentError::NetworkPolicyDenied(_)) = result else {
+        panic!("unexpected result: {result:?}");
+    };
+    // The redirect target can carry credentials too, so the report does not repeat it.
+    assert!(!error.to_string().contains("api.example.com"), "{error}");
 }
 
 #[tokio::test]

@@ -34,7 +34,8 @@ pub(crate) fn run_turn(
     Box::pin(async_stream::try_stream! {
         let request = openai::build_request(&transcript, &tools, &config);
         let url = openai::endpoint_url(&config.base_url);
-        network_policy::check_url_str(&url, "local agent request")?;
+        network_policy::check_url_str(&url, "local agent request")
+            .map_err(|denied| crate::redact_denial(&denied))?;
         let client = client()?;
         let mut builder = client.post(url).json(&request);
         if !config.api_key.trim().is_empty() {

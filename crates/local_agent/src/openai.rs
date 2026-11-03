@@ -353,7 +353,7 @@ pub(crate) async fn map_event_source_error(
             ))
         }
         Error::Transport(err) => match network_policy::denial_in_chain(&err) {
-            Some(denied) => LocalAgentError::NetworkPolicyDenied(denied),
+            Some(denied) => LocalAgentError::NetworkPolicyDenied(crate::redact_denial(&denied)),
             None => LocalAgentError::Transport(err.to_string()),
         },
         Error::Utf8(err) => LocalAgentError::Parse(err.to_string()),
