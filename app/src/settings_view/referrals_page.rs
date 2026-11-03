@@ -8,7 +8,6 @@ use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::Vector2F;
 use thiserror::Error;
 use validator::ValidateEmail;
-use warp_core::channel::ChannelState;
 use warp_errors::report_error;
 use warpui::clipboard::ClipboardContent;
 use warpui::elements::{
