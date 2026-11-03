@@ -9,6 +9,7 @@
 //! resolves to, so allowing one would invite DNS rebinding. Allowing a public range such as
 //! `0.0.0.0/0` is rejected for the same reason: it would turn local-only mode off.
 
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::RwLock;
 
@@ -16,6 +17,10 @@ use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::ServicesMode;
+use crate::endpoints::{
+    self, ConfiguredEndpoint, ENV_ALLOWED_ENDPOINTS, EndpointsError, configured_endpoints,
+    parse_endpoints,
+};
 
 /// Environment variable carrying the services mode to child processes (`local_only` / `online`).
 pub const ENV_SERVICES_MODE: &str = "WARP_SERVICES_MODE";
@@ -190,7 +195,52 @@ pub fn env_for_child() -> Vec<(&'static str, String)> {
 /// return a different list, and the child would then enforce a policy the app does not believe
 /// it has.
 pub fn env_for_child_with_hosts() -> (Vec<(&'static str, String)>, Vec<PrivateNetwork>) {
-    let hosts = allowed_private_hosts();
+    let (env, allow_list) = env_for_child_with_allow_list();
+    (env, allow_list.private_hosts)
+}
+
+/// Everything a local-only process allows beyond loopback: the private hosts the user listed and
+/// the configured AI endpoints.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AllowList {
+    pub private_hosts: Vec<PrivateNetwork>,
+    pub endpoints: BTreeSet<ConfiguredEndpoint>,
+}
+
+impl AllowList {
+    /// The allow-list this process enforces now.
+    pub fn current() -> Self {
+        Self {
+            private_hosts: allowed_private_hosts(),
+            endpoints: configured_endpoints(),
+        }
+    }
+
+    /// The allow-list a service reports. Entries that do not parse are dropped, which can only
+    /// make the list look different from the app's and so err toward a restart or a refusal.
+    pub fn from_report(report: Option<&PolicyReport>) -> Self {
+        let Some(report) = report else {
+            return Self::default();
+        };
+        Self {
+            private_hosts: parse_allowed_private_hosts(&report.allowed_private_hosts.join(","))
+                .unwrap_or_default(),
+            endpoints: parse_endpoints(&report.allowed_endpoints.join(",")).unwrap_or_default(),
+        }
+    }
+
+    /// Whether both lists allow the same destinations (see [`same_private_hosts`]).
+    pub fn same_as(&self, other: &Self) -> bool {
+        same_private_hosts(&self.private_hosts, &other.private_hosts)
+            && self.endpoints == other.endpoints
+    }
+}
+
+/// The environment a child process needs, together with the allow-list it encodes. Both come
+/// from a single read of each global list, so a caller that records the returned list knows
+/// exactly what the child was told it may reach.
+pub fn env_for_child_with_allow_list() -> (Vec<(&'static str, String)>, AllowList) {
+    let allow_list = AllowList::current();
     let mode = match crate::services_mode() {
         ServicesMode::LocalOnly => "local_only",
         ServicesMode::Online => "online",
@@ -199,14 +249,19 @@ pub fn env_for_child_with_hosts() -> (Vec<(&'static str, String)>, Vec<PrivateNe
         (ENV_SERVICES_MODE, mode.to_owned()),
         (
             ENV_ALLOWED_PRIVATE_HOSTS,
-            hosts
+            allow_list
+                .private_hosts
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(","),
         ),
+        (
+            ENV_ALLOWED_ENDPOINTS,
+            endpoints::format_endpoints(&allow_list.endpoints),
+        ),
     ];
-    (env, hosts)
+    (env, allow_list)
 }
 
 /// The policy a process enforces, as a service reports it on its health endpoint so that a client
@@ -217,6 +272,10 @@ pub struct PolicyReport {
     pub services_mode: ServicesMode,
     /// Allowed private hosts in the form [`PrivateNetwork`] displays and parses.
     pub allowed_private_hosts: Vec<String>,
+    /// Configured AI endpoints in the form [`ConfiguredEndpoint`] displays and parses. Absent
+    /// from services that predate configured endpoints, which then read as allowing none.
+    #[serde(default)]
+    pub allowed_endpoints: Vec<String>,
 }
 
 impl PolicyReport {
@@ -224,6 +283,10 @@ impl PolicyReport {
         Self {
             services_mode: crate::services_mode(),
             allowed_private_hosts: allowed_private_hosts()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            allowed_endpoints: configured_endpoints()
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
@@ -242,6 +305,10 @@ pub enum PolicyMismatch {
     InvalidHosts(#[from] PrivateHostsError),
     #[error("it allows private hosts [{service}] but this app allows [{app}]")]
     HostsDiffer { service: String, app: String },
+    #[error("it reports an invalid list of configured endpoints: {0}")]
+    InvalidEndpoints(#[from] EndpointsError),
+    #[error("it allows configured endpoints [{service}] but this app allows [{app}]")]
+    EndpointsDiffer { service: String, app: String },
 }
 
 /// Whether two allow-lists allow the same hosts. Order and redundant entries do not matter. A range
@@ -266,7 +333,37 @@ fn covers(outer: &[PrivateNetwork], inner: &[PrivateNetwork]) -> bool {
 /// entry of either list must lie inside an entry of the other. Order and redundant entries do not
 /// matter; a range written as several smaller ones is reported as different.
 pub fn check_service_policy(reported: Option<&PolicyReport>) -> Result<(), PolicyMismatch> {
-    check_service_policy_against(&allowed_private_hosts(), reported)
+    check_service_policy_against_allow_list(&AllowList::current(), reported)
+}
+
+/// Like [`check_service_policy_against`], for the whole allow-list: private hosts and configured
+/// endpoints must both match.
+pub fn check_service_policy_against_allow_list(
+    allow_list: &AllowList,
+    reported: Option<&PolicyReport>,
+) -> Result<(), PolicyMismatch> {
+    let mode = crate::services_mode();
+    check_policy(mode, &allow_list.private_hosts, reported)?;
+    check_endpoints(mode, &allow_list.endpoints, reported)
+}
+
+fn check_endpoints(
+    mode: ServicesMode,
+    endpoints: &BTreeSet<ConfiguredEndpoint>,
+    reported: Option<&PolicyReport>,
+) -> Result<(), PolicyMismatch> {
+    if mode != ServicesMode::LocalOnly {
+        return Ok(());
+    }
+    let reported = reported.ok_or(PolicyMismatch::NotReported)?;
+    let service_endpoints = parse_endpoints(&reported.allowed_endpoints.join(","))?;
+    if &service_endpoints == endpoints {
+        return Ok(());
+    }
+    Err(PolicyMismatch::EndpointsDiffer {
+        service: endpoints::format_endpoints(&service_endpoints),
+        app: endpoints::format_endpoints(endpoints),
+    })
 }
 
 /// Like [`check_service_policy`], against `hosts` instead of the current allow-list. For a service
@@ -309,18 +406,30 @@ fn check_policy(
     })
 }
 
+/// Why the policy a parent passed down through the environment could not be applied.
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum PolicyEnvError {
+    #[error(transparent)]
+    PrivateHosts(#[from] PrivateHostsError),
+    #[error(transparent)]
+    Endpoints(#[from] EndpointsError),
+}
+
 /// Applies the policy passed down by a parent through [`env_for_child`]. An absent
 /// `WARP_SERVICES_MODE` leaves the default (online); any value other than `online` is treated as
-/// local-only, so a typo fails closed. An invalid host list is an error rather than being
-/// partially applied, and nothing is changed in that case.
-pub fn init_from_env() -> Result<(), PrivateHostsError> {
+/// local-only, so a typo fails closed. An invalid host or endpoint list is an error rather than
+/// being partially applied, and nothing is changed in that case.
+pub fn init_from_env() -> Result<(), PolicyEnvError> {
     let mode = mode_from_var(std::env::var(ENV_SERVICES_MODE));
     let hosts = std::env::var(ENV_ALLOWED_PRIVATE_HOSTS).unwrap_or_default();
+    let endpoints = std::env::var(ENV_ALLOWED_ENDPOINTS).unwrap_or_default();
     let (mode, hosts) = parse_env(mode.as_deref(), &hosts)?;
+    let endpoints = parse_endpoints(&endpoints)?;
     if let Some(mode) = mode {
         crate::set_services_mode(mode);
     }
     set_allowed_private_hosts(hosts);
+    endpoints::set_parent_endpoints(endpoints);
     Ok(())
 }
 

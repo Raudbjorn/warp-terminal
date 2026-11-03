@@ -421,19 +421,20 @@ pub struct LocalMultiAgentManager {
     child: Option<Child>,
     restart_debounce: Option<AbortHandle>,
     openai_api_key: Option<String>,
-    /// The private hosts the running service enforces: the snapshot it was given at startup,
+    /// The allow-list (private hosts and configured AI endpoints) the running service enforces:
+    /// the snapshot it was given at startup,
     /// or the list it reports for a service this app did not start. The service reads its
     /// policy once at startup, so a change to the setting restarts it.
-    applied_private_hosts: Vec<network_policy::PrivateNetwork>,
+    applied_allow_list: network_policy::AllowList,
     /// The server root URL the app used before it was pointed at the local service. Publishing
     /// overrides the process-wide `ChannelState` URL, which other clients read without consulting
     /// this module, so unpublishing has to put it back.
     original_server_root_url: Option<String>,
     /// The allow-list in force when the service last failed to start or was refused, if it has
-    /// not been published since. `applied_private_hosts` keeps describing the last service that
+    /// not been published since. `applied_allow_list` keeps describing the last service that
     /// was validated, so on its own it cannot tell that nothing is running: an allow-list
     /// restored to that value would look unchanged and the failed service would never be retried.
-    failed_with_hosts: Option<Vec<network_policy::PrivateNetwork>>,
+    failed_with_allow_list: Option<network_policy::AllowList>,
 }
 
 impl LocalMultiAgentManager {
@@ -455,9 +456,9 @@ impl LocalMultiAgentManager {
             child: None,
             restart_debounce: None,
             openai_api_key: None,
-            applied_private_hosts: network_policy::allowed_private_hosts(),
+            applied_allow_list: network_policy::AllowList::current(),
             original_server_root_url: None,
-            failed_with_hosts: None,
+            failed_with_allow_list: None,
         };
         if ChannelState::is_local_only() {
             manager.schedule_restart(ctx);
@@ -509,6 +510,22 @@ impl LocalMultiAgentManager {
         }
         self.openai_api_key = openai_api_key;
         self.schedule_restart(ctx);
+    }
+
+    /// Publishes the AI endpoint URLs kept in the per-profile inference settings (the profile
+    /// base URLs and their custom endpoints) to the network policy, so the hosts the user typed
+    /// there are reachable over `https`. The service enforces its allow-list from startup, so a
+    /// change restarts it, as a change to the AI settings does.
+    pub fn apply_profile_endpoints(&mut self, ctx: &mut ModelContext<Self>) {
+        let urls = profile_endpoint_urls(::ai::api_keys::ApiKeyManager::as_ref(ctx).keys());
+        network_policy::set_configured_endpoints(
+            network_policy::EndpointSource::ProfileSettings,
+            urls.iter().map(String::as_str),
+        );
+        if ChannelState::is_local_only() && self.allow_list_needs_restart() {
+            self.revoke_running_service();
+            self.schedule_restart(ctx);
+        }
     }
 
     pub fn set_config(
@@ -835,7 +852,7 @@ impl LocalMultiAgentManager {
             root_url,
             pid,
             config_hash,
-            applied_private_hosts,
+            applied_allow_list,
         } = result;
         if child.is_some() {
             self.stop_child();
@@ -843,7 +860,7 @@ impl LocalMultiAgentManager {
         }
         // The service enforces the policy it was given at startup, not whatever the allow-list
         // says now, so record the snapshot it was given.
-        let needs_restart = self.record_applied_private_hosts(applied_private_hosts);
+        let needs_restart = self.record_applied_allow_list(applied_allow_list);
         // The allow-list changed while the service was starting, so it enforces a policy the app
         // no longer has and may forward to a host that was since revoked. Never publish it:
         // stop it and start a replacement with the current allow-list.
@@ -853,7 +870,7 @@ impl LocalMultiAgentManager {
             return;
         }
         // The service is healthy and enforces the app's policy, so it can be published.
-        self.failed_with_hosts = None;
+        self.failed_with_allow_list = None;
         set_global_root_url(Some(root_url.clone()));
         // Keep the first original: a republish without an unpublish in between would otherwise
         // record the previous service's URL as the original.
@@ -893,26 +910,20 @@ impl LocalMultiAgentManager {
     /// one, so it may succeed now. A failure under the current list is not retried, which keeps
     /// unrelated setting changes from restarting a service that cannot start.
     fn allow_list_needs_restart(&self) -> bool {
-        match &self.failed_with_hosts {
-            // Nothing validated is running, so `applied_private_hosts` (the last service that
+        match &self.failed_with_allow_list {
+            // Nothing validated is running, so `applied_allow_list` (the last service that
             // was) no longer says anything about now. Judge against the list the failure
             // happened under: a different one may succeed, the same one will fail again.
-            Some(failed_with) => !network_policy::same_private_hosts(
-                failed_with,
-                &network_policy::allowed_private_hosts(),
-            ),
-            None => policy_needs_restart(&self.applied_private_hosts),
+            Some(failed_with) => !failed_with.same_as(&network_policy::AllowList::current()),
+            None => policy_needs_restart(&self.applied_allow_list),
         }
     }
 
-    /// Records the private hosts the running service enforces and reports whether the service
+    /// Records the allow-list the running service enforces and reports whether the service
     /// must be restarted because the allow-list changed while it was starting.
-    fn record_applied_private_hosts(
-        &mut self,
-        applied_private_hosts: Vec<network_policy::PrivateNetwork>,
-    ) -> bool {
-        self.applied_private_hosts = applied_private_hosts;
-        policy_needs_restart(&self.applied_private_hosts)
+    fn record_applied_allow_list(&mut self, applied_allow_list: network_policy::AllowList) -> bool {
+        self.applied_allow_list = applied_allow_list;
+        policy_needs_restart(&self.applied_allow_list)
     }
 
     fn refresh_llm_preferences(&self, ctx: &mut ModelContext<Self>) {
@@ -931,7 +942,7 @@ impl LocalMultiAgentManager {
 
     fn set_failed(&mut self, message: String) {
         self.stop_child();
-        self.failed_with_hosts = Some(network_policy::allowed_private_hosts());
+        self.failed_with_allow_list = Some(network_policy::AllowList::current());
         self.status = LocalMultiAgentStatus::Failed { message };
         // A service that failed is not usable, so it must not receive requests.
         self.unpublish_service_url();
@@ -955,9 +966,9 @@ struct StartServiceResult {
     root_url: Url,
     pid: Option<u32>,
     config_hash: String,
-    /// The private hosts the running service enforces: the snapshot it was handed when the
+    /// The allow-list the running service enforces: the snapshot it was handed when the
     /// child was spawned, or the list it reports for a service this app did not start.
-    applied_private_hosts: Vec<network_policy::PrivateNetwork>,
+    applied_allow_list: network_policy::AllowList,
 }
 
 async fn start_service(
@@ -981,7 +992,7 @@ async fn start_service(
                 config_hash,
                 // The service enforces the policy it reports, so that is what the app compares
                 // against: the allow-list may have changed since the check.
-                applied_private_hosts: reported_private_hosts(&health),
+                applied_allow_list: reported_allow_list(&health),
             });
         }
         Err(_) => ensure_port_available(&config)?,
@@ -1015,7 +1026,7 @@ async fn start_service(
     // The service enforces the same network policy as the app, so hand it the current one. The
     // environment and the allow-list it encodes come from one read, so the app can record
     // exactly what the child was told.
-    let (policy_env, applied_private_hosts) = network_policy::env_for_child_with_hosts();
+    let (policy_env, applied_allow_list) = network_policy::env_for_child_with_allow_list();
     for (key, value) in policy_env {
         command.env(key, value);
     }
@@ -1029,29 +1040,20 @@ async fn start_service(
     let health = wait_until_healthy(root_url.clone()).await?;
     // Dropping `child` on this error kills it (`kill_on_drop`), so a service that does not
     // enforce the policy is never left running.
-    ensure_spawned_service_policy(&service_binary, &applied_private_hosts, &health)?;
+    ensure_spawned_service_policy(&service_binary, &applied_allow_list, &health)?;
 
     Ok(StartServiceResult {
         child: Some(child),
         root_url,
         pid,
         config_hash,
-        applied_private_hosts,
+        applied_allow_list,
     })
 }
 
-/// The private hosts a running service reports it may reach.
-fn reported_private_hosts(
-    health: &LocalMultiAgentHealthResponse,
-) -> Vec<network_policy::PrivateNetwork> {
-    health
-        .network_policy
-        .as_ref()
-        .and_then(|report| {
-            network_policy::parse_allowed_private_hosts(&report.allowed_private_hosts.join(","))
-                .ok()
-        })
-        .unwrap_or_default()
+/// The allow-list a running service reports it enforces.
+fn reported_allow_list(health: &LocalMultiAgentHealthResponse) -> network_policy::AllowList {
+    network_policy::AllowList::from_report(health.network_policy.as_ref())
 }
 
 /// Checks that a service this process just started enforces the policy it was given. Health only
@@ -1061,18 +1063,17 @@ fn reported_private_hosts(
 /// not the current one: if that changed meanwhile, the caller restarts the service.
 fn ensure_spawned_service_policy(
     service_binary: &Path,
-    given: &[network_policy::PrivateNetwork],
+    given: &network_policy::AllowList,
     health: &LocalMultiAgentHealthResponse,
 ) -> Result<()> {
-    network_policy::check_service_policy_against(given, health.network_policy.as_ref()).map_err(
-        |mismatch| {
+    network_policy::check_service_policy_against_allow_list(given, health.network_policy.as_ref())
+        .map_err(|mismatch| {
             anyhow!(
                 "The local multi-agent service at {} does not enforce the network policy it was \
                  given: {mismatch}. It may be a build from before the policy existed; rebuild it.",
                 service_binary.display()
             )
-        },
-    )
+        })
 }
 
 async fn wait_until_healthy(root_url: Url) -> Result<LocalMultiAgentHealthResponse> {
@@ -1104,10 +1105,12 @@ fn ensure_service_policy_matches(
     network_policy::check_service_policy(health.network_policy.as_ref()).map_err(|mismatch| {
         anyhow!(
             "A local multi-agent service is already running at {root_url}, but {mismatch}. Start \
-             it with {mode}=local_only and {hosts} set to the allowed private hosts from \
+             it with {mode}=local_only, {hosts} set to the allowed private hosts and \
+             {endpoints} set to the configured AI endpoints from \
              Settings, or stop it so Warp can start its own.",
             mode = network_policy::ENV_SERVICES_MODE,
             hosts = network_policy::ENV_ALLOWED_PRIVATE_HOSTS,
+            endpoints = network_policy::ENV_ALLOWED_ENDPOINTS,
         )
     })
 }
@@ -1355,15 +1358,34 @@ fn save_config(config: &LocalMultiAgentConfig, ctx: &AppContext) {
     }
 }
 
+/// Every AI endpoint URL in the per-profile inference settings, including the legacy global
+/// fields that older clients still write.
+fn profile_endpoint_urls(keys: &::ai::api_keys::ApiKeys) -> Vec<String> {
+    let profiles = keys.profile_inference_settings.values();
+    keys.openai_base_url
+        .iter()
+        .chain(keys.custom_endpoints.iter().map(|endpoint| &endpoint.url))
+        .chain(
+            profiles
+                .clone()
+                .filter_map(|profile| profile.openai_base_url.as_ref()),
+        )
+        .chain(profiles.flat_map(|profile| {
+            profile
+                .custom_endpoints
+                .iter()
+                .map(|endpoint| &endpoint.url)
+        }))
+        .cloned()
+        .collect()
+}
+
 /// Whether the service must be restarted to enforce the current allow-list.
 ///
 /// The service reads its policy only at startup, so an allow-list that changed while it was
 /// starting is not in force yet.
-fn policy_needs_restart(applied_private_hosts: &[network_policy::PrivateNetwork]) -> bool {
-    !network_policy::same_private_hosts(
-        &network_policy::allowed_private_hosts(),
-        applied_private_hosts,
-    )
+fn policy_needs_restart(applied_allow_list: &network_policy::AllowList) -> bool {
+    !network_policy::AllowList::current().same_as(applied_allow_list)
 }
 
 fn set_global_root_url(root_url: Option<Url>) {

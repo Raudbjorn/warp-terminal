@@ -1831,6 +1831,7 @@ pub(crate) fn initialize_app(
         let openai_key = ::ai::api_keys::ApiKeyManager::as_ref(ctx)
             .openai_key_for_profile(::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY);
         manager.update_provider_config(openai_key, ctx);
+        manager.apply_profile_endpoints(ctx);
         ctx.subscribe_to_model(
             &::ai::api_keys::ApiKeyManager::handle(ctx),
             |manager: &mut local_multi_agent::LocalMultiAgentManager, _, event, ctx| {
@@ -1838,6 +1839,7 @@ pub(crate) fn initialize_app(
                     let openai_key = ::ai::api_keys::ApiKeyManager::as_ref(ctx)
                         .openai_key_for_profile(::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY);
                     manager.update_provider_config(openai_key, ctx);
+                    manager.apply_profile_endpoints(ctx);
                 }
             },
         );

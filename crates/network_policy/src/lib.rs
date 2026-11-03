@@ -1,4 +1,6 @@
-//! The network policy of local-only services mode: only loopback destinations are allowed.
+//! The network policy of local-only services mode: loopback destinations are allowed, plus the
+//! private hosts the user listed (`private_hosts`) and the `https` origins of the AI endpoints the
+//! user configured (`endpoints`).
 //!
 //! [`check_url`] decides whether a request may start. Native clients must also be built with
 //! `apply_to_client_builder` (or `apply_to_blocking_client_builder`), which re-checks every
@@ -21,13 +23,20 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+mod endpoints;
 mod private_hosts;
 
+pub use endpoints::{
+    ConfiguredEndpoint, ENV_ALLOWED_ENDPOINTS, EndpointSource, EndpointsError,
+    configured_endpoints, parse_endpoints, set_configured_endpoints,
+};
+
 pub use private_hosts::{
-    ENV_ALLOWED_PRIVATE_HOSTS, ENV_SERVICES_MODE, PolicyMismatch, PolicyReport, PrivateHostsError,
-    PrivateNetwork, allowed_private_hosts, check_service_policy, check_service_policy_against, env_for_child,
-    env_for_child_with_hosts, init_from_env, parse_allowed_private_hosts, same_private_hosts,
-    set_allowed_private_hosts,
+    AllowList, ENV_ALLOWED_PRIVATE_HOSTS, ENV_SERVICES_MODE, PolicyEnvError, PolicyMismatch,
+    PolicyReport, PrivateHostsError, PrivateNetwork, allowed_private_hosts, check_service_policy,
+    check_service_policy_against, check_service_policy_against_allow_list, env_for_child,
+    env_for_child_with_allow_list, env_for_child_with_hosts, init_from_env,
+    parse_allowed_private_hosts, same_private_hosts, set_allowed_private_hosts,
 };
 
 static SERVICES_MODE: AtomicU8 = AtomicU8::new(ServicesMode::Online as u8);
@@ -125,6 +134,7 @@ pub fn check_url_for_mode(
         || !is_guarded_scheme(url.scheme())
         || is_loopback_url(url)
         || private_hosts::is_allowed_private_url(url)
+        || endpoints::is_configured_endpoint_url(url)
     {
         return Ok(());
     }
@@ -185,8 +195,10 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
 /// The loopback check only looks at the request URL, not the route. With `HTTP_PROXY` set, reqwest
 /// would send an allowed `http://localhost:11434` request to the proxy, which leaks the
 /// destination off-machine and can't reach this machine's loopback anyway. Local-only mode only
-/// permits loopback and the private hosts the user listed (see [`set_allowed_private_hosts`]), all
-/// of which are on-link, so there is never a reason to proxy. The mode is fixed at startup by
+/// permits loopback, the private hosts the user listed (see [`set_allowed_private_hosts`]) and the
+/// `https` origins of AI endpoints the user configured (see [`set_configured_endpoints`]). Those
+/// are reached directly: a proxy would see every destination, which is what local-only mode
+/// exists to avoid, so configured endpoints do not work behind a mandatory proxy. The mode is fixed at startup by
 /// `ChannelState::set`, so reading it when the client is built is enough.
 ///
 /// This replaces any redirect or proxy setting already on `builder`.

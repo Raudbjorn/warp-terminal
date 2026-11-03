@@ -19,7 +19,7 @@ known to be incomplete, the text says so and links the tracking issue.
 | Where the code runs | In the app: `LocalOpenAIClient` (`app/src/ai/local_openai.rs`) | In the app: the `local_agent` crate (`crates/local_agent`), chosen by `app/src/ai/agent/api/local_route.rs` | A bundled child process, `warp-local-multi-agent` (`crates/local_multi_agent_service`), started by `app/src/local_multi_agent` when the app starts. It listens on `127.0.0.1:8787` by default |
 | Where you configure it | **Settings → Local AI**, or `[agents.local_openai]` in `settings.toml` | **Settings → Agents → Warp Agent → Custom Inference → Add custom endpoint** (base URL, API key, model names), when the workspace policy allows it | **Settings → Agents → Agent Profiles**, section *LOCAL INFERENCE* (API key, *OpenAI Base URL*, model aliases, *Autocomplete* switch) |
 | Providers | OpenAI-compatible Chat Completions, or OpenCode | Custom endpoints that use the OpenAI Chat Completions schema | OpenAI-compatible Chat Completions |
-| Network policy | Enforced: loopback only (see [Network behavior](#network-behavior-in-the-oss-build)) | Not enforced: the engine uses a plain `reqwest` client | Not enforced: the service and the app's health and `/models` calls use plain `reqwest` clients ([#32](https://github.com/Raudbjorn/warp-terminal/issues/32)) |
+| Network policy | Enforced: loopback, allowed private hosts, and the `https` host of the configured base URL (see [Network behavior](#network-behavior-in-the-oss-build)) | Not enforced: the engine uses a plain `reqwest` client | Not enforced: the service and the app's health and `/models` calls use plain `reqwest` clients ([#32](https://github.com/Raudbjorn/warp-terminal/issues/32)) |
 
 > **Turn on *Use Local AI provider* first.** In the OSS build AI counts as
 > enabled only while `agents.local_openai.enabled` is on: `is_any_ai_enabled`
@@ -41,7 +41,7 @@ Open **Settings → Local AI**, turn on *Use Local AI provider*, pick a
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | Master switch for AI in the OSS build, not only for the single-shot features: `is_any_ai_enabled` returns this value, so with it off the AI surfaces, including the Agent Profile *LOCAL INFERENCE* fields, are disabled. |
-| `base_url` | string | `http://127.0.0.1:1234/v1` | OpenAI-compatible base URL. Must be loopback (see below). Not used by the OpenCode provider. |
+| `base_url` | string | `http://127.0.0.1:1234/v1` | OpenAI-compatible base URL: loopback, an allowed private host, or any `https://` host, which configuring it here allows (see below). Not used by the OpenCode provider. |
 | `api_key` | string | empty | Optional. Local servers such as Ollama and LM Studio usually do not need one. |
 | `command_model` | string | `google/gemma-4-e4b` | Model for command generation and workflow metadata. |
 | `prediction_model` | string | `google/gemma-4-e4b` | Model for command prediction. |
@@ -208,7 +208,7 @@ and auto-update configuration unset. Concretely:
 
 | Component | Reachable hosts |
 |---|---|
-| Single-shot Local AI, OpenAI-compatible | Loopback only |
+| Single-shot Local AI, OpenAI-compatible | Loopback, allowed private hosts, and the `https` origin of the configured base URL |
 | Single-shot Local AI, OpenCode | Loopback to the sidecar; the sidecar reaches whatever its configured provider uses |
 | Warp Agent conversations | Whatever base URL the custom endpoint sets (not policy-checked) |
 | Bundled service (autocomplete, *Test*, model discovery) | Whatever base URL the profile sets (not policy-checked; `https://api.openai.com/v1` when empty) |

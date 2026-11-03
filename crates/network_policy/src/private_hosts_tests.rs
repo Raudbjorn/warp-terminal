@@ -267,6 +267,7 @@ fn report(mode: ServicesMode, hosts: &[&str]) -> PolicyReport {
     PolicyReport {
         services_mode: mode,
         allowed_private_hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+        allowed_endpoints: Vec::new(),
     }
 }
 
@@ -416,7 +417,12 @@ fn the_policy_report_round_trips_through_json() {
     let json = serde_json::to_value(&report).unwrap();
     assert_eq!(
         json,
-        serde_json::json!({ "servicesMode": "local_only", "allowedPrivateHosts": ["10.77.0.0/16"] })
+        // `allowedEndpoints` joined the report with configured AI endpoints; it is always written.
+        serde_json::json!({
+            "servicesMode": "local_only",
+            "allowedPrivateHosts": ["10.77.0.0/16"],
+            "allowedEndpoints": [],
+        })
     );
     assert_eq!(
         serde_json::from_value::<PolicyReport>(json).unwrap(),
@@ -438,4 +444,12 @@ fn denial_in_chain_finds_a_denial_behind_other_errors() {
 
     let unrelated = std::io::Error::other("connection refused");
     assert_eq!(crate::denial_in_chain(&unrelated), None);
+}
+
+#[test]
+fn a_report_from_a_service_without_endpoints_reads_as_allowing_none() {
+    // Services built before configured endpoints existed do not send `allowedEndpoints`.
+    let json = serde_json::json!({ "servicesMode": "local_only", "allowedPrivateHosts": [] });
+    let report = serde_json::from_value::<PolicyReport>(json).unwrap();
+    assert!(report.allowed_endpoints.is_empty());
 }

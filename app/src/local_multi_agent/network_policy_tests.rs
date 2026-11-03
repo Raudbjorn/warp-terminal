@@ -31,6 +31,21 @@ impl Drop for LocalOnlyGuard {
     fn drop(&mut self) {
         network_policy::set_services_mode(self.mode);
         network_policy::set_allowed_private_hosts(std::mem::take(&mut self.hosts));
+        // Tests publish endpoints only through these app-side sources; leave none behind.
+        for source in [
+            network_policy::EndpointSource::AiSettings,
+            network_policy::EndpointSource::ProfileSettings,
+        ] {
+            network_policy::set_configured_endpoints(source, std::iter::empty());
+        }
+    }
+}
+
+/// An allow-list with the given private hosts and no configured endpoints.
+fn hosts_only(private_hosts: Vec<network_policy::PrivateNetwork>) -> network_policy::AllowList {
+    network_policy::AllowList {
+        private_hosts,
+        endpoints: Default::default(),
     }
 }
 
@@ -49,6 +64,7 @@ fn report(
     network_policy::PolicyReport {
         services_mode,
         allowed_private_hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
+        allowed_endpoints: Vec::new(),
     }
 }
 
@@ -207,9 +223,9 @@ fn test_manager() -> LocalMultiAgentManager {
         child: None,
         restart_debounce: None,
         openai_api_key: None,
-        applied_private_hosts: Vec::new(),
+        applied_allow_list: network_policy::AllowList::default(),
         original_server_root_url: None,
-        failed_with_hosts: None,
+        failed_with_allow_list: None,
     }
 }
 
@@ -222,15 +238,15 @@ fn the_applied_policy_is_the_snapshot_the_service_was_given() {
     network_policy::set_allowed_private_hosts(started_with.clone());
 
     // The service enforces the list it was handed, and the allow-list still matches it.
-    assert!(!manager.record_applied_private_hosts(started_with.clone()));
-    assert_eq!(manager.applied_private_hosts, started_with);
+    assert!(!manager.record_applied_allow_list(hosts_only(started_with.clone())));
+    assert_eq!(manager.applied_allow_list, hosts_only(started_with.clone()));
 
     // The allow-list changed while the service was starting: it enforces the old list, so it
     // must be restarted with the current one.
     network_policy::set_allowed_private_hosts(Vec::new());
-    assert!(manager.record_applied_private_hosts(started_with.clone()));
+    assert!(manager.record_applied_allow_list(hosts_only(started_with.clone())));
     // The recorded list is the snapshot the service was given, not the current allow-list.
-    assert_eq!(manager.applied_private_hosts, started_with);
+    assert_eq!(manager.applied_allow_list, hosts_only(started_with.clone()));
 }
 
 #[test]
@@ -290,23 +306,23 @@ fn a_service_refused_for_its_policy_is_retried_when_the_allow_list_is_restored()
 
     // A service validated against the original list is running.
     network_policy::set_allowed_private_hosts(original.clone());
-    manager.applied_private_hosts = original.clone();
+    manager.applied_allow_list = hosts_only(original.clone());
     assert!(!manager.allow_list_needs_restart());
 
     // The list changes and the replacement is refused for its policy, so nothing is running.
     network_policy::set_allowed_private_hosts(changed.clone());
     manager.set_failed("the running service enforces a different policy".to_string());
-    assert_eq!(manager.failed_with_hosts, Some(changed));
+    assert_eq!(manager.failed_with_allow_list, Some(hosts_only(changed)));
 
     // While the list is still the one the failure happened under, unrelated setting changes do
     // not restart it, even though it differs from the last validated list.
-    assert!(policy_needs_restart(&manager.applied_private_hosts));
+    assert!(policy_needs_restart(&manager.applied_allow_list));
     assert!(!manager.allow_list_needs_restart());
 
     // Restoring the original list makes it equal to the last validated one, which alone looks
     // like no change. The failure was under another list, so the service is tried again.
     network_policy::set_allowed_private_hosts(original);
-    assert!(!policy_needs_restart(&manager.applied_private_hosts));
+    assert!(!policy_needs_restart(&manager.applied_allow_list));
     assert!(manager.allow_list_needs_restart());
 
     // A failure under the current list is not retried by unrelated setting changes.
@@ -319,7 +335,7 @@ fn a_service_refused_for_its_policy_is_retried_when_the_allow_list_is_restored()
 fn a_spawned_service_is_published_only_if_it_enforces_the_policy_it_was_given() {
     let _local_only = LocalOnlyGuard::enter();
     let binary = Path::new("target/debug/local_multi_agent_service");
-    let given = network_policy::parse_allowed_private_hosts("10.77.0.0/16").unwrap();
+    let given = hosts_only(network_policy::parse_allowed_private_hosts("10.77.0.0/16").unwrap());
 
     // A build from before the policy existed reports nothing, or reports online mode: it
     // ignored the environment it was started with.
@@ -349,4 +365,79 @@ fn a_spawned_service_is_published_only_if_it_enforces_the_policy_it_was_given() 
         &["10.88.0.0/16"],
     )));
     assert!(ensure_spawned_service_policy(binary, &given, &other).is_err());
+}
+
+#[test]
+#[serial_test::serial]
+fn a_changed_configured_endpoint_restarts_the_service() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut manager = test_manager();
+    network_policy::set_configured_endpoints(
+        network_policy::EndpointSource::AiSettings,
+        ["https://api.minimax.io/v1"],
+    );
+    manager.applied_allow_list = network_policy::AllowList::current();
+    assert!(!manager.allow_list_needs_restart());
+
+    // The user points the base URL at another provider: the running service still allows the
+    // old host and not the new one, so it has to be restarted.
+    network_policy::set_configured_endpoints(
+        network_policy::EndpointSource::AiSettings,
+        ["https://api.openai.com/v1"],
+    );
+    assert!(manager.allow_list_needs_restart());
+}
+
+#[test]
+#[serial_test::serial]
+fn a_spawned_service_with_other_configured_endpoints_is_refused() {
+    let _local_only = LocalOnlyGuard::enter();
+    let binary = Path::new("target/debug/local_multi_agent_service");
+    network_policy::set_configured_endpoints(
+        network_policy::EndpointSource::AiSettings,
+        ["https://api.minimax.io/v1"],
+    );
+    let given = network_policy::AllowList::current();
+
+    let mut matching = report(network_policy::ServicesMode::LocalOnly, &[]);
+    matching.allowed_endpoints = vec!["https://api.minimax.io:443".to_owned()];
+    assert!(ensure_spawned_service_policy(binary, &given, &health(Some(matching))).is_ok());
+
+    // A service from before configured endpoints reports none, so it would refuse the provider.
+    let without = report(network_policy::ServicesMode::LocalOnly, &[]);
+    assert!(ensure_spawned_service_policy(binary, &given, &health(Some(without))).is_err());
+}
+
+#[test]
+#[serial_test::serial]
+fn configured_https_provider_urls_pass_the_policy_and_others_do_not() {
+    let _local_only = LocalOnlyGuard::enter();
+    network_policy::set_configured_endpoints(
+        network_policy::EndpointSource::AiSettings,
+        ["https://api.minimax.io/v1"],
+    );
+    let check = |url: &str| network_policy::check_url(&Url::parse(url).unwrap(), "test");
+    assert!(check("https://api.minimax.io/v1/chat/completions").is_ok());
+    assert!(check("http://api.minimax.io/v1/chat/completions").is_err());
+    assert!(check("https://api.openai.com/v1/chat/completions").is_err());
+    // Loopback http keeps working without configuration.
+    assert!(check("http://127.0.0.1:1234/v1/models").is_ok());
+}
+
+#[test]
+fn profile_endpoint_urls_collects_every_profile_and_legacy_url() {
+    let mut keys = ::ai::api_keys::ApiKeys {
+        openai_base_url: Some("https://legacy.example/v1".to_owned()),
+        ..Default::default()
+    };
+    keys.profile_inference_settings.insert(
+        "default".to_owned(),
+        ::ai::api_keys::ProfileInferenceSettings {
+            openai_base_url: Some("https://profile.example/v1".to_owned()),
+            ..Default::default()
+        },
+    );
+    let urls = profile_endpoint_urls(&keys);
+    assert!(urls.contains(&"https://legacy.example/v1".to_owned()));
+    assert!(urls.contains(&"https://profile.example/v1".to_owned()));
 }

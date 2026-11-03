@@ -2447,10 +2447,21 @@ impl AISettings {
         }
     }
 
-    /// Applies the user's allowed private hosts to the process-wide network policy. An invalid
-    /// value (for example from a hand-edited settings file) allows nothing extra rather than
-    /// being partly applied.
+    /// Applies the user's allowed private hosts and the AI endpoints configured in these settings
+    /// to the process-wide network policy. An invalid private-host value (for example from a
+    /// hand-edited settings file) allows nothing extra rather than being partly applied. Endpoint
+    /// base URLs that are not `https` are skipped (see `network_policy::ConfiguredEndpoint`).
     pub(crate) fn apply_network_policy(&self) {
+        let custom_endpoints = self.custom_endpoints.value();
+        network_policy::set_configured_endpoints(
+            network_policy::EndpointSource::AiSettings,
+            std::iter::once(self.local_openai_base_url.value().as_str()).chain(
+                custom_endpoints
+                    .definitions()
+                    .map(|(_, endpoint)| endpoint.base_url.as_str()),
+            ),
+        );
+
         let raw = self.local_openai_allowed_private_hosts.value();
         match network_policy::parse_allowed_private_hosts(raw) {
             Ok(hosts) => network_policy::set_allowed_private_hosts(hosts),
