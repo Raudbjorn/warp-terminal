@@ -241,8 +241,19 @@ impl ConnSession {
         };
         let mut covered = vec![false; covered_end];
         let mut search_from = 0;
+        let mut first_matched = None;
+        // A failure is not in the transcript, so it stays in flight for as long as it belongs to
+        // the latest turn. Once a later prompt exists it is history, and holding it back would
+        // drag every covered entry after it back into the slice.
+        let last_prompt = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry.kind, ConnEntryKind::Prompt { .. }));
 
         for turn in &story.turns {
+            // A resumed conversation, or one whose oldest hook prompts were evicted, starts with
+            // transcript turns that have no live entries. Those say nothing about the later
+            // turns, so they are skipped rather than ending the match.
             let Some(prompt_index) = self.entries[search_from..covered_end]
                 .iter()
                 .position(|entry| match &entry.kind {
@@ -251,8 +262,9 @@ impl ConnSession {
                 })
                 .map(|offset| search_from + offset)
             else {
-                break;
+                continue;
             };
+            first_matched.get_or_insert(prompt_index);
 
             let next_prompt = self.entries[prompt_index + 1..covered_end]
                 .iter()
@@ -264,16 +276,25 @@ impl ConnSession {
             } else {
                 turn.last_activity().min(through)
             };
-            for (index, entry) in self.entries[prompt_index..next_prompt].iter().enumerate() {
+            for index in prompt_index..next_prompt {
+                let entry = &self.entries[index];
                 if entry.at <= end {
-                    covered[prompt_index + index] =
-                        !matches!(entry.kind, ConnEntryKind::Failed { .. });
+                    let latest_failure = matches!(entry.kind, ConnEntryKind::Failed { .. })
+                        && last_prompt.is_none_or(|last| index > last);
+                    covered[index] = !latest_failure;
                 }
             }
             search_from = next_prompt;
             if search_from == covered_end {
                 break;
             }
+        }
+
+        // What precedes the first matched prompt belongs to turns older than one the story
+        // holds, so the story already accounts for it, or it has been evicted from the story's
+        // reach altogether.
+        if let Some(first) = first_matched {
+            covered[..first].fill(true);
         }
 
         let first_uncovered = covered.iter().position(|is_covered| !is_covered);
@@ -402,9 +423,7 @@ impl ConnSession {
 fn prompt_matches(hook: &str, transcript: &str) -> bool {
     !hook.is_empty()
         && !transcript.is_empty()
-        && (hook == transcript
-            || transcript.starts_with(hook)
-            || hook.starts_with(transcript))
+        && (hook == transcript || transcript.starts_with(hook) || hook.starts_with(transcript))
 }
 
 #[cfg(test)]

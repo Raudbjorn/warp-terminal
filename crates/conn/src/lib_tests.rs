@@ -313,7 +313,10 @@ fn a_transcript_story_does_not_hide_a_failure_entry() {
 
     assert!(session.adopt_story(story(vec![turn(1, Some(3), Some("partial"))]), at(9)));
     assert_eq!(session.in_flight().len(), 1);
-    assert!(matches!(session.in_flight()[0].kind, ConnEntryKind::Failed { .. }));
+    assert!(matches!(
+        session.in_flight()[0].kind,
+        ConnEntryKind::Failed { .. }
+    ));
 }
 
 #[test]
@@ -343,6 +346,67 @@ fn repeated_prompts_are_matched_one_at_a_time() {
         at(20)
     ));
     assert!(session.in_flight().is_empty());
+}
+
+#[test]
+fn a_transcript_turn_without_live_entries_does_not_stop_matching() {
+    let mut session = ConnSession::default();
+    // The hook history starts at the second turn: the first was evicted, or the conversation
+    // was resumed in this pane.
+    session.push(prompt("second", 10));
+    session.push(responded("two", 12));
+
+    assert!(session.adopt_story(
+        story(vec![
+            turn_with_prompt(1, Some(2), Some("one"), "first"),
+            turn_with_prompt(10, Some(12), Some("two"), "second"),
+        ]),
+        at(12)
+    ));
+    assert!(session.in_flight().is_empty());
+}
+
+#[test]
+fn entries_before_the_first_matched_prompt_are_covered() {
+    let mut session = ConnSession::default();
+    session.push(tool(3));
+    session.push(prompt("second", 10));
+
+    assert!(session.adopt_story(
+        story(vec![
+            turn_with_prompt(1, Some(4), Some("one"), "first"),
+            turn_with_prompt(10, Some(11), Some("two"), "second"),
+        ]),
+        at(11)
+    ));
+    assert!(session.in_flight().is_empty());
+}
+
+#[test]
+fn a_failure_followed_by_another_turn_does_not_drag_covered_entries_back() {
+    let mut session = ConnSession::default();
+    session.push(prompt("first", 1));
+    session.push(ConnEntry::new(
+        ConnEntryKind::Failed {
+            error_type: Some("rate_limit".to_owned()),
+            message: None,
+        },
+        at(3),
+    ));
+    session.push(prompt("second", 10));
+    session.push(responded("two", 12));
+
+    assert!(session.adopt_story(
+        story(vec![
+            turn_with_prompt(1, Some(3), Some("one"), "first"),
+            turn_with_prompt(10, Some(12), Some("two"), "second"),
+        ]),
+        at(12)
+    ));
+    assert!(
+        session.in_flight().is_empty(),
+        "the old failure is history once a later turn exists"
+    );
 }
 
 /// Pasted text arrives wrapped in a tag addressed to the agent. Left in, it
@@ -515,7 +579,15 @@ fn a_running_last_turn_is_still_not_counted_as_unseen() {
     let mut session = ConnSession::default();
     session.push(prompt("first", 1));
     session.status = super::ConnStatus::Working;
-    assert!(session.adopt_story(story(vec![turn(1, Some(5), Some("narration"))]), at(6)));
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(
+            1,
+            Some(5),
+            Some("narration"),
+            "first"
+        )]),
+        at(6)
+    ));
 
     assert_eq!(session.unseen_turns(), 0);
 }
@@ -528,6 +600,9 @@ fn a_story_newer_than_its_dispatch_boundary_is_handled() {
     session.push(prompt("first", 1));
     session.push(responded("done", 4));
 
-    assert!(session.adopt_story(story(vec![turn(1, Some(9), Some("done"))]), at(4)));
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(1, Some(9), Some("done"), "first")]),
+        at(4)
+    ));
     assert!(session.in_flight().is_empty());
 }

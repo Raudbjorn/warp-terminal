@@ -67,7 +67,7 @@ pub struct ConnModel {
     paced_reads: HashMap<EntityId, SpawnedFutureHandle>,
     /// The delayed read still to come for each pane, by dispatch order, so that a burst of
     /// events does not each start a whole-transcript read of the same file.
-    delayed_reads: HashMap<EntityId, u64>,
+    delayed_reads: HashMap<EntityId, PendingRead>,
     /// Project names by working directory. Resolving one runs git, so each directory is resolved
     /// once per process.
     /// `None` when the directory names nothing, which leaves the plugin's name in place.
@@ -83,6 +83,14 @@ struct InFlightRead {
     /// Position in dispatch order. See [`ConnModel::next_read_seq`].
     seq: u64,
     future_id: FutureId,
+}
+
+/// A delayed read that has been dispatched and has not landed yet.
+struct PendingRead {
+    /// Position in dispatch order. See [`ConnModel::next_read_seq`].
+    seq: u64,
+    /// Kept so that a newer boundary can replace the read instead of queueing another.
+    handle: SpawnedFutureHandle,
 }
 
 /// The reader's time in one pane of the key window.
@@ -126,14 +134,6 @@ const FLUSH_GRACE: Duration = Duration::from_millis(1500);
 /// skipped, and the live entries keep describing the session.
 #[cfg(not(target_family = "wasm"))]
 const MAX_TRANSCRIPT_BYTES: u64 = 128 * 1024 * 1024;
-
-/// How many project directories the search for a transcript looks through.
-///
-/// Claude Code writes one directory per project, and the session's own project is
-/// usually found by name. This is the fallback for when it is not, and it must not
-/// cost a filesystem walk of the whole directory every time a pane is re-read.
-#[cfg(not(target_family = "wasm"))]
-const MAX_SCANNED_PROJECTS: usize = 256;
 
 /// Emitted whenever a pane's history changes.
 ///
@@ -366,11 +366,11 @@ impl ConnModel {
         if let Some(handle) = self.paced_reads.remove(&terminal_view_id) {
             handle.abort();
         }
+        self.cancel_delayed_read(terminal_view_id);
         self.reads_in_flight.remove(&terminal_view_id);
         self.last_read.remove(&terminal_view_id);
         self.adopted_reads.remove(&terminal_view_id);
         self.transcript_lengths.remove(&terminal_view_id);
-        self.delayed_reads.remove(&terminal_view_id);
         self.session_epochs.remove(&terminal_view_id);
         if self
             .visit
@@ -466,12 +466,13 @@ impl ConnModel {
         if self.should_read(terminal_view_id, event, at) {
             self.read_transcript(terminal_view_id, locator.clone(), through, None, ctx);
         }
-        if (finished || waiting) && !self.delayed_reads.contains_key(&terminal_view_id) {
-            // One delayed read per pane: the read is of the whole transcript, and a burst of
-            // events would otherwise each start one over the same file.
-            let seq =
-                self.read_transcript(terminal_view_id, locator, through, Some(FLUSH_GRACE), ctx);
-            self.delayed_reads.insert(terminal_view_id, seq);
+        if finished || waiting {
+            // One delayed read per pane, always for the latest boundary: the read is of the
+            // whole transcript, so a burst of events must not each start one over the same file,
+            // and a read left pending for an older boundary would be dropped as stale once this
+            // boundary's immediate read lands, leaving nothing to pick up the flushed answer.
+            // `read_transcript` replaces the pending one.
+            self.read_transcript(terminal_view_id, locator, through, Some(FLUSH_GRACE), ctx);
         }
         self.record_status(terminal_view_id, event, ctx);
         if let Some(cwd) = unresolved_cwd {
@@ -554,7 +555,7 @@ impl ConnModel {
         // behind says nothing about it.
         self.transcript_lengths.remove(&terminal_view_id);
         self.adopted_reads.remove(&terminal_view_id);
-        self.delayed_reads.remove(&terminal_view_id);
+        self.cancel_delayed_read(terminal_view_id);
         ctx.notify();
         ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
     }
@@ -722,7 +723,11 @@ impl ConnModel {
                     me.reads_in_flight.remove(&terminal_view_id);
                 }
                 // The delayed read this pane was waiting for has landed.
-                if delayed && me.delayed_reads.get(&terminal_view_id) == Some(&seq) {
+                if me
+                    .delayed_reads
+                    .get(&terminal_view_id)
+                    .is_some_and(|pending| pending.seq == seq)
+                {
                     me.delayed_reads.remove(&terminal_view_id);
                 }
                 // The agent this was read for has been replaced in the pane: the transcript is its,
@@ -766,7 +771,21 @@ impl ConnModel {
                 future_id: handle.future_id(),
             },
         );
+        if delayed {
+            // The read for an older boundary is dropped for this one, which is later and so
+            // reads at least as much of the transcript.
+            self.cancel_delayed_read(terminal_view_id);
+            self.delayed_reads
+                .insert(terminal_view_id, PendingRead { seq, handle });
+        }
         seq
+    }
+
+    /// Drops the delayed read still pending for a pane, if any.
+    fn cancel_delayed_read(&mut self, terminal_view_id: EntityId) {
+        if let Some(pending) = self.delayed_reads.remove(&terminal_view_id) {
+            pending.handle.abort();
+        }
     }
 }
 
@@ -903,20 +922,7 @@ async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
     // The directory name is a guess; the session id is not. When the guess is
     // wrong, look for the file itself rather than give up on the session.
     let mut entries = tokio::fs::read_dir(&projects).await.ok()?;
-    let mut scanned = 0;
     while let Ok(Some(entry)) = entries.next_entry().await {
-        // A plain file cannot hold a transcript, and the listing already says what each
-        // entry is, so one among them costs nothing to skip. A link is followed, since it
-        // may lead to a directory.
-        if matches!(entry.file_type().await, Ok(file_type) if file_type.is_file()) {
-            continue;
-        }
-        // ponytail: the search looks through a bounded number of project directories; raise the
-        // bound or index the projects directory if a user has more projects than that.
-        scanned += 1;
-        if scanned > MAX_SCANNED_PROJECTS {
-            break;
-        }
         let candidate = entry.path().join(&file_name);
         if is_regular_file(&candidate).await {
             return Some(candidate);

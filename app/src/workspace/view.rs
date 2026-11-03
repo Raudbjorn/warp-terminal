@@ -4649,7 +4649,18 @@ impl Workspace {
             pg.right_panel_open = true;
             pg.is_right_panel_maximized = right_panel_snapshot.is_maximized;
         });
-        self.right_panel_content = Some(RightPanelContent::CodeReview);
+        // Remembered for this tab's focused pane rather than set window-wide: the window-wide
+        // content is what every tab shows until its own pane says otherwise, so setting it here
+        // would open Code Review on each restored tab that had no right panel. Activating the
+        // tab restores it from this entry.
+        if let Some(pane) = pane_group
+            .as_ref(ctx)
+            .focused_session_view(ctx)
+            .map(|terminal| terminal.id())
+        {
+            self.right_panel_by_pane
+                .insert(pane, Some(RightPanelContent::CodeReview));
+        }
 
         let resizable = ResizableData::handle(ctx);
         if let Some(modal_sizes) = resizable.as_ref(ctx).get_all_handles(self.window_id)
@@ -5283,10 +5294,7 @@ impl Workspace {
         if self.left_panel_view.is_self_or_child_focused(app) {
             return FocusRegion::LeftPanel;
         }
-        if self.right_panel_view.is_self_or_child_focused(app)
-            || (self.right_panel_content == Some(RightPanelContent::Conn)
-                && self.conn_panel_view.is_self_or_child_focused(app))
-        {
+        if self.right_panel_view.is_self_or_child_focused(app) {
             return FocusRegion::RightPanel;
         }
 
@@ -5305,9 +5313,7 @@ impl Workspace {
 
     fn has_right_region(&self, app: &AppContext) -> bool {
         let group = self.active_tab_pane_group().as_ref(app);
-        group.right_panel_open
-            || self.right_panel_content == Some(RightPanelContent::Conn)
-            || self.current_workspace_state.is_right_panel_open()
+        group.right_panel_open || self.current_workspace_state.is_right_panel_open()
     }
 
     fn focus_next_pane_in_group(&mut self, ctx: &mut ViewContext<Self>) -> bool {
@@ -5344,9 +5350,7 @@ impl Workspace {
             ctx.focus(&self.right_panel_view);
             return;
         }
-        if self.right_panel_content == Some(RightPanelContent::Conn) {
-            ctx.focus(&self.conn_panel_view);
-        } else if self.current_workspace_state.is_ai_assistant_panel_open {
+        if self.current_workspace_state.is_ai_assistant_panel_open {
             ctx.focus(&self.ai_assistant_panel);
         } else if self.current_workspace_state.is_resource_center_open {
             ctx.focus(&self.resource_center_view);

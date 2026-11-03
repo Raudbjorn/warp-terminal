@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use ::conn::overview::{OverviewItem, ProjectGroup, group_by_project};
+use ::conn::overview::{OverviewItem, ProjectGroup, group_by_project, project_label};
 use ::conn::story::ConnTurn;
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession, ConnStatus};
 use chrono::{DateTime, Datelike, Local, Utc};
@@ -428,7 +428,8 @@ impl ConnPanelView {
             .flatten();
         let status = self.with_session(app, |session| session.status);
         let heading = match project {
-            Some(project) => format!("Conn — {project}"),
+            // The session holds a grouping key, which can be a whole path.
+            Some(project) => format!("Conn — {}", project_label(&project)),
             None => "Conn".to_owned(),
         };
 

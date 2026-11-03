@@ -744,7 +744,11 @@ fn a_session_in_a_subdirectory_is_named_after_its_repository() {
             me.session(view_id)
                 .and_then(|session| session.project.clone())
         });
-        assert_eq!(project.as_deref(), Some("checkout"));
+        // The session keeps the repository's grouping key, so two checkouts that share a
+        // directory name stay apart. The overview turns it into a name.
+        let project = project.expect("the project was resolved");
+        assert!(std::path::Path::new(&project).is_absolute(), "{project}");
+        assert_eq!(::conn::overview::project_label(&project), "checkout");
     });
 }
 
@@ -1025,7 +1029,7 @@ fn an_earlier_read_does_not_replace_a_later_story() {
         // The first read is dispatched first and lands last, having seen less of the
         // transcript than the second.
         let through = Utc::now();
-        let stale = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+        let stale = ConnModel::handle(&app).update(&mut app, |me, ctx| {
             me.dispatch_read(
                 view_id,
                 older.to_str().expect("utf-8 path"),
@@ -1034,7 +1038,7 @@ fn an_earlier_read_does_not_replace_a_later_story() {
                 ctx,
             )
         });
-        let fresh = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+        let fresh = ConnModel::handle(&app).update(&mut app, |me, ctx| {
             me.dispatch_read(
                 view_id,
                 newer.to_str().expect("utf-8 path"),
@@ -1046,11 +1050,11 @@ fn an_earlier_read_does_not_replace_a_later_story() {
 
         // The later read lands first.
         let awaiting =
-            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(fresh));
+            ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(fresh));
         awaiting.await;
         // The earlier read lands after it, and must not put its story back.
         let awaiting =
-            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(stale));
+            ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(stale));
         awaiting.await;
 
         let (title, path) = ConnModel::handle(&app).read(&app, |me, _| {
@@ -1086,7 +1090,7 @@ fn a_later_read_replaces_an_earlier_story() {
         .expect("write transcript");
 
         let through = Utc::now();
-        let early = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+        let early = ConnModel::handle(&app).update(&mut app, |me, ctx| {
             me.dispatch_read(
                 view_id,
                 older.to_str().expect("utf-8 path"),
@@ -1095,7 +1099,7 @@ fn a_later_read_replaces_an_earlier_story() {
                 ctx,
             )
         });
-        let late = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+        let late = ConnModel::handle(&app).update(&mut app, |me, ctx| {
             me.dispatch_read(
                 view_id,
                 newer.to_str().expect("utf-8 path"),
@@ -1106,10 +1110,10 @@ fn a_later_read_replaces_an_earlier_story() {
         });
 
         let awaiting =
-            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(early));
+            ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(early));
         awaiting.await;
         let awaiting =
-            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(late));
+            ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(late));
         awaiting.await;
 
         let title = ConnModel::handle(&app).read(&app, |me, _| {
@@ -1153,12 +1157,12 @@ fn a_running_turn_is_re_read() {
                 .read(&app, |me, _| me.paced_read_in_flight(view_id))
                 .expect("a running turn schedules a paced read");
             let awaiting =
-                ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(paced));
+                ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(paced));
             awaiting.await;
             // The read the timer dispatched may have landed already.
             let read = ConnModel::handle(&app).read(&app, |me, _| me.read_in_flight(view_id));
             if let Some(read) = read {
-                let awaiting = ConnModel::handle(&*app)
+                let awaiting = ConnModel::handle(&app)
                     .update(&mut app, |_, ctx| ctx.await_spawned_future(read));
                 awaiting.await;
             }
@@ -1179,21 +1183,35 @@ fn a_running_turn_is_re_read() {
     });
 }
 
-/// A burst of events must not each start a whole-transcript read of the same file.
+/// A burst of events must not leave a whole-transcript read pending for each of them, and the one
+/// that is pending must be for the latest boundary: an older one would be dropped as stale once
+/// the newer boundary's immediate read landed, and nothing would be left to pick up the answer
+/// the transcript flushed after it.
 #[test]
-fn a_burst_of_events_starts_one_delayed_read() {
+fn a_burst_of_events_keeps_one_delayed_read_for_the_latest_boundary() {
     with_session(|app, view_id| {
         send(app, view_id, stop("done", Some("/tmp/session.jsonl")));
-        let after_stop = ConnModel::handle(&*app).read(app, |me, _| me.next_read_seq);
+        let first = ConnModel::handle(&*app).read(app, |me, _| {
+            me.delayed_reads.get(&view_id).map(|pending| pending.seq)
+        });
+        assert!(first.is_some(), "a finished turn schedules a delayed read");
 
         send(app, view_id, stop("done again", Some("/tmp/session.jsonl")));
-        let after_second = ConnModel::handle(&*app).read(app, |me, _| me.next_read_seq);
+        let (pending, newest, count) = ConnModel::handle(&*app).read(app, |me, _| {
+            (
+                me.delayed_reads.get(&view_id).map(|pending| pending.seq),
+                me.next_read_seq - 1,
+                me.delayed_reads.len(),
+            )
+        });
 
+        assert_eq!(count, 1, "one delayed read is pending per pane");
         assert_eq!(
-            after_second - after_stop,
-            1,
-            "the second event reads at once, but the delayed read is already pending"
+            pending,
+            Some(newest),
+            "the pending read is the newest dispatched, not the one for the older boundary"
         );
+        assert_ne!(pending, first, "the older boundary's read was replaced");
     });
 }
 
@@ -1273,7 +1291,7 @@ fn an_unchanged_transcript_is_not_read_again() {
         let first = announced_panes(&mut app, &announced).len();
 
         // The same file again: it has not grown, so there is nothing new in it.
-        let read = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+        let read = ConnModel::handle(&app).update(&mut app, |me, ctx| {
             me.dispatch_read(
                 view_id,
                 path.to_str().expect("utf-8 path"),
@@ -1283,7 +1301,7 @@ fn an_unchanged_transcript_is_not_read_again() {
             )
         });
         let awaiting =
-            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(read));
+            ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(read));
         awaiting.await;
 
         assert_eq!(

@@ -36,9 +36,13 @@ pub struct ProjectGroup<P> {
     pub items: Vec<OverviewItem<P>>,
 }
 
-fn project_label(project_key: &str) -> String {
+/// The name shown for a project key: its directory's name, without a bare repository's `.git`.
+pub fn project_label(project_key: &str) -> String {
     let path = Path::new(project_key);
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or(project_key);
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(project_key);
     name.strip_suffix(".git").unwrap_or(name).to_owned()
 }
 

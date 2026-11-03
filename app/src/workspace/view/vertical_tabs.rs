@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ::conn::story::ConnTurn;
+use ::conn::story::{ConnStory, ConnTurn};
 use ::conn::{ConnEntryKind, ConnSession};
 use languages::language_by_local_filename;
 use pathfinder_color::ColorU;
