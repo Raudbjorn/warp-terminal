@@ -184,6 +184,7 @@ fn test_manager() -> LocalMultiAgentManager {
         restart_debounce: None,
         openai_api_key: None,
         applied_private_hosts: Vec::new(),
+        original_server_root_url: None,
     }
 }
 
@@ -234,4 +235,18 @@ fn a_revoked_service_is_unpublished_until_its_replacement_is_healthy() {
     // The allow-list lost a host: requests stop at once, not after the restart debounce.
     manager.revoke_running_service();
     assert_eq!(local_no_cloud_root_url(), None);
+}
+
+#[test]
+fn unpublishing_gives_back_the_original_server_root_url() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut manager = test_manager();
+    manager.original_server_root_url = Some("https://app.example.test".to_string());
+    set_global_root_url(Some(root_url()));
+
+    // Every route goes, including the process-wide one other clients read: the remembered
+    // original is consumed by the restore, so a later publish records a fresh one.
+    manager.unpublish_service_url();
+    assert_eq!(local_no_cloud_root_url(), None);
+    assert_eq!(manager.original_server_root_url, None);
 }

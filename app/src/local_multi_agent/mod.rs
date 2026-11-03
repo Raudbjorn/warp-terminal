@@ -425,6 +425,10 @@ pub struct LocalMultiAgentManager {
     /// or the list it reports for a service this app did not start. The service reads its
     /// policy once at startup, so a change to the setting restarts it.
     applied_private_hosts: Vec<network_policy::PrivateNetwork>,
+    /// The server root URL the app used before it was pointed at the local service. Publishing
+    /// overrides the process-wide `ChannelState` URL, which other clients read without consulting
+    /// this module, so unpublishing has to put it back.
+    original_server_root_url: Option<String>,
 }
 
 impl LocalMultiAgentManager {
@@ -447,6 +451,7 @@ impl LocalMultiAgentManager {
             restart_debounce: None,
             openai_api_key: None,
             applied_private_hosts: network_policy::allowed_private_hosts(),
+            original_server_root_url: None,
         };
         if ChannelState::is_local_only() {
             manager.schedule_restart(ctx);
@@ -551,7 +556,7 @@ impl LocalMultiAgentManager {
         }
         self.stop_child();
         self.status = LocalMultiAgentStatus::Disabled;
-        set_global_root_url(None);
+        self.unpublish_service_url();
         ctx.emit(LocalMultiAgentManagerEvent::StatusChanged);
     }
 
@@ -770,7 +775,7 @@ impl LocalMultiAgentManager {
         if !ChannelState::is_local_only() {
             self.stop_child();
             self.status = LocalMultiAgentStatus::Disabled;
-            set_global_root_url(None);
+            self.unpublish_service_url();
             ctx.emit(LocalMultiAgentManagerEvent::StatusChanged);
             return;
         }
@@ -844,6 +849,10 @@ impl LocalMultiAgentManager {
         }
         // The service is healthy and enforces the app's policy, so it can be published.
         set_global_root_url(Some(root_url.clone()));
+        // Keep the first original: a republish without an unpublish in between would otherwise
+        // record the previous service's URL as the original.
+        self.original_server_root_url
+            .get_or_insert_with(|| ChannelState::server_root_url().into_owned());
         let _ = ChannelState::override_server_root_url(root_url.to_string());
         self.status = LocalMultiAgentStatus::Running {
             root_url,
@@ -857,8 +866,20 @@ impl LocalMultiAgentManager {
     /// routed to it, and stops it if this app started it. A service this app did not start cannot
     /// be stopped from here, but without a published URL nothing reaches it.
     fn revoke_running_service(&mut self) {
-        set_global_root_url(None);
+        self.unpublish_service_url();
         self.stop_child();
+    }
+
+    /// Removes every route to the local service: this module's URL and the process-wide server
+    /// root URL, which is restored to what it was before the service was published. In local-only
+    /// mode that is a cloud URL the network policy refuses, so requests fail closed.
+    fn unpublish_service_url(&mut self) {
+        set_global_root_url(None);
+        if let Some(original) = self.original_server_root_url.take()
+            && let Err(error) = ChannelState::override_server_root_url(original)
+        {
+            log::warn!("Could not restore the server root URL after unpublishing: {error}");
+        }
     }
 
     /// Records the private hosts the running service enforces and reports whether the service
@@ -889,7 +910,7 @@ impl LocalMultiAgentManager {
         self.stop_child();
         self.status = LocalMultiAgentStatus::Failed { message };
         // A service that failed is not usable, so it must not receive requests.
-        set_global_root_url(None);
+        self.unpublish_service_url();
     }
 }
 
