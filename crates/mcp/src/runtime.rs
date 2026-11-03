@@ -335,7 +335,9 @@ pub async fn spawn_server(
             if let Err(denied) =
                 network_policy::check_url_str(&sse_server.url, "MCP server connection")
             {
-                logger.log("[error] MCP: Network policy refused the MCP server connection".to_string());
+                logger.log(
+                    "[error] MCP: Network policy refused the MCP server connection".to_string(),
+                );
                 return Err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(
                     denied.to_string(),
                 ));

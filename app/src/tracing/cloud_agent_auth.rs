@@ -374,8 +374,12 @@ impl AuthenticatedHttpClient {
 #[async_trait]
 impl HttpClient for AuthenticatedHttpClient {
     async fn send_bytes(&self, mut request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
-        if let Err(error) = network_policy::check_url_str(&request.uri().to_string(), "cloud agent trace export") {
-            return Err(network_policy::NetworkPolicyDenied::new(error.purpose(), "<redacted>").into());
+        if let Err(error) =
+            network_policy::check_url_str(&request.uri().to_string(), "cloud agent trace export")
+        {
+            return Err(
+                network_policy::NetworkPolicyDenied::new(error.purpose(), "<redacted>").into(),
+            );
         }
         self.authorize_request(&mut request)?;
 
