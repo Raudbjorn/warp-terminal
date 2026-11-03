@@ -874,6 +874,26 @@ impl WorkingDirectoriesModel {
             .insert(repo_key, terminal_id);
     }
 
+    /// Returns whether `directory` is one of the pane group's local directories and is not inside
+    /// a repository.
+    pub fn is_non_repo_directory(&self, pane_group_id: EntityId, directory: &Path) -> bool {
+        let directory = LocalOrRemotePath::Local(directory.to_path_buf());
+        self.pane_groups
+            .get(&pane_group_id)
+            .is_some_and(|directories| directories.contains(&directory))
+            && !self
+                .repository_roots
+                .get(pane_group_id)
+                .is_some_and(|repos| repos.contains(&directory))
+    }
+
+    /// Returns whether `directory` is a non-repository directory of any pane group.
+    pub fn is_non_repo_directory_of_any_pane_group(&self, directory: &Path) -> bool {
+        self.pane_groups
+            .keys()
+            .any(|pane_group_id| self.is_non_repo_directory(*pane_group_id, directory))
+    }
+
     /// Registers a remote repository root for a pane group. Inserts it into
     /// the unified `repository_roots` map and emits `RepositoriesChanged` if
     /// the repo was newly added.

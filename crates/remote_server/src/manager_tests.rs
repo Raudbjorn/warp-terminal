@@ -101,6 +101,8 @@ fn start_ripgrep_search_without_connected_host_resolves_immediately() {
                     ignore_case: false,
                     multiline: false,
                     max_matches: 100,
+                    scope_include: String::new(),
+                    scope_exclude: String::new(),
                 },
             )
         });

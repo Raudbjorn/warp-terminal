@@ -1,0 +1,9 @@
+[package]
+name = "file_write_guard"
+version = "0.1.0"
+edition = "2024"
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+dunce.workspace = true

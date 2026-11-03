@@ -851,6 +851,10 @@ pub struct RipgrepSearchParams {
     pub multiline: bool,
     /// Maximum number of matches requested from the remote host.
     pub max_matches: u32,
+    /// Comma-separated file patterns to include, exactly as entered by the user.
+    pub scope_include: String,
+    /// Comma-separated file patterns to exclude, exactly as entered by the user.
+    pub scope_exclude: String,
 }
 
 /// A host-scoped remote ripgrep search registered synchronously with
@@ -1687,6 +1691,8 @@ impl RemoteServerManager {
                     ignore_case: params.ignore_case,
                     multiline: params.multiline,
                     max_matches: params.max_matches,
+                    scope_include: params.scope_include,
+                    scope_exclude: params.scope_exclude,
                 },
             ),
         );

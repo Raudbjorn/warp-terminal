@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
 
@@ -76,7 +78,8 @@ define_settings_group!(CodeSettings, settings: [
         toml_path: "code.editor.show_hidden_files",
         description: "Whether hidden files (dotfiles) are shown in the project explorer.",
     },
-    // Controls whether the language server reformats the file on save.
+    // Controls whether the file is reformatted on save, by the project's formatter or the
+    // language server.
     format_on_save: FormatOnSave {
         type: bool,
         default: true,
@@ -85,7 +88,43 @@ define_settings_group!(CodeSettings, settings: [
         surface: settings::SettingSurfaces::GUI,
         private: false,
         toml_path: "code.editor.format_on_save",
-        description: "Whether the language server automatically formats the file on save. Other LSP features (hover, go-to-definition, references, diagnostics) are unaffected.",
+        description: "Whether the file is automatically formatted on save, with the project's formatter when one is set up and otherwise with the language server. Other LSP features (hover, go-to-definition, references, diagnostics) are unaffected.",
+    },
+    // Controls whether formatting prefers the formatter a project is set up with over the
+    // language server.
+    use_project_formatters: UseProjectFormatters {
+        type: bool,
+        default: true,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Globally(RespectUserSyncSetting::Yes),
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "code.editor.use_project_formatters",
+        description: "Whether files are formatted with the formatter their project is set up with (Prettier, Biome, Ruff, Black, rustfmt, gofmt and others) when it is installed and the project has been explicitly approved for this application session, instead of with the language server. Use Format document to approve a project.",
+    },
+    // Formatter choice per language, keyed by a language identifier ("typescript"), a file
+    // extension ("md") or "*". Not synced because the tools available differ per machine.
+    formatter_overrides: FormatterOverrides {
+        type: HashMap<String, String>,
+        default: HashMap::default(),
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "code.editor.formatters",
+        max_table_depth: 1,
+        description: "Which formatter to use per language. Keys are a language identifier such as typescript or python, a file extension such as md, or * for every file. Values are auto (the project's formatter, else the language server), lsp, off, or the name of a formatter such as prettier, biome, ruff or black.",
+    },
+    // How long a project formatter may run before it is stopped and the file left as it was.
+    formatter_timeout_ms: FormatterTimeoutMs {
+        type: u64,
+        default: 5000,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        toml_path: "code.editor.formatter_timeout_ms",
+        description: "How long, in milliseconds, to wait for shell PATH capture, project formatter discovery and execution before saving the file unformatted.",
     },
     // Controls whether the Warp text editor automatically saves file changes as the
     // user types (debounced) and when the editor loses focus. Only applies to the

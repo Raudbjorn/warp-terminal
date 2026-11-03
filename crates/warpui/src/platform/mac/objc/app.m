@@ -502,7 +502,29 @@ static BOOL isSystemInitiatedTermination(void) {
 
 - (void)showModal:(NSAlert *)alert modalId:(NSUInteger)modalId {
     dispatch_async(dispatch_get_main_queue(), ^{
+      // AppKit gives a button titled "Cancel" the Escape key in place of Return, which leaves an
+      // alert that lists it first without a default button. Return presses it like any other
+      // first button, and Escape keeps doing so.
+      id escapeMonitor = nil;
+      NSButton *firstButton = alert.buttons.firstObject;
+      if (firstButton != nil && [firstButton.keyEquivalent isEqualToString:@"\033"]) {
+          firstButton.keyEquivalent = @"\r";
+          escapeMonitor = [NSEvent
+              addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                           handler:^NSEvent *(NSEvent *event) {
+                                             if (event.keyCode == kVK_Escape &&
+                                                 event.window == alert.window) {
+                                                 [firstButton performClick:nil];
+                                                 return nil;
+                                             }
+                                             return event;
+                                           }];
+      }
+
       NSModalResponse response = configureAndRunModal(alert, self);
+      if (escapeMonitor != nil) {
+          [NSEvent removeMonitor:escapeMonitor];
+      }
 
       BOOL disable_modal = alert.suppressionButton.state == NSControlStateValueOn;
       // Subtracting `NSAlertFirstButtonReturn` from `response` yields the 0-based index of the

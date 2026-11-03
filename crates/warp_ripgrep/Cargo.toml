@@ -11,10 +11,10 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-grep = "0.4.1"
 ignore = "0.4.20"
 instant.workspace = true
 log.workspace = true
+project_replace.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 string-offset.workspace = true

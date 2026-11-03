@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
+use project_replace::scope::ScopeGlobs;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -16,7 +17,14 @@ fn main() -> Result<()> {
     println!("Searching for pattern: {pattern}");
     println!("In paths: {paths:?}");
 
-    warp_ripgrep::search::run_search_subprocess(&[pattern], paths, false, false, None)?;
+    warp_ripgrep::search::run_search_subprocess(
+        &[pattern],
+        paths,
+        false,
+        false,
+        &ScopeGlobs::default(),
+        None,
+    )?;
 
     Ok(())
 }

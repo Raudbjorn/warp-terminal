@@ -143,10 +143,13 @@ fn test_save_file() {
         let new_version = ContentVersion::new();
 
         // Save new content to the file.
-        files.update(app, |model, ctx| {
-            let result = model.save(file_id, "Overwrite content".to_string(), new_version, ctx);
-            assert!(result.is_ok());
+        let completion = files.update(app, |model, ctx| {
+            model
+                .save(file_id, "Overwrite content".to_string(), new_version, ctx)
+                .unwrap()
         });
+        // Dispatch alone does not prove persistence; the per-request completion does.
+        completion.await.unwrap();
 
         // Make sure that the file saved event was emitted.
         match receiver.recv().await.expect("Could not receive the result") {
@@ -162,6 +165,34 @@ fn test_save_file() {
         let model_version = files.read(app, |files, _ctx| files.version(file_id));
         assert_ne!(old_version, model_version);
         assert_eq!(Some(new_version), model_version);
+    });
+}
+
+#[test]
+fn save_completion_reports_a_write_failure_after_dispatch() {
+    App::test((), |mut app| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let files = app.add_singleton_model(FileModel::new);
+        let events = setup_event_channel(&mut app, &files);
+        let file_id = files.update(&mut app, |model, ctx| model.open(&path, false, ctx));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TestFileModelEvent::FileLoaded { .. }
+        ));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        let completion = files.update(&mut app, |model, ctx| {
+            model
+                .save(file_id, "replacement".into(), ContentVersion::new(), ctx)
+                .unwrap()
+        });
+        assert!(
+            completion.await.is_err(),
+            "a dispatched write is not a successful save"
+        );
+        assert!(path.is_dir());
     });
 }
 
@@ -394,5 +425,272 @@ fn remote_move_reports_disconnected_host_through_future_and_event() {
         let (event_id, event_error) = rx.recv().await.unwrap();
         assert_eq!(event_id, file_id);
         assert_eq!(error.to_string(), event_error.to_string());
+    });
+}
+
+#[test]
+fn save_guard_rejects_other_writers_and_authorizes_only_its_own_file() {
+    App::test((), |mut app| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        let transaction = directory.path().join("transaction");
+        let guard =
+            file_write_guard::WriteGuard::acquire(canonical.clone(), transaction.clone()).unwrap();
+        let wrong_guard = file_write_guard::WriteGuard::acquire(
+            directory.path().join("other.txt"),
+            transaction.clone(),
+        )
+        .unwrap();
+        let files = app.add_singleton_model(FileModel::new);
+        let events = setup_event_channel(&mut app, &files);
+        let file_id = files.update(&mut app, |model, ctx| model.open(&path, false, ctx));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TestFileModelEvent::FileLoaded { .. }
+        ));
+
+        files.update(&mut app, |model, ctx| {
+            assert!(matches!(
+                model.save(
+                    file_id,
+                    "ordinary overwrite".into(),
+                    ContentVersion::new(),
+                    ctx
+                ),
+                Err(FileSaveError::Other(_))
+            ));
+            assert!(matches!(
+                model.save_with_guard(
+                    file_id,
+                    "wrong owner overwrite".into(),
+                    ContentVersion::new(),
+                    Some(&wrong_guard),
+                    ctx
+                ),
+                Err(FileSaveError::Other(_))
+            ));
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        wrong_guard.cancel_before_dispatch();
+        let completion = files.update(&mut app, |model, ctx| {
+            model
+                .save_with_guard(
+                    file_id,
+                    "owned write".into(),
+                    ContentVersion::new(),
+                    Some(&guard),
+                    ctx,
+                )
+                .unwrap()
+        });
+        completion.await.unwrap();
+        guard.write_finished();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "owned write");
+        assert!(
+            file_write_guard::is_quarantined(&canonical),
+            "journal completion must still keep the file quarantined"
+        );
+        assert!(file_write_guard::transaction_is_pinned(&transaction));
+        guard.journal_finished();
+        assert!(!file_write_guard::is_quarantined(&canonical));
+        assert!(!file_write_guard::transaction_is_pinned(&transaction));
+    });
+}
+
+#[test]
+fn save_guard_blocks_rename_and_delete_of_its_source() {
+    App::test((), |mut app| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("source.txt");
+        let destination = directory.path().join("destination.txt");
+        std::fs::write(&path, "original").unwrap();
+        let files = app.add_singleton_model(FileModel::new);
+        let events = setup_event_channel(&mut app, &files);
+        let file_id = files.update(&mut app, |model, ctx| model.open(&path, false, ctx));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TestFileModelEvent::FileLoaded { .. }
+        ));
+        let guard = file_write_guard::WriteGuard::acquire(
+            std::fs::canonicalize(&path).unwrap(),
+            directory.path().join("transaction"),
+        )
+        .unwrap();
+        files.update(&mut app, |model, ctx| {
+            assert!(matches!(
+                model.rename_and_save(
+                    file_id,
+                    destination.clone(),
+                    "changed".into(),
+                    ContentVersion::new(),
+                    ctx
+                ),
+                Err(FileSaveError::Other(_))
+            ));
+            assert!(matches!(
+                model.delete(file_id, ContentVersion::new(), ctx),
+                Err(FileSaveError::Other(_))
+            ));
+        });
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original");
+        assert!(!destination.exists());
+        guard.cancel_before_dispatch();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn save_guard_blocks_rename_to_an_alias_of_its_destination_before_source_write() {
+    App::test((), |mut app| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.txt");
+        let target = directory.path().join("target.txt");
+        let alias = directory.path().join("alias.txt");
+        std::fs::write(&source, "source original").unwrap();
+        std::fs::write(&target, "target original").unwrap();
+        std::os::unix::fs::symlink(&target, &alias).unwrap();
+        let files = app.add_singleton_model(FileModel::new);
+        let events = setup_event_channel(&mut app, &files);
+        let file_id = files.update(&mut app, |model, ctx| model.open(&source, false, ctx));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TestFileModelEvent::FileLoaded { .. }
+        ));
+        let guard = file_write_guard::WriteGuard::acquire(
+            std::fs::canonicalize(&target).unwrap(),
+            directory.path().join("transaction"),
+        )
+        .unwrap();
+        files.update(&mut app, |model, ctx| {
+            assert!(matches!(
+                model.rename_and_save(
+                    file_id,
+                    std::fs::canonicalize(&target).unwrap(),
+                    "changed".into(),
+                    ContentVersion::new(),
+                    ctx
+                ),
+                Err(FileSaveError::Other(_))
+            ));
+        });
+        let completion = files.update(&mut app, |model, ctx| {
+            model
+                .rename_and_save(
+                    file_id,
+                    alias.clone(),
+                    "changed".into(),
+                    ContentVersion::new(),
+                    ctx,
+                )
+                .unwrap()
+        });
+        assert!(completion.await.is_err());
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "source original");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "target original");
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        guard.cancel_before_dispatch();
+    });
+}
+
+#[cfg(unix)]
+#[test]
+fn save_guard_blocks_rename_from_a_retargeted_source_alias_before_write() {
+    App::test((), |mut app| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original.txt");
+        let pending = directory.path().join("pending.txt");
+        let alias = directory.path().join("alias.txt");
+        let destination = directory.path().join("destination.txt");
+        std::fs::write(&original, "original content").unwrap();
+        std::fs::write(&pending, "pending content").unwrap();
+        std::os::unix::fs::symlink(&original, &alias).unwrap();
+        let files = app.add_singleton_model(FileModel::new);
+        let events = setup_event_channel(&mut app, &files);
+        let file_id = files.update(&mut app, |model, ctx| model.open(&alias, false, ctx));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TestFileModelEvent::FileLoaded { .. }
+        ));
+        let guard = file_write_guard::WriteGuard::acquire(
+            std::fs::canonicalize(&pending).unwrap(),
+            directory.path().join("transaction"),
+        )
+        .unwrap();
+        // The cached canonical source remains original; rename writes through the entry alias.
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&pending, &alias).unwrap();
+        let completion = files.update(&mut app, |model, ctx| {
+            model
+                .rename_and_save(
+                    file_id,
+                    destination.clone(),
+                    "changed".into(),
+                    ContentVersion::new(),
+                    ctx,
+                )
+                .unwrap()
+        });
+        assert!(completion.await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&original).unwrap(),
+            "original content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&pending).unwrap(),
+            "pending content"
+        );
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!destination.exists());
+        guard.cancel_before_dispatch();
+    });
+}
+
+#[test]
+fn save_completion_does_not_require_a_live_model_callback() {
+    App::test((), |mut app| async move {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("file.txt");
+        std::fs::write(&path, "original").unwrap();
+        let files = app.add_model(FileModel::new);
+        let events = setup_event_channel(&mut app, &files);
+        let file_id = files.update(&mut app, |model, ctx| model.open(&path, false, ctx));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            TestFileModelEvent::FileLoaded { .. }
+        ));
+        let weak = files.downgrade();
+        let completion = app.update(move |ctx| {
+            let completion = files.update(ctx, |model, ctx| {
+                model
+                    .save(
+                        file_id,
+                        "persisted after model dropped".into(),
+                        ContentVersion::new(),
+                        ctx,
+                    )
+                    .unwrap()
+            });
+            // Drop the last owner before queued UI completion callbacks can run.
+            drop(files);
+            assert!(weak.upgrade(ctx).is_none());
+            completion
+        });
+        completion.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "persisted after model dropped"
+        );
     });
 }
