@@ -349,7 +349,6 @@ pub enum TerminalAction {
         selected_range: Range<usize>,
     },
     ClearMarkedText,
-    HideTelemetryBannerPermanently,
     ShowInitializationBlock,
     GenerateCodebaseIndex,
     /// This is for debugging, dev only for now
@@ -692,7 +691,6 @@ impl fmt::Debug for TerminalAction {
                 selected_range,
             } => write!(f, "SetMarkedText {{{marked_text:?}, {selected_range:?}}}"),
             ClearMarkedText => write!(f, "ClearMarkedText"),
-            HideTelemetryBannerPermanently => write!(f, "HideTelemetryBannerPermanently"),
             ShowInitializationBlock => write!(f, "ShowInitializationBlock"),
             GenerateCodebaseIndex => write!(f, "GenerateIndexForRepo"),
             LoadAgentModeConversation => write!(f, "LoadAgentModeConversation"),

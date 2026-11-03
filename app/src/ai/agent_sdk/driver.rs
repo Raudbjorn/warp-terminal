@@ -46,8 +46,7 @@ use crate::ai::agent_sdk::driver::harness::exit_escalation::{
 };
 use crate::ai::agent_sdk::driver::harness::{
     HarnessCleanupDisposition, HarnessKind, HarnessRunner, ResumePayload, SavePoint,
-    ThirdPartyHarness, ThirdPartyHarnessTelemetryEvent, harness_env_vars, renders_natively,
-    task_env_vars,
+    ThirdPartyHarness, harness_env_vars, renders_natively, task_env_vars,
 };
 use crate::ai::agent_sdk::environment_snapshot::EnvironmentSnapshotReporter;
 use crate::ai::agent_sdk::execution_config;
@@ -79,7 +78,7 @@ use crate::ai::llms::{LLMId, LLMPreferences};
 use crate::auth::AuthStateProvider;
 use crate::auth::credentials::Credentials;
 use crate::cloud_object::{CloudObject, CloudObjectLookup as _};
-use crate::send_telemetry_from_app_ctx;
+
 use crate::server::ids::{ServerId, SyncId};
 use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::ai::{AIClient, TaskGitCredentialsError, TaskStatusUpdate};
@@ -3340,19 +3339,6 @@ impl AgentDriver {
                             error.pattern,
                             error.excerpt,
                         );
-                        let telemetry_harness = harness_name.clone();
-                        let telemetry_pattern = error.pattern.clone();
-                        let _ = foreground
-                            .spawn(move |_, ctx| {
-                                use warp_core::telemetry::TelemetryEvent as _;
-                                let event =
-                                    ThirdPartyHarnessTelemetryEvent::RuntimeErrorDetected {
-                                        harness: telemetry_harness,
-                                        pattern: telemetry_pattern,
-                                    };
-                                send_telemetry_from_app_ctx!(event, ctx);
-                            })
-                            .await;
                         let session_status = foreground
                             .spawn(|me, ctx| {
                                 let view_id =
@@ -3500,7 +3486,6 @@ impl AgentDriver {
             "Ambient agent CLI lifecycle: event=harness_exit_attempt \
              harness={harness_name} attempt=1 method=exit"
         );
-        Self::send_harness_exit_telemetry(harness_name, "exit", foreground).await;
         report_if_error!(
             runner
                 .exit(foreground)
@@ -3532,7 +3517,6 @@ impl AgentDriver {
             "Ambient agent CLI lifecycle: event=harness_exit_attempt \
              harness={harness_name} attempt=2 method=exit_followup"
         );
-        Self::send_harness_exit_telemetry(harness_name, "exit_followup", foreground).await;
         report_if_error!(
             runner
                 .exit_followup(foreground)
@@ -3572,7 +3556,6 @@ impl AgentDriver {
             "Ambient agent CLI lifecycle: event=harness_exit_attempt \
              harness={harness_name} attempt={attempt} method=force_kill"
         );
-        Self::send_harness_exit_telemetry(harness_name, "force_kill", foreground).await;
         Self::force_kill_harness(foreground).await;
         Err(AgentDriverError::HarnessExitTimedOut {
             harness: harness_name.to_owned(),
@@ -3624,26 +3607,6 @@ impl AgentDriver {
             return;
         };
         harness::process_control::force_kill_harness_if_safe(&shell_process_info);
-    }
-
-    /// Emits a telemetry event for one attempt in the harness exit
-    /// escalation ladder (`method` is `"exit"`, `"exit_followup"`, or
-    /// `"force_kill"`), so how often graceful exit succeeds vs. requires
-    /// escalation is measurable in production instead of only
-    /// reconstructable from logs.
-    async fn send_harness_exit_telemetry(
-        harness_name: &str,
-        method: &'static str,
-        foreground: &ModelSpawner<Self>,
-    ) {
-        let harness = harness_name.to_owned();
-        let _ = foreground
-            .spawn(move |_, ctx| {
-                use warp_core::telemetry::TelemetryEvent as _;
-                let event = ThirdPartyHarnessTelemetryEvent::ExitEscalation { harness, method };
-                send_telemetry_from_app_ctx!(event, ctx);
-            })
-            .await;
     }
 
     /// Configure the active terminal session with the specified profile.

@@ -6,8 +6,8 @@ use warp::settings::{AISettings, TuiVoiceSettings};
 pub(crate) use warp::tui_export::VoiceInputLifecycleState as TuiVoiceInputState;
 use warp::tui_export::{
     AIRequestUsageModel, BlocklistAIInputModel, RequestTeamScope, StartListeningError,
-    TeamContextResolver, TelemetryEvent, TranscribeError, UserWorkspaces, VoiceInput,
-    VoiceInputToggledFrom, VoiceSessionResult, VoiceTranscriber,
+    TeamContextResolver, TranscribeError, UserWorkspaces, VoiceInput, VoiceInputToggledFrom,
+    VoiceSessionResult, VoiceTranscriber,
 };
 use warp_core::settings::Setting as _;
 use warp_errors::report_error;
@@ -161,15 +161,7 @@ impl TuiVoiceInputModel {
         self.hold_key = source.hold_key();
         self.animation_clock = AnimationClock::starting_at(Duration::ZERO);
         self.set_state(TuiVoiceInputState::Listening, ctx);
-        warp::send_telemetry_from_ctx!(
-            TelemetryEvent::VoiceInputUsed {
-                action: "start".to_owned(),
-                session_duration_ms: None,
-                is_udi_enabled: false,
-                current_input_mode: self.input_mode.as_ref(ctx).input_type(),
-            },
-            ctx
-        );
+
         self.recording_handle = Some(ctx.spawn(
             async move { session.await_result().await },
             Self::handle_session_result,
@@ -287,30 +279,10 @@ impl TuiVoiceInputModel {
             VoiceSessionResult::Audio {
                 wav_base64,
                 session_duration_ms,
-            } => {
-                warp::send_telemetry_from_ctx!(
-                    TelemetryEvent::VoiceInputUsed {
-                        action: "stop".to_owned(),
-                        session_duration_ms: Some(session_duration_ms),
-                        is_udi_enabled: false,
-                        current_input_mode: self.input_mode.as_ref(ctx).input_type(),
-                    },
-                    ctx
-                );
-                wav_base64
-            }
+            } => wav_base64,
             VoiceSessionResult::Aborted {
                 session_duration_ms,
             } => {
-                warp::send_telemetry_from_ctx!(
-                    TelemetryEvent::VoiceInputUsed {
-                        action: "cancel".to_owned(),
-                        session_duration_ms,
-                        is_udi_enabled: false,
-                        current_input_mode: self.input_mode.as_ref(ctx).input_type(),
-                    },
-                    ctx
-                );
                 self.fail("Voice input stopped", ctx);
                 return;
             }

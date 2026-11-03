@@ -53,7 +53,6 @@ mod pi_transcript;
 pub(crate) mod process_control;
 mod save_coordinator;
 mod skill_dirs_publish;
-mod telemetry;
 mod transcript_persistence;
 mod usage_reporting;
 use acp::AcpHarness;
@@ -65,7 +64,6 @@ use gemini::GeminiHarness;
 use harness_persistence::{HarnessPersistence, PersistenceOutcome};
 use pi::pi_env_vars;
 pub(crate) use skill_dirs_publish::HarnessSupportSkills;
-pub(crate) use telemetry::ThirdPartyHarnessTelemetryEvent;
 
 const HARNESS_FAILURE_OUTPUT_TRUNCATION_MARKER: &str = "\n… harness output truncated …\n";
 

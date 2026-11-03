@@ -6,7 +6,6 @@
 //! leaves device authorization behind an explicit welcome-screen action. The
 //! authentication gate remains visible until the browser flow completes.
 mod mcp;
-mod telemetry;
 mod user_info;
 
 pub use mcp::{
@@ -15,12 +14,9 @@ pub use mcp::{
     TuiMcpServerStatus, TuiMcpSnapshot, TuiMcpSyncedTemplateProvenance, TuiMcpTemplateVariable,
     TuiMcpTransport, TuiMcpVariableValue,
 };
-use telemetry::{
-    AbandonmentPhase, AuthenticationEntrypoint, TuiOnboardingTelemetry, TuiOnboardingTelemetryEvent,
-};
 use url::Url;
 pub use user_info::{TuiUserInfoManager, TuiUserInfoManagerEvent, TuiUserInfoSnapshot};
-use warp_core::telemetry::TelemetryEvent as _;
+
 use warpui::{AppContext, Entity, SingletonEntity};
 
 use crate::TuiMountFn;
@@ -69,7 +65,6 @@ enum TuiAuthBrowserFlow {
 pub struct TuiLoginModel {
     phase: TuiLoginPhase,
     browser_flow: TuiAuthBrowserFlow,
-    telemetry: TuiOnboardingTelemetry,
 }
 
 impl TuiLoginModel {
@@ -84,29 +79,7 @@ impl TuiLoginModel {
 
     /// Starts device authorization and records that the generated URL should be copied.
     pub fn start_device_login_and_copy_url(ctx: &mut AppContext) {
-        start_tui_device_login_with_entrypoint(AuthenticationEntrypoint::CopyUrl, ctx);
-    }
-
-    /// Records the outcome of copying the current authentication URL.
-    pub fn record_login_url_copied(succeeded: bool, ctx: &mut AppContext) {
-        let event =
-            Self::handle(ctx).update(ctx, |model, _| model.telemetry.login_url_copied(succeeded));
-        send_tui_onboarding_event(event, ctx);
-    }
-
-    /// Records that the user exited while the authentication UI was visible.
-    pub fn record_authentication_abandoned(ctx: &mut AppContext) {
-        let event = Self::handle(ctx).update(ctx, |model, _| {
-            let phase = AbandonmentPhase::from_login_phase(&model.phase)?;
-            model.telemetry.abandoned(phase)
-        });
-        send_tui_onboarding_event(event, ctx);
-    }
-
-    /// Records that the terminal became usable after interactive authentication.
-    pub fn record_terminal_shown(ctx: &mut AppContext) {
-        let event = Self::handle(ctx).update(ctx, |model, _| model.telemetry.completed());
-        send_tui_onboarding_event(event, ctx);
+        start_tui_device_login(ctx);
     }
 
     /// Opens the current device-authorization URL.
@@ -131,10 +104,6 @@ impl TuiLoginModel {
             TuiLoginPhase::BrowserOpenFailed { .. }
         );
         let browser_opened = ctx.try_open_url(browser_url);
-        let event = TuiLoginModel::handle(ctx).update(ctx, |model, _| {
-            model.telemetry.browser_launch(browser_opened)
-        });
-        send_tui_onboarding_event(event, ctx);
         if !browser_opened {
             TuiLoginModel::handle(ctx).update(ctx, |model, _| {
                 if model.browser_flow == TuiAuthBrowserFlow::LogoutThenDeviceAuthorizationOpened {
@@ -171,7 +140,6 @@ impl TuiLoginModel {
         Self {
             phase: TuiLoginPhase::SignedOutWelcome,
             browser_flow: TuiAuthBrowserFlow::DirectDeviceAuthorization,
-            telemetry: TuiOnboardingTelemetry::new(false),
         }
     }
 
@@ -182,7 +150,6 @@ impl TuiLoginModel {
                 message: message.into(),
             },
             browser_flow: TuiAuthBrowserFlow::DirectDeviceAuthorization,
-            telemetry: TuiOnboardingTelemetry::new(false),
         }
     }
 
@@ -191,7 +158,6 @@ impl TuiLoginModel {
         Self {
             phase: TuiLoginPhase::AwaitingLogin { browser_url },
             browser_flow: TuiAuthBrowserFlow::DirectDeviceAuthorization,
-            telemetry: TuiOnboardingTelemetry::new(false),
         }
     }
 }
@@ -212,7 +178,6 @@ pub(crate) fn init(mount: TuiMountFn, ctx: &mut AppContext) {
     ctx.add_singleton_model(move |_| TuiLoginModel {
         phase: initial_phase,
         browser_flow: TuiAuthBrowserFlow::DirectDeviceAuthorization,
-        telemetry: TuiOnboardingTelemetry::new(logged_in),
     });
     ctx.add_singleton_model(TuiMcpManager::new);
     ctx.add_singleton_model(TuiUserInfoManager::new);
@@ -256,9 +221,6 @@ fn handle_auth_manager_event(event: &AuthManagerEvent, ctx: &mut AppContext) {
             verification_url_complete,
             user_code,
         } => {
-            let event = TuiLoginModel::handle(ctx)
-                .update(ctx, |model, _| model.telemetry.device_authorization_ready());
-            send_tui_onboarding_event(event, ctx);
             // Prefer the "complete" URL (device code pre-filled) for opening.
             let url_to_open = verification_url_complete
                 .as_deref()
@@ -296,9 +258,6 @@ fn handle_auth_manager_event(event: &AuthManagerEvent, ctx: &mut AppContext) {
             activate_global_mcp_servers(ctx);
         }
         AuthManagerEvent::AuthFailed(err) => {
-            let event = TuiLoginModel::handle(ctx)
-                .update(ctx, |model, _| model.telemetry.authentication_failed(err));
-            send_tui_onboarding_event(event, ctx);
             let should_finish_web_logout = matches!(
                 TuiLoginModel::as_ref(ctx).browser_flow,
                 TuiAuthBrowserFlow::LogoutThenDeviceAuthorizationPending
@@ -358,14 +317,11 @@ fn activate_global_mcp_servers(ctx: &mut AppContext) {
 
 /// Starts device authorization from a signed-out screen, preserving any required web logout.
 pub fn start_tui_device_login(ctx: &mut AppContext) {
-    start_tui_device_login_with_entrypoint(AuthenticationEntrypoint::OpenBrowser, ctx);
+    start_tui_device_login_with_entrypoint(ctx);
 }
 
-fn start_tui_device_login_with_entrypoint(
-    entrypoint: AuthenticationEntrypoint,
-    ctx: &mut AppContext,
-) {
-    let (should_authorize, event) = TuiLoginModel::handle(ctx).update(ctx, |model, ctx| {
+fn start_tui_device_login_with_entrypoint(ctx: &mut AppContext) {
+    let should_authorize = TuiLoginModel::handle(ctx).update(ctx, |model, ctx| {
         match model.phase {
             TuiLoginPhase::SignedOutWelcome => {
                 model.browser_flow = TuiAuthBrowserFlow::DirectDeviceAuthorization;
@@ -373,15 +329,13 @@ fn start_tui_device_login_with_entrypoint(
             TuiLoginPhase::Failed { .. } => {}
             TuiLoginPhase::AwaitingLogin { .. }
             | TuiLoginPhase::BrowserOpenFailed { .. }
-            | TuiLoginPhase::LoggedIn => return (false, None),
+            | TuiLoginPhase::LoggedIn => return false,
         }
         model.phase = TuiLoginPhase::AwaitingLogin { browser_url: None };
-        let event = model.telemetry.authentication_started(entrypoint);
         ctx.notify();
         ctx.emit(TuiLoginEvent::PhaseChanged);
-        (true, Some(event))
+        true
     });
-    send_tui_onboarding_event(event, ctx);
     if should_authorize {
         authorize_device(ctx);
     }
@@ -397,16 +351,13 @@ pub fn log_out_tui(ctx: &mut AppContext) {
 }
 
 fn set_logged_out_phase(ctx: &mut AppContext) {
-    let event = TuiLoginModel::handle(ctx).update(ctx, |model, ctx| {
+    TuiLoginModel::handle(ctx).update(ctx, |model, ctx| {
         model.phase = TuiLoginPhase::AwaitingLogin { browser_url: None };
         model.browser_flow = TuiAuthBrowserFlow::LogoutThenDeviceAuthorizationPending;
-        let event = model.telemetry.post_logout_authentication_started();
         ctx.notify();
         ctx.emit(TuiLoginEvent::PhaseChanged);
         ctx.emit(TuiLoginEvent::LoggedOut);
-        event
     });
-    send_tui_onboarding_event(Some(event), ctx);
 }
 
 /// Updates the shared [`TuiLoginModel`] phase and notifies observers, so the
@@ -425,12 +376,6 @@ fn set_login_phase(ctx: &mut AppContext, phase: TuiLoginPhase) {
             ctx.emit(TuiLoginEvent::LoggedIn);
         }
     });
-}
-
-fn send_tui_onboarding_event(event: Option<TuiOnboardingTelemetryEvent>, ctx: &mut AppContext) {
-    if let Some(event) = event {
-        warp_core::send_telemetry_from_app_ctx!(event, ctx);
-    }
 }
 
 #[cfg(test)]

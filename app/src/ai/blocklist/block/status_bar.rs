@@ -51,7 +51,8 @@ use crate::ai::blocklist::{
 };
 use crate::ai::llms::LLMPreferences;
 use crate::server::server_api::ServerApiProvider;
-use crate::server::telemetry::TelemetryEvent;
+
+use crate::BlocklistAIHistoryModel;
 use crate::settings::{InputModeSettings, InputSettings, PrivacySettings};
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::terminal::input::buffer_model::{InputBufferModel, InputBufferUpdateEvent};
@@ -70,7 +71,6 @@ use crate::terminal::{
     TOGGLE_HIDE_CLI_RESPONSES_KEYBINDING, TOGGLE_QUEUE_NEXT_PROMPT_KEYBINDING, TerminalModel,
 };
 use crate::util::bindings::keybinding_name_to_keystroke;
-use crate::{BlocklistAIHistoryModel, send_telemetry_from_app_ctx};
 
 pub fn init(app: &mut AppContext) {
     summarization_cancel_dialog::init(app);
@@ -759,16 +759,6 @@ impl BlocklistAIStatusBar {
 
             // Get the current tip from the model
             self.current_tip = tip_model.as_ref(ctx).current_tip().cloned();
-
-            if let Some(tip) = self.current_tip.as_ref() {
-                send_telemetry_from_app_ctx!(
-                    TelemetryEvent::AgentTipShown {
-                        tip: tip.description.clone()
-                    },
-                    ctx
-                );
-                send_agent_tip_shown_analytics_event(tip.description.clone(), ctx);
-            }
         } else {
             self.current_tip = None;
         }
@@ -1084,13 +1074,6 @@ fn render_agent_tip(tip: &AgentTip, app: &AppContext) -> Box<dyn Element> {
         use warpui::elements::HyperlinkLens;
         match link {
             HyperlinkLens::Url(url) => {
-                send_telemetry_from_app_ctx!(
-                    TelemetryEvent::AgentTipClicked {
-                        tip: tip_description.clone(),
-                        click_target: url.to_string(),
-                    },
-                    app
-                );
                 app.open_url(url);
             }
             HyperlinkLens::Action(action_ref) => {
@@ -1098,13 +1081,6 @@ fn render_agent_tip(tip: &AgentTip, app: &AppContext) -> Box<dyn Element> {
                     .as_any()
                     .downcast_ref::<crate::workspace::WorkspaceAction>()
                 {
-                    send_telemetry_from_app_ctx!(
-                        TelemetryEvent::AgentTipClicked {
-                            tip: tip_description.clone(),
-                            click_target: action_text.clone().unwrap_or_default(),
-                        },
-                        app
-                    );
                     evt.dispatch_typed_action(action.clone());
                 }
             }
@@ -1268,40 +1244,6 @@ fn resolve_warping_model_message<V: View>(
         previous,
         is_new_user_query,
     })
-}
-
-fn should_send_agent_tip_shown_analytics_event(app: &AppContext) -> bool {
-    let privacy_settings_snapshot = PrivacySettings::handle(app).as_ref(app).get_snapshot(app);
-    if privacy_settings_snapshot.should_disable_telemetry() {
-        return false;
-    }
-    if !FeatureFlag::AgentModeAnalytics.is_enabled() || ChannelState::is_release_bundle() {
-        return false;
-    }
-
-    if matches!(
-        ChannelState::channel(),
-        Channel::Dev | Channel::Local | Channel::Integration
-    ) {
-        return true;
-    }
-
-    ChannelState::server_root_url().contains("staging")
-}
-
-fn send_agent_tip_shown_analytics_event(tip: String, app: &AppContext) {
-    if !should_send_agent_tip_shown_analytics_event(app) {
-        return;
-    }
-
-    let server_api = ServerApiProvider::handle(app).as_ref(app).get();
-    app.background_executor()
-        .spawn(async move {
-            if let Err(error) = server_api.send_agent_tip_shown_analytics_event(tip).await {
-                log::warn!("Error occurred with sending AgentTipShown analytics event: {error}");
-            }
-        })
-        .detach();
 }
 
 impl View for BlocklistAIStatusBar {
