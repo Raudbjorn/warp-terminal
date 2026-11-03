@@ -1975,13 +1975,20 @@ fn render_vertical_tabs_panel(
                 WorkspaceAction::ToggleVerticalTabsPanel,
                 app,
             ))
-            .with_child(sidebar::header_button(
-                WarpIcon::SidebarPlus,
-                state.sidebar_plus_mouse_state.clone(),
-                None,
-                WorkspaceAction::AddDefaultTab,
-                app,
-            ))
+            // The tab configs menu anchors to the panel's "+" in either layout.
+            .with_child(
+                SavePosition::new(
+                    sidebar::header_button(
+                        WarpIcon::SidebarPlus,
+                        state.sidebar_plus_mouse_state.clone(),
+                        None,
+                        WorkspaceAction::AddDefaultTab,
+                        app,
+                    ),
+                    VERTICAL_TABS_ADD_TAB_POSITION_ID,
+                )
+                .finish(),
+            )
             .finish();
         panel_content.add_child(
             ConstrainedBox::new(
