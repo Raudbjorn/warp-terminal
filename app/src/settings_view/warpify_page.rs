@@ -9,7 +9,8 @@ use strum::IntoEnumIterator;
 use warp_core::features::FeatureFlag;
 use warp_errors::report_if_error;
 use warpui::elements::{
-    Container, Flex, FormattedTextElement, HighlightedHyperlink, MouseStateHandle, ParentElement,
+    ConstrainedBox, Container, Flex, FormattedTextElement, HighlightedHyperlink, MouseStateHandle,
+    ParentElement,
 };
 use warpui::keymap::ContextPredicate;
 use warpui::presenter::ChildView;
@@ -38,6 +39,9 @@ use crate::terminal::warpify::settings::{
 use crate::ui_components::blended_colors;
 use crate::view_components::dropdown::{Dropdown, DropdownItem};
 use crate::view_components::{SubmittableTextInput, SubmittableTextInputEvent};
+
+/// Width of the inline SSH extension download URL input, in logical pixels.
+const SSH_EXTENSION_URL_INPUT_WIDTH: f32 = 360.;
 
 pub fn init_actions_from_parent_view<T: Action + Clone>(
     app: &mut AppContext,
@@ -420,7 +424,13 @@ impl WarpifyPageView {
             local_only_icon_state,
             ToggleState::Enabled,
             appearance,
-            ChildView::new(&self.ssh_extension_download_base_url_editor).finish(),
+            // A bare editor here gets an unbounded width from the body-item row and
+            // panics in the editor element's layout, so give it a fixed width.
+            ConstrainedBox::new(
+                ChildView::new(&self.ssh_extension_download_base_url_editor).finish(),
+            )
+            .with_width(SSH_EXTENSION_URL_INPUT_WIDTH)
+            .finish(),
             None,
         )
     }
