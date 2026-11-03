@@ -274,3 +274,7 @@ impl Default for SseClientConfig {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sse_client_tests.rs"]
+mod tests;
