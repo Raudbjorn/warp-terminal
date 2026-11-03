@@ -454,7 +454,10 @@ fn a_parse_error_does_not_echo_the_event_payload() {
     };
 
     assert!(!message.contains(secret), "{message}");
-    assert!(message.contains("13 bytes"), "{message}");
+    assert!(
+        message.contains(&format!("({} bytes)", data.len())),
+        "{message}"
+    );
 }
 
 #[test]

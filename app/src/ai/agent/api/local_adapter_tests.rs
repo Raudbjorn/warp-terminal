@@ -2222,6 +2222,34 @@ mod reasoning {
     }
 
     #[test]
+    fn a_replay_item_backfilled_after_the_text_still_reaches_the_next_transcript() {
+        // A provider that omits the reasoning `output_item.done` delivers the
+        // replay item at `response.completed`, after the text closed the
+        // reasoning message.
+        let messages = persisted_messages(vec![
+            AgentEvent::ReasoningDelta("Plan".to_string()),
+            AgentEvent::TextDelta("All done.".to_string()),
+            AgentEvent::ReplayItem(replay_item()),
+            AgentEvent::Done,
+        ]);
+
+        let reasoning = reasoning_messages(&messages);
+        assert_eq!(reasoning.len(), 1, "the late item joins the earlier message");
+        assert_eq!(reasoning[0].1.reasoning, "Plan");
+        assert!(!reasoning[0].0.server_message_data.is_empty());
+
+        let transcript = transcript_after(messages, user_query_input("thanks"), &route());
+        assert_eq!(
+            assistants(&transcript),
+            vec![&ChatMessage::Assistant {
+                text: "All done.".to_string(),
+                tool_calls: vec![],
+                replay_items: vec![replay_item()],
+            }]
+        );
+    }
+
+    #[test]
     fn several_reasoning_items_keep_stream_order() {
         let messages = persisted_messages(vec![
             AgentEvent::ReasoningDelta("first".to_string()),

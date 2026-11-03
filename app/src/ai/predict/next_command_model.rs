@@ -552,7 +552,7 @@ impl NextCommandModel {
                             fetch_input_suggestions(
                                 &server_api,
                                 #[cfg(not(target_family = "wasm"))]
-                                &local_endpoint,
+                                &local_route,
                                 &request,
                                 team_scope,
                             )
@@ -639,7 +639,7 @@ impl NextCommandModel {
                     let response = fetch_input_suggestions(
                         &server_api,
                         #[cfg(not(target_family = "wasm"))]
-                        &local_endpoint,
+                        &local_route,
                         &request,
                                 team_scope,
                     )
