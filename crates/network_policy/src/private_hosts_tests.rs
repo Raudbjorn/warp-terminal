@@ -301,6 +301,51 @@ fn a_service_with_the_same_policy_is_accepted() {
 }
 
 #[test]
+fn a_range_written_as_smaller_ones_is_a_different_policy() {
+    // Every address of the /16 is covered by the two /17s, but each /17 lies inside the /16 and
+    // the /16 lies inside neither /17, so the lists are reported as different. Pinned so the
+    // doc and `check_service_policy` cannot drift apart again.
+    let whole = networks("10.77.0.0/16");
+    let halves = networks("10.77.0.0/17, 10.77.128.0/17");
+    assert!(!same_private_hosts(&whole, &halves));
+    assert!(!same_private_hosts(&halves, &whole));
+    assert!(same_private_hosts(&halves, &halves));
+
+    let reported = report(ServicesMode::LocalOnly, &["10.77.0.0/17", "10.77.128.0/17"]);
+    assert_eq!(
+        check_policy(ServicesMode::LocalOnly, &whole, Some(&reported)),
+        Err(PolicyMismatch::HostsDiffer {
+            service: "10.77.0.0/17, 10.77.128.0/17".to_owned(),
+            app: "10.77.0.0/16".to_owned(),
+        })
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_services_mode_that_is_not_unicode_fails_closed() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let not_unicode = Err(std::env::VarError::NotUnicode(OsString::from_vec(vec![
+        0xff, 0xfe,
+    ])));
+    let mode = mode_from_var(not_unicode);
+    assert_eq!(
+        parse_env(mode.as_deref(), "").unwrap().0,
+        Some(ServicesMode::LocalOnly)
+    );
+
+    // Absent still leaves the default alone, and a real `online` still means online.
+    assert_eq!(mode_from_var(Err(std::env::VarError::NotPresent)), None);
+    let online = mode_from_var(Ok("online".to_owned()));
+    assert_eq!(
+        parse_env(online.as_deref(), "").unwrap().0,
+        Some(ServicesMode::Online)
+    );
+}
+
+#[test]
 fn a_service_that_enforces_a_different_policy_is_refused() {
     let hosts = networks("10.77.0.0/16");
 

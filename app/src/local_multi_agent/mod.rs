@@ -429,6 +429,11 @@ pub struct LocalMultiAgentManager {
     /// overrides the process-wide `ChannelState` URL, which other clients read without consulting
     /// this module, so unpublishing has to put it back.
     original_server_root_url: Option<String>,
+    /// The allow-list in force when the service last failed to start or was refused, if it has
+    /// not been published since. `applied_private_hosts` keeps describing the last service that
+    /// was validated, so on its own it cannot tell that nothing is running: an allow-list
+    /// restored to that value would look unchanged and the failed service would never be retried.
+    failed_with_hosts: Option<Vec<network_policy::PrivateNetwork>>,
 }
 
 impl LocalMultiAgentManager {
@@ -452,6 +457,7 @@ impl LocalMultiAgentManager {
             openai_api_key: None,
             applied_private_hosts: network_policy::allowed_private_hosts(),
             original_server_root_url: None,
+            failed_with_hosts: None,
         };
         if ChannelState::is_local_only() {
             manager.schedule_restart(ctx);
@@ -459,8 +465,7 @@ impl LocalMultiAgentManager {
         ctx.subscribe_to_model(&AISettings::handle(ctx), |manager, _, _, ctx| {
             // Another subscriber may not have applied the new setting yet; applying is idempotent.
             AISettings::as_ref(ctx).apply_network_policy();
-            if ChannelState::is_local_only() && policy_needs_restart(&manager.applied_private_hosts)
-            {
+            if ChannelState::is_local_only() && manager.allow_list_needs_restart() {
                 // The running service still enforces the old allow-list, so it must not take
                 // requests while the debounce waits to start its replacement.
                 manager.revoke_running_service();
@@ -848,6 +853,7 @@ impl LocalMultiAgentManager {
             return;
         }
         // The service is healthy and enforces the app's policy, so it can be published.
+        self.failed_with_hosts = None;
         set_global_root_url(Some(root_url.clone()));
         // Keep the first original: a republish without an unpublish in between would otherwise
         // record the previous service's URL as the original.
@@ -882,6 +888,20 @@ impl LocalMultiAgentManager {
         }
     }
 
+    /// Whether the service has to be (re)started because of the allow-list: the running one
+    /// enforces a different list, or the last attempt failed under a list other than the current
+    /// one, so it may succeed now. A failure under the current list is not retried, which keeps
+    /// unrelated setting changes from restarting a service that cannot start.
+    fn allow_list_needs_restart(&self) -> bool {
+        policy_needs_restart(&self.applied_private_hosts)
+            || self.failed_with_hosts.as_ref().is_some_and(|failed_with| {
+                !network_policy::same_private_hosts(
+                    failed_with,
+                    &network_policy::allowed_private_hosts(),
+                )
+            })
+    }
+
     /// Records the private hosts the running service enforces and reports whether the service
     /// must be restarted because the allow-list changed while it was starting.
     fn record_applied_private_hosts(
@@ -908,6 +928,7 @@ impl LocalMultiAgentManager {
 
     fn set_failed(&mut self, message: String) {
         self.stop_child();
+        self.failed_with_hosts = Some(network_policy::allowed_private_hosts());
         self.status = LocalMultiAgentStatus::Failed { message };
         // A service that failed is not usable, so it must not receive requests.
         self.unpublish_service_url();

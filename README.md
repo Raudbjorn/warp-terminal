@@ -31,8 +31,10 @@ There are three separate AI paths, each with its own settings:
 - **Natural-language commands, workflow metadata and command prediction:**
   **Settings → Local AI.** Set the base URL (e.g. `http://localhost:11434/v1`),
   an API key *if your server requires one*, and the model names. In this build
-  the endpoint must be a loopback address (`localhost`, `127.0.0.1`, `::1`);
-  LAN, Tailscale and public hosts are rejected.
+  the endpoint must be a loopback address (`localhost`, `127.0.0.1`, `::1`) or
+  an IP address you have listed under **Settings → Local AI → Allowed private
+  hosts** (see below). Other host names and public hosts are rejected. A CIDR
+  range can be an allow-list entry, but the endpoint itself is one address.
 - **Warp Agent conversations:** **Settings → Agents → Warp Agent → Custom
   Inference.** Add a custom endpoint that uses the OpenAI Chat Completions
   schema and select one of its models. A request for any other model is

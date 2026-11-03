@@ -653,39 +653,57 @@ impl Drop for LocalOnlyGuard {
 #[tokio::test]
 async fn local_only_mode_refuses_a_public_endpoint_before_any_request() {
     let _local_only = LocalOnlyGuard::enter();
-    let config = LocalEndpointConfig {
-        base_url: "https://api.example.com/v1".to_string(),
-        api_key: "secret".to_string(),
-        model_slug: "test-model".to_string(),
-    };
+    for schema in [
+        crate::EndpointSchema::ChatCompletions,
+        crate::EndpointSchema::Responses,
+    ] {
+        let config = LocalEndpointConfig {
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model_slug: "test-model".to_string(),
+            schema,
+        };
 
-    let result = complete_text(user_only_transcript(), config).await;
+        let result = complete_text(user_only_transcript(), config).await;
 
-    assert!(
-        matches!(result, Err(LocalAgentError::NetworkPolicyDenied(_))),
-        "unexpected result: {result:?}"
-    );
+        assert!(
+            matches!(result, Err(LocalAgentError::NetworkPolicyDenied(_))),
+            "{schema:?}: unexpected result: {result:?}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn a_refused_endpoint_is_reported_without_its_url() {
     let _local_only = LocalOnlyGuard::enter();
-    let config = LocalEndpointConfig {
-        base_url: "https://user:hunter2@api.example.com/v1?token=hunter2".to_string(),
-        api_key: "secret".to_string(),
-        model_slug: "test-model".to_string(),
-    };
+    for schema in [
+        crate::EndpointSchema::ChatCompletions,
+        crate::EndpointSchema::Responses,
+    ] {
+        let config = LocalEndpointConfig {
+            base_url: "https://user:hunter2@api.example.com/v1?token=hunter2".to_string(),
+            api_key: "secret".to_string(),
+            model_slug: "test-model".to_string(),
+            schema,
+        };
 
-    let result = complete_text(user_only_transcript(), config).await;
+        let result = complete_text(user_only_transcript(), config).await;
 
-    // Still the deterministic-refusal variant, so the host does not retry it.
-    let Err(error @ LocalAgentError::NetworkPolicyDenied(_)) = result else {
-        panic!("unexpected result: {result:?}");
-    };
-    let message = error.to_string();
-    assert!(!message.contains("hunter2"), "{message}");
-    assert!(!message.contains("api.example.com"), "{message}");
-    assert!(message.contains("local agent request"), "{message}");
+        // Still the deterministic-refusal variant, so the host does not retry it.
+        let Err(error @ LocalAgentError::NetworkPolicyDenied(_)) = result else {
+            panic!("{schema:?}: unexpected result: {result:?}");
+        };
+        let message = error.to_string();
+        assert!(!message.contains("hunter2"), "{schema:?}: {message}");
+        assert!(
+            !message.contains("api.example.com"),
+            "{schema:?}: {message}"
+        );
+        assert!(
+            message.contains("local agent request"),
+            "{schema:?}: {message}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -2454,8 +2454,12 @@ impl AISettings {
         let raw = self.local_openai_allowed_private_hosts.value();
         match network_policy::parse_allowed_private_hosts(raw) {
             Ok(hosts) => network_policy::set_allowed_private_hosts(hosts),
-            Err(err) => {
-                log::warn!("Ignoring invalid agents.local_openai.allowed_private_hosts: {err}");
+            Err(_) => {
+                // The error quotes the offending entry, and what a user typed into this field
+                // can be anything, including a URL with credentials. Log the rule, not the text.
+                log::warn!(
+                    "Ignoring invalid agents.local_openai.allowed_private_hosts; no extra private hosts are allowed"
+                );
                 network_policy::set_allowed_private_hosts(Vec::new());
             }
         }

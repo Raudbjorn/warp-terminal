@@ -244,8 +244,10 @@ pub enum PolicyMismatch {
     HostsDiffer { service: String, app: String },
 }
 
-/// Whether two allow-lists allow the same hosts. Order and redundant entries do not matter; a
-/// range written as several smaller ones counts as the same.
+/// Whether two allow-lists allow the same hosts. Order and redundant entries do not matter. A range
+/// written as several smaller ones does not match the larger range (one `/16` against two `/17`s is
+/// different): each entry has to lie inside a single entry of the other list. That errs toward
+/// "different", which costs a restart or a refusal and never lets a mismatched policy through.
 pub fn same_private_hosts(a: &[PrivateNetwork], b: &[PrivateNetwork]) -> bool {
     covers(a, b) && covers(b, a)
 }
@@ -301,7 +303,7 @@ fn check_policy(
 /// local-only, so a typo fails closed. An invalid host list is an error rather than being
 /// partially applied, and nothing is changed in that case.
 pub fn init_from_env() -> Result<(), PrivateHostsError> {
-    let mode = std::env::var(ENV_SERVICES_MODE).ok();
+    let mode = mode_from_var(std::env::var(ENV_SERVICES_MODE));
     let hosts = std::env::var(ENV_ALLOWED_PRIVATE_HOSTS).unwrap_or_default();
     let (mode, hosts) = parse_env(mode.as_deref(), &hosts)?;
     if let Some(mode) = mode {
@@ -309,6 +311,17 @@ pub fn init_from_env() -> Result<(), PrivateHostsError> {
     }
     set_allowed_private_hosts(hosts);
     Ok(())
+}
+
+/// The services mode named by the environment, as text for [`parse_env`]. A value that is not
+/// Unicode cannot be `online`, so it is passed on as an unrecognized one and fails closed like any
+/// other typo, instead of being read as absent and leaving the default (online).
+fn mode_from_var(var: Result<String, std::env::VarError>) -> Option<String> {
+    match var {
+        Ok(mode) => Some(mode),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => Some(String::new()),
+    }
 }
 
 fn parse_env(

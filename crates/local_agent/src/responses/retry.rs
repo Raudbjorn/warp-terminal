@@ -71,7 +71,10 @@ fn is_transient(error: &LocalAgentError) -> bool {
         LocalAgentError::ErrorStatus { status, .. } => {
             TRANSIENT_STATUSES.contains(status) || (500..=599).contains(status)
         }
-        LocalAgentError::InvalidApiKey { .. }
+        // The policy gives the same answer to every repeat of the request, so waiting changes
+        // nothing.
+        LocalAgentError::NetworkPolicyDenied(_)
+        | LocalAgentError::InvalidApiKey { .. }
         | LocalAgentError::ContextWindowExceeded { .. }
         | LocalAgentError::Parse(_)
         | LocalAgentError::Unimplemented(_) => false,

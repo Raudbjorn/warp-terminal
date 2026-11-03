@@ -196,10 +196,13 @@ impl ProviderRuntime {
         };
 
         let completions_url = format!("{base_url}/chat/completions");
+        // The configured base URL can carry credentials in its userinfo or query, and this
+        // message reaches the service log and the HTTP response, so the URL is left out.
         network_policy::check_url_str(&completions_url, "provider chat completion request")
             .map_err(|error| {
                 LocalAgentError::new(
-                    error.to_string(),
+                    network_policy::NetworkPolicyDenied::new(error.purpose(), "<redacted>")
+                        .to_string(),
                     FinishReason::LlmUnavailable,
                     Some(model.clone()),
                 )

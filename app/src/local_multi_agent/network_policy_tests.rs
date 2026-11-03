@@ -185,6 +185,7 @@ fn test_manager() -> LocalMultiAgentManager {
         openai_api_key: None,
         applied_private_hosts: Vec::new(),
         original_server_root_url: None,
+        failed_with_hosts: None,
     }
 }
 
@@ -249,4 +250,32 @@ fn unpublishing_gives_back_the_original_server_root_url() {
     manager.unpublish_service_url();
     assert_eq!(local_no_cloud_root_url(), None);
     assert_eq!(manager.original_server_root_url, None);
+}
+
+#[test]
+fn a_service_refused_for_its_policy_is_retried_when_the_allow_list_is_restored() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut manager = test_manager();
+    let original = network_policy::parse_allowed_private_hosts("10.77.0.0/16").unwrap();
+    let changed = network_policy::parse_allowed_private_hosts("10.88.0.0/16").unwrap();
+
+    // A service validated against the original list is running.
+    network_policy::set_allowed_private_hosts(original.clone());
+    manager.applied_private_hosts = original.clone();
+    assert!(!manager.allow_list_needs_restart());
+
+    // The list changes and the replacement is refused for its policy, so nothing is running.
+    network_policy::set_allowed_private_hosts(changed.clone());
+    manager.set_failed("the running service enforces a different policy".to_string());
+    assert_eq!(manager.failed_with_hosts, Some(changed));
+
+    // Restoring the original list makes it equal to the last validated one, which alone looks
+    // like no change. The failure was under another list, so the service is tried again.
+    network_policy::set_allowed_private_hosts(original);
+    assert!(!policy_needs_restart(&manager.applied_private_hosts));
+    assert!(manager.allow_list_needs_restart());
+
+    // A failure under the current list is not retried by unrelated setting changes.
+    manager.set_failed("still refused".to_string());
+    assert!(!manager.allow_list_needs_restart());
 }

@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use settings::{Setting, ToggleableSetting};
 use warp_core::channel::ChannelState;
@@ -338,32 +339,70 @@ impl LocalAIProviderWidget {
             }
         });
 
+        // The last value the field and the stored setting agreed on. The field is filled once,
+        // so without this an unedited field would write its stale text back over a newer
+        // setting (edited in the settings file or another window) on blur, and with it replace
+        // the allow-list. It also tells whether the field holds an unsaved edit.
+        let allowed_private_hosts_synced = Rc::new(RefCell::new(allowed_private_hosts.clone()));
         let allowed_private_hosts_editor = Self::create_editor(
             ctx,
             allowed_private_hosts,
             "192.168.1.50, 100.64.0.0/10",
             false,
         );
-        ctx.subscribe_to_view(&allowed_private_hosts_editor, |view, editor, event, ctx| {
-            if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
-                let value = editor.as_ref(ctx).buffer_text(ctx).trim().to_string();
-                // An invalid list is not saved, so a typo cannot leave part of it applied. The
-                // text stays in the field, with the reason shown under it, for the user to fix.
-                match network_policy::parse_allowed_private_hosts(&value) {
-                    Ok(_) => {
+        let synced = allowed_private_hosts_synced.clone();
+        ctx.subscribe_to_view(
+            &allowed_private_hosts_editor,
+            move |view, editor, event, ctx| {
+                if matches!(event, EditorEvent::Blurred | EditorEvent::Enter) {
+                    let value = editor.as_ref(ctx).buffer_text(ctx).trim().to_string();
+                    // Nothing was edited, so there is nothing to save, and no earlier complaint
+                    // about the text still applies.
+                    if value == synced.borrow().trim() {
                         view.allowed_private_hosts_error = None;
-                        AISettings::handle(ctx).update(ctx, |settings, ctx| {
-                            report_if_error!(
-                                settings
-                                    .local_openai_allowed_private_hosts
-                                    .set_value(value, ctx)
-                            );
-                        });
+                        ctx.notify();
+                        return;
                     }
-                    Err(err) => view.allowed_private_hosts_error = Some(err.to_string()),
+                    // An invalid list is not saved, so a typo cannot leave part of it applied.
+                    // The text stays in the field, with the reason shown under it, for the user
+                    // to fix.
+                    match network_policy::parse_allowed_private_hosts(&value) {
+                        Ok(_) => {
+                            view.allowed_private_hosts_error = None;
+                            AISettings::handle(ctx).update(ctx, |settings, ctx| {
+                                let saved = settings
+                                    .local_openai_allowed_private_hosts
+                                    .set_value(value.clone(), ctx);
+                                // Only a write that took effect moves the agreed value.
+                                if saved.is_ok() {
+                                    *synced.borrow_mut() = value;
+                                }
+                                report_if_error!(saved);
+                            });
+                        }
+                        Err(err) => view.allowed_private_hosts_error = Some(err.to_string()),
+                    }
+                    ctx.notify();
                 }
-                ctx.notify();
+            },
+        );
+        // Follow the stored setting when it changes elsewhere, unless the field holds an unsaved
+        // edit, which is kept. The subscription is here, not on the page, because this widget
+        // owns the editor handle.
+        let editor = allowed_private_hosts_editor.clone();
+        let synced = allowed_private_hosts_synced;
+        ctx.subscribe_to_model(&AISettings::handle(ctx), move |_, _, _, ctx| {
+            let stored = AISettings::as_ref(ctx)
+                .local_openai_allowed_private_hosts
+                .value()
+                .clone();
+            let has_unsaved_edit =
+                editor.as_ref(ctx).buffer_text(ctx).trim() != synced.borrow().trim();
+            if has_unsaved_edit || stored.trim() == synced.borrow().trim() {
+                return;
             }
+            editor.update(ctx, |editor, ctx| editor.set_buffer_text(&stored, ctx));
+            *synced.borrow_mut() = stored;
         });
 
         Self {
@@ -630,8 +669,7 @@ impl SettingsWidget for LocalAIProviderWidget {
                     "API Key",
                     self.api_key_editor.clone(),
                 ))
-                .with_child(self.render_use_responses_api_toggle(view, appearance, app))
-                .with_child(self.render_allowed_private_hosts(view, appearance)),
+                .with_child(self.render_use_responses_api_toggle(view, appearance, app)),
             LocalProviderKind::OpenCode => column
                 .with_child(Self::render_description(
                     appearance,
@@ -652,6 +690,10 @@ impl SettingsWidget for LocalAIProviderWidget {
                     "With OpenCode, write models as `providerID/modelID`, for example `ollama/qwen2.5-coder:7b`. The provider must already be configured in OpenCode. A hosted provider sends your prompts off this machine.",
                 )),
         };
+
+        // The allow-list applies to MCP servers and the local multi-agent service whichever
+        // provider is selected, so it is not tied to either provider's fields.
+        column = column.with_child(self.render_allowed_private_hosts(view, appearance));
 
         Container::new(
             column
