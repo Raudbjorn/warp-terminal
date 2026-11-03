@@ -461,6 +461,13 @@ debug = "line-tables-only"
 split-debuginfo = "unpacked"
 
 [profile.dev.package]
+# No debuginfo for third-party dependencies ("*" matches only non-workspace
+# crates; workspace crates keep the line tables set above). Dependency DWARF
+# adds rustc/linker memory and target/ size but is rarely stepped through, and
+# panics inside dependencies still symbolicate by function name. Set this back to
+# `true` locally to debug into a dependency. See
+# docs/building-on-linux-workstations.md.
+"*".debug = false
 # Improve the performance of core terminal logic.
 warp_terminal.opt-level = 3
 # Minimize the runtime overhead of CPU profiling at the cost of a small
