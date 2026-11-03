@@ -71,9 +71,19 @@ dependency.
   or `cdylib` outputs. **Observed once:** a 15.7% Rust hit rate across several
   checkouts of this repo; the cause (path-keyed entries) is a hypothesis, not tested.
 
+## Recommended GUI dev loop (measured)
+
+**Verified (2026-11-03, this host):** for `cargo check -p warp --bin warp-oss --features gui` with
+`sccache`, `CARGO_INCREMENTAL=0`, and the shared mergerfs target dir:
+- cold (clean target): ~1m 30s–1m 55s wall time depending on cache state
+- warm (unchanged): ~0.6–0.9s wall time
+
+Keep host-specific overrides in `~/.cargo/config.toml` (target dir, `jobs`, profile
+tweaks) as documented above; do not commit them.
+
 ## Not measured
 
 The `"*".debug = false` profile line has not been benchmarked on the full
-workspace: no before/after peak-RSS, build time, or `target/` size. Its
+workspace in isolation: no before/after peak-RSS, build time, or `target/` size. Its
 effect on the 12-17 GiB `warp` build is unknown and may be small, since that
 memory is likely dominated by the one large crate rather than its dependencies.
