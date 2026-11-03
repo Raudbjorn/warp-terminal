@@ -1,5 +1,5 @@
 use ui_components::{Component as _, Options as _, button};
-use warp_core::send_telemetry_from_ctx;
+
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::icons::Icon;
 use warp_core::ui::theme::Fill;
@@ -24,7 +24,6 @@ use super::OnboardingSlide;
 use super::upgrade_auth_prompt::render_upgrade_auth_prompt_bar;
 use crate::model::OnboardingStateModel;
 use crate::slides::{layout, slide_content};
-use crate::telemetry::OnboardingEvent;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OfferVariant {
@@ -110,29 +109,6 @@ impl OfferVariant {
                 "Use the Warp Agent locally and in the cloud",
             ],
             OfferVariant::ChooseHowToStart => &[],
-        }
-    }
-
-    pub(crate) fn slide_name(self) -> &'static str {
-        match self {
-            OfferVariant::HeadStart => "head_start",
-            OfferVariant::ChooseHowToStart => "choose_how_to_start",
-        }
-    }
-
-    pub(crate) fn account_class(self) -> &'static str {
-        match self {
-            OfferVariant::HeadStart => "free_icp",
-            OfferVariant::ChooseHowToStart => "free_standard",
-        }
-    }
-
-    fn primary_action(self) -> &'static str {
-        match self {
-            OfferVariant::HeadStart => "get_more_ai",
-            // Telemetry identifier, not user-facing copy: kept stable across the
-            // card's copy changes so existing dashboards don't lose continuity.
-            OfferVariant::ChooseHowToStart => "use_warp_with_ai",
         }
     }
 }
@@ -468,22 +444,10 @@ impl OfferSlide {
         )
     }
 
-    fn send_action(&self, variant: OfferVariant, action: &str, ctx: &mut ViewContext<Self>) {
-        send_telemetry_from_ctx!(
-            OnboardingEvent::OnboardingAction {
-                slide_name: variant.slide_name().to_string(),
-                action: action.to_string(),
-                account_class: Some(variant.account_class().to_string()),
-            },
-            ctx
-        );
-    }
-
     fn request_upgrade(&mut self, ctx: &mut ViewContext<Self>) {
-        let Some(variant) = self.variant(ctx) else {
+        if self.variant(ctx).is_none() {
             return;
-        };
-        self.send_action(variant, variant.primary_action(), ctx);
+        }
         self.show_auth_prompt_bar = true;
         self.onboarding_state.update(ctx, |model, ctx| {
             model.request_upgrade(ctx);
@@ -495,7 +459,6 @@ impl OfferSlide {
         let Some(variant) = self.variant(ctx) else {
             return;
         };
-        self.send_action(variant, "set_up_later", ctx);
         ctx.emit(OfferSlideEvent::SetUpLaterSelected { variant });
     }
 

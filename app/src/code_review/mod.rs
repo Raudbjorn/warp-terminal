@@ -21,8 +21,6 @@ pub(crate) mod nested_repos;
 #[cfg(feature = "local_fs")]
 pub(crate) mod nested_repos_view;
 pub mod telemetry_event;
-#[cfg_attr(not(feature = "local_fs"), allow(unused_imports))]
-pub use telemetry_event::CodeReviewTelemetryEvent;
 
 pub(crate) mod code_review_header;
 pub(crate) mod comment_rendering;

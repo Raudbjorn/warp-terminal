@@ -217,21 +217,149 @@ fn route_request_blocks_unsupported_input_from_server() {
     ));
 }
 
+fn request_with_schema(schema: i32) -> api::Request {
+    let mut providers = custom_providers();
+    providers.providers[0].schema = schema;
+    request_for_model("cfg-123", Some(providers), user_query_input())
+}
+
+fn block_reason_of(request: &api::Request) -> &'static str {
+    match route_request(request) {
+        RequestDisposition::BlockedFromServer(reason) => reason,
+        other => panic!("expected the request to be blocked, got {other:?}"),
+    }
+}
+
 #[test]
-fn unsupported_endpoint_schemas_stay_blocked_from_server() {
+fn routes_chat_completions_providers_to_the_chat_schema() {
     use api::request::settings::custom_model_providers::CustomEndpointSchema;
 
-    for schema in [
-        CustomEndpointSchema::OpenaiResponses as i32,
-        CustomEndpointSchema::AnthropicMessages as i32,
-        i32::MAX,
-    ] {
-        let mut providers = custom_providers();
-        providers.providers[0].schema = schema;
-        let request = request_for_model("cfg-123", Some(providers), user_query_input());
-        assert!(matches!(
-            route_request(&request),
-            RequestDisposition::BlockedFromServer(_)
-        ));
-    }
+    let request = request_with_schema(CustomEndpointSchema::OpenaiChatCompletions as i32);
+
+    let route = resolve_local_route(&request).expect("chat completions should route locally");
+    assert_eq!(
+        route.endpoint.schema,
+        local_agent::EndpointSchema::ChatCompletions
+    );
+}
+
+#[test]
+fn routes_responses_providers_to_the_responses_schema() {
+    use api::request::settings::custom_model_providers::CustomEndpointSchema;
+
+    let request = request_with_schema(CustomEndpointSchema::OpenaiResponses as i32);
+
+    let route = resolve_local_route(&request).expect("responses should route locally");
+    assert_eq!(
+        route.endpoint.schema,
+        local_agent::EndpointSchema::Responses
+    );
+    assert_eq!(route.endpoint.base_url, "https://llm.example.com/v1");
+    assert_eq!(route.endpoint.model_slug, "llama-3.3-70b");
+    assert_eq!(route.config_key, "cfg-123");
+    assert!(matches!(
+        route_request(&request),
+        RequestDisposition::Local(_)
+    ));
+}
+
+#[test]
+fn schema_follows_the_provider_that_owns_the_selected_model() {
+    use api::request::settings::custom_model_providers::{
+        CustomEndpointSchema, CustomModel, CustomModelProvider,
+    };
+
+    let mut providers = custom_providers();
+    providers.providers.push(CustomModelProvider {
+        base_url: "https://api.openai.example/v1".to_string(),
+        api_key: "sk-responses".to_string(),
+        schema: CustomEndpointSchema::OpenaiResponses as i32,
+        models: vec![CustomModel {
+            slug: "gpt-5".to_string(),
+            config_key: "cfg-456".to_string(),
+            reasoning_effort: String::new(),
+        }],
+    });
+
+    let chat = request_for_model("cfg-123", Some(providers.clone()), user_query_input());
+    let responses = request_for_model("cfg-456", Some(providers), user_query_input());
+
+    assert_eq!(
+        resolve_local_route(&chat)
+            .expect("chat route")
+            .endpoint
+            .schema,
+        local_agent::EndpointSchema::ChatCompletions
+    );
+    assert_eq!(
+        resolve_local_route(&responses)
+            .expect("responses route")
+            .endpoint
+            .schema,
+        local_agent::EndpointSchema::Responses
+    );
+}
+
+#[test]
+fn anthropic_messages_providers_stay_blocked_from_server_with_an_accurate_reason() {
+    use api::request::settings::custom_model_providers::CustomEndpointSchema;
+
+    let request = request_with_schema(CustomEndpointSchema::AnthropicMessages as i32);
+
+    assert!(resolve_local_route(&request).is_none());
+    let reason = block_reason_of(&request);
+    assert!(
+        reason.contains("Anthropic Messages") && reason.contains("OpenAI Responses"),
+        "reason should name the unsupported schema and the supported ones: {reason}"
+    );
+}
+
+#[test]
+fn unrecognized_endpoint_schemas_stay_blocked_from_server() {
+    let request = request_with_schema(i32::MAX);
+
+    assert!(resolve_local_route(&request).is_none());
+    assert!(block_reason_of(&request).contains("does not recognize"));
+}
+
+#[test]
+fn block_reason_distinguishes_unsupported_input_unknown_model_and_schema() {
+    use api::request::settings::custom_model_providers::CustomEndpointSchema;
+
+    let unsupported_input = request_for_model(
+        "cfg-123",
+        Some(custom_providers()),
+        api::request::input::Type::CodeReview(api::request::input::CodeReview::default()),
+    );
+    let not_custom = request_for_model(
+        "claude-4-sonnet",
+        Some(custom_providers()),
+        user_query_input(),
+    );
+    let anthropic = request_with_schema(CustomEndpointSchema::AnthropicMessages as i32);
+
+    let reasons = [
+        block_reason_of(&unsupported_input),
+        block_reason_of(&not_custom),
+        block_reason_of(&anthropic),
+    ];
+    assert!(reasons[0].contains("kind of request"));
+    assert!(reasons[1].contains("not a custom endpoint model"));
+    assert!(reasons[2].contains("Anthropic Messages"));
+}
+
+#[test]
+fn resuming_an_interrupted_request_is_blocked_with_a_specific_reason() {
+    let request = request_for_model(
+        "cfg-123",
+        Some(custom_providers()),
+        api::request::input::Type::ResumeConversation(api::request::input::ResumeConversation {}),
+    );
+
+    assert!(resolve_local_route(&request).is_none());
+    let reason = block_reason_of(&request);
+    assert!(
+        reason.contains("resume") && reason.contains("send your message again"),
+        "{reason}"
+    );
 }

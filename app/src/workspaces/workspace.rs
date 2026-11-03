@@ -375,12 +375,6 @@ pub struct AIAutonomyPolicy {
     pub toggleable: bool,
 }
 
-#[derive(Clone, Debug, Copy, Serialize, Deserialize)]
-pub struct TelemetryDataCollectionPolicy {
-    pub default: bool,
-    pub toggleable: bool,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UgcDataCollectionPolicy {
     pub default_setting: UgcCollectionEnablementSetting,
@@ -560,7 +554,6 @@ pub struct Tier {
     pub shared_workflows_policy: Option<SharedWorkflowsPolicy>,
     pub session_sharing_policy: Option<SessionSharingPolicy>,
     pub ai_autonomy_policy: Option<AIAutonomyPolicy>,
-    pub telemetry_data_collection_policy: Option<TelemetryDataCollectionPolicy>,
     pub ugc_data_collection_policy: Option<UgcDataCollectionPolicy>,
     pub usage_based_pricing_policy: Option<UsageBasedPricingPolicy>,
     pub codebase_context_policy: Option<CodebaseContextPolicy>,
@@ -817,18 +810,6 @@ impl BillingMetadata {
         }
     }
 
-    pub fn is_byo_api_key_enabled(&self) -> bool {
-        self.tier
-            .byo_api_key_policy
-            .is_some_and(|policy| policy.enabled)
-    }
-
-    pub fn is_byo_endpoint_enabled(&self) -> bool {
-        self.tier
-            .byo_endpoint_policy
-            .is_some_and(|policy| policy.enabled)
-    }
-
     pub fn is_managed_byok_byoe_enabled(&self) -> bool {
         self.tier
             .managed_byok_byoe_policy
@@ -915,11 +896,6 @@ pub struct LlmSettings {
     pub enabled: bool,
     #[serde(default)]
     pub host_configs: std::collections::HashMap<LLMModelHost, LlmHostSettings>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct TelemetrySettings {
-    pub force_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1104,7 +1080,6 @@ pub struct SandboxedAgentSettings {
 pub struct WorkspaceSettings {
     pub llm_settings: LlmSettings,
     pub team_byo: Option<TeamByoSettings>,
-    pub telemetry_settings: TelemetrySettings,
     pub ugc_collection_settings: UgcCollectionSettings,
     pub cloud_conversation_storage_settings: CloudConversationStorageSettings,
     pub link_sharing_settings: LinkSharingSettings,
@@ -1273,7 +1248,6 @@ pub struct TeamSettings {
     pub link_sharing: TeamLinkSharingSettings,
     pub sandboxed_agent: TeamSandboxedAgentSettings,
     pub llm_settings: LlmSettings,
-    pub telemetry_settings: TelemetrySettings,
     pub usage_based_pricing_settings: UsageBasedPricingSettings,
     pub addon_credits_settings: AddonCreditsSettings,
     /// The team-level agent attribution setting. When `Enable` or `Disable`, the

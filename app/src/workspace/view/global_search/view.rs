@@ -6,14 +6,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_channel::Sender;
-use instant::Instant;
 use pathfinder_geometry::vector::vec2f;
 use project_replace::engine::SearchSpec;
 use project_replace::scope::{ScopeGlobs, folder_pattern};
 use remote_server::HostId;
 use string_offset::{ByteOffset, CharCounter};
 use warp_core::r#async::debounce;
-use warp_core::send_telemetry_from_ctx;
+
 use warp_core::ui::Icon;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::theme::color::internal_colors;
@@ -42,7 +41,6 @@ use warpui::{
     ViewHandle, WeakViewHandle,
 };
 
-use crate::TelemetryEvent;
 use crate::code::{default_file_icon, icon_from_file_path, icon_from_folder_path};
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
 use crate::editor::{
@@ -423,7 +421,6 @@ pub struct GlobalSearchView {
     capped_matches: bool,
     last_error: Option<String>,
     /// When the current search started, for completion telemetry.
-    search_started_at: Option<Instant>,
     active_search_remote_host_count: usize,
     scroll_state: ScrollStateHandle,
     uniform_list_state: UniformListState,
@@ -892,7 +889,6 @@ impl GlobalSearchView {
             is_search_in_progress: false,
             capped_matches: false,
             last_error: None,
-            search_started_at: None,
             active_search_remote_host_count: 0,
             scroll_state: ScrollStateHandle::default(),
             uniform_list_state: UniformListState::new(),
@@ -1044,7 +1040,6 @@ impl GlobalSearchView {
     fn stop_tracking_text_search(&mut self) {
         self.is_search_in_progress = false;
         self.current_search_id = None;
-        self.search_started_at = None;
     }
 
     fn cancel_search(&mut self, ctx: &mut ViewContext<Self>) {
@@ -1251,11 +1246,8 @@ impl GlobalSearchView {
                 remote_host_count,
                 name_search_started,
             } => {
-                send_telemetry_from_ctx!(TelemetryEvent::GlobalSearchQueryStarted, ctx);
-
                 self.current_search_id = Some(*search_id);
                 self.pending_name_search_id = name_search_started.then_some(*search_id);
-                self.search_started_at = Some(Instant::now());
                 self.active_search_remote_host_count = *remote_host_count;
 
                 self.is_search_in_progress = true;
@@ -1331,19 +1323,6 @@ impl GlobalSearchView {
                     self.uniform_list_state.add_scroll_top(scroll_top);
                 }
 
-                if let Some(started_at) = self.search_started_at.take() {
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::GlobalSearchQueryCompleted {
-                            duration_ms: started_at.elapsed().as_millis() as u64,
-                            remote_host_count: self.active_search_remote_host_count,
-                            total_match_count: *total_match_count,
-                            capped: self.capped_matches,
-                            local_source_failed: *local_source_failed,
-                            remote_source_failures: *remote_source_failures,
-                        },
-                        ctx
-                    );
-                }
                 self.refresh_replace_controls(ctx);
             }
             GlobalSearchEvent::Failed { search_id, error } => {
@@ -1352,7 +1331,6 @@ impl GlobalSearchView {
                 }
 
                 self.is_search_in_progress = false;
-                self.search_started_at = None;
                 // Name matches come from a separate source and stay valid.
                 self.clear_text_matches();
                 if matches!(

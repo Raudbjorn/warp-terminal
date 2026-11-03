@@ -30,7 +30,6 @@ use crate::view_components::action_button::{
 use crate::view_components::compactible_action_button::{
     CompactibleActionButton, MEDIUM_SIZE_SWITCH_THRESHOLD, render_compact_and_regular_button_rows,
 };
-use crate::{TelemetryEvent, send_telemetry_from_ctx};
 
 const ACCEPT_LABEL: &str = "Generate tests";
 const CANCEL_LABEL: &str = "Dismiss";
@@ -410,16 +409,6 @@ impl TypedActionView for SuggestedUnitTestsView {
                         .toggle_and_save_value(ctx)
                 });
                 ctx.notify();
-
-                if let Ok(checked) = checked {
-                    send_telemetry_from_ctx!(
-                        TelemetryEvent::ToggleCodeSuggestionsSetting {
-                            source: ToggleCodeSuggestionsSettingSource::Speedbump,
-                            is_code_suggestions_enabled: checked,
-                        },
-                        ctx
-                    );
-                }
             }
             SuggestedUnitTestsAction::OpenSettings => {
                 ctx.emit(SuggestedUnitTestsEvent::OpenSettings)

@@ -7848,10 +7848,12 @@ name = "local_agent"
 version = "0.0.0"
 dependencies = [
  "aha-reqwest-eventsource",
+ "async-io",
  "async-stream",
  "futures",
  "log",
  "mockito",
+ "rand 0.8.6",
  "reqwest",
  "serde",
  "serde_json",
@@ -16108,7 +16110,6 @@ dependencies = [
  "anyhow",
  "async-broadcast",
  "async-channel",
- "async-io",
  "base64 0.22.1",
  "bimap",
  "bincode",
@@ -16126,7 +16127,6 @@ dependencies = [
  "enum-iterator",
  "flate2",
  "futures",
- "futures-lite 1.13.0",
  "get-size",
  "gethostname",
  "hex",

@@ -74,12 +74,12 @@ use crate::global_resource_handles::GlobalResourceHandlesProvider;
 use crate::network::NetworkStatus;
 use crate::notebooks::editor::model::FileLinkResolutionContext;
 use crate::persistence::ModelEvent;
-use crate::send_telemetry_from_ctx;
+
 use crate::server::server_api::AIApiError;
 #[cfg(not(target_family = "wasm"))]
 use crate::server::server_api::ServerApiProvider;
 use crate::server::team_scope::RequestTeamScope;
-use crate::server::telemetry::TelemetryEvent;
+
 use crate::terminal::ShellLaunchData;
 use crate::terminal::model::block::{
     BlockId, CURSOR_MARKER, formatted_terminal_contents_for_input,
@@ -839,19 +839,6 @@ impl BlocklistAIController {
         let (query, user_query_mode) = extract_user_query_mode(query);
 
         // Attribute /orchestrate queries to the slash-command entry surface.
-        if matches!(user_query_mode, UserQueryMode::Orchestrate) {
-            send_telemetry_from_ctx!(
-                super::telemetry::BlocklistOrchestrationTelemetryEvent::OrchestrationEntered(
-                    super::telemetry::OrchestrationEnteredEvent {
-                        conversation_id,
-                        plan_id: None,
-                        entry_source:
-                            super::telemetry::OrchestrationEntrySource::SlashCommandOrchestrate,
-                    }
-                ),
-                ctx
-            );
-        }
 
         let should_prepend_finished_action_results = matches!(
             input_query.input_query,
@@ -3113,19 +3100,6 @@ impl BlocklistAIController {
             .in_flight_response_streams
             .has_active_stream_for_conversation(conversation_id, ctx)
         {
-            send_telemetry_from_ctx!(
-                TelemetryEvent::AIInputNotSent {
-                    entrypoint: query_metadata.map(|metadata| metadata.entrypoint),
-                    inputs: request_input
-                        .all_inputs()
-                        .cloned()
-                        .map(|input| input.into())
-                        .collect(),
-                    active_server_conversation_id: conversation_server_token.clone(),
-                    active_client_conversation_id: Some(conversation_id),
-                },
-                ctx
-            );
             const AI_INPUT_NOT_SENT_ERROR_STR: &str =
                 "Not sending AI input because there is an in-flight request";
             safe_assert!(false, "{}", AI_INPUT_NOT_SENT_ERROR_STR);

@@ -25,7 +25,9 @@ use crate::ai::execution_profiles::profiles::{
 };
 use crate::ai::harness_availability::{HarnessAvailabilityEvent, HarnessAvailabilityModel};
 use crate::ai::harness_display::icon_for as harness_icon_for;
-use crate::ai::llms::{LLMId, LLMPreferences, LLMPreferencesEvent};
+use crate::ai::llms::{
+    LLMId, LLMPreferences, LLMPreferencesEvent, effective_disable_reason_for_model,
+};
 use crate::editor::{
     EditorView, Event as EditorEvent, PropagateAndNoOpEscapeKey, PropagateAndNoOpNavigationKeys,
     SingleLineEditorOptions, TextOptions,
@@ -551,7 +553,9 @@ impl ModelSelector {
                     .with_padding_override(ITEM_VERTICAL_PADDING, MENU_HORIZONTAL_PADDING)
                     .with_override_hover_background_color(hover_background)
                     .with_on_select_action(ModelSelectorAction::SelectModel(llm.id.clone()))
-                    .with_disabled(llm.disable_reason.is_some());
+                    .with_disabled(
+                        effective_disable_reason_for_model(llm, None, scope, ctx).is_some(),
+                    );
                 MenuItem::Item(fields)
             })
             .collect();

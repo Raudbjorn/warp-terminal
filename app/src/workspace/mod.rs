@@ -82,6 +82,7 @@ use crate::workspace::view::{
 };
 
 pub fn init(app: &mut AppContext) {
+    crate::ssh_manager::init(app);
     app.add_singleton_model(|_| WorkspaceRegistry::new());
     app.add_singleton_model(|_| cross_window_tab_drag::CrossWindowTabDrag::new());
     use warpui::keymap::macros::*;

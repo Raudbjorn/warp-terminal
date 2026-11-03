@@ -85,7 +85,7 @@ use crate::server::server_api::ServerApiProvider;
 use crate::server::server_api::presigned_upload::HttpStatusError;
 use crate::server::sync_queue::SyncQueue;
 use crate::server::team_scope::RequestTeamScope;
-use crate::server::telemetry::context_provider::AppTelemetryContextProvider;
+
 use crate::settings::PrivacySettings;
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::suggestions::ignored_suggestions_model::IgnoredSuggestionsModel;
@@ -139,7 +139,6 @@ fn initialize_app_with_history(app: &mut App, conversations: Vec<AgentConversati
         )
     });
     app.add_singleton_model(|_| AuthStateProvider::new_for_test());
-    app.add_singleton_model(AppTelemetryContextProvider::new_context_provider);
     app.add_singleton_model(AuthManager::new_for_test);
     app.add_singleton_model(|_ctx| PtySpawner::new_for_test());
     app.add_singleton_model(|_| NetworkStatus::new());

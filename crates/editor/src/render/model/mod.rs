@@ -3551,7 +3551,7 @@ impl RenderState {
 
         log::trace!(
             "Incoming block replacements {:?}",
-            &pending_edit.laid_out_line
+            pending_edit.laid_out_line
         );
 
         let hidden_range_clone = hidden_ranges.clone();
@@ -3701,7 +3701,7 @@ impl RenderState {
 
         for range in ranges {
             let hidden_range_size = range.end - range.start - 1;
-            log::trace!("==== Processing range: {:?} ====", &range);
+            log::trace!("==== Processing range: {:?} ====", range);
             new_tree.push_tree(cursor.slice(&range.start, SeekBias::Left));
             log::trace!("After pushing prefix tree:\n {}", new_tree.describe());
             let sub_tree = cursor.slice(&range.end, SeekBias::Right);

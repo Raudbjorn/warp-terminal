@@ -10,8 +10,6 @@ pub use overrides::{get_overrides, set_overrides};
 pub enum FeatureFlag {
     DebugMode,
     Autoupdate,
-    WithSandboxTelemetry,
-    RecordAppActiveEvents,
 
     WelcomeTips,
     ThinStrokes,
@@ -66,10 +64,6 @@ pub enum FeatureFlag {
     /// lib will use the user's history as a last-ditch effort to find a reasonable correction.
     CommandCorrectionsHistoryRule,
 
-    /// Used to gate an experiment we're doing on WarpDev ONLY
-    /// to get a sense of PTY throughput over time.
-    RecordPtyThroughput,
-
     /// Whether to fetch generic string objects from the server.
     FetchGenericStringObjects,
 
@@ -84,7 +78,6 @@ pub enum FeatureFlag {
     /// This is enabled automatically for local and dev builds.
     /// Collect conversation and input autodetection data for agent mode.
     /// Also collects block data for Next Command, if enabled.
-    AgentModeAnalytics,
 
     /// A setting to enable a traditional completions experience.
     ClassicCompletions,
@@ -219,14 +212,6 @@ pub enum FeatureFlag {
 
     /// Enables support for Warp Packs.
     WarpPacks,
-
-    /// Enables the revised AI analytics policy banner.
-    ///
-    /// This does not gate actual collection of data under the new policy.
-    GlobalAIAnalyticsBanner,
-
-    /// Enables actual collection of AI analytics data per the revised AI analytics policy.
-    GlobalAIAnalyticsCollection,
 
     /// Enables auto-generated AI memories.
     AIMemories,
@@ -366,9 +351,6 @@ pub enum FeatureFlag {
 
     /// Enables the tabbed file viewer
     TabbedEditorView,
-
-    /// Enables sending telemetry data to a file in addition to the server
-    SendTelemetryToFile,
 
     /// Enables multiple agent profiles in settings for managing different AI agent configurations.
     MultiProfile,
@@ -808,7 +790,9 @@ pub enum FeatureFlag {
     /// Enables the ask_user_question tool allowing the agent to ask clarifying questions.
     AskUserQuestion,
 
-    /// When enabled, solo users (not on a team) can use BYO API keys.
+    /// Only selects the sign-up copy shown to anonymous or logged-out users in the API keys
+    /// settings. BYO API keys for signed-in users no longer depend on it: that gate is open to
+    /// every signed-in user (see `UserWorkspaces::is_byo_api_key_enabled`).
     SoloUserByok,
 
     /// Replaces the in-block warpification banner with a warpify footer.
@@ -1027,7 +1011,6 @@ pub const DOGFOOD_FLAGS: &[FeatureFlag] = &[
     FeatureFlag::RemoveAutosuggestionDuringTabCompletions,
     FeatureFlag::ResizeFix,
     FeatureFlag::AgentModeWorkflows,
-    FeatureFlag::AgentModeAnalytics,
     FeatureFlag::LazySceneBuilding,
     FeatureFlag::SshDragAndDrop,
     FeatureFlag::MultiWorkspace,

@@ -46,10 +46,10 @@ use crate::code_review::comments::{
     AttachedReviewComment, AttachedReviewCommentTarget, CommentId, CommentOrigin,
     ReviewCommentBatch, ReviewCommentBatchEvent,
 };
-use crate::code_review::telemetry_event::CodeReviewTelemetryEvent;
+
 use crate::menu::{Event, Menu, MenuItem, MenuItemFields};
 use crate::notebooks::editor::view::{EditorViewEvent, RichTextEditorView};
-use crate::send_telemetry_from_ctx;
+
 use crate::settings::AISettings;
 use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{
@@ -1181,13 +1181,6 @@ impl TypedActionView for CommentListView {
                     }
 
                     // Telemetry: comment list view expanded.
-                    send_telemetry_from_ctx!(
-                        CodeReviewTelemetryEvent::CommentListExpanded {
-                            is_local: self.repo_is_local(),
-                            comment_count: self.comments_by_id.len(),
-                        },
-                        ctx
-                    );
                 }
                 ctx.notify();
             }
@@ -1274,12 +1267,6 @@ impl TypedActionView for CommentListView {
                 self.close_overflow_menu(ctx);
             }
             CommentListAction::JumpToCommentLocation(comment_id) => {
-                send_telemetry_from_ctx!(
-                    CodeReviewTelemetryEvent::CommentListItemClicked {
-                        is_local: self.repo_is_local(),
-                    },
-                    ctx
-                );
                 ctx.emit(CommentListEvent::JumpToCommentLocation(*comment_id));
             }
         }

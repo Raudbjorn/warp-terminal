@@ -5,8 +5,8 @@ use ai::agent::orchestration_config::{
     OrchestrationConfig, OrchestrationConfigStatus, OrchestrationExecutionMode,
 };
 use warp::tui_export::{
-    AIActionStatus, AIAgentAction, AIAgentActionId, AIAgentActionType, AIConversationId,
-    Appearance, AuthSecretSelection, Harness, OptionRow, OptionSnapshot, OptionSourceStatus,
+    AIActionStatus, AIAgentAction, AIAgentActionId, AIAgentActionType, Appearance,
+    AuthSecretSelection, Harness, OptionRow, OptionSnapshot, OptionSourceStatus,
     OrchestrationConfigState, OrchestrationEditState, ResolvedTeamScope, RunAgentsAgentRunConfig,
     RunAgentsExecutionMode, RunAgentsRequest, ServerApiProvider, TaskId, TeamContext,
     UserWorkspaces, register_tui_session_view_test_singletons,
@@ -226,7 +226,6 @@ fn window_team_change_reseeds_the_auth_secret_for_the_new_scope() {
         let block = app.update(|ctx| {
             ctx.add_typed_action_tui_view(window_id, move |ctx| {
                 TuiOrchestrationBlock::new(
-                    AIConversationId::new(),
                     action,
                     &incoming,
                     None,
@@ -241,7 +240,6 @@ fn window_team_change_reseeds_the_auth_secret_for_the_new_scope() {
         let other_block = app.update(|ctx| {
             ctx.add_typed_action_tui_view(other_window_id, move |ctx| {
                 TuiOrchestrationBlock::new(
-                    AIConversationId::new(),
                     other_action,
                     &other_incoming,
                     None,
@@ -486,7 +484,6 @@ fn test_block(
     request: &RunAgentsRequest,
 ) -> (ViewHandle<TuiOrchestrationBlock>, Rc<TestController>) {
     app.add_singleton_model(|_| Appearance::mock());
-    app.update(warp_core::telemetry::testing::MockTelemetryContextProvider::register);
     app.add_singleton_model(|_| ServerApiProvider::new_for_test());
     app.add_singleton_model(|ctx| {
         let provider = ServerApiProvider::as_ref(ctx);
@@ -516,7 +513,6 @@ fn test_block(
         );
         ctx.add_typed_action_tui_view(window_id, move |ctx| {
             TuiOrchestrationBlock::from_parts(
-                AIConversationId::new(),
                 action,
                 &request,
                 None,
@@ -562,7 +558,6 @@ fn renderable_test_block(app: &mut App) -> ViewHandle<TuiOrchestrationBlock> {
         );
         ctx.add_typed_action_tui_view(window_id, move |ctx| {
             TuiOrchestrationBlock::from_parts(
-                AIConversationId::new(),
                 action,
                 &request,
                 None,

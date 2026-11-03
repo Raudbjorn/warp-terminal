@@ -3,7 +3,7 @@ use std::time::Duration;
 use ai::LLMId;
 use instant::Instant;
 use warp_core::features::FeatureFlag;
-use warp_core::send_telemetry_from_ctx;
+
 use warpui_core::assets::asset_cache::AssetSource;
 use warpui_core::image_cache::ImageType;
 use warpui_core::windowing::WindowManager;
@@ -19,7 +19,6 @@ use crate::slides::{
     IntroSlide, IntroSlideEvent, OfferSlide, OfferSlideEvent, OfferVariant, OnboardingModelInfo,
     OnboardingSlide, ThemePickerSlide, ThemePickerSlideEvent, ThirdPartySlide,
 };
-use crate::telemetry::OnboardingEvent;
 
 const APP_BECAME_ACTIVE_DEBOUNCE: Duration = Duration::from_secs(15);
 
@@ -413,19 +412,6 @@ impl AgentOnboardingView {
 
         // Preload customize-slide images so they're ready when the user reaches that slide.
         Self::preload_onboarding_images(ctx);
-
-        send_telemetry_from_ctx!(OnboardingEvent::OnboardingStarted, ctx);
-        send_telemetry_from_ctx!(
-            OnboardingEvent::SlideViewed {
-                slide_name: if FeatureFlag::AccountFirstOnboarding.is_enabled() {
-                    "welcome"
-                } else {
-                    "intro"
-                }
-                .to_string(),
-            },
-            ctx
-        );
     }
 
     /// Eagerly loads all onboarding slide images into the asset cache
