@@ -282,3 +282,43 @@ fn the_claude_ring_is_read_from_the_state_dir() {
     assert_eq!(providers["claude"]["used5h"].as_f64(), Some(4.));
     assert_eq!(providers["claude"]["_ts"].as_f64(), Some(5.));
 }
+
+#[test]
+fn legacy_harp_status_file_is_read_when_it_is_the_only_one() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join("state");
+    let legacy = legacy_claude_status_file(root.path());
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "{}").unwrap();
+
+    let (path, _) = newest_status_file([claude_status_file(&state_dir), legacy.clone()]).unwrap();
+    assert_eq!(path, legacy);
+}
+
+#[test]
+fn the_newer_status_file_wins() {
+    let root = tempfile::tempdir().unwrap();
+    let state_dir = root.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let current = claude_status_file(&state_dir);
+    let legacy = legacy_claude_status_file(root.path());
+    std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+    std::fs::write(&legacy, "{}").unwrap();
+    std::fs::write(&current, "{}").unwrap();
+    let older = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+    std::fs::File::options()
+        .write(true)
+        .open(&legacy)
+        .unwrap()
+        .set_modified(older)
+        .unwrap();
+
+    let (path, _) = newest_status_file([current.clone(), legacy]).unwrap();
+    assert_eq!(path, current);
+}
+
+#[test]
+fn no_status_file_gives_none() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(newest_status_file([claude_status_file(root.path())]).is_none());
+}

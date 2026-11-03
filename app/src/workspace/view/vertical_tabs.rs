@@ -11507,6 +11507,23 @@ pub(in crate::workspace::view) mod limit_sources {
         providers
     }
 
+    /// Where Harp 0.1.8 had Claude Code store its status line input. A `~/.claude/settings.json`
+    /// set up by Harp keeps writing here, and the app never replaces an existing status line, so
+    /// the ring reads this file too rather than going blank for those users.
+    pub(in crate::workspace::view) fn legacy_claude_status_file(home: &Path) -> PathBuf {
+        home.join(".harp").join(CLAUDE_STATUS_FILE_NAME)
+    }
+
+    /// The most recently modified of `paths` that exists, with its modification time.
+    pub(in crate::workspace::view) fn newest_status_file(
+        paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Option<(PathBuf, SystemTime)> {
+        paths
+            .into_iter()
+            .filter_map(|path| modified(&path).map(|time| (path, time)))
+            .max_by_key(|(_, time)| *time)
+    }
+
     fn modified(path: &Path) -> Option<SystemTime> {
         std::fs::metadata(path).ok()?.modified().ok()
     }
@@ -11610,8 +11627,9 @@ pub(in crate::workspace::view) mod limit_sources {
     }
 
     fn claude(state_dir: &Path, cache: &mut Cache, now: f64) -> Option<Value> {
-        let path = claude_status_file(state_dir);
-        let modified = modified(&path)?;
+        let legacy = dirs::home_dir().map(|home| legacy_claude_status_file(&home));
+        let (path, modified) =
+            newest_status_file(std::iter::once(claude_status_file(state_dir)).chain(legacy))?;
         if cache
             .claude
             .as_ref()

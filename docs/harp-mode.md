@@ -61,7 +61,9 @@ the toolbar comes back as configured when Harp mode is off.
 | `integrations.tmux.session_script` | `""` | Optional script that renames and regroups instead of the built-in tmux commands: `<script> rename <shell_pid> <group> <title>`, `<script> group <session_id> <old_group> <new_group>`. |
 
 With tmux sync on, a tmux session started elsewhere (for example over ssh) can
-ask for a tab with `tmux set-option @warp_adopt 1`.
+ask for a tab with `tmux set-option -t <session> @warp_adopt 1`. The app adopts
+only sessions with no client attached, so detach first (or run the command
+from outside the session); the tab opens on the next poll.
 
 ## Requirements
 
@@ -69,8 +71,10 @@ ask for a tab with `tmux set-option @warp_adopt 1`.
   reports nothing.
 - `tmux`, only if `integrations.tmux.enabled` is on.
 
-The app logs a warning when `jq` is missing, or when tmux sync is on and
-`tmux` is missing.
+The app logs a warning at startup and when Harp mode or tmux sync is turned
+on if the bundled plugin is not found, `jq` is missing, or tmux sync is on and
+`tmux` is missing. It checks the app's own `PATH`, which can differ from the
+one your shell's startup files build.
 
 ## Shell environment
 
@@ -82,6 +86,13 @@ In Harp mode the app sets two variables in every new shell:
   in that shell loads the plugin for that session. The plugin is not installed
   into `~/.claude`, and Claude Code in other terminals is not affected.
 - `HARP_AGENT_STATUS=1`.
+
+With Harp mode off, new shells get neither: `HARP_AGENT_STATUS` is removed, so
+a plugin inherited from an outer Harp-mode window stays quiet.
+
+Loading a plugin from `CLAUDE_CODE_PLUGIN_DIRS` needs Claude Code 2.1.280 or
+later. An older Claude Code ignores the variable; its rows still show working
+and done, but not "needs you" or the background dot.
 
 Only shells started after Harp mode was turned on get these variables. Shells
 that were already open, and warpkeep sessions recovered from before, keep the
@@ -98,19 +109,30 @@ status line's input to the fork's state directory
 prints nothing.
 
 An existing `statusLine` is left alone. To keep yours and get the rings, save
-the input first:
+the input first. Write to a temporary file and rename it, as the app's own
+entry does, so several Claude Code sessions updating at once never leave a
+half-written file:
 
 ```json
 "statusLine": {
   "type": "command",
-  "command": "tee ~/.local/state/warp-oss/claude-statusline.json | your-command"
+  "command": "f=~/.local/state/warp-oss/claude-statusline.json; mkdir -p \"${f%/*}\"; tee \"$f.$$\" | your-command; mv -f \"$f.$$\" \"$f\""
 }
 ```
 
+A status line set up by Harp itself writes `~/.harp/claude-statusline.json`.
+The app reads that file too and uses whichever of the two is newer, so the
+rings keep working without changing it.
+
 The app adds the entry only once. It then writes a marker file,
-`claude-statusline.installed`, and does not add the entry again while the
-marker exists. To undo the side effect, remove the `statusLine` entry from
-`~/.claude/settings.json`; it stays removed.
+`claude-statusline.installed`, in the same state directory, and does not add
+the entry again while the marker exists. To undo the side effect, remove the
+`statusLine` entry from `~/.claude/settings.json`; it stays removed. Turning
+Harp mode off does not remove the entry.
+
+Claude Code has one status line for all its sessions, while each channel or
+data profile of the app has its own state directory. Only the one that added
+the entry gets Claude rings.
 
 Codex rings are read from `$CODEX_HOME/sessions` (default `~/.codex/sessions`).
 They appear once Codex has answered at least once.
@@ -146,6 +168,7 @@ status as a `[status-check]` line to `~/.local/state/warp-oss/warp-oss.log`.
 
 - Check that `integrations.limit_rings.enabled` is `true`.
 - Claude: check that `~/.claude/settings.json` has a `statusLine` that writes
-  `claude-statusline.json` (see above). The rings appear after Claude Code's
+  `claude-statusline.json` to the state directory or to `~/.harp` (see
+  above). The rings appear after Claude Code's
   next answer, and only for Claude.ai plans, not API keys.
 - Codex: check that `$CODEX_HOME/sessions` or `~/.codex/sessions` exists.
