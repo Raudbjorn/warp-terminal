@@ -92,7 +92,9 @@ use crate::workspace::{
     VerticalTabsPaneDropTargetData, Workspace,
 };
 
-const PANEL_WIDTH: f32 = 248.;
+/// Upstream's default panel width in logical px; Harp mode swaps in `sidebar::SIDEBAR_WIDTH`
+/// (`Workspace::sync_vertical_tabs_panel_width_to_mode`).
+pub(super) const PANEL_WIDTH: f32 = 248.;
 const MIN_PANEL_WIDTH: f32 = 200.;
 const MAX_PANEL_WIDTH_RATIO: f32 = 0.5;
 const DETAIL_SIDECAR_SECTION_PADDING: f32 = 12.;

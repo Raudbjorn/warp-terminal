@@ -6405,7 +6405,7 @@ fn test_harp_mode_switches_default_panel_width_but_keeps_a_dragged_one() {
         workspace.read(&app, |workspace, _| {
             assert_eq!(
                 vertical_tabs_panel_width(workspace),
-                UPSTREAM_VERTICAL_TABS_PANEL_WIDTH
+                vertical_tabs::PANEL_WIDTH
             );
         });
 

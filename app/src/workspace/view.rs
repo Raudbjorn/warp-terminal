@@ -733,10 +733,6 @@ const KEYBINDINGS_TO_CACHE: [&str; 4] = [
 
 const WORKFLOW_AND_ENV_VAR_SPLIT_RATIO: f32 = 0.56;
 const NOTEBOOK_SMART_SPLIT_RATIO: f32 = 0.42;
-/// Plain vertical tabs' default panel width in logical px (master's `vertical_tabs::PANEL_WIDTH`).
-/// Harp mode swaps it for the framed sidebar's wider default.
-const UPSTREAM_VERTICAL_TABS_PANEL_WIDTH: f32 = 248.;
-
 #[cfg(target_family = "wasm")]
 const MOBILE_OVERLAY_PANEL_WIDTH_RATIO: f32 = 0.9;
 #[cfg(target_family = "wasm")]
@@ -22444,13 +22440,13 @@ impl Workspace {
     fn sync_vertical_tabs_panel_width_to_mode(&self, ctx: &AppContext) {
         let (other_default, mode_default) = if Self::framed_sidebar_configured(ctx) {
             (
-                UPSTREAM_VERTICAL_TABS_PANEL_WIDTH,
+                vertical_tabs::PANEL_WIDTH,
                 vertical_tabs::sidebar::SIDEBAR_WIDTH,
             )
         } else {
             (
                 vertical_tabs::sidebar::SIDEBAR_WIDTH,
-                UPSTREAM_VERTICAL_TABS_PANEL_WIDTH,
+                vertical_tabs::PANEL_WIDTH,
             )
         };
         let Ok(mut state) = self.vertical_tabs_panel.resizable_state.lock() else {
