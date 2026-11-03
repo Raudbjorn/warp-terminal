@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use warp_core::settings::Setting as _;
 use warp_terminal::model::escape_sequences::{BRACKETED_PASTE_END, BRACKETED_PASTE_START};
-use warpui::{App, AppContext, SingletonEntity, ViewContext};
+use warpui::{App, AppContext, EntityId, SingletonEntity, ViewContext};
 
 use super::super::{AIBlockMetadata, RichContentMetadata, RichContentType};
 use super::*;
@@ -343,11 +343,6 @@ fn cli_agent_footer_renders_for_viewer_of_shared_cloud_agent_session() {
 
         let terminal = add_window_with_terminal(&mut app, None);
 
-        // WarpOss defaults the CLI agent toolbar off; this test is about the toolbar showing.
-        AISettings::handle(&app).update(&mut app, |settings, ctx| {
-            let _ = settings.should_render_cli_agent_footer.set_value(true, ctx);
-        });
-
         terminal.update(&mut app, |view, ctx| {
             simulate_user_started_long_running_command(view);
 
@@ -458,14 +453,23 @@ fn claude_session() -> CLIAgentSession {
     }
 }
 
-/// WarpOss: the CLI agent toolbar follows upstream's "Show coding agent toolbar" setting
-/// (`agents.third_party.should_render_cli_agent_toolbar`): hidden under a Claude session by
-/// default (the fork's default), shown once the setting is on.
+/// The CLI agent toolbar follows upstream's "Show coding agent toolbar" setting
+/// (`agents.third_party.should_render_cli_agent_toolbar`): hidden under a Claude session while
+/// the setting is off, shown once it is on.
 #[test]
 fn cli_agent_toolbar_follows_its_setting() {
     App::test((), |mut app| async move {
         initialize_app_for_terminal_view(&mut app);
         let terminal = add_window_with_terminal(&mut app, None);
+
+        // Harp shipped this setting defaulting off and relied on that here; the fork keeps the
+        // upstream default (on), so the test turns it off itself to start from the hidden state.
+        AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .should_render_cli_agent_footer
+                .set_value(false, ctx)
+                .unwrap();
+        });
 
         terminal.update(&mut app, |view, ctx| {
             simulate_user_started_long_running_command(view);
@@ -478,13 +482,68 @@ fn cli_agent_toolbar_follows_its_setting() {
         });
 
         AISettings::handle(&app).update(&mut app, |settings, ctx| {
-            let _ = settings
-                .should_render_cli_agent_footer
-                .set_value(true, ctx);
+            let _ = settings.should_render_cli_agent_footer.set_value(true, ctx);
         });
         terminal.read(&app, |view, ctx| {
             let model = view.model.lock();
             assert!(view.should_render_use_agent_footer(&model, ctx));
+        });
+    })
+}
+
+/// The CLI agent footer view rendered in the blocklist after the active block, if any.
+fn rendered_cli_agent_footer(view: &TerminalView) -> Option<EntityId> {
+    let model = view.model.lock();
+    let active_block_index = model.block_list().active_block_index();
+    model
+        .block_list()
+        .last_non_hidden_rich_content_block_after_block(Some(active_block_index))
+        .map(|(_, item)| item.view_id)
+}
+
+/// Harp mode's sidebar row shows agent state, so the CLI agent footer hides while the mode is
+/// on even with the footer setting on, and an already-open pane follows a mode toggle both ways.
+#[test]
+fn cli_agent_footer_hidden_in_harp_mode_and_follows_mode_toggle() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+
+        AISettings::handle(&app).read(&app, |settings, _| {
+            assert!(*settings.should_render_cli_agent_footer);
+        });
+
+        terminal.update(&mut app, |view, ctx| {
+            simulate_user_started_long_running_command(view);
+            let view_id = view.id();
+            CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
+                sessions.set_session(view_id, claude_session(), ctx);
+            });
+            view.maybe_show_use_agent_footer_in_blocklist(ctx);
+            assert_eq!(
+                rendered_cli_agent_footer(view),
+                Some(view.use_agent_footer.id())
+            );
+        });
+
+        TabSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.harp_mode.set_value(true, ctx).unwrap();
+        });
+        terminal.read(&app, |view, ctx| {
+            let model = view.model.lock();
+            assert!(!view.should_render_use_agent_footer(&model, ctx));
+            drop(model);
+            assert_eq!(rendered_cli_agent_footer(view), None);
+        });
+
+        TabSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.harp_mode.set_value(false, ctx).unwrap();
+        });
+        terminal.read(&app, |view, _| {
+            assert_eq!(
+                rendered_cli_agent_footer(view),
+                Some(view.use_agent_footer.id())
+            );
         });
     })
 }

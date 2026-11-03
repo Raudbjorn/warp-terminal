@@ -377,6 +377,7 @@ use crate::settings::{
     DebugSettingsChangedEvent, EmacsBindingsSettings, FontSettings, FontSettingsChangedEvent,
     InputModeSettings, InputModeSettingsChangedEvent, InputSettings, PaneSettings,
     PaneSettingsChangedEvent, PrivacySettings, SelectionSettings, VimBannerSettings,
+    cli_agent_footer_visible,
 };
 use crate::settings_view::keybindings::KeybindingChangedNotifier;
 use crate::settings_view::mcp_servers_page::MCPServersSettingsPage;
@@ -14102,7 +14103,7 @@ impl TerminalView {
         let ai_settings = AISettings::as_ref(ctx);
         if !*ai_settings.auto_open_rich_input_on_cli_agent_start
             || !ai_settings.is_any_ai_enabled(ctx)
-            || !*ai_settings.should_render_cli_agent_footer
+            || !cli_agent_footer_visible(ctx)
             || !is_rich_input_chip_in_cli_toolbar(ctx)
         {
             return;
@@ -14202,7 +14203,7 @@ impl TerminalView {
         let ai_settings = AISettings::as_ref(ctx);
         if *ai_settings.auto_toggle_rich_input
             && ai_settings.is_any_ai_enabled(ctx)
-            && *ai_settings.should_render_cli_agent_footer
+            && cli_agent_footer_visible(ctx)
             && is_rich_input_chip_in_cli_toolbar(ctx)
         {
             let should_auto_toggle_input = CLIAgentSessionsModel::as_ref(ctx)
@@ -30145,9 +30146,7 @@ impl View for TerminalView {
 
         if let Some(session) = CLIAgentSessionsModel::as_ref(app).session(self.view_id) {
             context.set.insert(init::CLI_AGENT_SESSION_ACTIVE_KEY);
-            if session.agent.supports_cli_agent_footer()
-                && *AISettings::as_ref(app).should_render_cli_agent_footer
-            {
+            if session.agent.supports_cli_agent_footer() && cli_agent_footer_visible(app) {
                 context.set.insert(flags::CLI_AGENT_FOOTER_ENABLED);
 
                 if is_rich_input_chip_in_cli_toolbar(app) {

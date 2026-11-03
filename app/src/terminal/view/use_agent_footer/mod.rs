@@ -54,6 +54,7 @@ use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::server::telemetry::{CLISubagentControlState, FileTreeSource};
 use crate::settings::{
     AISettings, AISettingsChangedEvent, CompiledCommandsForCodingAgentToolbar, InputModeSettings,
+    cli_agent_footer_visible,
 };
 pub use crate::terminal::CLIAgent;
 use crate::terminal::TerminalModel;
@@ -64,6 +65,7 @@ use crate::ui_components::icons::Icon;
 use crate::view_components::action_button::{
     ActionButton, ActionButtonTheme, ButtonSize, KeystrokeSource, TooltipAlignment,
 };
+use crate::workspace::tab_settings::{TabSettings, TabSettingsChangedEvent};
 
 /// Small delay inserted between separate PTY writes to CLI agents.
 /// (Used both for the mode-switch prefix split and for the `DelayedEnter`
@@ -175,6 +177,14 @@ impl TerminalView {
                 me.maybe_show_use_agent_footer_in_blocklist(ctx);
             }
             _ => (),
+        });
+
+        // Harp mode hides the CLI agent footer (see `cli_agent_footer_visible`), so a mode toggle
+        // must re-evaluate it on already-open panes just like the footer setting does.
+        ctx.subscribe_to_model(&TabSettings::handle(ctx), |me, _, event, ctx| {
+            if matches!(event, TabSettingsChangedEvent::HarpMode { .. }) {
+                me.maybe_show_use_agent_footer_in_blocklist(ctx);
+            }
         });
 
         ctx.subscribe_to_view(&self.use_agent_footer, |me, _, event, ctx| {
@@ -316,10 +326,11 @@ impl TerminalView {
             if !cli_agent.supports_cli_agent_footer() {
                 return false;
             }
-            // For CLI agent commands, only check the CLI agent footer setting.
+            // For CLI agent commands, only check the CLI agent footer setting (and Harp mode,
+            // whose sidebar row replaces the footer).
             // This is independent of the global AI toggle so that users who
             // disable Warp AI still get the footer for third-party coding agents.
-            if !*ai_settings.should_render_cli_agent_footer {
+            if !cli_agent_footer_visible(app) {
                 return false;
             }
 
