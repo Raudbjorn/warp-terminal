@@ -50,8 +50,9 @@ check the destination against one policy, re-check every redirect, and ignore
   Entries are IP addresses or CIDR ranges inside the private ranges (`10/8`,
   `172.16/12`, `192.168/16`, `100.64/10` for Tailscale, link-local, IPv6
   `fc00::/7`). Host names cannot be listed, because a name says nothing about
-  the address it resolves to. Redirects from an allowed host to anywhere else
-  are refused.
+  the address it resolves to. Redirects are checked against the same policy: a
+  redirect to a destination that is not permitted is refused, while a redirect
+  to another permitted host is followed.
 - **The public internet**, including OpenAI and OpenRouter, is denied. An
   endpoint that has to be reached over the internet needs a proxy or tunnel
   on a host you have allowed above.

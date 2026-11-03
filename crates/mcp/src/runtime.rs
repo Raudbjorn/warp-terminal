@@ -335,7 +335,7 @@ pub async fn spawn_server(
             if let Err(denied) =
                 network_policy::check_url_str(&sse_server.url, "MCP server connection")
             {
-                logger.log(format!("[error] MCP: {denied}"));
+                logger.log("[error] MCP: Network policy refused the MCP server connection".to_string());
                 return Err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(
                     denied.to_string(),
                 ));
@@ -371,19 +371,13 @@ pub async fn spawn_server(
                 }
                 Ok(Transport::Http(None, protocol)) => {
                     logger.log("[info] MCP: Using Streaming HTTP transport".to_string());
-                    let transport = if headers.is_empty() {
-                        rmcp::transport::StreamableHttpClientTransport::from_uri(
+                    let client = build_client_with_headers(&headers)?;
+                    let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
+                        client,
+                        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                             sse_server.url.clone(),
-                        )
-                    } else {
-                        let client = build_client_with_headers(&headers)?;
-                        rmcp::transport::StreamableHttpClientTransport::with_client(
-                            client,
-                            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
-                                sse_server.url.clone(),
-                            ),
-                        )
-                    };
+                        ),
+                    );
                     let transport = TransportLoggingWrapper {
                         transport,
                         logger: logger.clone(),

@@ -463,7 +463,7 @@ impl LocalOpenAIClient {
                 })
                 .collect();
             let response = Self::responses_request(http_client, config, model, input).await?;
-            return first_output_text(response.output);
+            return all_output_text(response.output);
         }
 
         let mut request_builder = http_client
@@ -623,7 +623,7 @@ impl LocalOpenAIClient {
         self.reasoning_cache
             .lock()
             .replace(conversation_id, reasoning_items(&response.output));
-        first_output_text(response.output)
+        all_output_text(response.output)
     }
 
     /// Drops the cached reasoning items of a conversation. Callers should invoke this when a
@@ -762,23 +762,29 @@ fn reasoning_items(output: &[ResponsesOutputItem]) -> Vec<ReasoningItem> {
         .collect()
 }
 
-/// The first `output_text` block of a Responses API `output` array.
-fn first_output_text(output: Vec<ResponsesOutputItem>) -> Result<String, LocalOpenAIError> {
-    output
-        .into_iter()
-        .find_map(|item| {
-            item.content.into_iter().find_map(|content| {
-                match (content.kind.as_str(), content.text) {
-                    ("output_text", Some(text)) => Some(text),
-                    _ => None,
-                }
-            })
-        })
-        .ok_or_else(|| {
-            LocalOpenAIError::ResponsesShape(
-                "responses API output had no `output_text` content".to_string(),
-            )
-        })
+/// The complete textual output of a Responses API `output` array.
+///
+/// A provider may split one reply across several `output_text` blocks, so every block is
+/// concatenated in order instead of keeping only the first one. The blocks are joined without
+/// a separator: they are fragments of a single answer, and inserting one would corrupt a JSON
+/// document that was split mid-token (a newline inside a JSON string is invalid).
+fn all_output_text(output: Vec<ResponsesOutputItem>) -> Result<String, LocalOpenAIError> {
+    let mut text = String::new();
+    let mut found = false;
+    for item in output {
+        for content in item.content {
+            if let ("output_text", Some(block)) = (content.kind.as_str(), content.text) {
+                found = true;
+                text.push_str(&block);
+            }
+        }
+    }
+    if !found {
+        return Err(LocalOpenAIError::ResponsesShape(
+            "responses API output had no `output_text` content".to_string(),
+        ));
+    }
+    Ok(text)
 }
 
 fn parse_json_content<T: DeserializeOwned>(content: &str) -> Result<T, serde_json::Error> {

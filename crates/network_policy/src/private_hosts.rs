@@ -180,18 +180,33 @@ pub(crate) fn is_allowed_private_url(url: &Url) -> bool {
 /// The environment a child process needs to enforce the same policy as this process. Pass it to
 /// the child's `Command` and call [`init_from_env`] at the start of the child's `main`.
 pub fn env_for_child() -> Vec<(&'static str, String)> {
-    let report = PolicyReport::current();
-    let mode = match report.services_mode {
+    env_for_child_with_hosts().0
+}
+
+/// The environment a child process needs, together with the allow-list it encodes.
+///
+/// Both come from a single read of the global list, so a caller that records the returned list
+/// knows exactly which hosts the child was told it may reach. Reading the list again later can
+/// return a different list, and the child would then enforce a policy the app does not believe
+/// it has.
+pub fn env_for_child_with_hosts() -> (Vec<(&'static str, String)>, Vec<PrivateNetwork>) {
+    let hosts = allowed_private_hosts();
+    let mode = match crate::services_mode() {
         ServicesMode::LocalOnly => "local_only",
         ServicesMode::Online => "online",
     };
-    vec![
+    let env = vec![
         (ENV_SERVICES_MODE, mode.to_owned()),
         (
             ENV_ALLOWED_PRIVATE_HOSTS,
-            report.allowed_private_hosts.join(","),
+            hosts
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
         ),
-    ]
+    ];
+    (env, hosts)
 }
 
 /// The policy a process enforces, as a service reports it on its health endpoint so that a client
@@ -229,6 +244,19 @@ pub enum PolicyMismatch {
     HostsDiffer { service: String, app: String },
 }
 
+/// Whether two allow-lists allow the same hosts. Order and redundant entries do not matter; a
+/// range written as several smaller ones counts as the same.
+pub fn same_private_hosts(a: &[PrivateNetwork], b: &[PrivateNetwork]) -> bool {
+    covers(a, b) && covers(b, a)
+}
+
+/// Whether every entry of `inner` lies inside an entry of `outer`.
+fn covers(outer: &[PrivateNetwork], inner: &[PrivateNetwork]) -> bool {
+    inner
+        .iter()
+        .all(|network| outer.iter().any(|outer| network.is_within(outer)))
+}
+
 /// Checks that a service this process did not start enforces the same policy as this process.
 /// A process that is not in local-only mode has no policy to enforce, so anything matches. A
 /// service that allows more private hosts than this process lets requests through that this
@@ -252,12 +280,7 @@ fn check_policy(
         return Err(PolicyMismatch::NotLocalOnly);
     }
     let service_hosts = parse_allowed_private_hosts(&reported.allowed_private_hosts.join(","))?;
-    let covers = |outer: &[PrivateNetwork], inner: &[PrivateNetwork]| {
-        inner
-            .iter()
-            .all(|network| outer.iter().any(|outer| network.is_within(outer)))
-    };
-    if covers(hosts, &service_hosts) && covers(&service_hosts, hosts) {
+    if same_private_hosts(hosts, &service_hosts) {
         return Ok(());
     }
     let describe = |networks: &[PrivateNetwork]| {

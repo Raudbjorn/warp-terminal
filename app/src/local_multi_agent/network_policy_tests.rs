@@ -172,3 +172,54 @@ fn a_running_service_is_reused_only_if_it_enforces_the_same_policy() {
         );
     }
 }
+
+/// A manager that has not started a service yet.
+fn test_manager() -> LocalMultiAgentManager {
+    LocalMultiAgentManager {
+        config: LocalMultiAgentConfig::default(),
+        status: LocalMultiAgentStatus::Starting,
+        test_status: LocalMultiAgentTestStatus::NotRun,
+        discovered_models: Vec::new(),
+        child: None,
+        restart_debounce: None,
+        openai_api_key: None,
+        applied_private_hosts: Vec::new(),
+    }
+}
+
+#[test]
+fn the_applied_policy_is_the_snapshot_the_service_was_given() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut manager = test_manager();
+    let started_with = network_policy::parse_allowed_private_hosts("10.88.0.0/16").unwrap();
+    network_policy::set_allowed_private_hosts(started_with.clone());
+
+    // The service enforces the list it was handed, and the allow-list still matches it.
+    assert!(!manager.record_applied_private_hosts(started_with.clone()));
+    assert_eq!(manager.applied_private_hosts, started_with);
+
+    // The allow-list changed while the service was starting: it enforces the old list, so it
+    // must be restarted with the current one.
+    network_policy::set_allowed_private_hosts(Vec::new());
+    assert!(manager.record_applied_private_hosts(started_with.clone()));
+    // The recorded list is the snapshot the service was given, not the current allow-list.
+    assert_eq!(manager.applied_private_hosts, started_with);
+}
+
+#[test]
+fn a_service_that_failed_validation_publishes_no_root_url() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut manager = test_manager();
+
+    // Nothing has been validated, so there is no local service to talk to.
+    set_global_root_url(None);
+    assert_eq!(local_no_cloud_root_url(), None);
+
+    // A validated service is published.
+    set_global_root_url(Some(root_url()));
+    assert_eq!(local_no_cloud_root_url(), Some(root_url()));
+
+    // A service that failed is not usable, so it must not stay published.
+    manager.set_failed("the running service enforces a different policy".to_string());
+    assert_eq!(local_no_cloud_root_url(), None);
+}

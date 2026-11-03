@@ -29,6 +29,8 @@ pub enum SseTransportError<E: std::error::Error + Send + Sync + 'static> {
     Io(#[from] std::io::Error),
     #[error("Client error: {0}")]
     Client(E),
+    #[error(transparent)]
+    NetworkPolicyDenied(#[from] network_policy::NetworkPolicyDenied),
     #[error("unexpected end of stream")]
     UnexpectedEndOfStream,
     #[error("Unexpected content type: {0:?}")]

@@ -235,6 +235,34 @@ fn child_environment_parses_mode_and_hosts() {
     assert!(parse_env(Some("local_only"), "10.0.0.1, 8.8.8.8").is_err());
 }
 
+#[test]
+fn the_child_environment_and_the_applied_hosts_come_from_one_read() {
+    let _list = AllowedList::set("10.77.0.0/16, 100.100.0.7");
+
+    let (env, applied) = env_for_child_with_hosts();
+    assert_eq!(
+        child_env_value(&env, ENV_ALLOWED_PRIVATE_HOSTS),
+        "10.77.0.0/16,100.100.0.7"
+    );
+    assert_eq!(applied, networks("10.77.0.0/16, 100.100.0.7"));
+
+    // Setting the list changes the environment and the snapshot together.
+    set_allowed_private_hosts(networks("192.168.7.0/24"));
+    let (env, applied) = env_for_child_with_hosts();
+    assert_eq!(
+        child_env_value(&env, ENV_ALLOWED_PRIVATE_HOSTS),
+        "192.168.7.0/24"
+    );
+    assert_eq!(applied, networks("192.168.7.0/24"));
+}
+
+fn child_env_value(env: &[(&'static str, String)], key: &str) -> String {
+    env.iter()
+        .find(|(name, _)| *name == key)
+        .map(|(_, value)| value.clone())
+        .unwrap_or_else(|| panic!("{key} is missing from the child environment"))
+}
+
 fn report(mode: ServicesMode, hosts: &[&str]) -> PolicyReport {
     PolicyReport {
         services_mode: mode,

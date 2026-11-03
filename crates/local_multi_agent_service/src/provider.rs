@@ -379,7 +379,10 @@ impl ProviderRuntime {
         if let Err(error) =
             network_policy::check_url_str(&models_url, "provider model list request")
         {
-            log::warn!("{error}");
+            log::warn!(
+                "{}",
+                network_policy::NetworkPolicyDenied::new(error.purpose(), "<redacted>")
+            );
             return fallback_local_models(config);
         }
         let mut request = self
@@ -463,7 +466,10 @@ impl ProviderRuntime {
         if let Err(error) =
             network_policy::check_url_str(&models_url, "provider model list request")
         {
-            log::warn!("{error}");
+            log::warn!(
+                "{}",
+                network_policy::NetworkPolicyDenied::new(error.purpose(), "<redacted>")
+            );
             return context_windows_by_model;
         }
         let result = self

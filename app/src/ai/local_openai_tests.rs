@@ -250,6 +250,20 @@ fn responses_reply(text: &str, reasoning_ids: &[&str]) -> serde_json::Value {
     serde_json::json!({ "output": output })
 }
 
+/// A Responses API reply whose answer is split across several `output_text` blocks.
+fn segmented_responses_reply(parts: &[&str]) -> serde_json::Value {
+    let content: Vec<serde_json::Value> = parts
+        .iter()
+        .map(|text| serde_json::json!({ "type": "output_text", "text": text }))
+        .collect();
+    serde_json::json!({
+        "output": [{
+            "type": "message",
+            "content": content,
+        }],
+    })
+}
+
 fn user_messages() -> Vec<ChatMessage> {
     vec![
         ChatMessage {
@@ -315,6 +329,47 @@ async fn single_shot_requests_use_the_responses_api_when_the_flag_is_on() {
     assert_eq!(input[1]["content"], "hello");
     // Single-shot callers have no conversation, so nothing is carried over.
     assert_eq!(client.reasoning_cache.lock().conversation_count(), 0);
+}
+
+/// A provider may split one reply across several `output_text` blocks. The blocks are
+/// fragments of a single answer, so they are concatenated in order, without a separator.
+#[tokio::test(flavor = "current_thread")]
+async fn a_reply_split_across_output_text_blocks_is_concatenated() {
+    let (port, _requests) = spawn_mock_server(vec![segmented_responses_reply(&[
+        "{\"cmd\":\"git sta",
+        "tus\"}",
+    ])]);
+    let client = responses_client(port, true);
+    let config = client.configured_for_command().unwrap();
+
+    let text = client
+        .chat_completion(
+            &test_http_client(),
+            &config,
+            "model".into(),
+            user_messages(),
+        )
+        .await
+        .unwrap();
+
+    // Joined in order and without a separator, so the split JSON is whole again.
+    assert_eq!(text, "{\"cmd\":\"git status\"}");
+    let parsed: serde_json::Value = parse_json_content(&text).unwrap();
+    assert_eq!(parsed["cmd"], "git status");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_conversation_reply_split_across_output_text_blocks_is_concatenated_in_order() {
+    let (port, _requests) = spawn_mock_server(vec![segmented_responses_reply(&["alpha", "beta"])]);
+    let client = responses_client(port, true);
+
+    let text = client
+        .chat_completion_responses(&test_http_client(), "conv", "hello".to_string(), None)
+        .await
+        .unwrap();
+
+    // The blocks keep their order, so this is not "betaalpha".
+    assert_eq!(text, "alphabeta");
 }
 
 #[tokio::test(flavor = "current_thread")]
