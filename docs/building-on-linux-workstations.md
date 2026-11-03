@@ -33,10 +33,21 @@ memory. Several such builds, plus `rust-analyzer` instances, add up quickly.
 
 ## Toolchain
 
-`rust-toolchain.toml` pins 1.92.0, but only `rustup`'s `cargo` honors it. A
-distribution `cargo` ignores the file and builds with whatever it ships (1.99.1
-here). **Verified** by comparing `rustc --version` with the pin. That toolchain
-also links with `-fuse-ld=lld` by default (**verified** via
+`rust-toolchain.toml` pins 1.92.0. The file is read by rustup's proxies
+(`cargo`, `rustc`, ...), not by Cargo itself, and Cargo picks its compiler
+separately: `RUSTC`, then `build.rustc`, then `rustc` on `PATH`. So the compiler
+that builds this workspace depends on which `rustc` Cargo finds, not on which
+`cargo` you ran. A distribution `cargo` with a distribution `rustc` first on
+`PATH` never consults the pin; a distribution `cargo` that finds rustup's `rustc`
+proxy would (**from the docs**, not tested: rustup is not installed on the host
+these notes were written on).
+
+**Verified** on that host: in a directory containing a `rust-toolchain.toml` that
+pins 1.92.0, `cargo rustc -- --version` reported rustc 1.99.1 (the distribution
+compiler), i.e. the pin was ignored. Check what your own build uses the same way,
+not with a bare `rustc --version`.
+
+That compiler also links with `-fuse-ld=lld` by default (**verified** via
 `rustc --print link-args`), so a custom linker such as mold is rarely worth a hard
 dependency.
 
