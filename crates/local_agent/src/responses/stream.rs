@@ -10,7 +10,7 @@
 //! final `response.completed` payload, so providers that skip the incremental
 //! events still produce the same result.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{Map, Value, json};
 
@@ -55,6 +55,10 @@ struct PendingCall {
     output_index: Option<u64>,
     name: Option<String>,
     arguments: String,
+    /// The provider finished this call: its arguments were streamed to the
+    /// end, or the item completed. A call that was only announced is not a
+    /// call yet and must not be executed.
+    finished: bool,
 }
 
 struct CallIds<'a> {
@@ -97,8 +101,9 @@ impl<'a> CallIds<'a> {
 #[derive(Default)]
 pub(super) struct ResponseStream {
     calls: Vec<PendingCall>,
-    /// Ids of output items whose text already reached the caller as deltas.
-    streamed_text: HashSet<String>,
+    /// Text already streamed per output item, so the backfill can emit only
+    /// what the caller has not seen yet.
+    streamed_text: HashMap<String, String>,
     /// Same, for reasoning summaries.
     streamed_reasoning: HashSet<String>,
     /// Keys of reasoning items already emitted as replay items.
@@ -117,8 +122,14 @@ impl ResponseStream {
         if data.trim() == "[DONE]" {
             return Ok(Step::default());
         }
-        let payload: Value = serde_json::from_str(data)
-            .map_err(|err| LocalAgentError::Parse(format!("malformed event: {err}: {data}")))?;
+        let payload: Value = serde_json::from_str(data).map_err(|err| {
+            // The payload can hold user content and provider reasoning
+            // items, so only the failure and its size are reported.
+            LocalAgentError::Parse(format!(
+                "malformed {sse_event} event: {err} ({} bytes)",
+                data.len()
+            ))
+        })?;
         let kind = payload
             .get("type")
             .and_then(Value::as_str)
@@ -146,7 +157,7 @@ impl ResponseStream {
                 Ok(Step::default())
             }
             "response.output_item.done" => Ok(Step::with_events(self.item_done(&payload))),
-            "response.completed" => self.complete(&payload),
+            "response.completed" => self.complete(&payload, false),
             "response.incomplete" => self.incomplete(&payload),
             "response.failed" | "error" => Err(failure_error(&payload, config)),
             // created, in_progress, content_part.*, output_text.done, ...
@@ -158,7 +169,10 @@ impl ResponseStream {
         let Some(delta) = non_empty_str(payload, "delta") else {
             return vec![];
         };
-        self.streamed_text.insert(event_item_key(payload));
+        self.streamed_text
+            .entry(event_item_key(payload))
+            .or_default()
+            .push_str(delta);
         vec![AgentEvent::TextDelta(delta.to_string())]
     }
 
@@ -193,7 +207,7 @@ impl ResponseStream {
             return;
         }
         let output_index = payload.get("output_index").and_then(Value::as_u64);
-        self.absorb_function_call(item, output_index);
+        self.absorb_function_call(item, output_index, false);
     }
 
     fn arguments_delta(&mut self, payload: &Value) {
@@ -213,6 +227,9 @@ impl ResponseStream {
         if let Some(arguments) = non_empty_str(payload, "arguments") {
             call.arguments = arguments.to_string();
         }
+        // The provider closed the argument stream, so the call is finished
+        // even if no `output_item.done` follows.
+        call.finished = true;
     }
 
     fn item_done(&mut self, payload: &Value) -> Vec<AgentEvent> {
@@ -220,25 +237,34 @@ impl ResponseStream {
             return vec![];
         };
         let output_index = payload.get("output_index").and_then(Value::as_u64);
-        self.finish_item(item, output_index)
+        self.finish_item(item, output_index, true)
     }
 
     /// Reconciles one finished output item with what was streamed for it.
-    fn finish_item(&mut self, item: &Value, output_index: Option<u64>) -> Vec<AgentEvent> {
+    ///
+    /// `complete` says the item is final: its contents are the whole truth.
+    /// An item that was only announced (`output_item.added`) may still grow,
+    /// so its contents are a prefix of the final ones.
+    fn finish_item(
+        &mut self,
+        item: &Value,
+        output_index: Option<u64>,
+        complete: bool,
+    ) -> Vec<AgentEvent> {
         match item.get("type").and_then(Value::as_str) {
             Some("function_call") => {
-                self.absorb_function_call(item, output_index);
+                self.absorb_function_call(item, output_index, complete);
                 vec![]
             }
-            Some("reasoning") => self.finish_reasoning(item),
-            Some("message") => self.finish_message(item),
+            Some("reasoning") => self.finish_reasoning(item, output_index),
+            Some("message") => self.finish_message(item, output_index),
             _ => vec![],
         }
     }
 
-    fn finish_reasoning(&mut self, item: &Value) -> Vec<AgentEvent> {
+    fn finish_reasoning(&mut self, item: &Value, output_index: Option<u64>) -> Vec<AgentEvent> {
         let mut events = vec![];
-        let key = output_item_key(item);
+        let key = output_item_key(item, output_index);
         if !self.streamed_reasoning.contains(&key)
             && let Some(text) = reasoning_text(item)
         {
@@ -253,27 +279,58 @@ impl ResponseStream {
         events
     }
 
-    fn finish_message(&mut self, item: &Value) -> Vec<AgentEvent> {
-        let key = output_item_key(item);
-        if self.streamed_text.contains(&key) {
-            return vec![];
-        }
+    /// Emits the part of the final message the caller has not seen yet.
+    ///
+    /// A provider may stream a prefix of the text and only the finished item
+    /// carries the rest, so the already-streamed text is subtracted rather
+    /// than the whole message being dropped (which would lose the tail) or
+    /// emitted again (which would duplicate it).
+    fn finish_message(&mut self, item: &Value, output_index: Option<u64>) -> Vec<AgentEvent> {
         let text = message_text(item);
         if text.is_empty() {
             return vec![];
         }
-        self.streamed_text.insert(key);
-        vec![AgentEvent::TextDelta(text)]
+        let key = output_item_key(item, output_index);
+        // A provider that omits ids files every delta under the empty key.
+        let streamed = match self.streamed_text.get(&key) {
+            Some(streamed) => Some(streamed.clone()),
+            None if non_empty_str(item, "id").is_none() => self.streamed_text.get("").cloned(),
+            None => None,
+        };
+        let missing = match streamed {
+            Some(streamed) => text.strip_prefix(&streamed).unwrap_or_default().to_string(),
+            None => text.clone(),
+        };
+        if missing.is_empty() {
+            return vec![];
+        }
+        self.streamed_text.insert(key, text);
+        vec![AgentEvent::TextDelta(missing)]
     }
 
-    fn absorb_function_call(&mut self, item: &Value, output_index: Option<u64>) {
+    /// Folds a function-call item into the pending call.
+    ///
+    /// `complete` says the item is final, so its arguments are the whole
+    /// argument string. An announced item may still grow, so its arguments
+    /// are only a prefix and must not replace the streamed fragments.
+    fn absorb_function_call(&mut self, item: &Value, output_index: Option<u64>, complete: bool) {
         let call = self.call_mut(&CallIds::of_item(item, output_index));
         if let Some(name) = non_empty_str(item, "name") {
             call.name = Some(name.to_string());
         }
-        // The streamed fragments are authoritative unless there are none.
+        let arguments = non_empty_str(item, "arguments");
+        if complete {
+            call.finished = true;
+            // The finished item carries the whole argument string; the
+            // streamed fragments may be only a prefix of it.
+            if let Some(arguments) = arguments {
+                call.arguments = arguments.to_string();
+            }
+            return;
+        }
+        // An announced item may carry the arguments already, but they can grow.
         if call.arguments.is_empty()
-            && let Some(arguments) = non_empty_str(item, "arguments")
+            && let Some(arguments) = arguments
         {
             call.arguments = arguments.to_string();
         }
@@ -299,12 +356,17 @@ impl ResponseStream {
         call
     }
 
-    fn complete(&mut self, payload: &Value) -> Result<Step, LocalAgentError> {
+    /// Reconciles the final response payload.
+    ///
+    /// `truncated` marks a response the provider cut short (the output token
+    /// limit): its items are partial, so a function call it lists was never
+    /// finished and must not be executed.
+    fn complete(&mut self, payload: &Value, truncated: bool) -> Result<Step, LocalAgentError> {
         let response = payload.get("response").unwrap_or(payload);
         let mut events = vec![];
         let output = response.get("output").and_then(Value::as_array);
         for (index, item) in output.into_iter().flatten().enumerate() {
-            events.extend(self.finish_item(item, u64::try_from(index).ok()));
+            events.extend(self.finish_item(item, u64::try_from(index).ok(), !truncated));
         }
         events.extend(self.flush_tool_calls()?);
         if let Some(usage) = usage_event(response) {
@@ -323,7 +385,7 @@ impl ResponseStream {
             .unwrap_or("unknown");
         if reason == MAX_OUTPUT_TOKENS_REASON {
             log::warn!("Responses output was cut off by the output token limit");
-            return self.complete(payload);
+            return self.complete(payload, true);
         }
         Err(LocalAgentError::ErrorStatus {
             status: 400,
@@ -331,10 +393,18 @@ impl ResponseStream {
         })
     }
 
+    /// Emits the calls the provider finished.
+    ///
+    /// A call that was only announced was never described completely, so it
+    /// is dropped: the provider never said what to run.
     fn flush_tool_calls(&mut self) -> Result<Vec<AgentEvent>, LocalAgentError> {
         let mut calls = std::mem::take(&mut self.calls);
         calls.sort_by_key(|call| call.output_index.unwrap_or(u64::MAX));
-        calls.into_iter().map(tool_call_event).collect()
+        calls
+            .into_iter()
+            .filter(|call| call.finished)
+            .map(tool_call_event)
+            .collect()
     }
 }
 
@@ -436,18 +506,34 @@ fn message_text(item: &Value) -> String {
         .collect()
 }
 
-/// The output item a streamed event belongs to. Providers that omit ids all
-/// share the empty key, which still keeps streamed and backfilled text from
-/// being emitted twice.
+/// The output item a streamed event belongs to. A provider that omits ids
+/// leaves the output index to tell two items apart; the empty key is the
+/// last resort for a provider that gives neither.
 fn event_item_key(payload: &Value) -> String {
     non_empty_str(payload, "item_id")
+        .map(str::to_string)
+        .or_else(|| {
+            payload
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(index_key)
+        })
         .unwrap_or_default()
-        .to_string()
 }
 
 /// The key under which [`event_item_key`] files the deltas of this item.
-fn output_item_key(item: &Value) -> String {
-    non_empty_str(item, "id").unwrap_or_default().to_string()
+fn output_item_key(item: &Value, output_index: Option<u64>) -> String {
+    non_empty_str(item, "id")
+        .map(str::to_string)
+        .or_else(|| output_index.map(index_key))
+        .unwrap_or_default()
+}
+
+/// The key of an output item that has no id of its own. Both the delta and
+/// the finished item of one output position produce the same key, so a
+/// streamed delta still matches the item it belongs to.
+fn index_key(output_index: u64) -> String {
+    format!("index:{output_index}")
 }
 
 fn non_empty_str<'a>(value: &'a Value, field: &str) -> Option<&'a str> {

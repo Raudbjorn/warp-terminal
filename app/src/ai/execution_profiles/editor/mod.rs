@@ -1946,8 +1946,9 @@ impl ExecutionProfileEditorView {
         let is_any_ai_enabled = AISettings::as_ref(ctx).is_any_ai_enabled(ctx);
         let scope = view.team_context(ctx);
         let ai_autonomy_settings = UserWorkspaces::as_ref(ctx).ai_autonomy_settings(&scope);
-        let inference_settings_editable =
-            is_any_ai_enabled && UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx);
+        let inference_settings_editable = is_any_ai_enabled
+            && UserWorkspaces::as_ref(ctx).is_byo_api_key_enabled(ctx)
+            && UserWorkspaces::as_ref(ctx).are_member_byo_keys_allowed(&scope);
 
         Self::update_editor_interaction_state(
             view.command_denylist_editor.as_ref(ctx).editor().clone(),

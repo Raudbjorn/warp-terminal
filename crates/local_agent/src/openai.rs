@@ -354,7 +354,9 @@ pub(crate) async fn map_event_source_error(
                 "endpoint did not return an event stream (content-type {content_type:?}): {body}"
             ))
         }
-        Error::Transport(err) => LocalAgentError::Transport(err.to_string()),
+        // The URL is dropped: it may carry credentials in its query, and the
+        // error text ends up in logs.
+        Error::Transport(err) => LocalAgentError::Transport(err.without_url().to_string()),
         Error::Utf8(err) => LocalAgentError::Parse(err.to_string()),
         Error::Parser(err) => LocalAgentError::Parse(err.to_string()),
         Error::InvalidLastEventId(id) => {

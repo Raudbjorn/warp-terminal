@@ -99,10 +99,10 @@ fn attempt_events(
         let mut source = source?;
 
         let mut response = stream::ResponseStream::default();
-        while let Some(event) = source.next().await {
-            match event {
-                Ok(Event::Open) => {}
-                Ok(Event::Message(message)) => {
+        loop {
+            match engine::next_event(&mut source).await {
+                engine::NextEvent::Event(Ok(Event::Open)) => {}
+                engine::NextEvent::Event(Ok(Event::Message(message))) => {
                     let step = response.ingest(&message.event, &message.data, &config)?;
                     for event in step.events {
                         yield event;
@@ -113,9 +113,16 @@ fn attempt_events(
                         return;
                     }
                 }
-                Err(reqwest_eventsource::Error::StreamEnded) => break,
-                Err(err) => {
+                engine::NextEvent::Event(Err(reqwest_eventsource::Error::StreamEnded)) => break,
+                engine::NextEvent::Event(Err(err)) => {
                     Err(openai::map_event_source_error(err, &config).await)?;
+                }
+                engine::NextEvent::Ended => break,
+                engine::NextEvent::Idle => {
+                    Err(LocalAgentError::Transport(format!(
+                        "the provider sent no event for {:?} before the response completed",
+                        engine::SSE_IDLE_TIMEOUT
+                    )))?;
                 }
             }
         }

@@ -971,7 +971,7 @@ mod shell_and_glob_tools {
     }
 
     #[test]
-    fn file_glob_limits_reach_the_client_action_and_history() {
+    fn file_glob_ignores_unsupported_limits() {
         let tool_call = registry()
             .to_proto_tool_call(&ToolCallRequest {
                 id: "call".to_string(),
@@ -990,15 +990,16 @@ mod shell_and_glob_tools {
         };
         assert_eq!(
             (glob.max_matches, glob.max_depth, glob.min_depth),
-            (50, 3, 1)
+            (0, 0, 0)
         );
 
         let request = registry()
             .to_request_tool_call(&tool_call)
             .expect("history rebuild");
-        assert_eq!(request.arguments["max_matches"], json!(50));
-        assert_eq!(request.arguments["max_depth"], json!(3));
-        assert_eq!(request.arguments["min_depth"], json!(1));
+        assert_eq!(
+            request.arguments,
+            json!({ "patterns": ["*.rs"], "search_dir": "/repo" })
+        );
     }
 
     #[test]
@@ -1438,7 +1439,7 @@ mod tool_result_rendering {
 
         let text = render_tool_result_text(&result);
 
-        assert_eq!(text, "(image content, 4096 bytes, image/png)");
+        assert_eq!(text, "(image content, 4096 base64 characters, image/png)");
     }
 
     #[test]

@@ -484,8 +484,10 @@ struct HistoryState<'a> {
     /// Known limit: a turn that interleaves reasoning with output (reasoning,
     /// text, reasoning, tool call) is replayed flattened, as one assistant
     /// message with every reasoning item ahead of the text and calls. The
-    /// usual order within a response is reasoning first, which this keeps;
-    /// the interleaved case has not been checked against a real provider.
+    /// Responses API guidance says to preserve that interleaving; doing so
+    /// requires an ordered assistant-item representation instead of the
+    /// current parallel replay/text/tool-call fields. The usual order within
+    /// a response is reasoning first, which this keeps.
     pending_replay_items: Vec<serde_json::Value>,
 }
 
@@ -1058,9 +1060,7 @@ impl ToolRegistry {
                 Tool::FileGlobV2(api::message::tool_call::FileGlobV2 {
                     patterns: args.patterns,
                     search_dir: args.search_dir,
-                    max_matches: args.max_matches,
-                    max_depth: args.max_depth,
-                    min_depth: args.min_depth,
+                    ..Default::default()
                 })
             }
             READ_MCP_RESOURCE => {
@@ -1182,9 +1182,6 @@ impl ToolRegistry {
                 json!({
                     "patterns": glob.patterns,
                     "search_dir": glob.search_dir,
-                    "max_matches": glob.max_matches,
-                    "max_depth": glob.max_depth,
-                    "min_depth": glob.min_depth,
                 }),
             ),
             Tool::AskUserQuestion(ask) => (
@@ -1306,13 +1303,6 @@ struct FileGlobArgs {
     patterns: Vec<String>,
     #[serde(default)]
     search_dir: String,
-    /// Zero means unlimited, as on the wire.
-    #[serde(default)]
-    max_matches: i32,
-    #[serde(default)]
-    max_depth: i32,
-    #[serde(default)]
-    min_depth: i32,
 }
 
 #[derive(Deserialize)]
@@ -1639,18 +1629,6 @@ fn builtin_definitions() -> Vec<local_agent::ToolDefinition> {
                         "type": "string",
                         "description": "Directory to search in. Defaults to the working directory.",
                     },
-                    "max_matches": {
-                        "type": "integer",
-                        "description": "Maximum number of matches to return. 0 or omitted means unlimited; set it when searching large trees.",
-                    },
-                    "max_depth": {
-                        "type": "integer",
-                        "description": "Maximum directory depth to search; 1 matches only the direct children of search_dir. 0 or omitted means unlimited.",
-                    },
-                    "min_depth": {
-                        "type": "integer",
-                        "description": "Minimum directory depth to match; 2 skips the direct children of search_dir. 0 or omitted means no minimum.",
-                    },
                 },
                 "required": ["patterns"],
             }),
@@ -1904,7 +1882,7 @@ pub(crate) fn render_tool_result_text(result: &api::message::ToolCallResult) -> 
                         // The payload is base64 image data: describe it, never
                         // dump it into the prompt.
                         Some(McpContent::Image(image)) => format!(
-                            "(image content, {} bytes, {})",
+                            "(image content, {} base64 characters, {})",
                             image.data.len(),
                             image.mime_type
                         ),
@@ -2139,6 +2117,9 @@ pub(crate) struct EventMapper {
     streaming_message_id: Option<String>,
     /// Reasoning message currently receiving summary text appends.
     open_reasoning: Option<OpenReasoning>,
+    /// Id of the reasoning message for this turn, retained after it closes so
+    /// a replay item backfilled at response.completed can update it in place.
+    last_reasoning_message_id: Option<String>,
     input_tokens: u64,
     output_tokens: u64,
     /// Set once a terminal event (`Finished`, or the stream error that makes
@@ -2162,6 +2143,7 @@ impl EventMapper {
             registry: plan.tools.clone(),
             streaming_message_id: None,
             open_reasoning: None,
+            last_reasoning_message_id: None,
             input_tokens: 0,
             output_tokens: 0,
             terminated: false,
@@ -2361,6 +2343,7 @@ impl EventMapper {
         self.streaming_message_id = None;
         let Some(open) = self.open_reasoning.as_ref() else {
             let message = reasoning_message(&self.root_task_id, delta, None, String::new());
+            self.last_reasoning_message_id = Some(message.id.clone());
             self.open_reasoning = Some(OpenReasoning {
                 message_id: message.id.clone(),
                 started_at: Instant::now(),
@@ -2400,6 +2383,29 @@ impl EventMapper {
         };
         if self.open_reasoning.is_some() {
             return self.close_reasoning(Some(payload)).into_iter().collect();
+        }
+        if let Some(message_id) = self.last_reasoning_message_id.clone() {
+            self.streaming_message_id = None;
+            return vec![client_actions(vec![
+                api::client_action::Action::UpdateTaskMessage(
+                    api::client_action::UpdateTaskMessage {
+                        task_id: self.root_task_id.clone(),
+                        message: Some(api::Message {
+                            id: message_id,
+                            server_message_data: payload,
+                            ..reasoning_message(
+                                &self.root_task_id,
+                                String::new(),
+                                Some(prost_types::Duration::default()),
+                                String::new(),
+                            )
+                        }),
+                        mask: Some(prost_types::FieldMask {
+                            paths: vec![SERVER_MESSAGE_DATA_MASK.to_string()],
+                        }),
+                    },
+                ),
+            ])];
         }
         self.streaming_message_id = None;
         let message = reasoning_message(

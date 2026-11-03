@@ -18,25 +18,28 @@ use crate::ai::llms::LLMPreferences;
 use crate::server::server_api::AIApiError;
 use crate::workspaces::user_workspaces::{TeamScope, UserWorkspaces};
 
-/// Resolves the local endpoint to use for a next-command prediction, or `None`
-/// to fall back to the server. Returns a config only when custom endpoints are
-/// permitted for `scope` and the active base model belongs to one of the user's
-/// custom endpoints.
-///
-/// `scope` is the live team scope rather than a resolved `RequestTeamScope`
-/// because the endpoint policy is read per team.
+/// Outcome of resolving the active model's custom endpoint.
+#[derive(Debug)]
+pub(crate) enum LocalInputRoute {
+    Custom(LocalEndpointConfig),
+    Server,
+    UnsupportedSchema(&'static str),
+}
+
+const UNSUPPORTED_SCHEMA: &str =
+    "the selected custom endpoint uses the Anthropic Messages schema, which the local prediction engine does not support yet";
+
+/// Resolves the local endpoint to use for a next-command prediction.
 pub(crate) fn resolve_local_input_endpoint(
     ctx: &AppContext,
     terminal_view_id: Option<EntityId>,
     scope: &(impl TeamScope + ?Sized),
-) -> Option<LocalEndpointConfig> {
-    // The same gate agent requests apply (`ai::agent::api`): without it, a user or team that
-    // may not use custom endpoints would still have next-command predictions sent to one.
+) -> LocalInputRoute {
     let user_workspaces = UserWorkspaces::as_ref(ctx);
     if !(user_workspaces.is_byo_endpoint_enabled(ctx)
         && user_workspaces.are_member_byo_endpoints_allowed(scope))
     {
-        return None;
+        return LocalInputRoute::Server;
     }
     let active_model_id = LLMPreferences::as_ref(ctx)
         .get_active_base_model_for_team_uid(scope.team_uid(), ctx, terminal_view_id)
@@ -55,57 +58,52 @@ pub(crate) fn resolve_local_input_endpoint(
     )
 }
 
-/// Maps a configured endpoint schema onto the wire protocol the engine speaks,
-/// or `None` for protocols it cannot speak yet (Anthropic Messages).
-fn engine_schema(schema: CustomEndpointSchema) -> Option<EndpointSchema> {
+/// Maps a configured endpoint schema onto the wire protocol the engine speaks.
+fn engine_schema(schema: CustomEndpointSchema) -> Result<EndpointSchema, &'static str> {
     match schema {
-        CustomEndpointSchema::OpenaiChatCompletions => Some(EndpointSchema::ChatCompletions),
-        CustomEndpointSchema::OpenaiResponses => Some(EndpointSchema::Responses),
-        CustomEndpointSchema::AnthropicMessages => None,
+        CustomEndpointSchema::OpenaiChatCompletions => Ok(EndpointSchema::ChatCompletions),
+        CustomEndpointSchema::OpenaiResponses => Ok(EndpointSchema::Responses),
+        CustomEndpointSchema::AnthropicMessages => Err(UNSUPPORTED_SCHEMA),
     }
 }
 
 /// Finds the custom endpoint + model whose `config_key` matches the active base
-/// model id, skipping endpoints with an empty URL or a schema the engine cannot
-/// speak. The endpoint's schema is carried through so Responses endpoints are
-/// called with the Responses protocol.
+/// model id. An unsupported schema is returned explicitly rather than falling
+/// through to a different provider.
 pub(crate) fn pick_custom_endpoint(
     active_model_id: &str,
     endpoints: &[CustomEndpoint],
-) -> Option<LocalEndpointConfig> {
+) -> LocalInputRoute {
     if active_model_id.is_empty() {
-        return None;
+        return LocalInputRoute::Server;
     }
     for endpoint in endpoints {
         let base_url = endpoint.url.trim();
         if base_url.is_empty() {
             continue;
         }
-        let Some(schema) = engine_schema(endpoint.schema) else {
-            log::debug!(
-                "local next command: skipping custom endpoint {:?}, unsupported schema {}",
-                endpoint.name,
-                endpoint.schema.display_name()
-            );
-            continue;
-        };
         let api_key = endpoint.api_key.trim();
         for model in &endpoint.models {
             let model_slug = model.name.trim();
-            if model_slug.is_empty() {
+            if model_slug.is_empty() || model.config_key.is_empty() {
                 continue;
             }
-            if !model.config_key.is_empty() && model.config_key == active_model_id {
-                return Some(LocalEndpointConfig {
-                    base_url: base_url.to_string(),
-                    api_key: api_key.to_string(),
-                    model_slug: model_slug.to_string(),
-                    schema,
-                });
+            if model.config_key != active_model_id {
+                continue;
             }
+            let schema = match engine_schema(endpoint.schema) {
+                Ok(schema) => schema,
+                Err(reason) => return LocalInputRoute::UnsupportedSchema(reason),
+            };
+            return LocalInputRoute::Custom(LocalEndpointConfig {
+                base_url: base_url.to_string(),
+                api_key: api_key.to_string(),
+                model_slug: model_slug.to_string(),
+                schema,
+            });
         }
     }
-    None
+    LocalInputRoute::Server
 }
 
 /// Generates a next-command suggestion against the custom endpoint.
