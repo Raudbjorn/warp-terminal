@@ -19,6 +19,7 @@ use std::io::{self, Read};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
@@ -33,6 +34,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
 pub const SSH_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The same bound for the readiness probe, which only runs `true`.
+/// How long [`output_within`] waits for output pipes to close after the command has ended.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(500);
 const SSH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `ConnectTimeout` for the `ssh` client, in seconds: it bounds the connection and the protocol
@@ -281,7 +284,15 @@ fn wait_until_ready(
 /// Runs `command` to completion and collects its output like [`Command::output`], but kills it and
 /// fails with [`io::ErrorKind::TimedOut`] if it takes longer than `timeout`. Standard input is
 /// closed.
+///
+/// The deadline covers collecting the output too. On Unix the command runs in its own process
+/// group, and the whole group is killed when the command ends or times out, so a descendant that
+/// inherited the output pipes cannot keep them open. A descendant that left the group still
+/// cannot hold this up past `timeout` (plus [`PIPE_DRAIN_GRACE`] once the command has ended).
 pub fn output_within(mut command: Command, timeout: Duration) -> io::Result<Output> {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let program = command.get_program().to_string_lossy().into_owned();
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -298,24 +309,36 @@ pub fn output_within(mut command: Command, timeout: Duration) -> io::Result<Outp
             break Ok(status);
         }
         if Instant::now() >= deadline {
+            kill_group(&child);
             let _ = child.kill();
             let _ = child.wait();
             break Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!(
-                    "{} did not finish within {timeout:?}",
-                    command.get_program().to_string_lossy()
-                ),
+                format!("{program} did not finish within {timeout:?}"),
             ));
         }
         std::thread::sleep(STARTUP_POLL_INTERVAL);
     };
-    // The pipes close when the child is gone, so the readers end.
-    let [stdout, stderr] = readers.map(|reader| {
-        reader
-            .and_then(|reader| reader.join().ok())
-            .unwrap_or_default()
-    });
+    // Whatever the command left running holds its output pipes open.
+    kill_group(&child);
+
+    // The pipes close once nothing holds them, so the readers end. Stop waiting for them at the
+    // deadline, or `PIPE_DRAIN_GRACE` after the command ended if that is later.
+    let drain_deadline = deadline.max(Instant::now() + PIPE_DRAIN_GRACE);
+    let mut collected = [Vec::new(), Vec::new()];
+    for (reader, slot) in readers.into_iter().zip(&mut collected) {
+        let Some(reader) = reader else { continue };
+        match reader.recv_timeout(drain_deadline.saturating_duration_since(Instant::now())) {
+            Ok(bytes) => *slot = bytes,
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("{program} left its output open past {timeout:?}"),
+                ));
+            }
+        }
+    }
+    let [stdout, stderr] = collected;
     Ok(Output {
         status: status?,
         stdout,
@@ -323,12 +346,32 @@ pub fn output_within(mut command: Command, timeout: Duration) -> io::Result<Outp
     })
 }
 
-fn spawn_reader(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+/// Kills the process group `child` leads, which [`output_within`] puts it in. A group with no
+/// members left is not an error.
+#[cfg(unix)]
+fn kill_group(child: &Child) {
+    let Ok(pid) = libc::pid_t::try_from(child.id()) else {
+        return;
+    };
+    // SAFETY: `kill` takes no pointers. `-pid` addresses the group whose id is `pid`.
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_child: &Child) {}
+
+/// Reads `pipe` to its end on a thread and sends what it read. The thread is detached: if the
+/// pipe never closes, it ends when the pipe finally does.
+fn spawn_reader(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let _ = pipe.read_to_end(&mut bytes);
-        bytes
-    })
+        let _ = sender.send(bytes);
+    });
+    receiver
 }
 
 /// A port nothing is listening on right now.
@@ -436,84 +479,5 @@ fn current_user(id: &Path) -> Result<String, StartError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn program_found_through_a_relative_directory_gets_an_absolute_path() {
-        // `cargo test` runs in the package directory, which has a `Cargo.toml`.
-        let found = find_in(
-            "Cargo.toml",
-            [PathBuf::from("."), PathBuf::from("no-such-dir")],
-        )
-        .expect("Cargo.toml is in the current directory");
-
-        assert!(found.is_absolute(), "{found:?}");
-        assert!(found.is_file(), "{found:?}");
-    }
-
-    #[test]
-    fn missing_program_is_reported_by_name() {
-        let err = find_in("no-such-program-anywhere", [PathBuf::from(".")]).unwrap_err();
-
-        assert!(matches!(
-            err,
-            StartError::MissingProgram("no-such-program-anywhere")
-        ));
-    }
-
-    #[test]
-    fn command_that_outlives_its_deadline_is_killed() {
-        let mut command = Command::new("sleep");
-        command.arg("30");
-        let started = Instant::now();
-
-        let err = output_within(command, Duration::from_millis(200)).unwrap_err();
-
-        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
-        assert!(started.elapsed() < Duration::from_secs(10));
-    }
-
-    #[test]
-    fn command_that_finishes_returns_all_of_its_output() {
-        // More than a pipe buffer holds, on both streams.
-        let mut command = Command::new("sh");
-        command.args([
-            "-c",
-            "head -c 300000 /dev/zero; head -c 300000 /dev/zero >&2",
-        ]);
-
-        let output = output_within(command, Duration::from_secs(30)).unwrap();
-
-        assert!(output.status.success());
-        assert_eq!(output.stdout.len(), 300_000);
-        assert_eq!(output.stderr.len(), 300_000);
-    }
-
-    /// Another process answering on the port is not this server: `sshd` has not bound it yet,
-    /// or never will.
-    #[test]
-    fn port_held_by_another_process_is_not_ready() {
-        let Ok(ssh) = find_program("ssh") else {
-            eprintln!("skipping: ssh is not installed");
-            return;
-        };
-        // Accepts connections and says nothing, like any process that is not `sshd`.
-        let squatter = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = squatter.local_addr().unwrap().port();
-        let (user, identity) = ("nobody", Path::new("/nonexistent/id_ed25519"));
-        let probe = client_args(port, user, identity, ["true"]);
-        // Stands in for an `sshd` that is still running.
-        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-
-        let result = wait_until_ready(&mut child, &ssh, &probe, port, Duration::from_secs(1));
-
-        let _ = child.kill();
-        let _ = child.wait();
-        let reason = result.expect_err("a listener that is not sshd must not count as ready");
-        assert!(
-            reason.contains("did not accept the fixture's key"),
-            "{reason}"
-        );
-    }
-}
+#[path = "lib_tests.rs"]
+mod tests;
