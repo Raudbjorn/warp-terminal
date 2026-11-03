@@ -106,7 +106,7 @@ impl<'a> BufferMarkdownParser<'a> {
                         }
                         BufferBlockStyle::CodeBlock { code_block_type } => res.push_str(&format!(
                             "```{}\n",
-                            &code_block_type.to_markdown_representation(self.style)
+                            code_block_type.to_markdown_representation(self.style)
                         )),
                         BufferBlockStyle::TaskList {
                             indent_level,

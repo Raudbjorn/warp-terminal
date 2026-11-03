@@ -276,7 +276,7 @@ fn capture_surface_texture(
     staging_buffer.unmap();
 
     if format == wgpu::TextureFormat::Bgra8Unorm || format == wgpu::TextureFormat::Bgra8UnormSrgb {
-        for chunk in rgba_data.chunks_exact_mut(4) {
+        for chunk in rgba_data.as_chunks_mut::<4>().0 {
             chunk.swap(0, 2);
         }
     }
