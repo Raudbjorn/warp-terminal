@@ -72,7 +72,9 @@ Every plugin gets these, whatever its permissions:
 
 `contributes.keybindings` binds a key sequence to a command id. The binding is applied before
 `activate` runs and is resolved when the key is pressed, so it works whether or not `activate` has
-registered the command by then. `warp.keymap.bind` does the same at run time. A user override in
+registered the command by then. `warp.keymap.bind` does the same at run time. Both change the
+keymap, so both need the `commands` permission: a manifest that declares keybindings without it has
+all of them ignored, with a warning in the log. A user override in
 `keybindings.yaml` applies to a plugin binding only while that binding is the effective one. A later
 `warp.keymap.bind` registers a new binding that takes precedence over an earlier user override, so
 `keybindings.yaml` does not unconditionally win. The startup order of user overrides and contributed
@@ -158,6 +160,14 @@ edge of the terminal; that alignment exists only in the classic prompt mode.
 Schema string for the arguments. `run(argsJson)` gets the model's arguments as a JSON string and
 returns a string result. A tool without a `name` or without a `run` function is ignored with a
 warning.
+
+A registered tool is not isolated from the model. Its `name`, `description` and `schema` go into the
+model's tool list, and what `run` returns goes back to the model as the tool's result, both as the
+plugin wrote them: the host adds no label, delimiter or escaping that marks them as plugin text, and
+nothing stops the model from following instructions in them. A plugin that holds `ai` can therefore
+steer the agent, whatever the user asked for. Grant `ai` only to plugins you trust as much as the
+agent's own instructions. Marking this text as untrusted before it reaches the model is not
+implemented.
 
 ### 8.7 `warp.fs` (`fs:read`, `fs:write`)
 

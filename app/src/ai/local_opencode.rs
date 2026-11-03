@@ -411,7 +411,10 @@ async fn verify_sidecar(
                     if response.status() != http_client::StatusCode::UNAUTHORIZED
                         && response.status() != http_client::StatusCode::FORBIDDEN =>
                 {
-                    return Err(format!("{} from /api/session for {what}", response.status()));
+                    return Err(format!(
+                        "{} from /api/session for {what}",
+                        response.status()
+                    ));
                 }
                 Ok(_) => {}
                 Err(err) => {
@@ -1748,7 +1751,8 @@ mod tests {
         let seen = server.credentials_seen.lock().unwrap();
         assert!(!seen.is_empty());
         assert!(
-            seen.iter().all(|sent| *sent == wrong_password_credentials()),
+            seen.iter()
+                .all(|sent| *sent == wrong_password_credentials()),
             "the generated password reached the listener: {seen:?}"
         );
     }
@@ -1758,10 +1762,7 @@ mod tests {
     async fn listening_line_of_another_process_before_the_announcement_is_ignored() {
         let server = raw_server(RawOptions::default()).await;
         // A port nothing answers on, named by a line that is not the sidecar's announcement.
-        let args = announce_then_sleep(
-            server.port,
-            "echo 'not listening on http://127.0.0.1:1';",
-        );
+        let args = announce_then_sleep(server.port, "echo 'not listening on http://127.0.0.1:1';");
 
         let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
 

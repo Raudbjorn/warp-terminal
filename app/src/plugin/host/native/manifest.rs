@@ -104,6 +104,17 @@ impl Manifest {
         self.permissions.iter().any(|p| p == permission)
     }
 
+    /// The `contributes.keybindings` the plugin may have applied. A keybinding changes the keymap,
+    /// which is what `warp.keymap` (the `commands` permission) grants at run time, so a manifest
+    /// that does not declare `commands` gets none of them (PLUGIN_SPEC.md §6).
+    pub(super) fn permitted_keybindings(&self) -> &[KeybindingContribution] {
+        if self.permits("commands") {
+            &self.contributes.keybindings
+        } else {
+            &[]
+        }
+    }
+
     /// Checks the plugin's `engines.warp` range against [`PLUGIN_API_VERSION`].
     ///
     /// Returns `Err(reason)` if the plugin targets an API version this host does not provide, so

@@ -462,6 +462,8 @@ const LOCAL_ONLY_DISABLED_SUBCOMMANDS: &[&str] = &[
     "federate",
     "harness-support",
     "artifact",
+    "api-key",
+    "runner",
 ];
 
 /// Rewrites the help text of `command` for local-only mode, hiding the subcommands that need
@@ -493,6 +495,7 @@ fn disabled_subcommands() -> Vec<&'static str> {
         ("secret", FeatureFlag::WarpManagedSecrets),
         ("federate", FeatureFlag::OzIdentityFederation),
         ("artifact", FeatureFlag::ArtifactCommand),
+        ("harness-support", FeatureFlag::AgentHarness),
         ("api-key", FeatureFlag::APIKeyManagement),
         ("runner", FeatureFlag::CloudAgentRunners),
     ];
