@@ -395,6 +395,28 @@ impl QuickConnectDestination {
     }
 }
 
+/// Builds the profile for a quick-connect `destination`, avoiding an alias collision with an
+/// existing profile.
+///
+/// A renamed alias no longer names the destination, so the profile keeps the destination as an
+/// explicit host; the saved stanza then connects to it instead of to the renamed alias.
+pub fn profile_for_destination(
+    destination: &QuickConnectDestination,
+    existing: &[SshHostProfile],
+) -> SshHostProfile {
+    let mut profile = destination.to_profile();
+    let taken = |name: &str| existing.iter().any(|other| other.name == name);
+    let mut suffix = 2;
+    while taken(&profile.name) {
+        profile.name = format!("{}-{suffix}", destination.host);
+        suffix += 1;
+    }
+    if profile.name != destination.host {
+        profile.host_is_explicit = true;
+    }
+    profile
+}
+
 /// Returns the `ssh` arguments for a quick-connect entry, which may start with `ssh` and may name
 /// the port as `host:port`.
 pub fn quick_connect_args(input: &str) -> Option<String> {

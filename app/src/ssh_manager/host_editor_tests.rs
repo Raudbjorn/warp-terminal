@@ -74,3 +74,9 @@ fn linked_jump_hosts_connect_by_the_saved_alias() {
     assert_eq!(jump.host, "gateway");
     assert_eq!(jump.source_profile_id, Some(profile.id));
 }
+
+#[test]
+fn ssh_alias_format_error_rejects_at_sign() {
+    assert!(ssh_alias_format_error("prod@db").is_some());
+    assert!(ssh_alias_format_error("prod-db").is_none());
+}

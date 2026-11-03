@@ -660,6 +660,43 @@ fn a_jump_host_pointing_at_a_deleted_profile_keeps_its_source_id() {
 }
 
 #[test]
+fn a_linked_jump_hop_follows_the_current_source_profile() {
+    let gateway_id = Uuid::new_v4();
+    let dir = tempfile::tempdir().unwrap();
+    let source = format!(
+        "{WARP_ID_PREFIX} {gateway_id}\nHost gateway\n    Port 2222\n    User ops\n\n{WARP_JUMP_SOURCES_PREFIX} {gateway_id}\nHost work\n    HostName 10.0.0.9\n    ProxyJump ops@gateway:2222\n"
+    );
+    let path = write_config(dir.path(), &source);
+
+    let profiles = load_profiles_at(&path).unwrap();
+    let work = profiles
+        .iter()
+        .find(|profile| profile.name == "work")
+        .unwrap();
+    assert_eq!(work.jump_hosts[0].host, "gateway");
+    assert_eq!(work.jump_hosts[0].port, 2222);
+    assert_eq!(work.jump_hosts[0].user.as_deref(), Some("ops"));
+
+    // The gateway is edited: its port changes to 2200.
+    fs::write(&path, source.replace("Port 2222", "Port 2200")).unwrap();
+
+    let profiles = load_profiles_at(&path).unwrap();
+    let work = profiles
+        .iter()
+        .find(|profile| profile.name == "work")
+        .unwrap();
+    assert_eq!(work.jump_hosts[0].source_profile_id, Some(gateway_id));
+    assert_eq!(work.jump_hosts[0].host, "gateway");
+    assert_eq!(work.jump_hosts[0].port, 2200);
+    assert!(work.jump_hosts[0].port_is_explicit);
+    assert_eq!(work.jump_hosts[0].user.as_deref(), Some("ops"));
+
+    // Saving the dependent route writes the refreshed hop, not the stale snapshot.
+    upsert_profile_at(&path, work).unwrap();
+    assert!(read(&path).contains("ProxyJump ops@gateway:2200"));
+}
+
+#[test]
 fn a_legacy_proxy_jump_without_source_ids_parses_as_unlinked_hops() {
     let source = "Host app\n    HostName 10.0.0.9\n    ProxyJump ops@bastion:2222,relay\n";
 
