@@ -32,7 +32,10 @@ use crate::context_chips::display_chip::GitLineChanges;
 use crate::editor::EditorView;
 use crate::features::FeatureFlag;
 use crate::menu::{MenuItem, MenuItemFields};
-use crate::settings::{AISettings, AISettingsChangedEvent, InputSettings, WarpPromptSeparator};
+use crate::settings::{
+    AISettings, AISettingsChangedEvent, InputSettings, WarpPromptSeparator,
+    cli_agent_footer_visible,
+};
 use crate::terminal::event::BlockType;
 use crate::terminal::model::block::{Block, BlockMetadata};
 use crate::terminal::model::session::{ExecuteCommandOptions, Session, Sessions, SessionsEvent};
@@ -42,6 +45,7 @@ use crate::terminal::session_settings::{
     SessionSettings, SessionSettingsChangedEvent, ToolbarChipSelection,
 };
 use crate::terminal::view::{ContextMenuAction, PromptPart, PromptPosition, TerminalAction};
+use crate::workspace::tab_settings::{TabSettings, TabSettingsChangedEvent};
 
 #[cfg(test)]
 #[path = "current_prompt_tests.rs"]
@@ -306,6 +310,13 @@ impl CurrentPrompt {
                 event,
                 AISettingsChangedEvent::ShouldRenderCLIAgentToolbar { .. }
             ) {
+                me.update_states_with_new_context(ctx);
+            }
+        });
+        // Harp mode hides the CLI agent footer too (see `cli_agent_footer_visible`), so its chips
+        // must start or stop with a mode toggle just as they do with the footer setting.
+        ctx.subscribe_to_model(&TabSettings::handle(ctx), |me, _, event, ctx| {
+            if matches!(event, TabSettingsChangedEvent::HarpMode { .. }) {
                 me.update_states_with_new_context(ctx);
             }
         });
@@ -1128,7 +1139,7 @@ impl CurrentPrompt {
                 .and_then(|controller| controller.upgrade(ctx))
                 .is_some_and(|controller| controller.as_ref(ctx).is_active());
         let cli_agent_footer = self.terminal_view_id.is_some_and(|terminal_view_id| {
-            *AISettings::as_ref(ctx).should_render_cli_agent_footer
+            cli_agent_footer_visible(ctx)
                 && CLIAgentSessionsModel::as_ref(ctx)
                     .session(terminal_view_id)
                     .is_some_and(|session| session.agent.supports_cli_agent_footer())
