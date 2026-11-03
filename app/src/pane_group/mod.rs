@@ -82,6 +82,7 @@ use crate::auth::auth_view_modal::AuthViewVariant;
 use crate::banner::{Banner, BannerEvent, BannerState, BannerTextContent, DismissalType};
 use crate::channel::{Channel, ChannelState};
 use crate::cloud_object::Space;
+use crate::cmd_or_ctrl_shift;
 use crate::code::active_file::ActiveFileModel;
 use crate::code::buffer_location::LocalOrRemotePath;
 #[cfg(feature = "local_fs")]
@@ -112,9 +113,7 @@ use crate::resource_center::{
 use crate::server::cloud_objects::update_manager::UpdateManager;
 use crate::server::ids::{ObjectUid, SyncId};
 use crate::server::server_api::{ServerApi, ServerApiProvider};
-use crate::server::telemetry::{
-    AnonymousUserSignupEntrypoint, PaletteSource, SharingDialogSource, TelemetryEvent,
-};
+use crate::server::telemetry::{AnonymousUserSignupEntrypoint, PaletteSource, SharingDialogSource};
 use crate::session_management::SessionNavigationData;
 use crate::settings::{AISettings, DefaultSessionMode, PaneSettings};
 use crate::settings_view::SettingsSection;
@@ -172,7 +171,6 @@ use crate::workspace::{
     self, CommandSearchOptions, PaneViewLocator, TabBarLocation, WorkspaceAction,
 };
 use crate::workspaces::user_workspaces::{ResolvedTeamScope, UserWorkspaces};
-use crate::{cmd_or_ctrl_shift, send_telemetry_from_ctx};
 
 mod ambient_pane_restoration;
 mod child_agent;
@@ -2054,9 +2052,7 @@ impl PaneGroup {
             LeafContents::Welcome { .. } => {
                 // Welcome panes are not restored from persistence.
                 // They are opened on-demand via workspace actions.
-                Err(anyhow::anyhow!(
-                    "Welcome panes are not restored"
-                ))
+                Err(anyhow::anyhow!("Welcome panes are not restored"))
             }
         };
 
@@ -2774,8 +2770,6 @@ impl PaneGroup {
                 }
                 ctx.emit(Event::OpenSettings(SettingsSection::Teams));
                 ctx.notify();
-
-                send_telemetry_from_ctx!(TelemetryEvent::SharedSessionModalUpgradePressed, ctx);
             }
         }
     }
@@ -3007,12 +3001,6 @@ impl PaneGroup {
                     RoleChangeCloseSource::SharerGrant,
                     ctx,
                 );
-                send_telemetry_from_ctx!(
-                    TelemetryEvent::SharerCancelledGrantRole {
-                        role: Role::Executor
-                    },
-                    ctx
-                );
             }
             RoleChangeModalEvent::GrantRole {
                 terminal_pane_id,
@@ -3029,7 +3017,6 @@ impl PaneGroup {
                             "Failed to set should_confirm_shared_session_edit_access setting to false"
                         ));
                     }
-                    send_telemetry_from_ctx!(TelemetryEvent::SharerGrantModalDontShowAgain, ctx);
                 }
 
                 let Some(terminal_view) = self.terminal_view_from_pane_id(*terminal_pane_id, ctx)
@@ -6896,7 +6883,6 @@ impl PaneGroup {
     ) -> Option<PaneId> {
         if self.pane_count() == 1 {
             // Only sending telemetry event the first time a user enters split pane in a session.
-            send_telemetry_from_ctx!(TelemetryEvent::SplitPane, ctx);
         }
 
         self.tips_completed.update(ctx, |tips_completed, ctx| {

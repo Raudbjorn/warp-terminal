@@ -24,7 +24,6 @@ mod cloud_run_view;
 pub mod input;
 pub mod root_view;
 pub mod session;
-mod telemetry;
 mod tui_ask_question_view;
 mod tui_builder;
 mod ui;

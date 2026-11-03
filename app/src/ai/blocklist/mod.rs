@@ -31,11 +31,9 @@ pub mod suggested_agent_mode_workflow_modal;
 pub mod suggested_rule_modal;
 mod suggestion_chip_view;
 pub mod summarization_cancel_dialog;
-pub(crate) mod telemetry;
 pub mod usage;
 
 pub(crate) mod codebase_index_speedbump_banner;
-pub(crate) mod telemetry_banner;
 pub(crate) mod view_util;
 
 // Consumed by `tui_export` for the `warp_tui` frontend.

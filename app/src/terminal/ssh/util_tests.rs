@@ -135,3 +135,27 @@ fn ssh_interactive_shell_parsing() {
             == Some("localhost".to_string())
     );
 }
+
+#[test]
+fn ssh_login_user_parsing() {
+    let user_of = |command: &str| parse_interactive_ssh_command(command).unwrap().user;
+
+    assert_eq!(user_of("ssh localhost"), None);
+    assert_eq!(user_of("ssh root@localhost"), Some("root".to_string()));
+    assert_eq!(user_of("ssh -l root localhost"), Some("root".to_string()));
+    assert_eq!(
+        user_of("command ssh -l root -p 5022 -- localhost"),
+        Some("root".to_string())
+    );
+    assert_eq!(
+        user_of("ssh -l ignored root@localhost"),
+        Some("root".to_string())
+    );
+    assert_eq!(
+        parse_interactive_ssh_command("ssh -l root localhost")
+            .unwrap()
+            .host,
+        Some("localhost".to_string())
+    );
+    assert!(parse_interactive_ssh_command("ssh -l").is_none());
+}

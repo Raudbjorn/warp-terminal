@@ -1,6 +1,6 @@
-use warp_core::channel::ChannelState;
 use std::ops::Deref;
 use std::sync::Arc;
+use warp_core::channel::ChannelState;
 
 use lazy_static::lazy_static;
 use markdown_parser::{FormattedText, FormattedTextFragment, FormattedTextLine};
@@ -31,10 +31,10 @@ use crate::appearance::Appearance;
 use crate::auth::AuthStateProvider;
 use crate::editor::{EditorView, Event as EditorEvent, SingleLineEditorOptions, TextOptions};
 use crate::server::server_api::referral::{ReferralInfo, ReferralsClient};
-use crate::server::telemetry::TelemetryEvent;
+
+use crate::safe_info;
 use crate::ui_components::blended_colors;
 use crate::view_components::ToastFlavor;
-use crate::{safe_info, send_telemetry_from_ctx};
 
 const HEADER_FONT_SIZE: f32 = 18.;
 const HEADER_MARGIN_BOTTOM: f32 = 32.;
@@ -278,7 +278,6 @@ impl ReferralsPageView {
                 log::warn!("Attempting to copy link before API request is complete");
             }
             ApiState::Ready { referral_info, .. } => {
-                send_telemetry_from_ctx!(TelemetryEvent::CopyInviteLink, ctx);
                 ctx.clipboard()
                     .write(ClipboardContent::plain_text(referral_info.url.to_string()));
                 ctx.emit(ReferralsPageEvent::ShowToast {

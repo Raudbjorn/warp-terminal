@@ -137,7 +137,6 @@ impl AgentMessageBar {
                 AgentViewControllerEvent::EnteredAgentView { .. }
                     | AgentViewControllerEvent::ExitedAgentView { .. }
             ) {
-                me.record_visible_promotion(ctx);
                 ctx.notify();
             }
         });
@@ -184,7 +183,7 @@ impl AgentMessageBar {
                     me.ephemeral_message_model
                         .update(ctx, |m, ctx| m.try_dismiss_explicit_message(ctx));
                 }
-                me.record_visible_promotion(ctx);
+
                 ctx.notify();
             }
         });
@@ -206,7 +205,6 @@ impl AgentMessageBar {
         });
         ctx.subscribe_to_model(&PricingPromotionState::handle(ctx), |me, _, event, ctx| {
             if matches!(event, PricingPromotionStateEvent::Updated) {
-                me.record_visible_promotion(ctx);
                 ctx.notify();
             }
         });
@@ -275,7 +273,7 @@ impl AgentMessageBar {
             mouse_states: AgentMessageBarMouseStates::default(),
             figma_detected: false,
         };
-        message_bar.record_visible_promotion(ctx);
+
         message_bar
     }
 }
@@ -315,27 +313,6 @@ impl AgentMessageBar {
         } else {
             None
         }
-    }
-
-    fn record_visible_promotion(&self, ctx: &mut ViewContext<Self>) {
-        if cfg!(target_family = "wasm")
-            || !self.agent_view_controller.as_ref(ctx).is_active()
-            || self
-                .input_suggestions_model
-                .as_ref(ctx)
-                .is_inline_menu_open()
-        {
-            return;
-        }
-        if PricingPromotionState::as_ref(ctx)
-            .visible_message(PricingPromotionSurface::AgentMessageBar, ctx)
-            .is_none()
-        {
-            return;
-        }
-        PricingPromotionState::handle(ctx).update(ctx, |state, ctx| {
-            state.record_displayed(PricingPromotionSurface::AgentMessageBar, ctx);
-        });
     }
 }
 
@@ -490,9 +467,6 @@ impl TypedActionView for AgentMessageBar {
                 });
             }
             AgentMessageBarAction::UpgradePricingPromotion => {
-                PricingPromotionState::handle(ctx).update(ctx, |state, ctx| {
-                    state.record_clicked(PricingPromotionSurface::AgentMessageBar, ctx);
-                });
                 let upgrade_url = AuthManager::handle(ctx)
                     .update(ctx, |auth_manager, _| auth_manager.upgrade_url());
                 ctx.open_url(&upgrade_url);

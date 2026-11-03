@@ -29,6 +29,7 @@ use crate::workspace::tab_settings::TabSettings;
 pub enum HeaderToolbarItemKind {
     TabsPanel,
     ToolsPanel,
+    SshProfiles,
     AgentManagement,
     CodeReview,
     Conn,
@@ -40,6 +41,7 @@ impl HeaderToolbarItemKind {
         match self {
             Self::TabsPanel => "Tabs Panel",
             Self::ToolsPanel => "Tools Panel",
+            Self::SshProfiles => "SSH Profiles",
             Self::AgentManagement => "Agent Management",
             Self::CodeReview => "Code Review",
             Self::Conn => "Conn",
@@ -51,6 +53,7 @@ impl HeaderToolbarItemKind {
         match self {
             Self::TabsPanel => Icon::Menu,
             Self::ToolsPanel => Icon::Tool2,
+            Self::SshProfiles => Icon::Globe,
             Self::AgentManagement => Icon::Grid,
             Self::CodeReview => Icon::Diff,
             Self::Conn => Icon::ClockRewind,
@@ -68,6 +71,7 @@ impl HeaderToolbarItemKind {
                     && *TabSettings::as_ref(app).use_vertical_tabs
             }
             Self::ToolsPanel => true,
+            Self::SshProfiles => true,
             Self::AgentManagement => {
                 if ChannelState::is_local_only() {
                     return false;
@@ -107,12 +111,17 @@ impl HeaderToolbarItemKind {
     pub fn is_panel(&self) -> bool {
         matches!(
             self,
-            Self::TabsPanel | Self::ToolsPanel | Self::CodeReview | Self::Conn
+            Self::TabsPanel | Self::ToolsPanel | Self::SshProfiles | Self::CodeReview | Self::Conn
         )
     }
 
     pub fn default_left() -> Vec<Self> {
-        vec![Self::TabsPanel, Self::ToolsPanel, Self::AgentManagement]
+        vec![
+            Self::TabsPanel,
+            Self::ToolsPanel,
+            Self::SshProfiles,
+            Self::AgentManagement,
+        ]
     }
 
     pub fn default_right() -> Vec<Self> {
@@ -124,6 +133,7 @@ impl HeaderToolbarItemKind {
         vec![
             Self::TabsPanel,
             Self::ToolsPanel,
+            Self::SshProfiles,
             Self::AgentManagement,
             Self::CodeReview,
             Self::Conn,

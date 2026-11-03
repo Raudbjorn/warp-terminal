@@ -2,8 +2,7 @@ use pathfinder_color::ColorU;
 use pathfinder_geometry::vector::vec2f;
 use serde_json::Value;
 use strum_macros::{EnumDiscriminants, EnumIter};
-use warp_core::send_telemetry_from_ctx;
-use warp_core::telemetry::{EnablementState, TelemetryEvent, TelemetryEventDesc};
+
 use warp_core::ui::theme::Fill;
 use warpui::elements::{
     Align, ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment,
@@ -283,79 +282,11 @@ impl TypedActionView for ChatGPTPlanModal {
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
         match action {
             ChatGPTPlanModalAction::Close => {
-                send_telemetry_from_ctx!(ChatGPTPlanModalTelemetryEvent::Dismissed, ctx);
                 ctx.emit(ChatGPTPlanModalEvent::Close);
             }
             ChatGPTPlanModalAction::ManageUsage => {
-                send_telemetry_from_ctx!(ChatGPTPlanModalTelemetryEvent::ManageUsageClicked, ctx);
                 ctx.open_url(CHATGPT_USAGE_URL);
             }
         }
     }
 }
-
-#[derive(Debug, EnumDiscriminants)]
-#[strum_discriminants(derive(EnumIter))]
-pub enum ChatGPTPlanModalTelemetryEvent {
-    Shown,
-    Dismissed,
-    ManageUsageClicked,
-}
-
-impl TelemetryEvent for ChatGPTPlanModalTelemetryEvent {
-    fn name(&self) -> &'static str {
-        ChatGPTPlanModalTelemetryEventDiscriminants::from(self).name()
-    }
-
-    fn payload(&self) -> Option<Value> {
-        match self {
-            Self::Shown | Self::Dismissed | Self::ManageUsageClicked => None,
-        }
-    }
-
-    fn description(&self) -> &'static str {
-        ChatGPTPlanModalTelemetryEventDiscriminants::from(self).description()
-    }
-
-    fn enablement_state(&self) -> EnablementState {
-        ChatGPTPlanModalTelemetryEventDiscriminants::from(self).enablement_state()
-    }
-
-    fn contains_ugc(&self) -> bool {
-        match self {
-            Self::Shown | Self::Dismissed | Self::ManageUsageClicked => false,
-        }
-    }
-
-    fn event_descs() -> impl Iterator<Item = Box<dyn TelemetryEventDesc>> {
-        warp_core::telemetry::enum_events::<Self>()
-    }
-}
-
-impl TelemetryEventDesc for ChatGPTPlanModalTelemetryEventDiscriminants {
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Shown => "ChatGPTPlanModal.Shown",
-            Self::Dismissed => "ChatGPTPlanModal.Dismissed",
-            Self::ManageUsageClicked => "ChatGPTPlanModal.ManageUsageClicked",
-        }
-    }
-
-    fn description(&self) -> &'static str {
-        match self {
-            Self::Shown => "The \"You're using your ChatGPT plan\" modal was shown to the user",
-            Self::Dismissed => "The user dismissed the \"You're using your ChatGPT plan\" modal",
-            Self::ManageUsageClicked => {
-                "The user opened ChatGPT usage settings from the \"You're using your ChatGPT plan\" modal"
-            }
-        }
-    }
-
-    fn enablement_state(&self) -> EnablementState {
-        match self {
-            Self::Shown | Self::Dismissed | Self::ManageUsageClicked => EnablementState::Always,
-        }
-    }
-}
-
-warp_core::register_telemetry_event!(ChatGPTPlanModalTelemetryEvent);

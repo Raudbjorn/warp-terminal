@@ -18,13 +18,17 @@ fn main() -> Result<()> {
             server_config: WarpServerConfig::local_only(),
             oz_config: OzConfig::local_only(),
             services_mode: ServicesMode::LocalOnly,
-            telemetry_config: None,
             autoupdate_config: None,
             mcp_static_config: None,
         },
     );
     if cfg!(debug_assertions) {
         state = state.with_additional_features(warp_core::features::DEBUG_FLAGS);
+    }
+    #[cfg(not(windows))]
+    {
+        state =
+            state.with_additional_features(&[warp_core::features::FeatureFlag::SshRemoteServer]);
     }
     ChannelState::set(state);
 
