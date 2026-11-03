@@ -223,3 +223,15 @@ fn a_service_that_failed_validation_publishes_no_root_url() {
     manager.set_failed("the running service enforces a different policy".to_string());
     assert_eq!(local_no_cloud_root_url(), None);
 }
+
+#[test]
+fn a_revoked_service_is_unpublished_until_its_replacement_is_healthy() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut manager = test_manager();
+    set_global_root_url(Some(root_url()));
+    assert_eq!(local_no_cloud_root_url(), Some(root_url()));
+
+    // The allow-list lost a host: requests stop at once, not after the restart debounce.
+    manager.revoke_running_service();
+    assert_eq!(local_no_cloud_root_url(), None);
+}

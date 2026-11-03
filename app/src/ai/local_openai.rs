@@ -78,7 +78,9 @@ struct ChatMessage {
 struct ResponsesApiRequest {
     model: String,
     input: Vec<InputItem>,
-    temperature: f32,
+    // Deliberately absent: models served through the Responses API (the o-series, `gpt-5`) are
+    // reasoning models, and a provider answers a `temperature` for them with an HTTP 400.
+    // Leaving it out uses the provider's default for every model.
     stream: bool,
 }
 
@@ -559,7 +561,6 @@ impl LocalOpenAIClient {
             .json(&ResponsesApiRequest {
                 model,
                 input,
-                temperature: 0.2,
                 stream: false,
             });
         if !api_key.trim().is_empty() {

@@ -456,6 +456,9 @@ impl LocalMultiAgentManager {
             AISettings::as_ref(ctx).apply_network_policy();
             if ChannelState::is_local_only() && policy_needs_restart(&manager.applied_private_hosts)
             {
+                // The running service still enforces the old allow-list, so it must not take
+                // requests while the debounce waits to start its replacement.
+                manager.revoke_running_service();
                 manager.schedule_restart(ctx);
             }
         });
@@ -831,6 +834,14 @@ impl LocalMultiAgentManager {
         // The service enforces the policy it was given at startup, not whatever the allow-list
         // says now, so record the snapshot it was given.
         let needs_restart = self.record_applied_private_hosts(applied_private_hosts);
+        // The allow-list changed while the service was starting, so it enforces a policy the app
+        // no longer has and may forward to a host that was since revoked. Never publish it:
+        // stop it and start a replacement with the current allow-list.
+        if needs_restart {
+            self.revoke_running_service();
+            self.schedule_restart(ctx);
+            return;
+        }
         // The service is healthy and enforces the app's policy, so it can be published.
         set_global_root_url(Some(root_url.clone()));
         let _ = ChannelState::override_server_root_url(root_url.to_string());
@@ -840,11 +851,14 @@ impl LocalMultiAgentManager {
             config_hash,
         };
         self.refresh_llm_preferences(ctx);
-        // The service reads its policy only at startup, so an allow-list that changed while it
-        // was starting is not in force yet: restart it with the current one.
-        if needs_restart {
-            self.schedule_restart(ctx);
-        }
+    }
+
+    /// Takes the running service out of use at once: unpublishes its URL so no new request is
+    /// routed to it, and stops it if this app started it. A service this app did not start cannot
+    /// be stopped from here, but without a published URL nothing reaches it.
+    fn revoke_running_service(&mut self) {
+        set_global_root_url(None);
+        self.stop_child();
     }
 
     /// Records the private hosts the running service enforces and reports whether the service

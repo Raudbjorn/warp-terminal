@@ -327,6 +327,8 @@ async fn single_shot_requests_use_the_responses_api_when_the_flag_is_on() {
     assert_eq!(input[0]["role"], "system");
     assert_eq!(input[1]["role"], "user");
     assert_eq!(input[1]["content"], "hello");
+    // Reasoning models behind the Responses API reject `temperature`, so it is never sent.
+    assert!(requests[0].body.get("temperature").is_none());
     // Single-shot callers have no conversation, so nothing is carried over.
     assert_eq!(client.reasoning_cache.lock().conversation_count(), 0);
 }

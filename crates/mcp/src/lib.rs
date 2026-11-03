@@ -1,6 +1,8 @@
 #[cfg(not(target_family = "wasm"))]
 pub mod oauth;
 #[cfg(not(target_family = "wasm"))]
+mod policy_http_client;
+#[cfg(not(target_family = "wasm"))]
 pub mod runtime;
 #[cfg(not(target_family = "wasm"))]
 pub mod sse_transport;

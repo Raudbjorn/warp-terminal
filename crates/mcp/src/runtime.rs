@@ -28,8 +28,12 @@ use uuid::Uuid;
 use warp_errors::report_error;
 
 use super::TemplatableMCPServerInfo;
+use crate::policy_http_client::PolicyCheckedClient;
 
 type ReqwestHttpTransport = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
+
+/// Reported when the network policy refuses an MCP server. Names the rule, never the URL.
+const MCP_CONNECTION_DENIED_MESSAGE: &str = "the network policy refused this MCP server: local-only services mode only allows loopback addresses and the private hosts listed in Settings";
 type ReqwestSseTransport = crate::sse_transport::SseClientTransport<reqwest::Client>;
 
 /// Convert an rmcp error to a user-friendly error message.
@@ -332,14 +336,14 @@ pub async fn spawn_server(
             )
         }
         TransportType::ServerSentEvents(sse_server) => {
-            if let Err(denied) =
-                network_policy::check_url_str(&sse_server.url, "MCP server connection")
-            {
+            if network_policy::check_url_str(&sse_server.url, "MCP server connection").is_err() {
                 logger.log(
                     "[error] MCP: Network policy refused the MCP server connection".to_string(),
                 );
+                // The denial's text embeds the URL, which can carry credentials in its userinfo
+                // or query. This error reaches the UI and logs, so it states the rule instead.
                 return Err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(
-                    denied.to_string(),
+                    MCP_CONNECTION_DENIED_MESSAGE,
                 ));
             }
             let headers: HashMap<String, String> = sse_server
@@ -356,7 +360,7 @@ pub async fn spawn_server(
 
                     logger.log("[info] MCP: Using Streaming HTTP transport".to_string());
                     let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
-                        client,
+                        PolicyCheckedClient(client),
                         rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                             sse_server.url.clone(),
                         ),
@@ -375,7 +379,7 @@ pub async fn spawn_server(
                     logger.log("[info] MCP: Using Streaming HTTP transport".to_string());
                     let client = build_client_with_headers(&headers)?;
                     let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
-                        client,
+                        PolicyCheckedClient(client),
                         rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                             sse_server.url.clone(),
                         ),
