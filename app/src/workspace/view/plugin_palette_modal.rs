@@ -12,6 +12,7 @@
 //! never re-enter `plugin.get_mut()` from inside the calling callback). See PLUGIN_SPEC.md (M4).
 
 use fuzzy_match::match_indices_case_insensitive;
+use warp_editor::editor::NavigationKey;
 use warpui::elements::{
     Border, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable, ConstrainedBox,
     Container, CornerRadius, CrossAxisAlignment, Element, Fill, Flex, Hoverable, MainAxisAlignment,
@@ -30,7 +31,6 @@ use crate::editor::{
     PropagateHorizontalNavigationKeys, SingleLineEditorOptions, TextOptions,
 };
 use crate::plugin::app_requests::PalettePluginItem;
-use warp_editor::editor::NavigationKey;
 
 const SEARCH_BOX_HORIZONTAL_PADDING: f32 = 12.;
 const SEARCH_BOX_VERTICAL_PADDING: f32 = 8.;

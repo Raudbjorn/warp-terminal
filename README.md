@@ -31,8 +31,10 @@ There are three separate AI paths, each with its own settings:
 - **Natural-language commands, workflow metadata and command prediction:**
   **Settings → Local AI.** Set the base URL (e.g. `http://localhost:11434/v1`),
   an API key *if your server requires one*, and the model names. In this build
-  the endpoint must be a loopback address (`localhost`, `127.0.0.1`, `::1`);
-  LAN, Tailscale and public hosts are rejected.
+  the endpoint must be a loopback address (`localhost`, `127.0.0.1`, `::1`) or
+  an IP address you have listed under **Settings → Local AI → Allowed private
+  hosts** (see below). Other host names and public hosts are rejected. A CIDR
+  range can be an allow-list entry, but the endpoint itself is one address.
 - **Warp Agent conversations:** **Settings → Agents → Warp Agent → Custom
   Inference.** Add a custom endpoint that uses the OpenAI Chat Completions
   schema and select one of its models. A request for any other model is
@@ -45,6 +47,36 @@ There are three separate AI paths, each with its own settings:
 See [docs/local-ai.md](docs/local-ai.md) for every setting, the OpenCode
 provider, and exactly what the local-only network policy does and does not
 cover.
+
+### Which hosts the app can reach
+
+This build runs in *local-only* mode. The clients that carry AI requests,
+model-list lookups, the local agent service, MCP servers and asset downloads
+check the destination against one policy, re-check every redirect, and ignore
+`HTTP_PROXY`/`HTTPS_PROXY`:
+
+- **This machine** (`localhost`, `127.0.0.0/8`, `::1`) is always allowed.
+- **Other machines on your network** (a GPU box on the LAN, a tailnet peer) are
+  denied until you list them under **Settings → Local AI → Allowed private
+  hosts**, or in `settings.toml`:
+
+  ```toml
+  [agents.local_openai]
+  allowed_private_hosts = "192.168.1.50, 100.64.0.0/10"
+  ```
+
+  Entries are IP addresses or CIDR ranges inside the private ranges (`10/8`,
+  `172.16/12`, `192.168/16`, `100.64/10` for Tailscale, link-local, IPv6
+  `fc00::/7`). Host names cannot be listed, because a name says nothing about
+  the address it resolves to. Redirects are checked against the same policy: a
+  redirect to a destination that is not permitted is refused, while a redirect
+  to another permitted host is followed.
+- **The public internet**, including OpenAI and OpenRouter, is denied. An
+  endpoint that has to be reached over the internet needs a proxy or tunnel
+  on a host you have allowed above.
+
+Changing the list takes effect immediately; the local agent service restarts
+to pick it up.
 
 ### Editor and source-control additions from Hako
 

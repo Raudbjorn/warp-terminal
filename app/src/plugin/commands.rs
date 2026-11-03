@@ -57,14 +57,15 @@ pub fn title(id: &str) -> Option<String> {
 /// host; a non-empty returned string is shown as a toast. Generic over the view so it can be
 /// invoked both from the command palette and from keybinding handlers.
 pub fn run_plugin_command<V: warpui::View>(command_id: &str, ctx: &mut warpui::ViewContext<V>) {
+    use warp_js::SerializedJsValue;
+    use warpui::SingletonEntity;
+
+    use crate::plugin::PluginHost;
     use crate::plugin::service::{
         CallJsFunctionRequest, CallJsFunctionResponse, CallJsFunctionService,
     };
-    use crate::plugin::PluginHost;
     use crate::view_components::{DismissibleToast, ToastFlavor};
     use crate::workspace::ToastStack;
-    use warp_js::SerializedJsValue;
-    use warpui::SingletonEntity;
 
     let Some(function_id) = function_id(command_id) else {
         return;

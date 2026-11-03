@@ -1,6 +1,6 @@
-use warp_core::channel::ChannelState;
 use settings::macros::define_settings_group;
 use settings::{RespectUserSyncSetting, SupportedPlatforms, SyncToCloud};
+use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 
 use super::DriveSortOrder;

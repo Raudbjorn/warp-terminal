@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use command::blocking::Command;
 use nix::pty::openpty;
 
-use super::{set_winsize, READ_CHUNK, RING_CAPACITY, TAG_DATA, TAG_WINCH};
+use super::{READ_CHUNK, RING_CAPACITY, TAG_DATA, TAG_WINCH, set_winsize};
 
 /// Run the master event loop: spawn the shell in an inner PTY and relay between
 /// it and (at most one) connected attach client until the shell exits.

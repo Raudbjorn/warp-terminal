@@ -30,6 +30,7 @@ impl SseClient for reqwest::Client {
         message: rmcp::model::ClientJsonRpcMessage,
         auth_token: Option<String>,
     ) -> Result<(), SseTransportError<Self::Error>> {
+        network_policy::check_url_str(&uri.to_string(), "MCP SSE message post")?;
         let mut request_builder = self.post(uri.to_string()).json(&message);
         if let Some(auth_header) = auth_token {
             request_builder = request_builder.bearer_auth(auth_header);
@@ -48,6 +49,7 @@ impl SseClient for reqwest::Client {
         last_event_id: Option<String>,
         auth_token: Option<String>,
     ) -> Result<super::client_side_sse::BoxedSseResponse, SseTransportError<Self::Error>> {
+        network_policy::check_url_str(&uri.to_string(), "MCP SSE stream")?;
         let mut request_builder = self
             .get(uri.to_string())
             .header(ACCEPT, EVENT_STREAM_MIME_TYPE);
@@ -79,13 +81,15 @@ impl SseClient for reqwest::Client {
 impl SseClientTransport<reqwest::Client> {
     /// Creates a new transport using reqwest with the specified SSE endpoint.
     ///
-    /// This is a convenience method that creates a transport using the default
-    /// reqwest client.
+    /// This is a convenience method that creates a transport using a reqwest
+    /// client that follows the network policy.
     pub async fn start(
         uri: impl Into<Arc<str>>,
     ) -> Result<Self, SseTransportError<reqwest::Error>> {
         SseClientTransport::start_with_client(
-            reqwest::Client::default(),
+            crate::runtime::policy_client_builder()
+                .build()
+                .expect("HTTP client should build"),
             SseClientConfig {
                 sse_endpoint: uri.into(),
                 ..Default::default()

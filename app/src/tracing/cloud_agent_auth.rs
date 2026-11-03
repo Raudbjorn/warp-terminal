@@ -130,7 +130,11 @@ impl AuthContext {
     /// Creates a transport sharing the latest credential while leaving the exporter itself stable.
     pub(super) fn http_client(&self) -> AuthenticatedHttpClient {
         AuthenticatedHttpClient {
-            inner: reqwest::Client::new(),
+            // Follows the network policy: this client sends the cloud-agent bearer token, so a
+            // redirect must not carry it to a host the policy would have refused.
+            inner: network_policy::apply_to_client_builder(reqwest::Client::builder())
+                .build()
+                .expect("HTTP client should build"),
             token_store: self.token_store.clone(),
             refresh_hint_sender: self.refresh_hint_sender.clone(),
         }
@@ -370,10 +374,17 @@ impl AuthenticatedHttpClient {
 #[async_trait]
 impl HttpClient for AuthenticatedHttpClient {
     async fn send_bytes(&self, mut request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
+        if let Err(error) =
+            network_policy::check_url_str(&request.uri().to_string(), "cloud agent trace export")
+        {
+            return Err(
+                network_policy::NetworkPolicyDenied::new(error.purpose(), "<redacted>").into(),
+            );
+        }
         self.authorize_request(&mut request)?;
 
-        let request: reqwest::Request = request.try_into()?;
         // Reqwest requires a Tokio-compatible context, while the exporter may use another executor.
+        let request: reqwest::Request = request.try_into()?;
         let (status, response) = Compat::new(async {
             let mut response = self.inner.execute(request).await?;
             let status = response.status();

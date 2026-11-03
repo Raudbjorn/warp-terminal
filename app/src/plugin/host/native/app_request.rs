@@ -9,6 +9,7 @@
 use std::sync::{Arc, OnceLock};
 
 use warpui::r#async::executor::Background;
+
 use crate::plugin::app_requests::PluginAppRequest;
 use crate::plugin::service::{PluginAppRequestEnvelope, PluginAppRequestService};
 

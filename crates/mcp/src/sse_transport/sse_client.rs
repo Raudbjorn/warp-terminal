@@ -29,6 +29,12 @@ pub enum SseTransportError<E: std::error::Error + Send + Sync + 'static> {
     Io(#[from] std::io::Error),
     #[error("Client error: {0}")]
     Client(E),
+    /// The denial's own text embeds the URL, which can carry credentials, so only the purpose
+    /// (a fixed label chosen by the caller, never URL-derived) is kept.
+    #[error(
+        "the network policy refused this {purpose}: local-only services mode only allows loopback addresses and the private hosts listed in Settings"
+    )]
+    NetworkPolicyDenied { purpose: String },
     #[error("unexpected end of stream")]
     UnexpectedEndOfStream,
     #[error("Unexpected content type: {0:?}")]
@@ -39,6 +45,16 @@ pub enum SseTransportError<E: std::error::Error + Send + Sync + 'static> {
     InvalidUri(#[from] http::uri::InvalidUri),
     #[error("Invalid uri parts: {0}")]
     InvalidUriParts(#[from] http::uri::InvalidUriParts),
+}
+
+impl<E: std::error::Error + Send + Sync + 'static> From<network_policy::NetworkPolicyDenied>
+    for SseTransportError<E>
+{
+    fn from(denied: network_policy::NetworkPolicyDenied) -> Self {
+        Self::NetworkPolicyDenied {
+            purpose: denied.purpose().to_owned(),
+        }
+    }
 }
 
 pub trait SseClient: Clone + Send + Sync + 'static {
@@ -258,3 +274,7 @@ impl Default for SseClientConfig {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sse_client_tests.rs"]
+mod tests;

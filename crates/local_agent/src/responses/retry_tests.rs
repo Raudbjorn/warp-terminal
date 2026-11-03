@@ -40,6 +40,10 @@ fn does_not_retry_permanent_failures() {
             message: String::new(),
         },
         LocalAgentError::Parse("bad".to_string()),
+        LocalAgentError::NetworkPolicyDenied(network_policy::NetworkPolicyDenied::new(
+            "local agent request",
+            "<redacted>",
+        )),
     ] {
         assert!(!policy().should_retry(1, &error), "{error:?}");
     }

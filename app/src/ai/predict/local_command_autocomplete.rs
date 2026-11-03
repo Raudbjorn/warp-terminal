@@ -78,11 +78,14 @@ pub async fn request_local_command_autocomplete(
     request: &LocalCommandAutocompleteRequest,
     provider_settings: LocalCommandAutocompleteProviderSettings,
 ) -> anyhow::Result<LocalCommandAutocompleteResponse> {
-    let client = reqwest::Client::new();
     let url = format!(
         "{}/ai/local-command-autocomplete",
         root_url.as_str().trim_end_matches('/')
     );
+    network_policy::check_url_str(&url, "local command autocomplete")?;
+    // Redirects are re-checked and system proxies are not used in local-only mode; this request
+    // carries the API key.
+    let client = network_policy::apply_to_client_builder(reqwest::Client::builder()).build()?;
     let mut request_builder = client.post(url).json(request);
     if let Some(openai_api_key) = provider_settings.openai_api_key.as_deref() {
         request_builder = request_builder.bearer_auth(openai_api_key);

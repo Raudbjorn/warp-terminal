@@ -63,7 +63,9 @@ impl SkillPathOrigin {
                 // We operate on the raw string rather than using `PathBuf::components().collect()`
                 // because the latter re-serialises with platform-specific separators (backslashes
                 // on Windows) and treats leading `//` as a UNC prefix on Windows.
-                Ok(LocalOrRemotePath::Local(PathBuf::from(collapse_slashes(&path))))
+                Ok(LocalOrRemotePath::Local(PathBuf::from(collapse_slashes(
+                    &path,
+                ))))
             }
             SkillPathOrigin::Remote { host_id } => {
                 let path = StandardizedPath::try_new(&path)

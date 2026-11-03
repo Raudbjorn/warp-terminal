@@ -1,34 +1,34 @@
-use std::{collections::HashMap, convert::Infallible, net::SocketAddr, sync::Arc, time::Instant};
+use std::collections::HashMap;
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
-use axum::{
-    Router,
-    body::{Body, Bytes, to_bytes},
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode, Uri, header},
-    response::{IntoResponse, Response},
-    routing::{get, post},
-};
+use axum::Router;
+use axum::body::{Body, Bytes, to_bytes};
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode, Uri, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use futures_util::stream;
 use prost::Message as _;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 use warp_multi_agent_api as api;
 
-use crate::{
-    autocomplete::LocalCommandAutocompleteRequest,
-    config::{Config, LogLevel, SERVICE_VERSION, non_empty_str},
-    graphql::{graphql_error_messages, handle_local_graphql_request},
-    logger::Logger,
-    provider::{
-        ChatCompletionParams, FinishReason, LocalAgentError, ProviderChatMessage, ProviderResponse,
-        ProviderRuntime, assistant_message, content_with_images, messages_from_stored_conversation,
-        provider_messages_to_json, system_message, tool_result_message, user_text_message,
-    },
-    request::{SuggestPlanStatus, WarpRequestSummary, WarpToolResult, decode_warp_request},
-    response,
-    store::IntegrationStore,
+use crate::autocomplete::LocalCommandAutocompleteRequest;
+use crate::config::{Config, LogLevel, SERVICE_VERSION, non_empty_str};
+use crate::graphql::{graphql_error_messages, handle_local_graphql_request};
+use crate::logger::Logger;
+use crate::provider::{
+    ChatCompletionParams, FinishReason, LocalAgentError, ProviderChatMessage, ProviderResponse,
+    ProviderRuntime, assistant_message, content_with_images, messages_from_stored_conversation,
+    provider_messages_to_json, system_message, tool_result_message, user_text_message,
 };
+use crate::request::{SuggestPlanStatus, WarpRequestSummary, WarpToolResult, decode_warp_request};
+use crate::response;
+use crate::store::IntegrationStore;
 
 const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
 const OPENAI_BASE_URL_HEADER: &str = "x-warp-openai-base-url";
@@ -122,6 +122,9 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             "ok": true,
             "version": SERVICE_VERSION,
             "configHash": state.config.local_config_hash,
+            // Lets a client that did not start this service check that it enforces the same
+            // network policy as the client.
+            "networkPolicy": network_policy::PolicyReport::current(),
         })),
     )
 }

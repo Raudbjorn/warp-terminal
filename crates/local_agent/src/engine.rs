@@ -64,19 +64,32 @@ pub(crate) fn run_turn(
 /// The process-wide HTTP client, shared by every wire schema.
 ///
 /// Policy seam: anything that must hold for all outbound requests (proxy and
-/// redirect rules, network policy) belongs in this one builder.
-fn client() -> &'static reqwest::Client {
+/// redirect rules, network policy) belongs in this one builder. It follows the
+/// network policy: redirects are re-checked against it, and in local-only mode
+/// system proxies are not used. A redirect carries the request body (the
+/// transcript), so an endpoint must not be able to bounce it to a host the
+/// policy would have refused. Building can fail, and a plain client in its place
+/// would drop that protection, so the failure is reported instead.
+fn client() -> Result<&'static reqwest::Client, LocalAgentError> {
     // Reuse a single `reqwest::Client` across turns so TCP and TLS
     // sessions are pooled across requests.
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(reqwest::Client::new)
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = network_policy::apply_to_client_builder(reqwest::Client::builder())
+        .build()
+        .map_err(|err| LocalAgentError::Transport(err.without_url().to_string()))?;
+    Ok(CLIENT.get_or_init(|| client))
 }
 
 /// Opens the event stream for one JSON POST to `url`. Every wire schema's
 /// request goes through here, so the schema supplies only the URL, the body,
 /// and any extra headers.
 ///
-/// Policy seam: a per-request URL check belongs at the top of this function.
+/// The network policy is checked here, before anything is built, so no wire
+/// schema can reach an endpoint the policy refuses. The denial is reported
+/// without the URL, which may carry credentials.
 /// Retrying is left to the caller, so the SSE layer never reconnects itself.
 pub(crate) fn post_event_source(
     url: &str,
@@ -84,7 +97,9 @@ pub(crate) fn post_event_source(
     api_key: &str,
     extra_headers: &[(&str, &str)],
 ) -> Result<EventSource, LocalAgentError> {
-    let mut builder = client().post(url).json(body);
+    network_policy::check_url_str(url, "local agent request")
+        .map_err(|denied| crate::redact_denial(&denied))?;
+    let mut builder = client()?.post(url).json(body);
     if !api_key.trim().is_empty() {
         builder = builder.bearer_auth(api_key.trim());
     }

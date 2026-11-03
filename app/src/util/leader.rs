@@ -40,11 +40,11 @@
 //! if you change `LEADER` (or rebind to another `ctrl-<letter>`) add that keystroke
 //! to the allowlist there too, or binding validation will fail.
 
+use warpui::keymap::EditableBinding;
+use warpui::{AppContext, id};
+
 use crate::util::bindings::BindingGroup;
 use crate::workspace::WorkspaceAction;
-use warpui::id;
-use warpui::keymap::EditableBinding;
-use warpui::AppContext;
 
 /// The default leader (prefix) keystroke. Used to build each chord's default
 /// trigger; users can override individual chords (or the prefix) in

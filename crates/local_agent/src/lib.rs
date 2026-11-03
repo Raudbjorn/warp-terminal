@@ -104,6 +104,19 @@ pub enum AgentEvent {
     Done,
 }
 
+/// Stands in for the URL of a policy denial that leaves this crate.
+const REDACTED_URL: &str = "<redacted>";
+
+/// Keeps what a denial says about the rule (its purpose) and drops the URL it refused. The
+/// endpoint is user-configured and can carry credentials, and the host renders this error in its
+/// UI and logs. The result is still a [`network_policy::NetworkPolicyDenied`], so the host keeps
+/// treating it as a deterministic refusal rather than a transient transport failure.
+pub(crate) fn redact_denial(
+    denied: &network_policy::NetworkPolicyDenied,
+) -> network_policy::NetworkPolicyDenied {
+    network_policy::NetworkPolicyDenied::new(denied.purpose(), REDACTED_URL)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LocalAgentError {
     /// The endpoint rejected our credentials (HTTP 401/403).
@@ -119,6 +132,11 @@ pub enum LocalAgentError {
     /// Network/transport failure, including mid-stream disconnects.
     #[error("transport error: {0}")]
     Transport(String),
+    /// The network policy refused the endpoint, or a redirect it returned. Deterministic, so the
+    /// host should not retry it. Build it with [`redact_denial`]: the denial's own text embeds the
+    /// URL, which can carry credentials in its userinfo or query.
+    #[error(transparent)]
+    NetworkPolicyDenied(#[from] network_policy::NetworkPolicyDenied),
     /// The endpoint returned something we could not parse.
     #[error("malformed response: {0}")]
     Parse(String),

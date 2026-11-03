@@ -19,6 +19,7 @@ use warpui::{AppContext, Entity, ModelContext, SingletonEntity};
 
 use crate::ChannelState;
 use crate::ai::llms::LLMPreferences;
+use crate::settings::AISettings;
 
 const PREF_KEY: &str = "LocalMultiAgentConfig";
 const BUNDLED_SERVICE_DIR: &str = "bundled/local-multi-agent";
@@ -402,6 +403,9 @@ pub enum LocalMultiAgentManagerEvent {
 struct LocalMultiAgentHealthResponse {
     ok: bool,
     version: Option<String>,
+    /// Absent from services that predate the policy report.
+    #[serde(default, rename = "networkPolicy")]
+    network_policy: Option<network_policy::PolicyReport>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -417,6 +421,19 @@ pub struct LocalMultiAgentManager {
     child: Option<Child>,
     restart_debounce: Option<AbortHandle>,
     openai_api_key: Option<String>,
+    /// The private hosts the running service enforces: the snapshot it was given at startup,
+    /// or the list it reports for a service this app did not start. The service reads its
+    /// policy once at startup, so a change to the setting restarts it.
+    applied_private_hosts: Vec<network_policy::PrivateNetwork>,
+    /// The server root URL the app used before it was pointed at the local service. Publishing
+    /// overrides the process-wide `ChannelState` URL, which other clients read without consulting
+    /// this module, so unpublishing has to put it back.
+    original_server_root_url: Option<String>,
+    /// The allow-list in force when the service last failed to start or was refused, if it has
+    /// not been published since. `applied_private_hosts` keeps describing the last service that
+    /// was validated, so on its own it cannot tell that nothing is running: an allow-list
+    /// restored to that value would look unchanged and the failed service would never be retried.
+    failed_with_hosts: Option<Vec<network_policy::PrivateNetwork>>,
 }
 
 impl LocalMultiAgentManager {
@@ -427,12 +444,8 @@ impl LocalMultiAgentManager {
         } else {
             LocalMultiAgentStatus::Disabled
         };
-        if let Ok(root_url) = config.root_url() {
-            set_global_root_url(Some(root_url.clone()));
-            if ChannelState::is_local_only() {
-                let _ = ChannelState::override_server_root_url(root_url.to_string());
-            }
-        }
+        // The root URL is published only once a service has been validated (see
+        // `apply_start_result`), so a service that never runs does not receive requests.
 
         let mut manager = Self {
             config,
@@ -442,10 +455,23 @@ impl LocalMultiAgentManager {
             child: None,
             restart_debounce: None,
             openai_api_key: None,
+            applied_private_hosts: network_policy::allowed_private_hosts(),
+            original_server_root_url: None,
+            failed_with_hosts: None,
         };
         if ChannelState::is_local_only() {
             manager.schedule_restart(ctx);
         }
+        ctx.subscribe_to_model(&AISettings::handle(ctx), |manager, _, _, ctx| {
+            // Another subscriber may not have applied the new setting yet; applying is idempotent.
+            AISettings::as_ref(ctx).apply_network_policy();
+            if ChannelState::is_local_only() && manager.allow_list_needs_restart() {
+                // The running service still enforces the old allow-list, so it must not take
+                // requests while the debounce waits to start its replacement.
+                manager.revoke_running_service();
+                manager.schedule_restart(ctx);
+            }
+        });
         manager
     }
 
@@ -498,12 +524,7 @@ impl LocalMultiAgentManager {
         save_config(&self.config, ctx);
         self.discovered_models.clear();
         self.test_status = LocalMultiAgentTestStatus::NotRun;
-        if let Ok(root_url) = self.config.root_url() {
-            set_global_root_url(Some(root_url.clone()));
-            if ChannelState::is_local_only() {
-                let _ = ChannelState::override_server_root_url(root_url.to_string());
-            }
-        }
+        // The new root URL is published once the service that serves it has been validated.
         ctx.emit(LocalMultiAgentManagerEvent::ConfigChanged);
         ctx.emit(LocalMultiAgentManagerEvent::TestStatusChanged);
         self.refresh_llm_preferences(ctx);
@@ -540,13 +561,14 @@ impl LocalMultiAgentManager {
         }
         self.stop_child();
         self.status = LocalMultiAgentStatus::Disabled;
-        set_global_root_url(None);
+        self.unpublish_service_url();
         ctx.emit(LocalMultiAgentManagerEvent::StatusChanged);
     }
 
     pub fn health_check(&mut self, ctx: &mut ModelContext<Self>) {
         let Some(root_url) = self.root_url() else {
-            self.set_failed("Invalid local service URL.".to_string(), ctx);
+            self.set_failed("Invalid local service URL.".to_string());
+            ctx.emit(LocalMultiAgentManagerEvent::StatusChanged);
             return;
         };
         let current_status = self.status.clone();
@@ -561,7 +583,7 @@ impl LocalMultiAgentManager {
                         log::info!("Local multi-agent health check succeeded at {root_url}");
                     }
                     Err(error) => {
-                        manager.set_failed(format!("Health check failed: {error:#}"), ctx);
+                        manager.set_failed(format!("Health check failed: {error:#}"));
                     }
                 }
                 ctx.emit(LocalMultiAgentManagerEvent::StatusChanged);
@@ -758,7 +780,7 @@ impl LocalMultiAgentManager {
         if !ChannelState::is_local_only() {
             self.stop_child();
             self.status = LocalMultiAgentStatus::Disabled;
-            set_global_root_url(None);
+            self.unpublish_service_url();
             ctx.emit(LocalMultiAgentManagerEvent::StatusChanged);
             return;
         }
@@ -799,7 +821,7 @@ impl LocalMultiAgentManager {
                     }
                     Err(error) => {
                         log::warn!("Failed to start local multi-agent service: {error:#}");
-                        manager.set_failed(error.to_string(), ctx)
+                        manager.set_failed(error.to_string())
                     }
                 }
                 ctx.emit(LocalMultiAgentManagerEvent::StatusChanged);
@@ -813,12 +835,30 @@ impl LocalMultiAgentManager {
             root_url,
             pid,
             config_hash,
+            applied_private_hosts,
         } = result;
         if child.is_some() {
             self.stop_child();
             self.child = child;
         }
+        // The service enforces the policy it was given at startup, not whatever the allow-list
+        // says now, so record the snapshot it was given.
+        let needs_restart = self.record_applied_private_hosts(applied_private_hosts);
+        // The allow-list changed while the service was starting, so it enforces a policy the app
+        // no longer has and may forward to a host that was since revoked. Never publish it:
+        // stop it and start a replacement with the current allow-list.
+        if needs_restart {
+            self.revoke_running_service();
+            self.schedule_restart(ctx);
+            return;
+        }
+        // The service is healthy and enforces the app's policy, so it can be published.
+        self.failed_with_hosts = None;
         set_global_root_url(Some(root_url.clone()));
+        // Keep the first original: a republish without an unpublish in between would otherwise
+        // record the previous service's URL as the original.
+        self.original_server_root_url
+            .get_or_insert_with(|| ChannelState::server_root_url().into_owned());
         let _ = ChannelState::override_server_root_url(root_url.to_string());
         self.status = LocalMultiAgentStatus::Running {
             root_url,
@@ -826,6 +866,53 @@ impl LocalMultiAgentManager {
             config_hash,
         };
         self.refresh_llm_preferences(ctx);
+    }
+
+    /// Takes the running service out of use at once: unpublishes its URL so no new request is
+    /// routed to it, and stops it if this app started it. A service this app did not start cannot
+    /// be stopped from here, but without a published URL nothing reaches it.
+    fn revoke_running_service(&mut self) {
+        self.unpublish_service_url();
+        self.stop_child();
+    }
+
+    /// Removes every route to the local service: this module's URL and the process-wide server
+    /// root URL, which is restored to what it was before the service was published. In local-only
+    /// mode that is a cloud URL the network policy refuses, so requests fail closed.
+    fn unpublish_service_url(&mut self) {
+        set_global_root_url(None);
+        if let Some(original) = self.original_server_root_url.take()
+            && let Err(error) = ChannelState::override_server_root_url(original)
+        {
+            log::warn!("Could not restore the server root URL after unpublishing: {error}");
+        }
+    }
+
+    /// Whether the service has to be (re)started because of the allow-list: the running one
+    /// enforces a different list, or the last attempt failed under a list other than the current
+    /// one, so it may succeed now. A failure under the current list is not retried, which keeps
+    /// unrelated setting changes from restarting a service that cannot start.
+    fn allow_list_needs_restart(&self) -> bool {
+        match &self.failed_with_hosts {
+            // Nothing validated is running, so `applied_private_hosts` (the last service that
+            // was) no longer says anything about now. Judge against the list the failure
+            // happened under: a different one may succeed, the same one will fail again.
+            Some(failed_with) => !network_policy::same_private_hosts(
+                failed_with,
+                &network_policy::allowed_private_hosts(),
+            ),
+            None => policy_needs_restart(&self.applied_private_hosts),
+        }
+    }
+
+    /// Records the private hosts the running service enforces and reports whether the service
+    /// must be restarted because the allow-list changed while it was starting.
+    fn record_applied_private_hosts(
+        &mut self,
+        applied_private_hosts: Vec<network_policy::PrivateNetwork>,
+    ) -> bool {
+        self.applied_private_hosts = applied_private_hosts;
+        policy_needs_restart(&self.applied_private_hosts)
     }
 
     fn refresh_llm_preferences(&self, ctx: &mut ModelContext<Self>) {
@@ -842,10 +929,12 @@ impl LocalMultiAgentManager {
         }
     }
 
-    fn set_failed(&mut self, message: String, ctx: &mut ModelContext<Self>) {
+    fn set_failed(&mut self, message: String) {
         self.stop_child();
+        self.failed_with_hosts = Some(network_policy::allowed_private_hosts());
         self.status = LocalMultiAgentStatus::Failed { message };
-        ctx.emit(LocalMultiAgentManagerEvent::StatusChanged);
+        // A service that failed is not usable, so it must not receive requests.
+        self.unpublish_service_url();
     }
 }
 
@@ -866,6 +955,9 @@ struct StartServiceResult {
     root_url: Url,
     pid: Option<u32>,
     config_hash: String,
+    /// The private hosts the running service enforces: the snapshot it was handed when the
+    /// child was spawned, or the list it reports for a service this app did not start.
+    applied_private_hosts: Vec<network_policy::PrivateNetwork>,
 }
 
 async fn start_service(
@@ -876,14 +968,20 @@ async fn start_service(
     let root_url = config.root_url()?;
     let config_hash = config.config_hash();
 
-    match health_check(root_url.clone()).await {
-        Ok(()) => {
+    match fetch_health(root_url.clone()).await {
+        Ok(health) => {
+            // This process cannot change the policy of a service it did not start (and so cannot
+            // restart it with a new allow-list), so it only reuses one that already matches.
+            ensure_service_policy_matches(&root_url, &health)?;
             log::info!("Reusing existing healthy local multi-agent service at {root_url}");
             return Ok(StartServiceResult {
                 child: None,
                 root_url,
                 pid: None,
                 config_hash,
+                // The service enforces the policy it reports, so that is what the app compares
+                // against: the allow-list may have changed since the check.
+                applied_private_hosts: reported_private_hosts(&health),
             });
         }
         Err(_) => ensure_port_available(&config)?,
@@ -914,6 +1012,13 @@ async fn start_service(
     for (key, value) in service_env {
         command.env(key, value);
     }
+    // The service enforces the same network policy as the app, so hand it the current one. The
+    // environment and the allow-list it encodes come from one read, so the app can record
+    // exactly what the child was told.
+    let (policy_env, applied_private_hosts) = network_policy::env_for_child_with_hosts();
+    for (key, value) in policy_env {
+        command.env(key, value);
+    }
     command.env("LOCAL_CONFIG_HASH", &config_hash);
 
     let child = command
@@ -921,22 +1026,61 @@ async fn start_service(
         .with_context(|| format!("Failed to spawn {}", service_binary.display()))?;
     let pid = Some(child.id());
 
-    wait_until_healthy(root_url.clone()).await?;
+    let health = wait_until_healthy(root_url.clone()).await?;
+    // Dropping `child` on this error kills it (`kill_on_drop`), so a service that does not
+    // enforce the policy is never left running.
+    ensure_spawned_service_policy(&service_binary, &applied_private_hosts, &health)?;
 
     Ok(StartServiceResult {
         child: Some(child),
         root_url,
         pid,
         config_hash,
+        applied_private_hosts,
     })
 }
 
-async fn wait_until_healthy(root_url: Url) -> Result<()> {
+/// The private hosts a running service reports it may reach.
+fn reported_private_hosts(
+    health: &LocalMultiAgentHealthResponse,
+) -> Vec<network_policy::PrivateNetwork> {
+    health
+        .network_policy
+        .as_ref()
+        .and_then(|report| {
+            network_policy::parse_allowed_private_hosts(&report.allowed_private_hosts.join(","))
+                .ok()
+        })
+        .unwrap_or_default()
+}
+
+/// Checks that a service this process just started enforces the policy it was given. Health only
+/// shows that something Warp-shaped answers. The binary can be an older build (the app prefers an
+/// existing `target/` build) that ignores the policy environment, and would otherwise be published
+/// as if it enforced it. The comparison is against `given`, the allow-list the service was handed,
+/// not the current one: if that changed meanwhile, the caller restarts the service.
+fn ensure_spawned_service_policy(
+    service_binary: &Path,
+    given: &[network_policy::PrivateNetwork],
+    health: &LocalMultiAgentHealthResponse,
+) -> Result<()> {
+    network_policy::check_service_policy_against(given, health.network_policy.as_ref()).map_err(
+        |mismatch| {
+            anyhow!(
+                "The local multi-agent service at {} does not enforce the network policy it was \
+                 given: {mismatch}. It may be a build from before the policy existed; rebuild it.",
+                service_binary.display()
+            )
+        },
+    )
+}
+
+async fn wait_until_healthy(root_url: Url) -> Result<LocalMultiAgentHealthResponse> {
     let started = std::time::Instant::now();
     let mut last_error = None;
     while started.elapsed() < Duration::from_secs(10) {
-        match health_check(root_url.clone()).await {
-            Ok(()) => return Ok(()),
+        match fetch_health(root_url.clone()).await {
+            Ok(health) => return Ok(health),
             Err(error) => last_error = Some(error),
         }
         Timer::after(Duration::from_millis(150)).await;
@@ -944,12 +1088,40 @@ async fn wait_until_healthy(root_url: Url) -> Result<()> {
     Err(last_error.unwrap_or_else(|| anyhow!("Timed out waiting for local service health check")))
 }
 
+/// A client for the local service and the configured provider that follows the network policy:
+/// redirects are re-checked and, in local-only mode, system proxies are not used. Callers also
+/// check the request URL with [`network_policy::check_url`] first.
+fn policy_client() -> Result<reqwest::Client> {
+    network_policy::apply_to_client_builder(reqwest::Client::builder())
+        .build()
+        .context("Failed to build HTTP client")
+}
+
+fn ensure_service_policy_matches(
+    root_url: &Url,
+    health: &LocalMultiAgentHealthResponse,
+) -> Result<()> {
+    network_policy::check_service_policy(health.network_policy.as_ref()).map_err(|mismatch| {
+        anyhow!(
+            "A local multi-agent service is already running at {root_url}, but {mismatch}. Start \
+             it with {mode}=local_only and {hosts} set to the allowed private hosts from \
+             Settings, or stop it so Warp can start its own.",
+            mode = network_policy::ENV_SERVICES_MODE,
+            hosts = network_policy::ENV_ALLOWED_PRIVATE_HOSTS,
+        )
+    })
+}
+
 async fn health_check(root_url: Url) -> Result<()> {
+    fetch_health(root_url).await.map(|_| ())
+}
+
+async fn fetch_health(root_url: Url) -> Result<LocalMultiAgentHealthResponse> {
     let url = root_url
         .join("/health")
         .context("Failed to build local health URL")?;
-    let client = reqwest::Client::new();
-    let response = client
+    network_policy::check_url(&url, "local service health check")?;
+    let response = policy_client()?
         .get(url)
         .timeout(HEALTH_TIMEOUT)
         .send()
@@ -968,7 +1140,7 @@ async fn health_check(root_url: Url) -> Result<()> {
             .as_deref()
             .is_some_and(|version| !version.is_empty())
     {
-        Ok(())
+        Ok(health)
     } else {
         bail!("health response did not identify a Warp local service")
     }
@@ -977,8 +1149,12 @@ async fn health_check(root_url: Url) -> Result<()> {
 async fn fetch_provider_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
     validate_absolute_http_url(base_url)?;
     let models_url = format!("{}/models", base_url.trim_end_matches('/'));
-    let client = reqwest::Client::new();
-    let mut request = client
+    // The base URL is user-configured and can carry credentials in its userinfo or query. The
+    // error is shown in the UI and logged, so it keeps the typed denial but not the URL.
+    network_policy::check_url_str(&models_url, "provider model list request").map_err(
+        |denied| network_policy::NetworkPolicyDenied::new(denied.purpose(), "<redacted>"),
+    )?;
+    let mut request = policy_client()?
         .get(models_url)
         .timeout(HEALTH_TIMEOUT)
         .header(reqwest::header::ACCEPT, "application/json");
@@ -1179,6 +1355,17 @@ fn save_config(config: &LocalMultiAgentConfig, ctx: &AppContext) {
     }
 }
 
+/// Whether the service must be restarted to enforce the current allow-list.
+///
+/// The service reads its policy only at startup, so an allow-list that changed while it was
+/// starting is not in force yet.
+fn policy_needs_restart(applied_private_hosts: &[network_policy::PrivateNetwork]) -> bool {
+    !network_policy::same_private_hosts(
+        &network_policy::allowed_private_hosts(),
+        applied_private_hosts,
+    )
+}
+
 fn set_global_root_url(root_url: Option<Url>) {
     *LOCAL_ROOT_URL.write() = root_url;
 }
@@ -1270,10 +1457,17 @@ fn validate_context_tokens(value: &str) -> Result<(), LocalMultiAgentConfigError
     Ok(())
 }
 
+/// The root URL of the local multi-agent service, if the app has validated one.
+///
+/// There is no fallback to the configured endpoint: a service that was never validated, or that
+/// failed validation, must not receive requests.
 pub fn local_no_cloud_root_url() -> Option<Url> {
     LocalMultiAgentManager::global_root_url()
-        .or_else(|| LocalMultiAgentConfig::default().root_url().ok())
 }
+
+#[cfg(test)]
+#[path = "network_policy_tests.rs"]
+mod network_policy_tests;
 
 #[cfg(test)]
 mod tests {

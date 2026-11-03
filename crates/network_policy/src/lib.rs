@@ -16,10 +16,19 @@
 //! opaque response without a readable `Location`). Until then, code that runs on wasm must not
 //! treat a passed [`check_url`] as a promise that the request stays on the machine.
 
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use serde::{Deserialize, Serialize};
 use url::Url;
+
+mod private_hosts;
+
+pub use private_hosts::{
+    ENV_ALLOWED_PRIVATE_HOSTS, ENV_SERVICES_MODE, PolicyMismatch, PolicyReport, PrivateHostsError,
+    PrivateNetwork, allowed_private_hosts, check_service_policy, check_service_policy_against, env_for_child,
+    env_for_child_with_hosts, init_from_env, parse_allowed_private_hosts, same_private_hosts,
+    set_allowed_private_hosts,
+};
 
 static SERVICES_MODE: AtomicU8 = AtomicU8::new(ServicesMode::Online as u8);
 
@@ -112,7 +121,11 @@ pub fn check_url_for_mode(
     url: &Url,
     purpose: &str,
 ) -> Result<(), NetworkPolicyDenied> {
-    if mode == ServicesMode::Online || !is_guarded_scheme(url.scheme()) || is_loopback_url(url) {
+    if mode == ServicesMode::Online
+        || !is_guarded_scheme(url.scheme())
+        || is_loopback_url(url)
+        || private_hosts::is_allowed_private_url(url)
+    {
         return Ok(());
     }
 
@@ -120,6 +133,22 @@ pub fn check_url_for_mode(
         purpose: purpose.to_owned(),
         url: url.as_str().to_owned(),
     })
+}
+
+/// Finds a [`NetworkPolicyDenied`] in the source chain of `err`.
+///
+/// A redirect the policy refuses fails the request with the denial as the source of a transport
+/// error (see [`redirect_policy`]), so callers that only see the transport error use this to tell
+/// a deterministic policy denial from a transient network failure.
+pub fn denial_in_chain(err: &(dyn std::error::Error + 'static)) -> Option<NetworkPolicyDenied> {
+    let mut current = Some(err);
+    while let Some(err) = current {
+        if let Some(denied) = err.downcast_ref::<NetworkPolicyDenied>() {
+            return Some(denied.clone());
+        }
+        current = err.source();
+    }
+    None
 }
 
 /// Maximum number of redirects followed by [`redirect_policy`]. Matches reqwest's default limit.
@@ -156,7 +185,8 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
 /// The loopback check only looks at the request URL, not the route. With `HTTP_PROXY` set, reqwest
 /// would send an allowed `http://localhost:11434` request to the proxy, which leaks the
 /// destination off-machine and can't reach this machine's loopback anyway. Local-only mode only
-/// permits loopback, so there is never a reason to proxy. The mode is fixed at startup by
+/// permits loopback and the private hosts the user listed (see [`set_allowed_private_hosts`]), all
+/// of which are on-link, so there is never a reason to proxy. The mode is fixed at startup by
 /// `ChannelState::set`, so reading it when the client is built is enough.
 ///
 /// This replaces any redirect or proxy setting already on `builder`.
@@ -200,8 +230,7 @@ fn is_loopback_url(url: &Url) -> bool {
     match url.host() {
         Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
         Some(url::Host::Ipv6(ip)) => {
-            ip.is_loopback()
-                || ip.to_ipv4().is_some_and(|v4| v4.is_loopback())
+            ip.is_loopback() || ip.to_ipv4().is_some_and(|v4| v4.is_loopback())
         }
         Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
         None => false,
@@ -315,5 +344,4 @@ mod tests {
         let url = Url::parse("http://[fe80::1]:8080").unwrap();
         assert!(!is_loopback_url(&url));
     }
-
 }

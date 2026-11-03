@@ -1,10 +1,9 @@
 use futures::channel::oneshot;
 use warp_core::SessionId;
-use warp_util::standardized_path::StandardizedPath;
-use warpui_core::App;
-
 #[cfg(not(target_family = "wasm"))]
 use warp_core::channel::Channel;
+use warp_util::standardized_path::StandardizedPath;
+use warpui_core::App;
 
 #[cfg(not(target_family = "wasm"))]
 use super::version_is_compatible_for_channel;
