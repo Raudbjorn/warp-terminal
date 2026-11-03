@@ -13007,6 +13007,7 @@ dependencies = [
 name = "ssh_test_server"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "tempfile",
  "thiserror 2.0.17",
 ]
