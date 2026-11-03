@@ -614,3 +614,41 @@ fn saved_jump_aliases_preserve_inherited_and_explicit_default_ports() {
     assert!(proxy_command_value(&profile.to_saved_ssh_command()).contains("[%%h]:%%p"));
     assert!(!proxy_command_value(&profile.to_saved_ssh_command()).contains("-W gateway:22"));
 }
+
+#[test]
+fn a_renamed_quick_connect_alias_still_connects_to_the_requested_host() {
+    let destination = QuickConnectDestination::parse("alice@db.example.com:2222").unwrap();
+    let existing = vec![SshHostProfile::new(
+        "db.example.com".into(),
+        "db.example.com".into(),
+    )];
+
+    let profile = profile_for_destination(&destination, &existing);
+
+    // The alias is taken, so it is renamed; the destination must stay explicit so the saved
+    // stanza carries `HostName db.example.com` and connects there instead of to the alias.
+    assert_eq!(profile.name, "db.example.com-2");
+    assert_eq!(profile.host, "db.example.com");
+    assert!(profile.host_is_explicit);
+    assert_eq!(profile.user.as_deref(), Some("alice"));
+    assert_eq!(profile.port, 2222);
+    assert!(profile.port_is_explicit);
+    // OpenSSH resolves the alias through the `HostName` directive the profile writes.
+    assert!(
+        profile
+            .to_saved_ssh_command()
+            .contains("-- db.example.com-2")
+    );
+}
+
+#[test]
+fn an_unrenamed_quick_connect_alias_keeps_the_destination_implicit() {
+    let destination = QuickConnectDestination::parse("alice@db.example.com:2222").unwrap();
+    let existing = vec![SshHostProfile::new("other".into(), "other".into())];
+
+    let profile = profile_for_destination(&destination, &existing);
+
+    assert_eq!(profile.name, "db.example.com");
+    assert_eq!(profile.host, "db.example.com");
+    assert!(!profile.host_is_explicit);
+}

@@ -330,6 +330,19 @@ impl TerminalView {
                 me.ssh_profile.config_capture_task = None;
                 match result {
                     Ok(config) => {
+                        let input_dirty = me.input.as_ref(ctx).has_pending_command()
+                            || !me.input.as_ref(ctx).buffer_text(ctx).trim().is_empty()
+                            || !me.pending_command_queue.is_empty();
+                        if input_dirty {
+                            me.ssh_profile.connection = None;
+                            me.ssh_profile.warpify_disabled_command = None;
+                            me.show_error_toast(
+                                "Couldn't connect the SSH profile: clear the command line and wait for pending commands to finish."
+                                    .to_string(),
+                                ctx,
+                            );
+                            return;
+                        }
                         if let Some(connection) = me.ssh_profile.connection.as_mut() {
                             connection.captured_config = Some(config);
                         }
@@ -491,6 +504,21 @@ impl TerminalView {
         let Some(control_path) = self.ssh_upload_control_path(ctx) else {
             return false;
         };
+        let active_id = self
+            .active_block_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.session_id());
+        let watched_id = self
+            .ssh_profile
+            .connection
+            .as_ref()
+            .and_then(|connection| connection.remote_session_id);
+        if active_id
+            .zip(watched_id)
+            .is_some_and(|(active, watched)| active != watched)
+        {
+            return false;
+        }
         // Text copied from apps like spreadsheets often carries an image rendition too.
         if !clipboard_content.plain_text.is_empty() || clipboard_content.paths.is_some() {
             return false;
@@ -524,6 +552,22 @@ impl TerminalView {
                     log::info!("Not pasting the uploaded image path: the SSH connection ended");
                 }
                 Ok(()) => {
+                    let active_id = me
+                        .active_block_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.session_id());
+                    let watched_id = me
+                        .ssh_profile
+                        .connection
+                        .as_ref()
+                        .and_then(|connection| connection.remote_session_id);
+                    if active_id
+                        .zip(watched_id)
+                        .is_some_and(|(active, watched)| active != watched)
+                    {
+                        log::info!("Not pasting the uploaded image path: the SSH session changed");
+                        return;
+                    }
                     let text = if me.model.lock().needs_bracketed_paste() {
                         format!("{BRACKETED_PASTE_PREFIX}{path_to_paste}{BRACKETED_PASTE_SUFFIX}")
                     } else {
@@ -781,22 +825,33 @@ impl TerminalView {
         let profile_id = connection.profile_id;
         let target = connection.target.clone();
         let directory = connection.startup_directory.clone();
-        let profile = profile_id.and_then(|profile_id| {
-            SshSettings::as_ref(ctx)
-                .saved_ssh_host_profiles
-                .value()
-                .iter()
-                .find(|profile| profile.id == profile_id)
-                .cloned()
-        });
-        if profile_id.is_some() && profile.is_none() {
-            self.cancel_ssh_auto_reconnect(ctx);
-            self.show_error_toast(
-                format!("Can't reconnect: the SSH host \"{target}\" was removed."),
-                ctx,
-            );
-            return;
-        }
+        let profile = match profile_id {
+            Some(profile_id) => match crate::ssh_manager::config_file::load_profiles() {
+                Ok(profiles) => {
+                    let profile = profiles
+                        .into_iter()
+                        .find(|profile| profile.id == profile_id);
+                    if profile.is_none() {
+                        self.cancel_ssh_auto_reconnect(ctx);
+                        self.show_error_toast(
+                            format!("Can't reconnect: the SSH host \"{target}\" was removed."),
+                            ctx,
+                        );
+                        return;
+                    }
+                    profile
+                }
+                Err(err) => {
+                    self.cancel_ssh_auto_reconnect(ctx);
+                    self.show_error_toast(
+                        format!("Can't reconnect: couldn't read ~/.ssh/config: {err:#}"),
+                        ctx,
+                    );
+                    return;
+                }
+            },
+            None => None,
+        };
         self.remove_ssh_reconnect_banner();
         match profile {
             Some(profile) => self.connect_ssh_profile_in(&profile, directory, ctx),

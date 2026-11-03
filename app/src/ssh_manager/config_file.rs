@@ -499,7 +499,7 @@ fn load_profiles_at(path: &Path) -> Result<Vec<SshHostProfile>> {
 
     let config = parse(&contents);
     let mut alias_ordinals: HashMap<&str, usize> = HashMap::new();
-    config
+    let mut profiles = config
         .segments
         .iter()
         .filter_map(|segment| match segment {
@@ -511,7 +511,48 @@ fn load_profiles_at(path: &Path) -> Result<Vec<SshHostProfile>> {
             }
             _ => None,
         })
-        .collect()
+        .collect::<Result<Vec<SshHostProfile>>>()?;
+
+    refresh_source_linked_jump_hosts(&mut profiles);
+    Ok(profiles)
+}
+
+/// Source-linked jump hops inherit the source profile's current connection details, so editing
+/// a gateway is reflected by every route that jumps through it. The hop keeps the source's alias
+/// as its host, because that is what the `ProxyJump` directive resolves.
+fn refresh_source_linked_jump_hosts(profiles: &mut [SshHostProfile]) {
+    let sources: HashMap<Uuid, SshJumpHost> = profiles
+        .iter()
+        .map(|profile| {
+            (
+                profile.id,
+                SshJumpHost {
+                    source_profile_id: Some(profile.id),
+                    host: profile.name.clone(),
+                    user: profile.user.clone(),
+                    port: profile.port,
+                    port_is_explicit: profile.port_is_explicit,
+                    identity_file: profile.identity_file.clone(),
+                },
+            )
+        })
+        .collect();
+
+    for profile in profiles.iter_mut() {
+        for hop in &mut profile.jump_hosts {
+            let Some(source_id) = hop.source_profile_id else {
+                continue;
+            };
+            let Some(source) = sources.get(&source_id) else {
+                continue;
+            };
+            hop.host = source.host.clone();
+            hop.user = source.user.clone();
+            hop.port = source.port;
+            hop.port_is_explicit = source.port_is_explicit;
+            hop.identity_file = source.identity_file.clone();
+        }
+    }
 }
 
 /// Ids of the stanzas Warp wrote (those carrying `# warp-id:`); hand-written hosts are absent.

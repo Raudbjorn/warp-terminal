@@ -526,9 +526,24 @@ impl Workspace {
         profile_id: Uuid,
         ctx: &mut ViewContext<Self>,
     ) -> Option<ViewHandle<TerminalView>> {
-        let Some(profile) = self.saved_ssh_profile(profile_id, ctx) else {
-            log::warn!(
-                "Failed to start SSH profile session: no saved profile for profile_id={profile_id}"
+        let profile = match crate::ssh_manager::config_file::load_profiles() {
+            Ok(profiles) => profiles
+                .into_iter()
+                .find(|profile| profile.id == profile_id),
+            Err(err) => {
+                self.show_ssh_toast(
+                    DismissibleToast::error(format!("Couldn't read ~/.ssh/config: {err:#}")),
+                    ctx,
+                );
+                return None;
+            }
+        };
+        let Some(profile) = profile else {
+            self.show_ssh_toast(
+                DismissibleToast::error(
+                    "Can't connect: the SSH host was removed from ~/.ssh/config.".to_string(),
+                ),
+                ctx,
             );
             return None;
         };

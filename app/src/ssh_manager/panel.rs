@@ -34,7 +34,8 @@ use crate::ssh_manager::host_editor::{
 use crate::ssh_manager::open_connections::SshOpenConnections;
 use crate::ssh_manager::profile::{
     QuickConnectDestination, SshHostProfile, SshJumpHost, SshProfileIdReassignment,
-    normalize_ssh_host_profiles, quick_connect_args, ssh_profile_password_key,
+    normalize_ssh_host_profiles, profile_for_destination, quick_connect_args,
+    ssh_profile_password_key,
 };
 use crate::ssh_manager::ui::{ansi_color, host_color, host_subtitle, render_chip, render_dot};
 use crate::ssh_manager::usage::{SshHostUsage, format_relative_time};
@@ -330,13 +331,7 @@ impl SshProfilesPanelView {
         ctx: &mut ViewContext<Self>,
     ) -> Result<Uuid, String> {
         let profiles = Self::profiles(ctx);
-        let mut profile = destination.to_profile();
-        let taken = |name: &str| profiles.iter().any(|other| other.name == name);
-        let mut suffix = 2;
-        while taken(&profile.name) {
-            profile.name = format!("{}-{suffix}", destination.host);
-            suffix += 1;
-        }
+        let profile = profile_for_destination(destination, &profiles);
         if let Err(err) = config_file::upsert_profile(&profile) {
             log::error!("Failed to save SSH profile to ~/.ssh/config: {err:#}");
             return Err(format!("Could not write ~/.ssh/config: {err:#}"));
@@ -450,9 +445,11 @@ impl SshProfilesPanelView {
                 mode,
                 profile,
                 password,
+                original,
             } => match self.save_profile(
                 mode.clone(),
                 profile.as_ref().clone(),
+                original.as_deref().cloned(),
                 password.clone(),
                 ctx,
             ) {
@@ -521,6 +518,7 @@ impl SshProfilesPanelView {
         &mut self,
         mode: SshProfileModalMode,
         profile: SshHostProfile,
+        original: Option<SshHostProfile>,
         password: PasswordIntent,
         ctx: &mut ViewContext<Self>,
     ) -> Result<(), String> {
@@ -530,6 +528,19 @@ impl SshProfilesPanelView {
             profile.id = id;
             let profiles = Self::profiles(ctx);
             previous_profile = profiles.iter().find(|old| old.id == id).cloned();
+            if let Some(original) = original.as_ref() {
+                if let Ok(current_profiles) = config_file::load_profiles()
+                    && let Some(current) = current_profiles.iter().find(|current| current.id == id)
+                {
+                    let conflicts = conflicting_profile_fields(original, &profile, current);
+                    if !conflicts.is_empty() {
+                        return Err(format!(
+                            "This profile changed externally; review these fields before saving: {}.",
+                            conflicts.join(", ")
+                        ));
+                    }
+                }
+            }
             if rename_breaks_jump_route(&profile, &profiles) {
                 return Err(
                     "Remove this host from saved jump-host routes before renaming it.".to_string(),
@@ -1679,10 +1690,64 @@ fn rename_breaks_jump_route(profile: &SshHostProfile, profiles: &[SshHostProfile
         .find(|old| old.id == profile.id)
         .is_some_and(|old| old.name != profile.name && has_jump_references(old, profiles))
 }
+fn conflicting_profile_fields(
+    original: &SshHostProfile,
+    edited: &SshHostProfile,
+    current: &SshHostProfile,
+) -> Vec<&'static str> {
+    let mut conflicts = Vec::new();
+    if current.name != original.name && edited.name == original.name {
+        conflicts.push("name");
+    }
+    if current.user != original.user && edited.user == original.user {
+        conflicts.push("user");
+    }
+    if (current.port, current.port_is_explicit) != (original.port, original.port_is_explicit)
+        && (edited.port, edited.port_is_explicit) == (original.port, original.port_is_explicit)
+    {
+        conflicts.push("port");
+    }
+    if current.identity_file != original.identity_file
+        && edited.identity_file == original.identity_file
+    {
+        conflicts.push("identity file");
+    }
+    if original.host_is_explicit
+        && current.host_is_explicit
+        && current.host != original.host
+        && edited.host == original.host
+    {
+        conflicts.push("host");
+    }
+    conflicts
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_user_change_conflicts_when_user_was_not_edited() {
+        let mut original = SshHostProfile::new("work".into(), "work.example".into());
+        original.user = Some("alice".into());
+        let edited = original.clone();
+        let mut current = original.clone();
+        current.user = Some("bob".into());
+        assert_eq!(
+            conflicting_profile_fields(&original, &edited, &current),
+            vec!["user"]
+        );
+    }
+
+    #[test]
+    fn user_edit_wins_over_external_user_change() {
+        let mut original = SshHostProfile::new("work".into(), "work.example".into());
+        original.user = Some("alice".into());
+        let mut edited = original.clone();
+        edited.user = Some("carol".into());
+        let mut current = original.clone();
+        current.user = Some("bob".into());
+        assert!(conflicting_profile_fields(&original, &edited, &current).is_empty());
+    }
 
     #[test]
     fn renaming_a_linked_jump_host_is_rejected_until_routes_are_removed() {

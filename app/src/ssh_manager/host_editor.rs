@@ -34,7 +34,7 @@ const JUMP_HOST_DROPDOWN_WIDTH: f32 = 460.;
 const FIELD_RADIUS: f32 = 6.;
 const FIELD_LABEL_SPACING: f32 = 5.;
 const EDITOR_COUNT: usize = 6;
-const LABEL_FORBIDDEN_CHARACTERS: [char; 6] = ['#', '*', '?', '!', '"', '\''];
+const LABEL_FORBIDDEN_CHARACTERS: [char; 7] = ['#', '*', '?', '!', '"', '\'', '@'];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SshProfileModalMode {
@@ -64,6 +64,7 @@ pub enum SshProfileModalEvent {
         mode: SshProfileModalMode,
         profile: Box<SshHostProfile>,
         password: PasswordIntent,
+        original: Option<Box<SshHostProfile>>,
     },
 }
 
@@ -79,6 +80,7 @@ pub enum SshProfileModalAction {
 
 pub struct SshProfileModalView {
     mode: SshProfileModalMode,
+    original_profile: Option<SshHostProfile>,
     draft_id: Uuid,
     name_editor: ViewHandle<EditorView>,
     host_editor: ViewHandle<EditorView>,
@@ -144,6 +146,7 @@ impl SshProfileModalView {
 
         Self {
             mode: SshProfileModalMode::Add,
+            original_profile: None,
             draft_id: Uuid::new_v4(),
             name_editor,
             host_editor,
@@ -190,6 +193,7 @@ impl SshProfileModalView {
 
     pub fn open_add(&mut self, profiles: Vec<SshHostProfile>, ctx: &mut ViewContext<Self>) {
         self.mode = SshProfileModalMode::Add;
+        self.original_profile = None;
         self.draft_id = Uuid::new_v4();
         self.available_profiles = profiles;
         self.selected_jump_hosts.clear();
@@ -214,6 +218,7 @@ impl SshProfileModalView {
         ctx: &mut ViewContext<Self>,
     ) {
         self.mode = SshProfileModalMode::Edit(profile.id);
+        self.original_profile = Some(profile.clone());
         self.draft_id = profile.id;
         self.available_profiles = profiles
             .into_iter()
@@ -426,6 +431,7 @@ impl SshProfileModalView {
             mode: self.mode.clone(),
             profile: Box::new(profile),
             password: self.password_intent(),
+            original: self.original_profile.clone().map(Box::new),
         });
     }
 
@@ -821,7 +827,7 @@ fn ssh_alias_format_error(label: &str) -> Option<&'static str> {
         .chars()
         .any(|character| LABEL_FORBIDDEN_CHARACTERS.contains(&character))
     {
-        return Some("Label cannot contain # * ? ! \" or '");
+        return Some("Label cannot contain # * ? ! \" ' or @");
     }
     None
 }

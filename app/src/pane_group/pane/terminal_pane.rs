@@ -418,6 +418,9 @@ impl PaneContent for TerminalPane {
             .map(|(_, view)| view.id())
             .collect::<Vec<_>>();
         for (manager, view) in contents {
+            if !matches!(detach_type, DetachType::Moved) {
+                view.update(ctx, |view, ctx| view.set_ssh_manager_attached(false, ctx));
+            }
             // Notify the view that it's being detached so it can react appropriately
             // (e.g. the shared-session viewer tears down its network only when the detach
             // is not reversible).
@@ -445,8 +448,6 @@ impl PaneContent for TerminalPane {
             CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions, ctx| {
                 sessions.remove_session(terminal_view_id, ctx);
             });
-            self.terminal_view(ctx)
-                .update(ctx, |view, ctx| view.set_ssh_manager_attached(false, ctx));
         }
 
         ctx.unsubscribe_to_model(&pane_stack);
