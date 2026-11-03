@@ -6,7 +6,7 @@ use ai::agent::action::RunAgentsExecutionMode;
 use ai::agent::orchestration_config::OrchestrationConfigStatus;
 use pathfinder_geometry::vector::vec2f;
 use warp_cli::agent::Harness;
-use warp_core::send_telemetry_from_ctx;
+
 use warp_graphql::queries::get_runners::RunnerSortBy;
 use warpui::elements::{
     ChildAnchor, ChildView, ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Empty,
@@ -31,10 +31,6 @@ use crate::ai::blocklist::inline_action::host_picker::{HostPicker, HostPickerEve
 use crate::ai::blocklist::inline_action::orchestration_controls::{
     self as oc, AuthSecretSelection, OrchestrationConfigState, OrchestrationControlAction,
     OrchestrationEditState, OrchestrationPickerHandles,
-};
-use crate::ai::blocklist::telemetry::{
-    AgentProposedConfigEvent, BlocklistOrchestrationTelemetryEvent, OrchestrationApprovalStatus,
-    OrchestrationExecutionModeKind, OrchestrationHarnessKind, PlanConfigApprovalToggledEvent,
 };
 use crate::ai::connected_self_hosted_workers::{
     ConnectedSelfHostedWorkersEvent, ConnectedSelfHostedWorkersModel,
@@ -175,10 +171,6 @@ impl OrchestrationConfigBlockView {
         ctx: &mut ViewContext<Self>,
     ) -> Self {
         let history = BlocklistAIHistoryModel::as_ref(ctx);
-        let snapshot_loaded = history
-            .conversation(&conversation_id)
-            .and_then(|conv| conv.orchestration_config_for_plan(&plan_id))
-            .is_some();
         let (config_state, is_approved) = history
             .conversation(&conversation_id)
             .and_then(|conv| {
@@ -365,12 +357,6 @@ impl OrchestrationConfigBlockView {
             // Skip auto-open here: construction is also the restore code
             // path. The first user interaction (or `arm_for_fresh_dispatch`
             // from a live config update) arms the auto-open instead.
-        }
-        // Capture the agent's config proposal once per view instance.
-        // Gated on `snapshot_loaded` so we don't fire when the view is
-        // constructed with placeholder defaults (no real snapshot yet).
-        if snapshot_loaded {
-            view.emit_agent_proposed_config(ctx);
         }
         view
     }
@@ -1018,12 +1004,6 @@ impl TypedActionView for OrchestrationConfigBlockView {
                 if self.is_approved && !self.pickers_initialized {
                     self.ensure_pickers(ctx);
                 }
-                let status = if self.is_approved {
-                    OrchestrationApprovalStatus::Approved
-                } else {
-                    OrchestrationApprovalStatus::Disapproved
-                };
-                self.emit_plan_config_approval_toggled(status, ctx);
                 self.apply_field_change(ctx);
                 // First moment the picker exists — arm and evaluate.
                 if self.is_approved {
@@ -1149,99 +1129,5 @@ impl TypedActionView for OrchestrationConfigBlockView {
                 ctx.notify();
             }
         }
-    }
-}
-
-impl OrchestrationConfigBlockView {
-    fn emit_plan_config_approval_toggled(
-        &self,
-        status: OrchestrationApprovalStatus,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        send_telemetry_from_ctx!(
-            BlocklistOrchestrationTelemetryEvent::PlanConfigApprovalToggled(
-                PlanConfigApprovalToggledEvent {
-                    conversation_id: self.conversation_id,
-                    plan_id: (!self.plan_id.is_empty()).then(|| self.plan_id.clone()),
-                    status,
-                    execution_mode: OrchestrationExecutionModeKind::from_run_agents(
-                        &self
-                            .orchestration_edit_state
-                            .orchestration_config_state
-                            .execution_mode,
-                    ),
-                    harness: OrchestrationHarnessKind::from_str(
-                        &self
-                            .orchestration_edit_state
-                            .orchestration_config_state
-                            .harness_type
-                    ),
-                    has_model: !self
-                        .orchestration_edit_state
-                        .orchestration_config_state
-                        .model_id
-                        .trim()
-                        .is_empty(),
-                    has_environment: env_presence(
-                        &self
-                            .orchestration_edit_state
-                            .orchestration_config_state
-                            .execution_mode
-                    ),
-                    has_worker_host: host_presence(
-                        &self
-                            .orchestration_edit_state
-                            .orchestration_config_state
-                            .execution_mode
-                    ),
-                    has_auth_secret: self
-                        .orchestration_edit_state
-                        .orchestration_config_state
-                        .auth_secret_name()
-                        .is_some(),
-                }
-            ),
-            ctx
-        );
-    }
-
-    fn emit_agent_proposed_config(&self, ctx: &mut ViewContext<Self>) {
-        send_telemetry_from_ctx!(
-            BlocklistOrchestrationTelemetryEvent::AgentProposedConfig(AgentProposedConfigEvent {
-                conversation_id: self.conversation_id,
-                plan_id: (!self.plan_id.is_empty()).then(|| self.plan_id.clone()),
-                harness: OrchestrationHarnessKind::from_str(
-                    &self
-                        .orchestration_edit_state
-                        .orchestration_config_state
-                        .harness_type
-                ),
-                execution_mode: OrchestrationExecutionModeKind::from_run_agents(
-                    &self
-                        .orchestration_edit_state
-                        .orchestration_config_state
-                        .execution_mode,
-                ),
-                has_model: !self
-                    .orchestration_edit_state
-                    .orchestration_config_state
-                    .model_id
-                    .trim()
-                    .is_empty(),
-                has_environment: env_presence(
-                    &self
-                        .orchestration_edit_state
-                        .orchestration_config_state
-                        .execution_mode
-                ),
-                has_worker_host: host_presence(
-                    &self
-                        .orchestration_edit_state
-                        .orchestration_config_state
-                        .execution_mode
-                ),
-            }),
-            ctx
-        );
     }
 }

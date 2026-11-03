@@ -14,17 +14,15 @@
 use std::rc::Rc;
 
 use warp::tui_export::{
-    AIActionStatus, AIAgentAction, AIAgentActionId, AIAgentActionType, AIConversationId,
-    AuthSecretSelection, BlocklistAIActionEvent, BlocklistAIActionModel,
-    BlocklistOrchestrationTelemetryEvent, Harness, HarnessAvailabilityEvent,
+    AIActionStatus, AIAgentAction, AIAgentActionId, AIAgentActionType, AuthSecretSelection,
+    BlocklistAIActionEvent, BlocklistAIActionModel, Harness, HarnessAvailabilityEvent,
     HarnessAvailabilityModel, LLMPreferences, LLMPreferencesEvent, ORCHESTRATION_WARP_WORKER_HOST,
     OptionSnapshot, OrchestrationConfig, OrchestrationConfigState, OrchestrationConfigStatus,
-    OrchestrationEditState, OrchestrationEnteredEvent, OrchestrationEntrySource, ResolvedTeamScope,
-    RunAgentsCardDecision, RunAgentsExecutionMode, RunAgentsExecutor, RunAgentsExecutorEvent,
-    RunAgentsRequest, RunAgentsSpawningSnapshot, TeamContextResolver, UserWorkspaces,
-    UserWorkspacesEvent, persist_host_selection, resolve_auth_secret_selection_for_harness,
-    resolve_default_environment_id, resolve_default_host_slug, run_agents_card_decision_event,
-    should_show_auth_secret_picker,
+    OrchestrationEditState, ResolvedTeamScope, RunAgentsExecutionMode, RunAgentsExecutor,
+    RunAgentsExecutorEvent, RunAgentsRequest, RunAgentsSpawningSnapshot, TeamContextResolver,
+    UserWorkspaces, UserWorkspacesEvent, persist_host_selection,
+    resolve_auth_secret_selection_for_harness, resolve_default_environment_id,
+    resolve_default_host_slug, should_show_auth_secret_picker,
 };
 use warpui::SingletonEntity;
 use warpui_core::elements::tui::TuiElement;
@@ -134,7 +132,6 @@ pub(crate) enum TuiOrchestrationBlockAction {
 /// The TUI orchestration confirmation block. See the module docs.
 pub(crate) struct TuiOrchestrationBlock {
     // Request and action identity.
-    conversation_id: AIConversationId,
     action_id: AIAgentActionId,
     /// The latest streamed tool call, kept in sync by
     /// [`Self::update_request`]; terminal/streaming states render from it
@@ -163,8 +160,6 @@ pub(crate) struct TuiOrchestrationBlock {
     spawning: Option<RunAgentsSpawningSnapshot>,
     /// Set once the request is accepted or rejected.
     decided: bool,
-    entered_event_emitted: bool,
-    decision_event_emitted: bool,
     /// Identity palette pinned at construction so identities stay stable
     /// across re-renders, edits, and theme switches.
     identity_palette: Vec<AgentIdentity>,
@@ -178,7 +173,6 @@ impl TuiOrchestrationBlock {
     /// subscriptions.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
-        conversation_id: AIConversationId,
         action: AIAgentAction,
         request: &RunAgentsRequest,
         active_config: Option<(OrchestrationConfig, OrchestrationConfigStatus)>,
@@ -231,7 +225,6 @@ impl TuiOrchestrationBlock {
                 // "Configuring agents…" placeholder to the interactive
                 // acceptance card, so resolve display defaults now.
                 me.resolve_interactive_defaults(ctx);
-                me.emit_orchestration_entered_once(ctx);
                 ctx.emit(TuiOrchestrationBlockEvent::BlockingStateChanged);
                 ctx.notify();
             }
@@ -300,7 +293,6 @@ impl TuiOrchestrationBlock {
         let controller = Rc::new(ModelOrchestrationBlockController { action_model });
         let identity_palette = TuiUiBuilder::from_app(ctx).agent_identity_palette();
         let mut view = Self::from_parts(
-            conversation_id,
             action,
             request,
             active_config,
@@ -317,7 +309,6 @@ impl TuiOrchestrationBlock {
     /// Constructs the block from injected external behavior.
     #[allow(clippy::too_many_arguments)]
     fn from_parts(
-        conversation_id: AIConversationId,
         action: AIAgentAction,
         request: &RunAgentsRequest,
         active_config: Option<(OrchestrationConfig, OrchestrationConfigStatus)>,
@@ -336,7 +327,6 @@ impl TuiOrchestrationBlock {
         );
         let team_context_resolver = UserWorkspaces::team_context_resolver(ctx.handle());
         Self {
-            conversation_id,
             action_id: action.id.clone(),
             action,
             request_fields: request.clone(),
@@ -351,8 +341,6 @@ impl TuiOrchestrationBlock {
             controller,
             spawning: None,
             decided: false,
-            entered_event_emitted: false,
-            decision_event_emitted: false,
             identity_palette,
             team_context_resolver,
         }
@@ -469,42 +457,6 @@ impl TuiOrchestrationBlock {
         self.refresh_active_page(ctx);
         ctx.emit(TuiOrchestrationBlockEvent::LayoutInvalidated);
         ctx.notify();
-    }
-
-    fn emit_orchestration_entered_once(&mut self, ctx: &mut ViewContext<Self>) {
-        if self.entered_event_emitted || self.is_restored {
-            return;
-        }
-        self.entered_event_emitted = true;
-        warp::send_telemetry_from_ctx!(
-            BlocklistOrchestrationTelemetryEvent::OrchestrationEntered(OrchestrationEnteredEvent {
-                conversation_id: self.conversation_id,
-                plan_id: (!self.request_fields.plan_id.is_empty())
-                    .then(|| self.request_fields.plan_id.clone()),
-                entry_source: OrchestrationEntrySource::RunAgentsCardShown,
-            }),
-            ctx
-        );
-    }
-
-    fn emit_decision(&mut self, decision: RunAgentsCardDecision, ctx: &mut ViewContext<Self>) {
-        if self.decision_event_emitted || self.is_restored {
-            return;
-        }
-        self.decision_event_emitted = true;
-        let event = run_agents_card_decision_event(
-            self.conversation_id,
-            (!self.request_fields.plan_id.is_empty()).then(|| self.request_fields.plan_id.clone()),
-            decision,
-            self.request_fields.agent_run_configs.len(),
-            &self.orchestration_edit_state.orchestration_config_state,
-            &self.request_fields,
-            self.active_config.as_ref(),
-        );
-        warp::send_telemetry_from_ctx!(
-            BlocklistOrchestrationTelemetryEvent::RunAgentsCardDecision(event),
-            ctx
-        );
     }
 
     /// Whether this card still awaits a user decision.
@@ -751,7 +703,6 @@ impl TuiOrchestrationBlock {
             ctx.notify();
             return;
         }
-        self.emit_decision(RunAgentsCardDecision::Accept, ctx);
         self.controller.accept(&action_id, request, ctx);
         self.decided = true;
         self.accept_error = None;
@@ -766,7 +717,6 @@ impl TuiOrchestrationBlock {
         if self.decided || self.spawning.is_some() || !self.is_awaiting_confirmation(ctx) {
             return;
         }
-        self.emit_decision(RunAgentsCardDecision::Reject, ctx);
         self.decided = true;
         self.mode = CardMode::Acceptance;
         ctx.emit(TuiOrchestrationBlockEvent::RejectRequested);

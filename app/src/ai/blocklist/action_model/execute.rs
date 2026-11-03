@@ -53,7 +53,7 @@ use read_skill::ReadSkillExecutor;
 use request_computer_use::RequestComputerUseExecutor;
 pub use request_file_edits::{
     EditAcceptAndContinueClickedEvent, EditAcceptClickedEvent, EditResolvedEvent, EditStats,
-    RequestFileEditsExecutor, RequestFileEditsFormatKind, RequestFileEditsTelemetryEvent,
+    RequestFileEditsExecutor, RequestFileEditsFormatKind,
 };
 pub(crate) use request_file_edits::{FileReadResult, MalformedFinalLineProxyEvent, apply_edits};
 pub use run_agents::{RunAgentsExecutor, RunAgentsExecutorEvent, RunAgentsSpawningSnapshot};
@@ -94,7 +94,6 @@ use crate::ai::agent::{
 };
 use crate::ai::ambient_agents::AmbientAgentTaskId;
 use crate::ai::blocklist::action_model::recording_controller::RecordingController;
-use crate::ai::blocklist::telemetry::send_run_agents_completed_telemetry;
 use crate::ai::get_relevant_files::controller::GetRelevantFilesController;
 #[cfg(feature = "local_fs")]
 use crate::ai::{agent::AnyFileContent, paths::host_native_absolute_path};
@@ -914,12 +913,7 @@ impl BlocklistAIActionExecutor {
                 });
             }
             let result = running.action.action.cancelled_result();
-            send_run_agents_completed_telemetry(
-                running.conversation_id,
-                &running.action.action,
-                &result,
-                ctx,
-            );
+
             ctx.emit(BlocklistAIActionExecutorEvent::FinishedAction {
                 result: Arc::new(AIAgentActionResult {
                     id: running.action.id.clone(),

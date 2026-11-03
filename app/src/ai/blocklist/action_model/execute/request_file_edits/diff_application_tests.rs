@@ -6,7 +6,7 @@ use async_io::block_on;
 use serde_json::json;
 use tempfile::NamedTempFile;
 use vec1::vec1;
-use warp_core::telemetry::TelemetryEvent;
+
 use warpui::App;
 
 use super::*;
@@ -48,21 +48,6 @@ fn v4a_mixed_hunk_match_outcomes() {
             FileReadResult::Found("same\nold\n".into())
         })
         .await;
-        let outcomes = result.v4a_outcomes.unwrap();
-        let event = RequestFileEditsTelemetryEvent::V4AMatchFinished(V4AMatchFinishedEvent {
-            identifiers: AIIdentifiers {
-                server_conversation_id: Some("conversation".into()),
-                ..Default::default()
-            },
-            outcomes,
-        });
-        assert_eq!(
-            event.payload(),
-            Some(json!({
-                "server_conversation_id": "conversation", "total_hunks": 5,
-                "noop_hunks": 2, "unmatched_hunks": 1,
-            }))
-        );
         assert_eq!(result.errors.len(), 1);
         for diff in result.diffs {
             assert_eq!(update_deltas(&diff).len(), 1);

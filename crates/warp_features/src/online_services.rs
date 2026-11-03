@@ -4,19 +4,14 @@ pub(super) fn is_online_services_only(feature: FeatureFlag) -> bool {
     matches!(
         feature,
         FeatureFlag::Autoupdate
-            | FeatureFlag::WithSandboxTelemetry
-            | FeatureFlag::RecordAppActiveEvents
             | FeatureFlag::CloudObjects
             | FeatureFlag::FetchChannelVersionsFromWarpServer
             | FeatureFlag::CreatingSharedSessions
             | FeatureFlag::ViewingSharedSessions
             | FeatureFlag::AgentMode
-            | FeatureFlag::AgentModeAnalytics
             | FeatureFlag::AgentModeWorkflows
             | FeatureFlag::PromptSuggestionsViaMAA
             | FeatureFlag::AutoupdateUIRevamp
-            | FeatureFlag::GlobalAIAnalyticsBanner
-            | FeatureFlag::GlobalAIAnalyticsCollection
             | FeatureFlag::AIMemories
             | FeatureFlag::AgentModePrimaryXML
             | FeatureFlag::AgentModePrePlanXML
