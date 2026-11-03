@@ -3044,6 +3044,7 @@ impl BillingAndUsagePageView {
             .unwrap_or_default();
         let workspaces = UserWorkspaces::as_ref(app);
         let team = workspaces.team_for_view_handle(&self.self_handle, app);
+        let team_scope = workspaces.team_context(&self.self_handle, app);
         let billing_metadata = workspaces.current_workspace_billing_metadata();
         let has_admin_permissions =
             team.is_some_and(|team| team.has_admin_permissions(&current_user_email));
@@ -3416,7 +3417,9 @@ impl BillingAndUsagePageView {
                                 "Upgrade to the Build plan",
                                 upgrade_url,
                             )];
-                            if UserWorkspaces::as_ref(app).is_byo_api_key_enabled(app) {
+                            if workspaces.is_byo_api_key_enabled(app)
+                                && workspaces.are_member_byo_keys_allowed(&team_scope)
+                            {
                                 fragments.push(FormattedTextFragment::plain_text(" or "));
                                 fragments.push(FormattedTextFragment::hyperlink_action(
                                     "bring your own key",

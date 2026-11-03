@@ -4,6 +4,8 @@
 //! again with the tool results appended to the transcript, mirroring how the
 //! Warp server loop is driven.
 
+use std::time::Duration;
+
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use reqwest_eventsource::{Event, EventSource};
@@ -12,6 +14,41 @@ use crate::{
     AgentEvent, ChatMessage, EndpointSchema, LocalAgentError, LocalEndpointConfig, ToolDefinition,
     openai, responses,
 };
+
+/// How long the provider may go without sending an event before the stream
+/// counts as stalled.
+///
+/// A reasoning model can pause for a while, so the deadline is generous; it
+/// exists so a provider that stops answering leaves the turn with a
+/// retryable error instead of pending until the user cancels it.
+pub(crate) const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// What the event stream produced next.
+pub(crate) enum NextEvent {
+    /// An event, or the failure the stream reported.
+    Event(Result<Event, reqwest_eventsource::Error>),
+    /// The stream ended.
+    Ended,
+    /// The provider sent nothing for [`SSE_IDLE_TIMEOUT`].
+    Idle,
+}
+
+/// Reads the next event of the stream.
+///
+/// The wait is bounded by [`SSE_IDLE_TIMEOUT`], which is per event and not a
+/// deadline on the whole response, so a long reasoning pause is fine but a
+/// silent provider is not.
+pub(crate) async fn next_event(source: &mut EventSource) -> NextEvent {
+    let next = Box::pin(source.next());
+    let idle = Box::pin(async_io::Timer::after(SSE_IDLE_TIMEOUT));
+    match futures::future::select(next, idle).await {
+        futures::future::Either::Left((event, _idle)) => match event {
+            Some(event) => NextEvent::Event(event),
+            None => NextEvent::Ended,
+        },
+        futures::future::Either::Right((_idle, _next)) => NextEvent::Idle,
+    }
+}
 
 pub(crate) fn run_turn(
     transcript: Vec<ChatMessage>,
@@ -108,10 +145,10 @@ fn run_chat_turn(
         let mut accumulator = openai::StreamAccumulator::default();
         // Dropping this stream drops `source`, aborting the connection — that
         // is the cancellation path.
-        while let Some(event) = source.next().await {
-            match event {
-                Ok(Event::Open) => {}
-                Ok(Event::Message(message)) => {
+        loop {
+            match next_event(&mut source).await {
+                NextEvent::Event(Ok(Event::Open)) => {}
+                NextEvent::Event(Ok(Event::Message(message))) => {
                     if message.data.trim() == "[DONE]" {
                         source.close();
                         for event in accumulator.flush_tool_calls()? {
@@ -127,9 +164,16 @@ fn run_chat_turn(
                 // `StreamEnded` is how the EventSource reports EOF. Some
                 // servers close without sending `[DONE]`; treat that as a
                 // normal end if the model already reported a finish_reason.
-                Err(reqwest_eventsource::Error::StreamEnded) => break,
-                Err(err) => {
+                NextEvent::Event(Err(reqwest_eventsource::Error::StreamEnded)) => break,
+                NextEvent::Event(Err(err)) => {
                     Err(openai::map_event_source_error(err, &config).await)?;
+                }
+                NextEvent::Ended => break,
+                NextEvent::Idle => {
+                    Err(LocalAgentError::Transport(format!(
+                        "the provider sent no event for {:?} before the response completed",
+                        SSE_IDLE_TIMEOUT
+                    )))?;
                 }
             }
         }

@@ -171,7 +171,7 @@ fn gives_nested_objects_and_arrays_what_the_api_requires() {
 }
 
 #[test]
-fn an_unconstrained_property_accepts_any_value_but_keeps_its_description() {
+fn an_unconstrained_property_accepts_any_json_value_but_keeps_its_description() {
     let parameters = parameters_of(json!({
         "type": "object",
         "properties": { "payload": { "description": "anything" } },
@@ -179,8 +179,73 @@ fn an_unconstrained_property_accepts_any_value_but_keeps_its_description() {
 
     assert_eq!(
         parameters["properties"]["payload"],
-        json!({ "description": "anything", "anyOf": any_value_union() })
+        json!({ "description": "anything", "type": ANY_VALUE_TYPES })
     );
+}
+
+#[test]
+fn arrays_without_items_accept_any_json_value() {
+    let parameters = parameters_of(json!({
+        "type": "object",
+        "properties": { "values": { "type": "array" } },
+    }));
+
+    assert_eq!(
+        parameters["properties"]["values"]["items"],
+        json!({ "type": ANY_VALUE_TYPES })
+    );
+}
+
+#[test]
+fn does_not_infer_a_type_that_narrows_an_explicit_union() {
+    let parameters = parameters_of(json!({
+        "type": "object",
+        "properties": {
+            "nullable": {
+                "anyOf": [{ "type": "string" }, { "type": "null" }],
+                "maxLength": 100,
+            },
+            "exclusive": {
+                "oneOf": [{ "type": "number" }, { "type": "null" }],
+                "minimum": 0,
+            },
+        },
+    }));
+
+    assert_eq!(
+        parameters["properties"]["nullable"],
+        json!({
+            "anyOf": [{ "type": "string" }, { "type": "null" }],
+            "maxLength": 100,
+        })
+    );
+    assert_eq!(
+        parameters["properties"]["exclusive"],
+        json!({
+            "oneOf": [{ "type": "number" }, { "type": "null" }],
+            "minimum": 0,
+        })
+    );
+}
+
+#[test]
+fn infers_types_before_resolving_nullable() {
+    let parameters = parameters_of(json!({
+        "type": "object",
+        "properties": {
+            "object": {
+                "properties": { "x": { "type": "string" } },
+                "nullable": true,
+            },
+            "array": { "items": { "type": "string" }, "nullable": true },
+            "text": { "maxLength": 100, "nullable": true },
+        },
+    }));
+
+    let properties = &parameters["properties"];
+    assert_eq!(properties["object"]["type"], json!(["object", "null"]));
+    assert_eq!(properties["array"]["type"], json!(["array", "null"]));
+    assert_eq!(properties["text"]["type"], json!(["string", "null"]));
 }
 
 #[test]

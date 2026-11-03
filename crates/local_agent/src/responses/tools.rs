@@ -6,8 +6,9 @@
 //! without `items`. Normalization only fills in what the schema already
 //! implies (an untyped node with `properties` is an object) or states
 //! equivalently (`nullable: true` becomes a `null` type member); it never
-//! narrows what a schema accepts, except that an array with no `items` is
-//! given the permissive [`any_value_schema`].
+//! narrows what a schema accepts. A node that constrains nothing and an
+//! array with no `items` are both given the permissive
+//! [`any_value_schema`], which accepts every JSON value.
 
 use serde_json::{Map, Value, json};
 
@@ -18,6 +19,16 @@ use crate::ToolDefinition;
 const SELF_DESCRIBING_KEYWORDS: [&str; 8] = [
     "type", "$ref", "anyOf", "oneOf", "allOf", "not", "enum", "const",
 ];
+
+/// Keywords that already spell out the values a node accepts. A sibling
+/// type-specific keyword (`maxLength`, `minimum`, ...) only constrains one
+/// type, so inferring a type from it would narrow the node below what the
+/// schema itself accepts.
+const UNION_KEYWORDS: [&str; 4] = ["anyOf", "oneOf", "allOf", "not"];
+
+/// The JSON instance types a node accepts when the schema puts no
+/// constraint on its value. `number` covers the integers.
+const ANY_VALUE_TYPES: [&str; 6] = ["string", "number", "boolean", "object", "array", "null"];
 
 /// Keywords allowed on a node of a strict-mode schema.
 const STRICT_KEYWORDS: [&str; 8] = [
@@ -94,23 +105,31 @@ fn normalize_parameters(parameters: &Value) -> Value {
 }
 
 fn normalize_node(node: &mut Map<String, Value>) {
-    resolve_nullable(node);
+    // The type is inferred first: `resolve_nullable` can only add a `null`
+    // member to a type that is already there, so a node whose type still has
+    // to be inferred would lose its nullability.
     infer_type(node);
+    resolve_nullable(node);
     if node.get("required").is_some_and(Value::is_null) {
         node.remove("required");
     }
-    if has_type(node, "object") && !node.get("properties").is_some_and(Value::is_object) {
+    let any_value = is_any_value_schema(node);
+    if has_type(node, "object")
+        && !any_value
+        && !node.get("properties").is_some_and(Value::is_object)
+    {
         node.insert("properties".to_string(), json!({}));
     }
-    if has_type(node, "array") && !node.contains_key("items") {
+    if has_type(node, "array") && !any_value && !node.contains_key("items") {
         node.insert("items".to_string(), any_value_schema());
     }
     if !SELF_DESCRIBING_KEYWORDS
         .iter()
         .any(|keyword| node.contains_key(*keyword))
     {
-        // Untyped and unconstrained: "any value", which the API cannot take.
-        node.insert("anyOf".to_string(), any_value_union());
+        // Untyped and unconstrained: "any value", which the API cannot take
+        // without an explicit type.
+        node.insert("type".to_string(), json!(ANY_VALUE_TYPES));
     }
     normalize_children(node);
 }
@@ -171,6 +190,16 @@ fn infer_type(node: &mut Map<String, Value>) {
     if node.contains_key("type") || node.contains_key("$ref") {
         return;
     }
+    // A node that already states which values it accepts must not be
+    // narrowed: a sibling type-specific keyword (`maxLength`, `minimum`, ...)
+    // only constrains one kind, so inferring a type from it would drop the
+    // alternatives the node itself allows.
+    if UNION_KEYWORDS
+        .iter()
+        .any(|keyword| node.contains_key(*keyword))
+    {
+        return;
+    }
     let has_any = |keywords: &[&str]| keywords.iter().any(|keyword| node.contains_key(*keyword));
     let inferred = if has_any(&OBJECT_HINTS) {
         Some("object")
@@ -216,18 +245,26 @@ fn has_type(node: &Map<String, Value>, kind: &str) -> bool {
 
 /// Stand-in for a schema that accepts any value, expressed with the explicit
 /// types the API insists on.
+///
+/// Every JSON instance type is listed, so the stand-in accepts exactly what
+/// the original schema accepted: `null`, numbers, booleans, objects with any
+/// properties, and arrays with any contents.
 fn any_value_schema() -> Value {
-    json!({ "anyOf": any_value_union() })
+    json!({ "type": ANY_VALUE_TYPES })
 }
 
-fn any_value_union() -> Value {
-    json!([
-        { "type": "string" },
-        { "type": "number" },
-        { "type": "boolean" },
-        { "type": "object", "properties": {} },
-        { "type": "array", "items": { "type": "string" } },
-    ])
+/// Whether the node is the permissive any-value stand-in, which is the only
+/// node whose type names several kinds at once.
+fn is_any_value_schema(node: &Map<String, Value>) -> bool {
+    let Some(Value::Array(types)) = node.get("type") else {
+        return false;
+    };
+    types.len() == ANY_VALUE_TYPES.len()
+        && ANY_VALUE_TYPES.iter().all(|expected| {
+            types
+                .iter()
+                .any(|actual| actual.as_str() == Some(*expected))
+        })
 }
 
 /// Whether a (normalized) schema already meets every strict-mode rule, so

@@ -443,6 +443,216 @@ fn undecodable_event_data_is_a_parse_error() {
 }
 
 #[test]
+fn a_parse_error_does_not_echo_the_event_payload() {
+    let secret = "user-secret-content";
+    let data = format!("{{not json, {secret}");
+
+    let Err(LocalAgentError::Parse(message)) =
+        ResponseStream::default().ingest("", &data, &config())
+    else {
+        panic!("expected a parse error");
+    };
+
+    assert!(!message.contains(secret), "{message}");
+    assert!(message.contains("13 bytes"), "{message}");
+}
+
+#[test]
+fn a_call_announced_before_the_token_limit_is_not_executed() {
+    let events = run(vec![
+        json!({ "type": "response.output_item.added", "output_index": 0, "item": {
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "run_shell_command", "arguments": "",
+        }}),
+        // The token limit is reached before any argument arrives.
+        json!({
+            "type": "response.incomplete",
+            "response": {
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "output": [{
+                    "type": "function_call", "id": "fc_1", "call_id": "call_1",
+                    "name": "run_shell_command", "arguments": "",
+                }],
+                "usage": { "input_tokens": 11, "output_tokens": 7 },
+            },
+        }),
+    ])
+    .expect("a length cutoff is not an error");
+
+    assert_eq!(events, vec![usage()]);
+}
+
+#[test]
+fn a_call_that_finished_its_arguments_survives_the_token_limit() {
+    let events = run(vec![
+        json!({ "type": "response.output_item.added", "output_index": 0, "item": {
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "run_shell_command", "arguments": "",
+        }}),
+        json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_1", "output_index": 0, "arguments": "{}",
+        }),
+        json!({
+            "type": "response.incomplete",
+            "response": {
+                "incomplete_details": { "reason": "max_output_tokens" },
+                "output": [],
+                "usage": { "input_tokens": 11, "output_tokens": 7 },
+            },
+        }),
+    ])
+    .expect("a length cutoff is not an error");
+
+    assert_eq!(
+        events,
+        vec![call("call_1", "run_shell_command", json!({})), usage()]
+    );
+}
+
+#[test]
+fn the_finished_item_replaces_incomplete_argument_fragments() {
+    let events = run(vec![
+        json!({ "type": "response.output_item.added", "output_index": 0, "item": {
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "run_shell_command", "arguments": "",
+        }}),
+        // The gateway drops the rest of the arguments and the done event.
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_1", "output_index": 0, "delta": "{\"command\":",
+        }),
+        json!({ "type": "response.output_item.done", "output_index": 0, "item": {
+            "type": "function_call", "id": "fc_1", "call_id": "call_1",
+            "name": "run_shell_command", "arguments": "{\"command\":\"ls\"}",
+        }}),
+        completed(json!([])),
+    ])
+    .expect("stream should succeed");
+
+    assert_eq!(
+        events,
+        vec![
+            call("call_1", "run_shell_command", json!({ "command": "ls" })),
+            usage()
+        ]
+    );
+}
+
+#[test]
+fn the_unstreamed_tail_of_a_message_is_emitted() {
+    let events = run(vec![
+        text_delta("msg_1", "Hello"),
+        completed(json!([{
+            "type": "message", "id": "msg_1", "role": "assistant",
+            "content": [{ "type": "output_text", "text": "Hello world" }],
+        }])),
+    ])
+    .expect("stream should succeed");
+
+    assert_eq!(
+        events,
+        vec![
+            AgentEvent::TextDelta("Hello".to_string()),
+            AgentEvent::TextDelta(" world".to_string()),
+            usage(),
+        ]
+    );
+}
+
+#[test]
+fn the_unstreamed_tail_of_a_message_is_emitted_once() {
+    let message = json!({
+        "type": "message", "id": "msg_1", "role": "assistant",
+        "content": [{ "type": "output_text", "text": "Hello world" }],
+    });
+
+    let events = run(vec![
+        text_delta("msg_1", "Hello"),
+        json!({ "type": "response.output_item.done", "output_index": 0, "item": message }),
+        completed(json!([message])),
+    ])
+    .expect("stream should succeed");
+
+    assert_eq!(
+        events,
+        vec![
+            AgentEvent::TextDelta("Hello".to_string()),
+            AgentEvent::TextDelta(" world".to_string()),
+            usage(),
+        ]
+    );
+}
+
+#[test]
+fn items_without_an_id_are_kept_apart_by_their_output_index() {
+    let events = run(vec![completed(json!([
+        { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "first" }] },
+        { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "second" }] },
+    ]))])
+    .expect("stream should succeed");
+
+    assert_eq!(
+        events,
+        vec![
+            AgentEvent::TextDelta("first".to_string()),
+            AgentEvent::TextDelta("second".to_string()),
+            usage(),
+        ]
+    );
+}
+
+#[test]
+fn reasoning_summaries_without_an_id_are_kept_apart_by_their_output_index() {
+    let events = run(vec![completed(json!([
+        { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "A" }], "encrypted_content": "e1" },
+        { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "B" }], "encrypted_content": "e2" },
+    ]))])
+    .expect("stream should succeed");
+
+    assert_eq!(
+        events,
+        vec![
+            AgentEvent::ReasoningDelta("A".to_string()),
+            AgentEvent::ReplayItem(json!({
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "A" }],
+                "encrypted_content": "e1",
+            })),
+            AgentEvent::ReasoningDelta("B".to_string()),
+            AgentEvent::ReplayItem(json!({
+                "type": "reasoning",
+                "summary": [{ "type": "summary_text", "text": "B" }],
+                "encrypted_content": "e2",
+            })),
+            usage(),
+        ]
+    );
+}
+
+#[test]
+fn a_delta_and_its_item_are_matched_by_the_output_index_when_the_id_is_missing() {
+    let events = run(vec![
+        json!({ "type": "response.output_text.delta", "output_index": 0, "delta": "first" }),
+        json!({ "type": "response.output_text.delta", "output_index": 1, "delta": "second" }),
+        completed(json!([
+            { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "first" }] },
+            { "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": "second" }] },
+        ])),
+    ])
+    .expect("stream should succeed");
+
+    assert_eq!(
+        events,
+        vec![
+            AgentEvent::TextDelta("first".to_string()),
+            AgentEvent::TextDelta("second".to_string()),
+            usage(),
+        ]
+    );
+}
+
+#[test]
 fn max_output_tokens_ends_the_turn_normally() {
     let mut stream = ResponseStream::default();
     let _ = stream.ingest("", &text_delta("msg_1", "cut off").to_string(), &config());
