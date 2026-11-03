@@ -93,7 +93,7 @@ use crate::window_settings::{
 use crate::workspace::WorkspaceAction;
 use crate::workspace::header_toolbar_editor::HeaderToolbarInlineEditor;
 use crate::workspace::tab_settings::{
-    DirectoryTabColor, HideTitleBarSearchBarInVerticalTabs, PreserveActiveTabColor,
+    DirectoryTabColor, HarpMode, HideTitleBarSearchBarInVerticalTabs, PreserveActiveTabColor,
     ShowIndicatorsButton, ShowVerticalTabPanelInRestoredWindows, TabCloseButtonPosition,
     TabSettings, TabSettingsChangedEvent, UseLatestUserPromptAsConversationTitleInTabNames,
     UseVerticalTabs, VerticalTabsFullTabMenu, WorkspaceDecorationVisibility,
@@ -411,6 +411,14 @@ pub fn init_actions_from_parent_view<T: Action + Clone>(
             context,
             flags::VERTICAL_TABS_FULL_TAB_MENU_FLAG,
         ));
+        toggle_binding_pairs.push(ToggleSettingActionPair::new(
+            "harp mode",
+            builder(SettingsAction::AppearancePageToggle(
+                AppearancePageAction::ToggleHarpMode,
+            )),
+            context,
+            flags::HARP_MODE_FLAG,
+        ));
     }
 
     if FeatureFlag::Ligatures.is_enabled() {
@@ -504,6 +512,7 @@ pub enum AppearancePageAction {
     ToggleShowVerticalTabPanelInRestoredWindows,
     ToggleHideTitleBarSearchBarInVerticalTabs,
     ToggleVerticalTabsFullTabMenu,
+    ToggleHarpMode,
     ToggleUseLatestUserPromptAsConversationTitleInTabNames,
     ToggleLigatureRendering,
     SetWindowBackdrop(WindowBackdrop),
@@ -692,6 +701,7 @@ impl TypedActionView for AppearanceSettingsPageView {
                 self.toggle_hide_title_bar_search_bar_in_vertical_tabs(ctx)
             }
             ToggleVerticalTabsFullTabMenu => self.toggle_vertical_tabs_full_tab_menu(ctx),
+            ToggleHarpMode => self.toggle_harp_mode(ctx),
             ToggleUseLatestUserPromptAsConversationTitleInTabNames => {
                 self.toggle_use_latest_user_prompt_as_conversation_title_in_tab_names(ctx)
             }
@@ -1519,6 +1529,7 @@ impl AppearanceSettingsPageView {
                 HideTitleBarSearchBarInVerticalTabsWidget::default(),
             ));
             tab_settings_widgets.push(Box::new(VerticalTabsFullTabMenuWidget::default()));
+            tab_settings_widgets.push(Box::new(HarpModeWidget::default()));
             tab_settings_widgets.push(Box::new(
                 UseLatestUserPromptAsConversationTitleInTabNamesWidget::default(),
             ));
@@ -2432,6 +2443,11 @@ impl AppearanceSettingsPageView {
                     .toggle_and_save_value(ctx)
             );
         });
+    }
+
+    /// Same rule as the "Toggle Harp Mode" command (turning it on turns vertical tabs on).
+    fn toggle_harp_mode(&mut self, ctx: &mut ViewContext<Self>) {
+        crate::workspace::Workspace::toggle_harp_mode_setting(ctx);
     }
 
     fn toggle_use_latest_user_prompt_as_conversation_title_in_tab_names(
@@ -4964,6 +4980,54 @@ impl SettingsWidget for VerticalTabsFullTabMenuWidget {
                 .finish(),
             Some(
                 "Right-clicking a tab or group shows every entry: pin, share, copy, move, close others, save as launch configuration and colors. When off, only rename, move to group, read/unread, active/inactive and close."
+                    .to_string(),
+            ),
+        )
+    }
+}
+
+#[derive(Default)]
+struct HarpModeWidget {
+    switch_state: SwitchStateHandle,
+}
+
+impl SettingsWidget for HarpModeWidget {
+    type View = AppearanceSettingsPageView;
+
+    fn search_terms(&self) -> &str {
+        "harp agent sidebar mode"
+    }
+
+    fn render(
+        &self,
+        view: &Self::View,
+        appearance: &Appearance,
+        app: &AppContext,
+    ) -> Box<dyn Element> {
+        let tab_settings = TabSettings::as_ref(app);
+
+        render_body_item::<AppearancePageAction>(
+            "Harp mode (agent sidebar)".into(),
+            None,
+            LocalOnlyIconState::for_setting(
+                HarpMode::storage_key(),
+                HarpMode::sync_to_cloud(),
+                &mut view.local_only_icon_tooltip_states.borrow_mut(),
+                app,
+            ),
+            ToggleState::Enabled,
+            appearance,
+            appearance
+                .ui_builder()
+                .switch(self.switch_state.clone())
+                .check(*tab_settings.harp_mode)
+                .build()
+                .on_click(move |ctx, _, _| {
+                    ctx.dispatch_typed_action(AppearancePageAction::ToggleHarpMode);
+                })
+                .finish(),
+            Some(
+                "Turns vertical tabs on the left into the agent sidebar: framed rows with each agent's status, groups, pinned tmux sessions and the optional limit rings. When off, vertical tabs keep Warp's own layout and menus."
                     .to_string(),
             ),
         )

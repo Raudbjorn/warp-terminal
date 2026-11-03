@@ -6176,11 +6176,7 @@ fn test_framed_sidebar_cmd_numbers_skip_collapsed_groups() {
 
     App::test((), |mut app| async move {
         initialize_app(&mut app);
-        app.update(|ctx| {
-            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
-                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
-            });
-        });
+        enable_framed_sidebar(&mut app);
 
         let workspace = mock_workspace(&mut app);
         workspace.update(&mut app, |workspace, ctx| {
@@ -6211,10 +6207,247 @@ fn test_framed_sidebar_cmd_numbers_skip_collapsed_groups() {
     });
 }
 
+/// The framed sidebar needs Harp mode on as well as vertical tabs (whose panel defaults to the
+/// left).
 fn enable_framed_sidebar(app: &mut App) {
     app.update(|ctx| {
         TabSettings::handle(ctx).update(ctx, |settings, ctx| {
             report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+            report_if_error!(settings.harp_mode.set_value(true, ctx));
+        });
+    });
+}
+
+/// Plain vertical tabs, Harp mode off: the fork's upstream layout.
+fn enable_vertical_tabs_without_harp_mode(app: &mut App) {
+    app.update(|ctx| {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+            report_if_error!(settings.harp_mode.set_value(false, ctx));
+        });
+    });
+}
+
+/// With Harp mode off, vertical tabs stay the upstream layout: not framed, and the tab menu is
+/// Warp's own ("Pin tab", "New group with tab") without the sidebar's read/active marks.
+#[test]
+fn test_vertical_tabs_without_harp_mode_keep_upstream_layout_and_menu() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+    let _pinned_tabs_guard = FeatureFlag::PinnedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_vertical_tabs_without_harp_mode(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            assert!(crate::tab::uses_vertical_tabs(ctx));
+            assert!(!workspace.uses_framed_sidebar_layout(ctx));
+            let mut items = workspace.tabs[0].menu_items(
+                0,
+                workspace.tabs.len(),
+                &workspace.tab_groups,
+                false,
+                false,
+                true,
+                ctx,
+            );
+            // The workspace adds the sidebar's own "Pin" only in Harp mode; here it would repeat
+            // Warp's "Pin tab".
+            workspace.add_sidebar_pin_menu_item(0, &mut items, ctx);
+            for label in ["Pin tab", "New group with tab"] {
+                assert!(menu_has(&items, label), "upstream menu lacks {label}");
+            }
+            for label in ["Pin", "Mark as unread", "Mark inactive"] {
+                assert!(!menu_has(&items, label), "upstream menu shows {label}");
+            }
+        });
+    });
+}
+
+/// The fork keeps Panes as the vertical-tabs default; the framed sidebar is built for one row per
+/// tab, so it reads Tabs while framed and the setting again once Harp mode is off.
+#[test]
+fn test_framed_sidebar_forces_tabs_granularity() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_vertical_tabs_without_harp_mode(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(
+                    settings
+                        .vertical_tabs_display_granularity
+                        .set_value(VerticalTabsDisplayGranularity::Panes, ctx)
+                );
+            });
+        });
+        app.read(|ctx| {
+            assert_eq!(
+                Workspace::vertical_tabs_display_granularity(ctx),
+                VerticalTabsDisplayGranularity::Panes
+            );
+        });
+
+        enable_framed_sidebar(&mut app);
+        app.read(|ctx| {
+            assert_eq!(
+                Workspace::vertical_tabs_display_granularity(ctx),
+                VerticalTabsDisplayGranularity::Tabs
+            );
+        });
+    });
+}
+
+/// "Toggle Harp Mode" from horizontal tabs turns vertical tabs on and opens the sidebar; toggling
+/// it off leaves vertical tabs on but drops the framed layout.
+#[test]
+fn test_toggle_harp_mode_turns_on_vertical_tabs_and_off_keeps_them() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+                report_if_error!(settings.harp_mode.set_value(false, ctx));
+            });
+        });
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::ToggleHarpMode, ctx);
+        });
+        workspace.read(&app, |workspace, ctx| {
+            assert!(crate::tab::harp_mode_enabled(ctx));
+            assert!(*TabSettings::as_ref(ctx).use_vertical_tabs);
+            assert!(workspace.uses_framed_sidebar_layout(ctx));
+            assert!(workspace.vertical_tabs_panel_open);
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::ToggleHarpMode, ctx);
+        });
+        workspace.read(&app, |workspace, ctx| {
+            assert!(!crate::tab::harp_mode_enabled(ctx));
+            assert!(*TabSettings::as_ref(ctx).use_vertical_tabs);
+            assert!(!workspace.uses_framed_sidebar_layout(ctx));
+        });
+    });
+}
+
+/// The Settings switch shares the command's rule, and a header toolbar without the tabs panel
+/// still ends up framed with the sidebar's tab order (grouped tabs before ungrouped ones).
+#[test]
+fn test_harp_mode_setting_places_tabs_panel_and_orders_tabs() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+                report_if_error!(settings.harp_mode.set_value(false, ctx));
+                report_if_error!(settings.header_toolbar_chip_selection.set_value(
+                    HeaderToolbarChipSelection::Custom {
+                        left: vec![],
+                        right: vec![],
+                    },
+                    ctx,
+                ));
+            });
+        });
+        let workspace = mock_workspace(&mut app);
+        let grouped_tab = workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.handle_action(&WorkspaceAction::NewTabGroupFromTab(1), ctx);
+            assert_eq!(
+                workspace.tabs[0].group_id, None,
+                "ungrouped tab still first"
+            );
+            workspace.tabs[1].pane_group.id()
+        });
+
+        app.update(Workspace::toggle_harp_mode_setting);
+        workspace.read(&app, |workspace, ctx| {
+            assert!(workspace.uses_framed_sidebar_layout(ctx));
+            assert_eq!(workspace.tabs[0].pane_group.id(), grouped_tab);
+        });
+    });
+}
+
+fn vertical_tabs_panel_width(workspace: &Workspace) -> f32 {
+    workspace
+        .vertical_tabs_panel
+        .resizable_state
+        .lock()
+        .expect("panel width lock")
+        .size()
+}
+
+/// The panel takes each mode's default width when Harp mode switches, unless the user dragged
+/// it to a width of their own.
+#[test]
+fn test_harp_mode_switches_default_panel_width_but_keeps_a_dragged_one() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    const DRAGGED_WIDTH: f32 = 300.;
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_vertical_tabs_without_harp_mode(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(
+                vertical_tabs_panel_width(workspace),
+                UPSTREAM_VERTICAL_TABS_PANEL_WIDTH
+            );
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::ToggleHarpMode, ctx);
+        });
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(
+                vertical_tabs_panel_width(workspace),
+                vertical_tabs::sidebar::SIDEBAR_WIDTH
+            );
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace
+                .vertical_tabs_panel
+                .resizable_state
+                .lock()
+                .expect("panel width lock")
+                .set_size(DRAGGED_WIDTH);
+            workspace.handle_action(&WorkspaceAction::ToggleHarpMode, ctx);
+        });
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(vertical_tabs_panel_width(workspace), DRAGGED_WIDTH);
+        });
+    });
+}
+
+/// A window opened with Harp mode already on starts at the framed sidebar's width.
+#[test]
+fn test_new_workspace_in_harp_mode_starts_at_sidebar_width() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(
+                vertical_tabs_panel_width(workspace),
+                vertical_tabs::sidebar::SIDEBAR_WIDTH
+            );
         });
     });
 }
