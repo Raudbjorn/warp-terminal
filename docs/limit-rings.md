@@ -1,13 +1,15 @@
 # Limit rings file format
 
 The sidebar footer shows one double ring per AI provider: the outer ring is the share of the
-weekly limit used, the inner ring the share of the 5 hour window. Harp reads Claude Code's and
-Codex's numbers itself (see the README's "Limit rings"). This file format adds more providers, or
-replaces Harp's own reading of one: some other tool (a menu bar app, a cron job, a script) writes
-the numbers to a local JSON file, and the sidebar re-reads that file about every 30 seconds when
-it changes.
+weekly limit used, the inner ring the share of the 5 hour window. The rings show only in Harp
+mode ([harp-mode.md](harp-mode.md)). The app reads Claude Code's and Codex's numbers itself (see
+"Side effect on `~/.claude/settings.json`" in harp-mode.md). This file format adds more providers,
+or replaces the app's own reading of one: some other tool (a menu bar app, a cron job, a script)
+writes the numbers to a local JSON file, and the sidebar re-reads that file about every 30 seconds
+when it changes.
 
-Point Harp at the file in `~/.harp/settings.toml`:
+Point the app at the file in its `settings.toml` (`~/.config/warp-oss/settings.toml` for the oss
+channel):
 
 ```toml
 [integrations.limit_rings]
@@ -58,5 +60,5 @@ start with `_` and any other values are ignored, so metadata such as `"_version"
 A window with a missing number or reset time is drawn as a dashed track. From 80 % on the ring is
 drawn in ink and its label turns semibold; at 100 % a dot fills the center.
 
-The parser lives in `app/src/workspace/view/vertical_tabs.rs` (`mod limit_rings`), with tests next
-to it.
+The parser lives in `mod limit_rings` of `app/src/workspace/view/vertical_tabs.rs`. Its tests are
+in `app/src/workspace/view/vertical_tabs/limit_rings_tests.rs`.
