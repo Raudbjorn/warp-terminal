@@ -456,7 +456,6 @@ pub fn init(app: &mut AppContext) {
             "Toggle team workflows modal",
             TerminalAction::OpenWorkflowModal,
         )
-        .with_key_binding(cmd_or_ctrl_shift("s"))
         .with_context_predicate(
             id!("Terminal")
                 & !id!("IMEOpen")
@@ -573,10 +572,10 @@ pub fn init(app: &mut AppContext) {
         ),
         EditableBinding::new(
             "terminal:open_share_block_modal",
-            "Share selected block",
+            "Save selected block to file (legacy binding)",
             TerminalAction::OpenShareModal,
         )
-        .with_custom_action(CustomAction::CreateBlockPermalink)
+        .with_enabled(|| cfg!(feature = "local_fs"))
         .with_context_predicate(
             id!("Terminal") & eq!("TerminalView_BlockSelectionCardinality", "One"),
         ),
@@ -598,6 +597,58 @@ pub fn init(app: &mut AppContext) {
         .with_context_predicate(
             id!("Terminal") & ne!("TerminalView_BlockSelectionCardinality", "None"),
         ),
+        // Act on the selection, or the last block when nothing is selected, so
+        // they work straight after a command finishes. Deliberately no
+        // BlockSelectionCardinality predicate for that reason.
+        //
+        // Only the two output captures carry a default keystroke. The other
+        // four are registered without one so they appear in the keybindings
+        // panel and can be bound by the user; inventing four more default
+        // chords in this range would just collide with existing bindings.
+        EditableBinding::new(
+            "terminal:save_output_to_file",
+            "Save Output",
+            TerminalAction::SaveOutputToFile,
+        )
+        .with_enabled(|| cfg!(feature = "local_fs"))
+        .with_custom_action(CustomAction::CreateBlockPermalink)
+        .with_context_predicate(id!("Terminal")),
+        EditableBinding::new(
+            "terminal:stream_output_to_file",
+            "Stream Output",
+            TerminalAction::StreamOutputToFile,
+        )
+        .with_enabled(|| cfg!(feature = "local_fs"))
+        .with_key_binding("ctrl-alt-shift-S")
+        .with_context_predicate(id!("Terminal")),
+        EditableBinding::new(
+            "terminal:save_block_to_file",
+            "Save Block",
+            TerminalAction::SaveBlockToFile,
+        )
+        .with_enabled(|| cfg!(feature = "local_fs"))
+        .with_context_predicate(id!("Terminal")),
+        EditableBinding::new(
+            "terminal:stream_block_to_file",
+            "Stream Block",
+            TerminalAction::StreamBlockToFile,
+        )
+        .with_enabled(|| cfg!(feature = "local_fs"))
+        .with_context_predicate(id!("Terminal")),
+        EditableBinding::new(
+            "terminal:save_session_to_file",
+            "Save Session",
+            TerminalAction::SaveSessionToFile,
+        )
+        .with_enabled(|| cfg!(feature = "local_fs"))
+        .with_context_predicate(id!("Terminal")),
+        EditableBinding::new(
+            "terminal:stream_session_to_file",
+            "Stream Session",
+            TerminalAction::StreamSessionToFile,
+        )
+        .with_enabled(|| cfg!(feature = "local_fs"))
+        .with_context_predicate(id!("Terminal")),
         EditableBinding::new(
             "terminal:copy",
             "Copy command and output",

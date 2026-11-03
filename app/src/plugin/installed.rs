@@ -18,7 +18,7 @@ pub struct InstalledPlugin {
     pub description: String,
     pub permissions: Vec<String>,
     pub engines_warp: String,
-    /// Whether the directory has a `plugin.json` (vs a bare `main.js` legacy plugin).
+    /// Whether the directory has a `plugin.json` (vs a bare `main.js`, which has no permissions).
     pub has_manifest: bool,
 }
 

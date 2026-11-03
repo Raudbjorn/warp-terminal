@@ -77,7 +77,25 @@ pub const INPUT_EDITOR_KEYBINDINGS: &[&str] = &[
     "editor_view:up",
 ];
 
+/// The "Save .../Stream ... to file..." commands added by this fork. Only the
+/// two output captures ship with a default keystroke, so these names are also
+/// how `build_bindings` knows to list the other four before they are bound.
+pub const FILE_CAPTURE_KEYBINDINGS: &[&str] = &[
+    "terminal:save_output_to_file",
+    "terminal:stream_output_to_file",
+    "terminal:save_block_to_file",
+    "terminal:stream_block_to_file",
+    "terminal:save_session_to_file",
+    "terminal:stream_session_to_file",
+];
+
 pub const TERMINAL_KEYBINDINGS: &[&str] = &[
+    "terminal:save_output_to_file",
+    "terminal:stream_output_to_file",
+    "terminal:save_block_to_file",
+    "terminal:stream_block_to_file",
+    "terminal:save_session_to_file",
+    "terminal:stream_session_to_file",
     "find:find_next_occurrence",
     "find:find_prev_occurrence",
     "workspace:set_a11y_concise_verbosity_level",

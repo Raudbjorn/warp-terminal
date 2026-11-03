@@ -13076,6 +13076,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ssh_test_server"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "stable_deref_trait"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16475,6 +16484,7 @@ dependencies = [
  "warp_util",
  "warpui_core",
  "wasm-bindgen-futures",
+ "web-sys",
  "woothee",
 ]
 

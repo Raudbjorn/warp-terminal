@@ -16,13 +16,7 @@ pub(super) fn is_namespace_sandbox(platform: Option<IsolationPlatformType>) -> b
     match platform {
         #[cfg(not(target_family = "wasm"))]
         Some(IsolationPlatformType::Namespace) => true,
-        #[cfg(not(target_family = "wasm"))]
-        Some(
-            IsolationPlatformType::Docker
-            | IsolationPlatformType::DockerSandbox
-            | IsolationPlatformType::Kubernetes,
-        ) => false,
-        None => false,
+        _ => false,
     }
 }
 

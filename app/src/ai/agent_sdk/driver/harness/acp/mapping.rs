@@ -908,12 +908,16 @@ fn generic_args(raw_input: Option<&Value>) -> prost_types::Struct {
 /// Splits a Claude Code MCP tool name, `mcp__<server>__<tool>`, into the tool's own name and the
 /// identity of the server it belongs to. Claude Code writes the server name with every character
 /// outside `[A-Za-z0-9_-]` replaced by `_`; when several server names match, the longest wins.
+///
+/// Distinct configured names can normalize to the same string (`warp factory` and `warp_factory`).
+/// Their matches are then equally long and the tool name does not say which server it came from,
+/// so an ambiguous match yields `None` rather than asserting whichever the map yielded first.
 fn split_mcp_tool_name<'a>(
     title: &'a str,
     mcp_servers: &'a HashMap<String, McpServerIdentity>,
 ) -> Option<(&'a str, &'a McpServerIdentity)> {
     let qualified = title.strip_prefix("mcp__")?;
-    mcp_servers
+    let matches: Vec<(&str, &McpServerIdentity)> = mcp_servers
         .iter()
         .filter_map(|(name, identity)| {
             let server: String = name
@@ -929,7 +933,15 @@ fn split_mcp_tool_name<'a>(
             let tool = qualified.strip_prefix(&server)?.strip_prefix("__")?;
             (!tool.is_empty()).then_some((tool, identity))
         })
-        .min_by_key(|(tool, _)| tool.len())
+        .collect();
+    let shortest_tool = matches.iter().map(|(tool, _)| tool.len()).min()?;
+    let mut longest_server = matches
+        .into_iter()
+        .filter(|(tool, _)| tool.len() == shortest_tool);
+    let (tool, identity) = longest_server.next()?;
+    longest_server
+        .all(|(_, other)| other == identity)
+        .then_some((tool, identity))
 }
 
 fn mcp_tool_name(kind: Option<ToolKind>, title: &str) -> String {

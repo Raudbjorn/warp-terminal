@@ -71,5 +71,7 @@ pub(super) fn is_online_services_only(feature: FeatureFlag) -> bool {
             | FeatureFlag::HOANotifications
             | FeatureFlag::CloudModeSetupV2
             | FeatureFlag::CloudModeInputV2
+            | FeatureFlag::APIKeyManagement
+            | FeatureFlag::CloudAgentRunners
     )
 }

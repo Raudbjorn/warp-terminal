@@ -204,6 +204,17 @@ impl Client {
         client
     }
 
+    /// Like [`Client::new_external`], but never routes through a system proxy (`HTTP_PROXY` and
+    /// friends). For a listener on this machine: a proxy would either fail to reach it or be
+    /// handed the request, credentials included.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn new_external_without_proxy() -> Self {
+        let mut client = Self::from_client_builder(reqwest::Client::builder().no_proxy())
+            .expect("should not fail to create client");
+        client.include_warp_headers = false;
+        client
+    }
+
     #[cfg(feature = "test-util")]
     pub fn new_for_test() -> Self {
         let client_builder = reqwest::ClientBuilder::new()
