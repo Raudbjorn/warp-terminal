@@ -281,8 +281,14 @@ impl PaneContent for TerminalPane {
         // Attach the initial terminal view in the stack.
         attach_terminal_view(&self.terminal_view(ctx), terminal_pane_id, ctx);
 
-        // Subscribe to the pane stack to handle views being pushed/popped.
+        // Detach clears SSH-manager attachment on every stacked terminal, so reattach them all: a
+        // managed SSH terminal beneath a sandbox/cloud view must be registered again too.
         let pane_stack = self.view.as_ref(ctx).pane_stack().clone();
+        for (_, view) in pane_stack.as_ref(ctx).entries().to_vec() {
+            view.update(ctx, |view, ctx| view.set_ssh_manager_attached(true, ctx));
+        }
+
+        // Subscribe to the pane stack to handle views being pushed/popped.
         ctx.subscribe_to_model(&pane_stack, move |group, _, event, ctx| {
             handle_pane_stack_event(group, event, terminal_pane_id, ctx);
         });
@@ -416,6 +422,9 @@ impl PaneContent for TerminalPane {
             .map(|(_, view)| view.id())
             .collect::<Vec<_>>();
         for (manager, view) in contents {
+            if !matches!(detach_type, DetachType::Moved) {
+                view.update(ctx, |view, ctx| view.set_ssh_manager_attached(false, ctx));
+            }
             // Notify the view that it's being detached so it can react appropriately
             // (e.g. the shared-session viewer tears down its network only when the detach
             // is not reversible).

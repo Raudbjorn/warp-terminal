@@ -16,7 +16,6 @@ pub use driver::AgentDriver;
 use driver::AgentDriverError;
 use driver::agent_setup::configured_skills::{self, merge_skill_dirs};
 pub(crate) use driver::harness::{ClaudeHarness, task_env_vars, validate_cli_installed};
-use telemetry::CliTelemetryEvent;
 use tracing::Instrument as _;
 use warp_cli::agent::{
     AgentCommand, AgentProfileCommand, Harness, HarnessTransport, OutputFormat, Prompt,
@@ -76,7 +75,7 @@ use crate::auth::AuthStateProvider;
 use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
 use crate::cloud_object::CloudObjectLookup as _;
 use crate::cloud_object::model::persistence::CloudModel;
-use crate::send_telemetry_sync_from_app_ctx;
+
 use crate::server::ids::{ServerId, SyncId};
 use crate::server::retry_strategies::with_retry;
 use crate::server::server_api::ai::{
@@ -125,7 +124,6 @@ mod secret;
 pub(crate) mod setup_observability;
 #[cfg(not(target_family = "wasm"))]
 mod standby;
-mod telemetry;
 #[cfg(test)]
 mod test_support;
 mod text_layout;
@@ -218,9 +216,6 @@ pub fn run(
     command: CliCommand,
     global_options: GlobalOptions,
 ) -> anyhow::Result<()> {
-    let event = command_to_telemetry_event(&command);
-    send_telemetry_sync_from_app_ctx!(event, ctx);
-
     launch_command(ctx, command, global_options)
 }
 
@@ -2355,176 +2350,6 @@ fn report_fatal_error(err: anyhow::Error, ctx: &mut AppContext) {
 
     let error = anyhow::anyhow!(message);
     ctx.terminate_app(TerminationMode::ForceTerminate, Some(Err(error)));
-}
-
-fn resolve_orchestration_harness_label() -> &'static str {
-    let Ok(raw) = std::env::var(OZ_HARNESS_ENV) else {
-        return "unknown";
-    };
-    match Harness::parse_orchestration_harness(&raw) {
-        Some(Harness::Oz) => "oz",
-        Some(Harness::Claude) => "claude",
-        Some(Harness::OpenCode) => "opencode",
-        Some(Harness::Gemini) => "gemini",
-        Some(Harness::Pi) => "pi",
-        Some(Harness::Codex) => "codex",
-        Some(Harness::Unknown) | None => "unknown",
-    }
-}
-
-/// Map each CLI command into a telemetry event to emit when it's executed.
-fn command_to_telemetry_event(command: &CliCommand) -> CliTelemetryEvent {
-    match command {
-        CliCommand::Agent(AgentCommand::Run(args)) => CliTelemetryEvent::AgentRun {
-            gui: args.gui,
-            requested_mcp_servers: args.mcp_specs.len() + args.mcp_servers.len(),
-            has_environment: args.environment.is_some(),
-            task_id: args.task_id.clone(),
-            harness: args.harness.to_string(),
-        },
-        CliCommand::Agent(AgentCommand::RunCloud(_)) => CliTelemetryEvent::AgentRunAmbient,
-        CliCommand::Agent(AgentCommand::RunCloudStandby(_)) => {
-            CliTelemetryEvent::AgentRunCloudStandby
-        }
-        CliCommand::Agent(AgentCommand::Profile(sub)) => match sub {
-            AgentProfileCommand::List => CliTelemetryEvent::AgentProfileList,
-        },
-        CliCommand::Agent(AgentCommand::List(_)) => CliTelemetryEvent::AgentList,
-        CliCommand::Agent(AgentCommand::Get(_)) => CliTelemetryEvent::AgentGet,
-        CliCommand::Agent(AgentCommand::Create(_)) => CliTelemetryEvent::AgentCreate,
-        CliCommand::Agent(AgentCommand::Update(_)) => CliTelemetryEvent::AgentUpdate,
-        CliCommand::Agent(AgentCommand::Delete(_)) => CliTelemetryEvent::AgentDelete,
-        CliCommand::Agent(AgentCommand::Skills(_)) => CliTelemetryEvent::AgentSkills,
-        CliCommand::Environment(EnvironmentCommand::List { .. }) => {
-            CliTelemetryEvent::EnvironmentList
-        }
-        CliCommand::Environment(EnvironmentCommand::Create { .. }) => {
-            CliTelemetryEvent::EnvironmentCreate
-        }
-        CliCommand::Environment(EnvironmentCommand::Delete { .. }) => {
-            CliTelemetryEvent::EnvironmentDelete
-        }
-        CliCommand::Environment(EnvironmentCommand::Update { .. }) => {
-            CliTelemetryEvent::EnvironmentUpdate
-        }
-        CliCommand::Environment(EnvironmentCommand::Get { .. }) => {
-            CliTelemetryEvent::EnvironmentGet
-        }
-        CliCommand::Environment(EnvironmentCommand::Image(ImageCommand::List)) => {
-            CliTelemetryEvent::EnvironmentImageList
-        }
-        CliCommand::MCP(MCPCommand::List) => CliTelemetryEvent::MCPList,
-        CliCommand::EnvironmentCheckout(_) => CliTelemetryEvent::EnvironmentCheckout,
-        CliCommand::Run(TaskCommand::List(_)) => CliTelemetryEvent::TaskList,
-        CliCommand::Run(TaskCommand::Get(args)) => {
-            if args.conversation {
-                CliTelemetryEvent::RunConversationGet
-            } else {
-                CliTelemetryEvent::TaskGet
-            }
-        }
-        CliCommand::Run(TaskCommand::Conversation(_)) => CliTelemetryEvent::ConversationGet,
-        CliCommand::Run(TaskCommand::Message(message_cmd)) => match message_cmd {
-            MessageCommand::Watch(_) => CliTelemetryEvent::RunMessageWatch {
-                harness: resolve_orchestration_harness_label(),
-            },
-            MessageCommand::Send(_) => CliTelemetryEvent::RunMessageSend {
-                harness: resolve_orchestration_harness_label(),
-            },
-            MessageCommand::List(_) => CliTelemetryEvent::RunMessageList {
-                harness: resolve_orchestration_harness_label(),
-            },
-            MessageCommand::Read(_) => CliTelemetryEvent::RunMessageRead {
-                harness: resolve_orchestration_harness_label(),
-            },
-            MessageCommand::MarkDelivered(_) => CliTelemetryEvent::RunMessageMarkDelivered {
-                harness: resolve_orchestration_harness_label(),
-            },
-        },
-        CliCommand::Model(ModelCommand::List(_)) => CliTelemetryEvent::ModelList,
-        CliCommand::MemoryStore(memory_store_cmd) => match memory_store_cmd {
-            MemoryStoreCommand::List(_) => CliTelemetryEvent::MemoryStoreList,
-            MemoryStoreCommand::Get(_) => CliTelemetryEvent::MemoryStoreGetStore,
-            MemoryStoreCommand::Update(_) => CliTelemetryEvent::MemoryStoreUpdateStore,
-            MemoryStoreCommand::ListStoreAgents(_) => CliTelemetryEvent::MemoryStoreListStoreAgents,
-        },
-        CliCommand::Memory(memory_cmd) => match memory_cmd {
-            MemoryCommand::List(_) => CliTelemetryEvent::MemoryStoreListMemories,
-            MemoryCommand::Create(_) => CliTelemetryEvent::MemoryStoreCreateMemory,
-            MemoryCommand::Update(_) => CliTelemetryEvent::MemoryStoreUpdateMemory,
-            MemoryCommand::Delete(_) => CliTelemetryEvent::MemoryStoreDeleteMemory,
-            MemoryCommand::Versions(_) => CliTelemetryEvent::MemoryStoreListVersions,
-        },
-        CliCommand::Login => CliTelemetryEvent::Login,
-        CliCommand::Logout => CliTelemetryEvent::Logout,
-        CliCommand::Whoami => CliTelemetryEvent::Whoami,
-        CliCommand::Provider(ProviderCommand::Setup(_)) => CliTelemetryEvent::ProviderSetup,
-        CliCommand::Provider(ProviderCommand::List) => CliTelemetryEvent::ProviderList,
-        CliCommand::Integration(integration_cmd) => match integration_cmd {
-            IntegrationCommand::Create(_) => CliTelemetryEvent::IntegrationCreate,
-            IntegrationCommand::Update(_) => CliTelemetryEvent::IntegrationUpdate,
-            IntegrationCommand::List => CliTelemetryEvent::IntegrationList,
-        },
-        CliCommand::Schedule(c) => match c.subcommand() {
-            None | Some(ScheduleSubcommand::Create(_)) => CliTelemetryEvent::ScheduleCreate,
-            Some(ScheduleSubcommand::List) => CliTelemetryEvent::ScheduleList,
-            Some(ScheduleSubcommand::Get(_)) => CliTelemetryEvent::ScheduleGet,
-            Some(ScheduleSubcommand::Pause(_)) => CliTelemetryEvent::SchedulePause,
-            Some(ScheduleSubcommand::Unpause(_)) => CliTelemetryEvent::ScheduleUnpause,
-            Some(ScheduleSubcommand::Update(_)) => CliTelemetryEvent::ScheduleUpdate,
-            Some(ScheduleSubcommand::Delete(_)) => CliTelemetryEvent::ScheduleDelete,
-        },
-        CliCommand::Secret(secret_cmd) => match secret_cmd {
-            SecretCommand::Create(_) => CliTelemetryEvent::SecretCreate,
-            SecretCommand::Delete(_) => CliTelemetryEvent::SecretDelete,
-            SecretCommand::Update(_) => CliTelemetryEvent::SecretUpdate,
-            SecretCommand::List(_) => CliTelemetryEvent::SecretList,
-        },
-        CliCommand::Federate(federate_cmd) => match federate_cmd {
-            FederateCommand::IssueToken(_) => CliTelemetryEvent::FederateIssueToken,
-            FederateCommand::IssueGcpToken(_) => CliTelemetryEvent::FederateIssueGcpToken,
-        },
-        CliCommand::HarnessSupport(args) => match &args.command {
-            HarnessSupportCommand::Ping => CliTelemetryEvent::HarnessSupportPing,
-            HarnessSupportCommand::ReportArtifact(report_args) => match &report_args.command {
-                ReportArtifactCommand::PullRequest(_) => {
-                    CliTelemetryEvent::HarnessSupportReportArtifact {
-                        artifact_type: "pull_request",
-                    }
-                }
-            },
-            HarnessSupportCommand::ReportExternalReference(_) => {
-                CliTelemetryEvent::HarnessSupportReportArtifact {
-                    artifact_type: "external_reference",
-                }
-            }
-            HarnessSupportCommand::NotifyUser(_) => CliTelemetryEvent::HarnessSupportNotifyUser,
-            HarnessSupportCommand::FinishTask(finish_args) => {
-                CliTelemetryEvent::HarnessSupportFinishTask {
-                    success: finish_args.status == TaskStatus::Success,
-                }
-            }
-            HarnessSupportCommand::ReportShutdown(_) => {
-                CliTelemetryEvent::HarnessSupportReportShutdown
-            }
-        },
-        CliCommand::Artifact(artifact_cmd) => match artifact_cmd {
-            ArtifactCommand::Upload(_) => CliTelemetryEvent::ArtifactUpload,
-            ArtifactCommand::Get(_) => CliTelemetryEvent::ArtifactGet,
-            ArtifactCommand::Download(_) => CliTelemetryEvent::ArtifactDownload,
-        },
-        CliCommand::ApiKey(api_key_cmd) => match api_key_cmd {
-            ApiKeyCommand::List(_) => CliTelemetryEvent::ApiKeyList,
-            ApiKeyCommand::Create(_) => CliTelemetryEvent::ApiKeyCreate,
-            ApiKeyCommand::Expire(_) => CliTelemetryEvent::ApiKeyExpire,
-        },
-        CliCommand::Runner(runner_cmd) => match runner_cmd {
-            RunnerCommand::List(_) => CliTelemetryEvent::RunnerList,
-            RunnerCommand::Create(_) => CliTelemetryEvent::RunnerCreate,
-            RunnerCommand::Update(_) => CliTelemetryEvent::RunnerUpdate,
-            RunnerCommand::Delete(_) => CliTelemetryEvent::RunnerDelete,
-        },
-    }
 }
 
 #[cfg(test)]

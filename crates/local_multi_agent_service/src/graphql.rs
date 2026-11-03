@@ -552,7 +552,6 @@ fn get_user_settings() -> Value {
                     "settings": {
                         "isCloudConversationStorageEnabled": false,
                         "isCrashReportingEnabled": false,
-                        "isTelemetryEnabled": false,
                     }
                 }
             }

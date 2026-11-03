@@ -526,7 +526,6 @@ mod team_settings_conversion {
 
         // Passthrough groups map directly.
         assert!(settings.llm_settings.enabled);
-        assert!(settings.telemetry_settings.force_enabled);
         assert!(settings.usage_based_pricing_settings.enabled);
         assert_eq!(
             settings

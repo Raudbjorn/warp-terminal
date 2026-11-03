@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use warp_cli::agent::Harness;
 use warp_core::features::FeatureFlag;
-use warp_core::send_telemetry_from_ctx;
+
 use warp_core::ui::appearance::Appearance;
 use warp_terminal::model::BlockId;
 use warpui::elements::Align;
@@ -24,7 +24,7 @@ use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
 use crate::ai::agent::{RenderableAIError, display_user_query_with_mode};
 #[cfg(not(target_family = "wasm"))]
 use crate::ai::agent_sdk::driver::harness::auth_check_command_for;
-use crate::ai::ambient_agents::telemetry::{CloudAgentTelemetryEvent, CloudModeEntryPoint};
+use crate::ai::ambient_agents::telemetry::CloudModeEntryPoint;
 use crate::ai::blocklist::BlocklistAIHistoryModel;
 use crate::ai::blocklist::agent_view::AgentViewEntryOrigin;
 use crate::ai::conversation_details_panel::ConversationDetailsData;
@@ -869,13 +869,6 @@ impl TerminalView {
         stack.update(ctx, |stack, ctx| {
             stack.push(terminal_manager, pushed_view, ctx);
         });
-
-        send_telemetry_from_ctx!(
-            CloudAgentTelemetryEvent::EnteredCloudMode {
-                entry_point: CloudModeEntryPoint::LocalSession
-            },
-            ctx
-        );
 
         Some((terminal_view, ambient_agent_view_model))
     }

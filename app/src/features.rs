@@ -25,8 +25,6 @@ fn enabled_features() -> HashSet<FeatureFlag> {
     flags.extend([
         #[cfg(feature = "autoupdate")]
         FeatureFlag::Autoupdate,
-        #[cfg(feature = "record_app_active_events")]
-        FeatureFlag::RecordAppActiveEvents,
         #[cfg(feature = "runtime_feature_flags")]
         FeatureFlag::RuntimeFeatureFlags,
         #[cfg(feature = "sequential_storage")]
@@ -123,10 +121,6 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::KittyImages,
         #[cfg(feature = "warp_packs")]
         FeatureFlag::WarpPacks,
-        #[cfg(feature = "global_ai_analytics_banner")]
-        FeatureFlag::GlobalAIAnalyticsBanner,
-        #[cfg(feature = "global_ai_analytics_collection")]
-        FeatureFlag::GlobalAIAnalyticsCollection,
         #[cfg(feature = "default_adeberry_theme")]
         FeatureFlag::DefaultAdeberryTheme,
         #[cfg(feature = "agent_mode_primary_xml")]
@@ -229,8 +223,6 @@ fn enabled_features() -> HashSet<FeatureFlag> {
         FeatureFlag::LinkedCodeBlocks,
         #[cfg(feature = "tabbed_editor_view")]
         FeatureFlag::TabbedEditorView,
-        #[cfg(feature = "send_telemetry_to_file")]
-        FeatureFlag::SendTelemetryToFile,
         #[cfg(feature = "undo_closed_panes")]
         FeatureFlag::UndoClosedPanes,
         #[cfg(feature = "multi_profile")]
