@@ -4232,6 +4232,11 @@ impl Workspace {
                 self.limit_rings.refresh(ctx);
                 ctx.notify();
             }
+            // Harp mode switches the sidebar layout; every renderer reads the setting, so a
+            // repaint is enough here.
+            TabSettingsChangedEvent::HarpMode { .. } => {
+                ctx.notify();
+            }
             // The next tmux poll (every 10 s) reads the new values.
             TabSettingsChangedEvent::TmuxSyncEnabled { .. }
             | TabSettingsChangedEvent::TmuxSessionScript { .. } => {}

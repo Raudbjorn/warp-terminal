@@ -632,6 +632,19 @@ define_settings_group!(TabSettings, settings: [
         toml_path: "integrations.tmux.session_script",
         description: "Optional script that renames and regroups tmux sessions instead of the built-in tmux commands. Empty uses the built-in commands.",
     },
+    // Harp mode: the agent sidebar (framed vertical tabs, agent status rows, limit rings, tmux
+    // sync) and its integrations. Off keeps the fork's upstream tab layout untouched.
+    harp_mode: HarpMode {
+        type: bool,
+        default: false,
+        supported_platforms: SupportedPlatforms::ALL,
+        sync_to_cloud: SyncToCloud::Never,
+        surface: settings::SettingSurfaces::GUI,
+        private: false,
+        storage_key: "ModesHarpEnabled",
+        toml_path: "modes.harp.enabled",
+        description: "Whether Harp mode is on: vertical tabs become the agent sidebar with per-row agent status, groups, limit rings and the optional tmux sync.",
+    },
     header_toolbar_chip_selection: HeaderToolbarChipSelection,
     new_tab_placement: NewTabPlacement,
     workspace_decoration_visibility: WorkspaceDecorationVisibility,

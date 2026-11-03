@@ -277,6 +277,12 @@ pub fn uses_vertical_tabs(ctx: &AppContext) -> bool {
     FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs
 }
 
+/// True when Harp mode (`modes.harp.enabled`) is on. Every Harp-only behavior keys off this, so
+/// turning it off leaves the fork's upstream tab layout and menus.
+pub fn harp_mode_enabled(ctx: &AppContext) -> bool {
+    *TabSettings::as_ref(ctx).harp_mode
+}
+
 /// True when vertical tabs show the short tab and group menus instead of Warp's full ones
 /// (`appearance.vertical_tabs.full_tab_menu = false`).
 pub fn uses_slim_sidebar_menu(ctx: &AppContext) -> bool {
