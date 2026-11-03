@@ -22,6 +22,7 @@ pub(super) struct RipgrepSearchParams {
     ignore_case: bool,
     multiline: bool,
     match_cap: usize,
+    scope: project_replace::scope::ScopeGlobs,
 }
 
 pub(super) fn validate_request(msg: RipgrepSearchRequest) -> Result<RipgrepSearchParams, String> {
@@ -32,6 +33,11 @@ pub(super) fn validate_request(msg: RipgrepSearchRequest) -> Result<RipgrepSearc
         return Err(format!("RipgrepSearch root must be absolute: {root}"));
     }
 
+    let scope = project_replace::scope::ScopeGlobs {
+        include: msg.scope_include,
+        exclude: msg.scope_exclude,
+    };
+    project_replace::scope::Scope::parse(&scope).map_err(|err| err.to_string())?;
     let roots = msg.roots.iter().map(PathBuf::from).collect();
     let match_cap = match msg.max_matches as usize {
         0 => MAX_RIPGREP_SEARCH_MATCH_CAP,
@@ -44,19 +50,19 @@ pub(super) fn validate_request(msg: RipgrepSearchRequest) -> Result<RipgrepSearc
         ignore_case: msg.ignore_case,
         multiline: msg.multiline,
         match_cap,
+        scope,
     })
 }
 
 pub(super) async fn run_search(
     params: RipgrepSearchParams,
 ) -> anyhow::Result<RipgrepSearchSuccess> {
-    let scope = project_replace::scope::ScopeGlobs::default();
     let stream = warp_ripgrep::search::search_streaming(
         std::slice::from_ref(&params.pattern),
         &params.roots,
         params.ignore_case,
         params.multiline,
-        &scope,
+        &params.scope,
     )?;
     futures::pin_mut!(stream);
 

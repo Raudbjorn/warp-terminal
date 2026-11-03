@@ -68,6 +68,29 @@ pub fn node_dependency(scope: &SearchScope, packages: &[&str]) -> bool {
             })
         })
 }
+/// Finds the entry file of the first installed package, searching nearest scope directories first.
+pub fn node_package_entry(scope: &SearchScope, packages: &[&str]) -> Option<PathBuf> {
+    scope.dirs().find_map(|dir| {
+        packages.iter().find_map(|package| {
+            let package_dir = dir.join("node_modules").join(package);
+            let manifest = read_json(&package_dir.join("package.json"))?;
+            let candidates = [
+                manifest.get("main").and_then(Value::as_str),
+                manifest
+                    .get("exports")
+                    .and_then(Value::as_object)
+                    .and_then(|exports| exports.get("."))
+                    .and_then(Value::as_str),
+                Some("index.js"),
+            ];
+            candidates.into_iter().flatten().find_map(|entry| {
+                let entry = entry.strip_prefix("./").unwrap_or(entry);
+                let path = package_dir.join(entry);
+                path.is_file().then_some(path)
+            })
+        })
+    })
+}
 
 /// Whether one of `packages` is declared by, or installed in, the project.
 pub fn node_package_available(scope: &SearchScope, packages: &[&str]) -> bool {

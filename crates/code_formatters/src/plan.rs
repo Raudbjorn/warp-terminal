@@ -190,7 +190,8 @@ impl Planner<'_> {
 
     fn prettier(&self, forced: bool) -> Result<Planned, Skip> {
         let plugins = self.language.required_prettier_plugins();
-        if !forced && !plugins.is_empty() && !config::node_package_available(&self.scope, plugins) {
+        let plugin = config::node_package_entry(&self.scope, plugins);
+        if !forced && !plugins.is_empty() && plugin.is_none() {
             return Err(Skip::NotOptedIn);
         }
         let config = config::prettier_config(&self.scope);
@@ -209,6 +210,11 @@ impl Planner<'_> {
             .and_then(|ignore| parent_dir(&ignore))
             .unwrap_or_else(|| self.root());
         let mut args = vec!["--stdin-filepath".into(), self.file.into()];
+        if let Some(plugin) = plugin {
+            let mut plugin_arg = OsString::from("--plugin=");
+            plugin_arg.push(plugin);
+            args.push(plugin_arg.into());
+        }
         // Prettier's own ancestor search does not stop at our authorized repository boundary.
         // Pin the selected config (including package.json), or explicitly disable that search.
         if let Some(config) = config {

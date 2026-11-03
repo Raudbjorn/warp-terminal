@@ -265,6 +265,8 @@ impl GlobalSearch {
                 ignore_case,
                 multiline,
                 max_matches: REMOTE_MAX_MATCH_COUNT,
+                scope_include: options.scope.include.clone(),
+                scope_exclude: options.scope.exclude.clone(),
             };
             self.spawn_remote_search(search_id, host_id, params, scope.clone(), ctx);
         }

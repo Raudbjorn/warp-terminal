@@ -268,10 +268,71 @@ fn svelte_is_skipped_unless_the_project_has_the_prettier_plugin() {
         Tool::Prettier
     );
 
-    project.write("node_modules/prettier-plugin-svelte/package.json", "{}");
+    let plugin = project.write(
+        "node_modules/prettier-plugin-svelte/plugin.js",
+        "module.exports = {};",
+    );
+    project.write(
+        "node_modules/prettier-plugin-svelte/package.json",
+        r#"{"main":"plugin.js"}"#,
+    );
+    let invocation = invocation(auto(&project, "App.svelte", None));
+    assert_eq!(invocation.tool, Tool::Prettier);
     assert_eq!(
-        invocation(auto(&project, "App.svelte", None)).tool,
-        Tool::Prettier
+        args(&invocation)
+            .iter()
+            .find(|arg| arg.starts_with("--plugin=")),
+        Some(&format!("--plugin={}", plugin.display()))
+    );
+}
+
+#[test]
+fn prettier_loads_required_plugin_without_config() {
+    let project = Project::new();
+    project.write("package.json", r#"{"devDependencies":{"prettier":"3"}}"#);
+    project.script("node_modules/.bin/prettier", UPPERCASE);
+    let plugin = project.write(
+        "node_modules/prettier-plugin-svelte/plugin.js",
+        "module.exports = {};",
+    );
+    project.write(
+        "node_modules/prettier-plugin-svelte/package.json",
+        r#"{"main":"plugin.js"}"#,
+    );
+
+    let invocation = invocation(auto(&project, "App.svelte", None));
+    assert_eq!(
+        args(&invocation),
+        [
+            "--stdin-filepath",
+            &display(&project.path("App.svelte")),
+            &format!("--plugin={}", plugin.display()),
+            "--no-config",
+            "--no-editorconfig"
+        ]
+    );
+}
+
+#[test]
+fn blade_uses_the_first_resolvable_plugin() {
+    let project = Project::new();
+    project.write(".prettierrc", "{}");
+    project.script("node_modules/.bin/prettier", UPPERCASE);
+    let plugin = project.write(
+        "node_modules/@shufo/prettier-plugin-blade/dist/index.cjs",
+        "module.exports = {};",
+    );
+    project.write(
+        "node_modules/@shufo/prettier-plugin-blade/package.json",
+        r#"{"main":"dist/index.cjs"}"#,
+    );
+
+    let invocation = invocation(auto(&project, "resources/views/home.blade.php", None));
+    assert_eq!(
+        args(&invocation)
+            .iter()
+            .find(|arg| arg.starts_with("--plugin=")),
+        Some(&format!("--plugin={}", plugin.display()))
     );
 }
 
