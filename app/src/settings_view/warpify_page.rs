@@ -126,6 +126,12 @@ impl WarpifyPageView {
             }
             if matches!(
                 event,
+                WarpifySettingsChangedEvent::SshExtensionDownloadBaseUrl { .. }
+            ) {
+                me.sync_ssh_extension_download_base_url_editor(ctx);
+            }
+            if matches!(
+                event,
                 WarpifySettingsChangedEvent::SshExtensionDownloadChannel { .. }
             ) {
                 let channel = WarpifySettings::normalize_ssh_extension_download_channel(
@@ -189,7 +195,7 @@ impl WarpifyPageView {
         });
         ctx.subscribe_to_view(
             &ssh_extension_download_base_url_editor,
-            |_, _, event, ctx| match event {
+            |me, _, event, ctx| match event {
                 SubmittableTextInputEvent::Submit(value) => {
                     WarpifySettings::handle(ctx).update(ctx, |settings, ctx| {
                         report_if_error!(
@@ -199,6 +205,9 @@ impl WarpifyPageView {
                                     .set_value(value, ctx))
                         );
                     });
+                    // SubmittableTextInput clears its buffer on submit. Saving an unchanged
+                    // value emits no settings event, so put the stored value back here too.
+                    me.sync_ssh_extension_download_base_url_editor(ctx);
                 }
                 SubmittableTextInputEvent::Escape => ctx.emit(SettingsPageEvent::FocusModal),
             },
@@ -411,6 +420,19 @@ impl WarpifyPageView {
             );
             dropdown
         })
+    }
+
+    /// Shows the stored SSH extension download URL in its input. Unlike the list inputs on
+    /// this page, this field holds a single value, so it must not stay blank after submit.
+    fn sync_ssh_extension_download_base_url_editor(&self, ctx: &mut ViewContext<Self>) {
+        let value = WarpifySettings::as_ref(ctx)
+            .ssh_extension_download_base_url
+            .value()
+            .clone();
+        let editor = self
+            .ssh_extension_download_base_url_editor
+            .read(ctx, |input, _| input.editor().clone());
+        editor.update(ctx, |editor, ctx| editor.set_buffer_text(&value, ctx));
     }
 
     fn render_ssh_extension_download_base_url_setting(
@@ -878,3 +900,7 @@ mod styles {
     /// The space after a description.
     pub const DESCRIPTION_LINE_MARGIN_BOTTOM: f32 = 18.;
 }
+
+#[cfg(test)]
+#[path = "warpify_page_tests.rs"]
+mod tests;
