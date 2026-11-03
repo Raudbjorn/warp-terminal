@@ -50,14 +50,5 @@ impl OpenCodeSidecarPool {
 }
 
 /// Stub sidecar. Only ever produced by [`OpenCodeSidecarPool::get_or_spawn`],
-/// which always errors on wasm, so the accessors are unreachable at runtime —
-/// they exist only to satisfy the shared call sites.
-pub struct OpenCodeSidecar {
-    base_url: String,
-}
-
-impl OpenCodeSidecar {
-    pub fn base_url(&self) -> &str {
-        &self.base_url
-    }
-}
+/// which always errors on wasm, so it is never constructed.
+pub struct OpenCodeSidecar;

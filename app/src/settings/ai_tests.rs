@@ -1025,3 +1025,30 @@ fn ai_autodetection_setting_can_be_toggled_on_and_off() {
         });
     });
 }
+
+#[test]
+fn opencode_models_need_provider_and_model_ids() {
+    for model in [
+        "ollama/qwen2.5-coder:7b",
+        " ollama/m ",
+        "openrouter/anthropic/claude",
+    ] {
+        assert!(
+            LocalProviderKind::OpenCode.accepts_model(model),
+            "{model:?}"
+        );
+    }
+    for model in ["", "  ", "qwen2.5-coder:7b", "ollama/", "/m", "/"] {
+        assert!(
+            !LocalProviderKind::OpenCode.accepts_model(model),
+            "{model:?}"
+        );
+    }
+}
+
+#[test]
+fn openai_compatible_models_only_need_a_name() {
+    assert!(LocalProviderKind::OpenAICompatible.accepts_model("qwen2.5-coder:7b"));
+    assert!(LocalProviderKind::OpenAICompatible.accepts_model("ollama/m"));
+    assert!(!LocalProviderKind::OpenAICompatible.accepts_model("  "));
+}

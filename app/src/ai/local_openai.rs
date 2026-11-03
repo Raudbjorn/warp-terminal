@@ -56,7 +56,7 @@ pub(crate) enum LocalOpenAIError {
     Status(#[from] http_client::ResponseError),
     #[error("local OpenAI-compatible provider response could not be decoded")]
     Decode(#[from] reqwest::Error),
-    #[error("local OpenAI-compatible provider's OpenCode sidecar could not be started: {0}")]
+    #[error("OpenCode provider failed: {0}")]
     OpenCode(#[from] OpenCodeError),
     #[error("local OpenAI-compatible provider's Responses API response was malformed: {0}")]
     #[allow(dead_code)]
@@ -257,6 +257,17 @@ fn clamp_timeout(mut config: LocalOpenAISettingsSnapshot) -> LocalOpenAISettings
     config
 }
 
+/// Whether the field the selected provider needs to reach its backend is set:
+/// the Base URL for an OpenAI-compatible endpoint, the binary for an OpenCode
+/// sidecar. `AISettings::local_openai_endpoint_configured` applies the same
+/// rule to the stored settings.
+fn endpoint_configured(config: &LocalOpenAISettingsSnapshot) -> bool {
+    match config.provider_kind {
+        LocalProviderKind::OpenAICompatible => !config.base_url.trim().is_empty(),
+        LocalProviderKind::OpenCode => !config.opencode_command.trim().is_empty(),
+    }
+}
+
 impl LocalOpenAIClient {
     pub(crate) fn new(config: LocalOpenAISettingsSnapshot) -> Self {
         Self {
@@ -268,19 +279,20 @@ impl LocalOpenAIClient {
     }
 
     pub(crate) fn set_config(&self, config: LocalOpenAISettingsSnapshot) {
-        let old_config = self.config.read().clone();
-        let provider_kind = config.provider_kind;
-        *self.config.write() = config;
         // Clear the sidecar pool when:
         // 1. Switching away from OpenCode (avoid leaking unused children), or
         // 2. OpenCode settings change (command/args) so stale sidecars are dropped.
+        // The comparison and the swap happen under one write lock so a
+        // concurrent `set_config` cannot interleave between them.
         // `clear()` is synchronous (parking_lot lock) so this runs directly on
         // the UI thread — no Tokio runtime required, and no fire-and-forget task
         // that could be dropped before it runs.
-        let should_clear = provider_kind != LocalProviderKind::OpenCode
-            || (provider_kind == LocalProviderKind::OpenCode
-                && (old_config.opencode_command != self.config.read().opencode_command
-                    || old_config.opencode_args != self.config.read().opencode_args));
+        let mut guard = self.config.write();
+        let should_clear = config.provider_kind != LocalProviderKind::OpenCode
+            || guard.opencode_command != config.opencode_command
+            || guard.opencode_args != config.opencode_args;
+        *guard = config;
+        drop(guard);
         if should_clear {
             self.opencode_pool.clear();
         }
@@ -465,38 +477,14 @@ impl LocalOpenAIClient {
         model: String,
         messages: Vec<ChatMessage>,
     ) -> Result<String, LocalOpenAIError> {
-        let (base_url, api_key) = match config.provider_kind {
-            LocalProviderKind::OpenAICompatible => (config.base_url.clone(), config.api_key.clone()),
-            LocalProviderKind::OpenCode => {
-                let working_dir = self
-                    .opencode_working_dir
-                    .read()
-                    .clone()
-                    .or_else(|| std::env::current_dir().ok())
-                    .ok_or_else(|| {
-                        OpenCodeError::BadAnnouncement(
-                            "no working directory available for OpenCode sidecar".to_string(),
-                        )
-                    })?;
-                let sidecar = self
-                    .opencode_pool
-                    .get_or_spawn(
-                        &config.opencode_command,
-                        &config.opencode_args,
-                        &working_dir,
-                    )
-                    .await?;
-                // OpenCode ships an OpenAI-compatible /v1/chat/completions
-                // endpoint without an API key by default. We still pass
-                // the user-configured key through if one is set, since
-                // some self-hosted OpenCode builds gate `/v1` behind a
-                // bearer token.
-                (sidecar.base_url().to_string(), config.api_key.clone())
-            }
-        };
+        if config.provider_kind == LocalProviderKind::OpenCode {
+            return self
+                .opencode_completion(http_client, config, &model, &messages)
+                .await;
+        }
 
         let mut request_builder = http_client
-            .post(chat_completions_url(&base_url))
+            .post(chat_completions_url(&config.base_url))
             .timeout(Duration::from_millis(config.timeout_ms))
             .json(&ChatCompletionRequest {
                 model,
@@ -505,8 +493,8 @@ impl LocalOpenAIClient {
                 stream: false,
             });
 
-        if !api_key.trim().is_empty() {
-            request_builder = request_builder.bearer_auth(api_key.trim());
+        if !config.api_key.trim().is_empty() {
+            request_builder = request_builder.bearer_auth(config.api_key.trim());
         }
 
         let response: ChatCompletionResponse = request_builder
@@ -522,6 +510,56 @@ impl LocalOpenAIClient {
             .next()
             .map(|choice| choice.message.content)
             .ok_or(LocalOpenAIError::EmptyResponse)
+    }
+
+    /// Answer one chat request through the OpenCode sidecar for the current
+    /// working directory, spawning it on first use. OpenCode does not speak
+    /// Chat Completions, so the transcript is folded into a single prompt and
+    /// run through its session API (see `local_opencode`).
+    #[cfg(not(target_family = "wasm"))]
+    async fn opencode_completion(
+        &self,
+        http_client: &http_client::Client,
+        config: &LocalOpenAISettingsSnapshot,
+        model: &str,
+        messages: &[ChatMessage],
+    ) -> Result<String, LocalOpenAIError> {
+        let working_dir = self
+            .opencode_working_dir
+            .read()
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or(OpenCodeError::NoWorkingDirectory)?;
+        let sidecar = self
+            .opencode_pool
+            .get_or_spawn(
+                &config.opencode_command,
+                &config.opencode_args,
+                &working_dir,
+            )
+            .await?;
+        let text = sidecar
+            .generate(
+                http_client,
+                model,
+                &flatten_messages(messages),
+                Duration::from_millis(config.timeout_ms),
+            )
+            .await?;
+        Ok(text)
+    }
+
+    /// Spawning a local process is unavailable on wasm; fail with the stub's
+    /// `Unsupported` error instead of touching `current_dir()`.
+    #[cfg(target_family = "wasm")]
+    async fn opencode_completion(
+        &self,
+        _http_client: &http_client::Client,
+        _config: &LocalOpenAISettingsSnapshot,
+        _model: &str,
+        _messages: &[ChatMessage],
+    ) -> Result<String, LocalOpenAIError> {
+        Err(OpenCodeError::Unsupported.into())
     }
 
     /// Issue a Responses API request to the local provider, optionally
@@ -546,7 +584,7 @@ impl LocalOpenAIClient {
             ));
         }
 
-        let (base_url, api_key) = self.responses_endpoint(&config).await?;
+        let (base_url, api_key) = Self::responses_endpoint(&config)?;
 
         // Build the input list: system prompt (if any) -> cached
         // reasoning items -> user message. The Responses API treats
@@ -652,35 +690,20 @@ impl LocalOpenAIClient {
     }
 
     /// Resolve the base URL and API key for a Responses API request.
-    /// Mirrors the dispatch in [`Self::chat_completion`] but returns
-    /// the raw tuple so the caller can pick the right path
-    /// (`/v1/responses` vs `/v1/chat/completions`).
+    /// OpenCode is driven through its session API (see
+    /// [`Self::opencode_completion`]) and has no `/v1/responses` endpoint, so
+    /// only an OpenAI-compatible provider qualifies.
     #[allow(dead_code)]
-    async fn responses_endpoint(
-        &self,
+    fn responses_endpoint(
         config: &LocalOpenAISettingsSnapshot,
     ) -> Result<(String, String), LocalOpenAIError> {
         match config.provider_kind {
             LocalProviderKind::OpenAICompatible => {
                 Ok((config.base_url.clone(), config.api_key.clone()))
             }
-            LocalProviderKind::OpenCode => {
-                let working_dir = self
-                    .opencode_working_dir
-                    .read()
-                    .clone()
-                    .or_else(|| std::env::current_dir().ok())
-                    .ok_or_else(|| {
-                        OpenCodeError::BadAnnouncement(
-                            "no working directory available for OpenCode sidecar".to_string(),
-                        )
-                    })?;
-                let sidecar = self
-                    .opencode_pool
-                    .get_or_spawn(&config.opencode_command, &config.opencode_args, &working_dir)
-                    .await?;
-                Ok((sidecar.base_url().to_string(), config.api_key.clone()))
-            }
+            LocalProviderKind::OpenCode => Err(LocalOpenAIError::ResponsesShape(
+                "the OpenCode provider does not support the Responses API".to_string(),
+            )),
         }
     }
 
@@ -691,8 +714,8 @@ impl LocalOpenAIClient {
     fn configured_for_command(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
         let config = self.config.read();
         if !config.enabled
-            || config.base_url.trim().is_empty()
             || config.command_model.trim().is_empty()
+            || !endpoint_configured(&config)
         {
             return Err(LocalOpenAIError::NotConfigured);
         }
@@ -706,22 +729,10 @@ impl LocalOpenAIClient {
     fn configured_for_prediction(&self) -> Result<LocalOpenAISettingsSnapshot, LocalOpenAIError> {
         let config = self.config.read();
         if !config.enabled
-            || config.base_url.trim().is_empty()
             || config.prediction_model.trim().is_empty()
+            || !endpoint_configured(&config)
         {
             return Err(LocalOpenAIError::NotConfigured);
-        }
-        match config.provider_kind {
-            LocalProviderKind::OpenAICompatible => {
-                if config.base_url.trim().is_empty() {
-                    return Err(LocalOpenAIError::NotConfigured);
-                }
-            }
-            LocalProviderKind::OpenCode => {
-                if config.opencode_command.trim().is_empty() {
-                    return Err(LocalOpenAIError::NotConfigured);
-                }
-            }
         }
         // Clone only once validated, and clamp the timeout for settings-file values.
         Ok(clamp_timeout(config.clone()))
@@ -736,6 +747,25 @@ impl PredictionJson {
             Self::String(value) => value,
         }
     }
+}
+
+/// OpenCode's `/generate` takes one prompt string, so fold the chat
+/// transcript into one, each message under a `System:` / `User:` heading.
+#[cfg(not(target_family = "wasm"))]
+fn flatten_messages(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .map(|message| {
+            let heading = match message.role {
+                "system" => "System",
+                "user" => "User",
+                "assistant" => "Assistant",
+                other => other,
+            };
+            format!("{heading}:\n{}", message.content.trim())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn chat_completions_url(base_url: &str) -> String {
@@ -880,5 +910,101 @@ mod tests {
         let parsed: PredictionJson =
             parse_json_content("```json\n{\"suggestion\":\"git status\"}\n```").unwrap();
         assert_eq!(parsed.into_string(), "git status");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn flattens_chat_messages_into_one_prompt() {
+        let messages = vec![
+            ChatMessage {
+                role: "system",
+                content: "Reply with one shell command.\n".to_string(),
+            },
+            ChatMessage {
+                role: "user",
+                content: "list files".to_string(),
+            },
+        ];
+        assert_eq!(
+            flatten_messages(&messages),
+            "System:\nReply with one shell command.\n\nUser:\nlist files"
+        );
+    }
+
+    fn client(
+        provider_kind: LocalProviderKind,
+        base_url: &str,
+        opencode_command: &str,
+    ) -> LocalOpenAIClient {
+        LocalOpenAIClient::new(LocalOpenAISettingsSnapshot {
+            enabled: true,
+            base_url: base_url.to_string(),
+            command_model: "model".to_string(),
+            prediction_model: "model".to_string(),
+            timeout_ms: 1_000,
+            provider_kind,
+            opencode_command: opencode_command.to_string(),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn opencode_needs_its_command_not_a_base_url() {
+        let runnable = client(LocalProviderKind::OpenCode, "", "opencode");
+        assert!(runnable.configured_for_command().is_ok());
+        assert!(runnable.configured_for_prediction().is_ok());
+
+        let missing_binary = client(LocalProviderKind::OpenCode, "http://127.0.0.1:1/v1", "  ");
+        assert!(matches!(
+            missing_binary.configured_for_command(),
+            Err(LocalOpenAIError::NotConfigured)
+        ));
+        assert!(matches!(
+            missing_binary.configured_for_prediction(),
+            Err(LocalOpenAIError::NotConfigured)
+        ));
+    }
+
+    #[test]
+    fn openai_compatible_needs_a_base_url_not_the_opencode_command() {
+        let runnable = client(
+            LocalProviderKind::OpenAICompatible,
+            "http://127.0.0.1:1234/v1",
+            "",
+        );
+        assert!(runnable.configured_for_command().is_ok());
+        assert!(runnable.configured_for_prediction().is_ok());
+
+        let missing_url = client(LocalProviderKind::OpenAICompatible, " ", "opencode");
+        assert!(matches!(
+            missing_url.configured_for_command(),
+            Err(LocalOpenAIError::NotConfigured)
+        ));
+        assert!(matches!(
+            missing_url.configured_for_prediction(),
+            Err(LocalOpenAIError::NotConfigured)
+        ));
+    }
+
+    #[test]
+    fn responses_endpoint_is_openai_compatible_only() {
+        let compatible = LocalOpenAISettingsSnapshot {
+            base_url: "http://127.0.0.1:1234/v1".to_string(),
+            api_key: "key".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            LocalOpenAIClient::responses_endpoint(&compatible).unwrap(),
+            ("http://127.0.0.1:1234/v1".to_string(), "key".to_string())
+        );
+
+        let opencode = LocalOpenAISettingsSnapshot {
+            provider_kind: LocalProviderKind::OpenCode,
+            ..Default::default()
+        };
+        assert!(matches!(
+            LocalOpenAIClient::responses_endpoint(&opencode),
+            Err(LocalOpenAIError::ResponsesShape(_))
+        ));
     }
 }
