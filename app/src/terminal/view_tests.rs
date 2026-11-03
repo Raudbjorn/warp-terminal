@@ -11041,7 +11041,7 @@ fn file_capture_output_stream_keeps_output_scope_until_completion() {
             bootstrap_with_long_running_block(view);
             let ids = view.capture_block_ids(ctx);
             view.finish_capture(path.clone(), CaptureRequest::block_output(true), &ids, ctx);
-            ids[0]
+            ids[0].clone()
         });
         await_file_captures(&terminal, &mut app).await;
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "output");
@@ -11115,7 +11115,7 @@ fn file_capture_idle_session_follows_future_commands_and_preserves_separators() 
         assert!(after.starts_with(&before));
         assert!(after.ends_with("next\nnew output"));
         terminal.update(&mut app, |view, ctx| {
-            let id = *view.model.lock().block_list().active_block_id();
+            let id = view.model.lock().block_list().active_block_id().clone();
             view.model.lock().finish_block();
             view.model
                 .lock()
@@ -11221,10 +11221,10 @@ fn file_capture_session_survives_shell_reported_typeahead_repair() {
         });
         await_file_captures(&terminal, &mut app).await;
         let background_id = terminal.update(&mut app, |view, ctx| {
-            let completed = *view.model.lock().block_list().active_block_id();
+            let completed = view.model.lock().block_list().active_block_id().clone();
             view.model.lock().finish_block();
             view.model.lock().process_bytes("queued\r\n");
-            let background_id = *view
+            let background_id = view
                 .model
                 .lock()
                 .block_list()
@@ -11232,7 +11232,8 @@ fn file_capture_session_survives_shell_reported_typeahead_repair() {
                 .iter()
                 .find(|block| block.is_background())
                 .unwrap()
-                .id();
+                .id()
+                .clone();
             view.on_block_completed_for_captures(completed, ctx);
             background_id
         });
@@ -11291,7 +11292,7 @@ fn file_capture_session_includes_background_output_inserted_before_idle_prompt()
             view.model
                 .lock()
                 .simulate_long_running_block("next", "next output");
-            let completed = *view.model.lock().block_list().active_block_id();
+            let completed = view.model.lock().block_list().active_block_id().clone();
             view.model.lock().finish_block();
             view.on_block_completed_for_captures(completed, ctx);
         });
@@ -11299,6 +11300,56 @@ fn file_capture_session_includes_background_output_inserted_before_idle_prompt()
         let captured = std::fs::read_to_string(&path).unwrap();
         assert_eq!(captured.matches("background notification").count(), 1);
         assert!(captured.contains("next\nnext output"));
+    });
+}
+
+#[cfg(feature = "local_fs")]
+#[test]
+#[serial_test::serial(file_capture)]
+fn file_capture_session_keeps_live_background_output_after_in_band_command() {
+    App::test((), |mut app| async move {
+        initialize_app_for_terminal_view(&mut app);
+        let terminal = add_window_with_terminal(&mut app, None);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session.log");
+        terminal.update(&mut app, |view, _ctx| {
+            bootstrap_with_long_running_block(view);
+            view.model.lock().finish_block();
+            view.model.lock().process_bytes("background one\r\n");
+            assert!(
+                view.model
+                    .lock()
+                    .start_in_band_command_execution()
+                    .is_accepted()
+            );
+            view.model
+                .lock()
+                .simulate_cmd("warp_run_generator_command 1 'echo hi'");
+            view.model.lock().finish_block();
+
+            let model = view.model.lock();
+            let blocks = model.block_list().blocks();
+            let last_three = &blocks[blocks.len() - 3..];
+            assert!(last_three[0].is_background());
+            assert!(!last_three[0].finished());
+            assert!(last_three[1].is_in_band_command_block());
+            assert!(last_three[1].finished());
+            assert!(!last_three[2].is_background());
+            assert!(!last_three[2].is_in_band_command_block());
+        });
+        terminal.update(&mut app, |view, ctx| {
+            view.finish_capture(path.clone(), CaptureRequest::session(true), &[], ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+        terminal.update(&mut app, |view, ctx| {
+            view.model.lock().process_bytes("background two\r\n");
+            view.pump_file_captures(ctx);
+        });
+        await_file_captures(&terminal, &mut app).await;
+
+        let captured = std::fs::read_to_string(&path).unwrap();
+        assert!(captured.contains("background two"));
+        assert_eq!(captured.matches("background one").count(), 1);
     });
 }
 
@@ -11363,12 +11414,12 @@ fn file_capture_selection_excludes_hidden_blocks_inside_range() {
             let (first_index, first_id, hidden_index, last_index, last_id) = {
                 let mut model = view.model.lock();
                 let first_index = model.block_list().active_block_index();
-                let first_id = *model.block_list().active_block_id();
+                let first_id = model.block_list().active_block_id().clone();
                 model.finish_block();
                 let hidden_index = model.block_list().active_block_index();
                 model.simulate_block("hidden-command", "hidden output");
                 let last_index = model.block_list().active_block_index();
-                let last_id = *model.block_list().active_block_id();
+                let last_id = model.block_list().active_block_id().clone();
                 model.simulate_block("visible-command", "visible output");
                 model
                     .block_list_mut()

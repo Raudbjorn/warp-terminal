@@ -12770,7 +12770,7 @@ impl TerminalView {
             }
             ModelEvent::BlockCompleted(block_completed_event) => {
                 #[cfg(feature = "local_fs")]
-                self.on_block_completed_for_captures(block_completed_event.block_id, ctx);
+                self.on_block_completed_for_captures(block_completed_event.block_id.clone(), ctx);
                 record_trace_event!("command_execution:block_completed");
                 end_trace_after_next!("window:redraw:end");
                 let block_completed_event_clone = block_completed_event.clone();
@@ -22660,7 +22660,7 @@ impl TerminalView {
                         && !Self::capture_block_text(block, CaptureRequest::block_full(false))
                             .is_empty()
                 })
-                .map(|block| vec![*block.id()])
+                .map(|block| vec![block.id().clone()])
                 .unwrap_or_default();
         }
         let direction = InputModeSettings::as_ref(ctx)
@@ -22682,7 +22682,7 @@ impl TerminalView {
                     .block_list()
                     .block_at(index)
                     .filter(|block| !block.is_empty(model.block_list().transcript_scope()))
-                    .map(|block| *block.id())
+                    .map(|block| block.id().clone())
             })
             .collect()
     }
@@ -22936,10 +22936,13 @@ impl TerminalView {
         cache: &mut HashMap<BlockId, CaptureBlockText>,
     ) -> Option<CaptureUpdate> {
         if capture.request.is_session() {
-            let start = Self::capture_session_tail_start(blocks, capture.session_prefix_block_id)?;
+            let start =
+                Self::capture_session_tail_start(blocks, capture.session_prefix_block_id.as_ref())?;
             let last_completed = blocks.blocks()[start..]
                 .iter()
-                .rposition(|block| block.finished() && !block.is_background())
+                .rposition(|block| {
+                    block.finished() && !block.is_background() && !block.is_in_band_command_block()
+                })
                 .map(|offset| start + offset);
             let mut rendered = String::new();
             let (committed_bytes, prefix) = match last_completed {
@@ -22960,7 +22963,7 @@ impl TerminalView {
                         cache,
                         &mut rendered,
                     );
-                    (committed_bytes, Some(*blocks.blocks()[end].id()))
+                    (committed_bytes, Some(blocks.blocks()[end].id().clone()))
                 }
                 None => {
                     Self::append_capture_blocks_text_cached(
@@ -22969,7 +22972,7 @@ impl TerminalView {
                         cache,
                         &mut rendered,
                     );
-                    (0, capture.session_prefix_block_id)
+                    (0, capture.session_prefix_block_id.clone())
                 }
             };
             Some(CaptureUpdate {
@@ -23133,10 +23136,10 @@ impl TerminalView {
         }
     }
 
-    fn capture_session_tail_start(blocks: &BlockList, prefix: Option<BlockId>) -> Option<usize> {
+    fn capture_session_tail_start(blocks: &BlockList, prefix: Option<&BlockId>) -> Option<usize> {
         match prefix {
             Some(id) => blocks
-                .block_index_for_id(&id)
+                .block_index_for_id(id)
                 .map(|index| usize::from(index) + 1),
             None => Some(0),
         }
@@ -23171,7 +23174,7 @@ impl TerminalView {
         destination: &mut String,
         separator: bool,
     ) -> bool {
-        let text = cache.entry(*block.id()).or_insert_with(|| {
+        let text = cache.entry(block.id().clone()).or_insert_with(|| {
             let output = block.output_with_secrets_unobfuscated();
             let is_empty = output.trim().is_empty()
                 && block
@@ -23325,8 +23328,12 @@ impl TerminalView {
                         .blocks()
                         .iter()
                         .rev()
-                        .find(|block| block.finished() && !block.is_background())
-                        .map(|block| *block.id())
+                        .find(|block| {
+                            block.finished()
+                                && !block.is_background()
+                                && !block.is_in_band_command_block()
+                        })
+                        .map(|block| block.id().clone())
                 })
                 .flatten();
             let tail = tail_block.map(|block| {
@@ -23336,7 +23343,8 @@ impl TerminalView {
                     rendered = contents.clone();
                 } else if request.is_session() {
                     let start =
-                        Self::capture_session_tail_start(blocks, session_prefix_block_id).unwrap();
+                        Self::capture_session_tail_start(blocks, session_prefix_block_id.as_ref())
+                            .unwrap();
                     Self::append_capture_blocks_text_cached(
                         &blocks.blocks()[start..],
                         request,
@@ -23352,7 +23360,7 @@ impl TerminalView {
                         false,
                     );
                 }
-                (*block.id(), usize::from(block.index()), rendered)
+                (block.id().clone(), usize::from(block.index()), rendered)
             });
             if tail.as_ref().is_some_and(|(_, _, text)| text.is_empty()) && !contents.is_empty() {
                 contents.push_str(file_capture::BLOCK_SEPARATOR);
