@@ -46,6 +46,7 @@ use crate::ai::llms::LLMPreferences;
 use crate::ai::orchestration::{RemoteChildLaunchConfig, prepare_remote_child_launch};
 use crate::app_state::{AmbientAgentPaneSnapshot, LeafContents, TerminalPaneSnapshot};
 use crate::code::buffer_location::LocalOrRemotePath;
+use crate::conn::ConnModel;
 #[cfg(feature = "local_fs")]
 use crate::pane_group::CodeSource;
 use crate::pane_group::Event::OpenConversationHistory;
@@ -421,6 +422,13 @@ impl PaneContent for TerminalPane {
             .iter()
             .map(|(_, view)| view.id())
             .collect::<Vec<_>>();
+        if matches!(detach_type, DetachType::Closed) {
+            ConnModel::handle(ctx).update(ctx, |conn, ctx| {
+                for terminal_view_id in &terminal_view_ids {
+                    conn.forget_pane(*terminal_view_id, ctx);
+                }
+            });
+        }
         for (manager, view) in contents {
             if !matches!(detach_type, DetachType::Moved) {
                 view.update(ctx, |view, ctx| view.set_ssh_manager_attached(false, ctx));

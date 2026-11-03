@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use warp_core::execution_mode::{AppExecutionMode, ExecutionMode};
@@ -10,6 +11,7 @@ use super::event::{
 use super::{
     BlockedSource, CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentSession,
     CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
+    CLIAgentSessionsModelEvent,
 };
 use crate::ai::blocklist::{InputConfig, InputType};
 use crate::terminal::CLIAgent;
@@ -1454,5 +1456,92 @@ fn second_ctrl_c_while_armed_reuses_the_existing_window() {
                 "a second Ctrl-C while armed must reuse the existing window, not reset it"
             );
         });
+    });
+}
+
+/// Collects the event type of every `RawEvent` the model emits.
+fn track_raw_events(
+    app: &mut App,
+    model: &warpui::ModelHandle<CLIAgentSessionsModel>,
+) -> Arc<Mutex<Vec<CLIAgentEventType>>> {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let seen_for_closure = seen.clone();
+    app.update(|ctx| {
+        ctx.subscribe_to_model(model, move |_, event, _| {
+            if let CLIAgentSessionsModelEvent::RawEvent { event, .. } = event {
+                seen_for_closure
+                    .lock()
+                    .expect("test mutex is uncontended")
+                    .push(event.event.clone());
+            }
+        });
+    });
+    seen
+}
+
+/// Conn's whole purpose is the history the status model throws away, so
+/// `RawEvent` must fire for events `apply_event` deliberately drops:
+/// `IdlePrompt` always, and `ToolComplete` when the session isn't `Blocked`.
+/// Subscribing to `StatusChanged` instead would miss both.
+#[test]
+fn conn_raw_event_fires_for_events_apply_event_drops() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(
+                view_id,
+                cli_agent_session(CLIAgentSessionStatus::InProgress, true),
+                ctx,
+            );
+        });
+
+        let seen = track_raw_events(&mut app, &model);
+
+        // PromptSubmit changes status; the other two are discarded by apply_event.
+        for event in [
+            CLIAgentEventType::PromptSubmit,
+            CLIAgentEventType::IdlePrompt,
+            CLIAgentEventType::ToolComplete,
+        ] {
+            model.update(&mut app, |m, ctx| {
+                m.update_from_event(view_id, &rich_event(event.clone()), ctx);
+            });
+        }
+
+        let seen = seen.lock().expect("test mutex is uncontended").clone();
+        assert_eq!(
+            seen,
+            vec![
+                CLIAgentEventType::PromptSubmit,
+                CLIAgentEventType::IdlePrompt,
+                CLIAgentEventType::ToolComplete,
+            ],
+            "RawEvent must forward every parsed event, in order, including the \
+             status-irrelevant ones Conn depends on"
+        );
+    });
+}
+
+/// An event for a terminal with no tracked session is dropped before the
+/// emit, so Conn never sees events it couldn't attribute to a pane.
+#[test]
+fn conn_raw_event_requires_a_tracked_session() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let seen = track_raw_events(&mut app, &model);
+
+        model.update(&mut app, |m, ctx| {
+            m.update_from_event(
+                EntityId::new(),
+                &rich_event(CLIAgentEventType::PromptSubmit),
+                ctx,
+            );
+        });
+
+        assert!(
+            seen.lock().expect("test mutex is uncontended").is_empty(),
+            "an untracked terminal must not produce a RawEvent"
+        );
     });
 }

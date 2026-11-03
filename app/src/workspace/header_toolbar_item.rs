@@ -32,6 +32,7 @@ pub enum HeaderToolbarItemKind {
     SshProfiles,
     AgentManagement,
     CodeReview,
+    Conn,
     NotificationsMailbox,
 }
 
@@ -43,6 +44,7 @@ impl HeaderToolbarItemKind {
             Self::SshProfiles => "SSH Profiles",
             Self::AgentManagement => "Agent Management",
             Self::CodeReview => "Code Review",
+            Self::Conn => "Conn",
             Self::NotificationsMailbox => "Notifications",
         }
     }
@@ -54,6 +56,7 @@ impl HeaderToolbarItemKind {
             Self::SshProfiles => Icon::Globe,
             Self::AgentManagement => Icon::Grid,
             Self::CodeReview => Icon::Diff,
+            Self::Conn => Icon::ClockRewind,
             Self::NotificationsMailbox => Icon::Inbox,
         }
     }
@@ -83,6 +86,7 @@ impl HeaderToolbarItemKind {
                     && !is_web_anonymous_user
             }
             Self::CodeReview => cfg!(feature = "local_fs"),
+            Self::Conn => true,
             Self::NotificationsMailbox => {
                 !ChannelState::is_local_only() && FeatureFlag::HOANotifications.is_enabled()
             }
@@ -107,7 +111,7 @@ impl HeaderToolbarItemKind {
     pub fn is_panel(&self) -> bool {
         matches!(
             self,
-            Self::TabsPanel | Self::ToolsPanel | Self::SshProfiles | Self::CodeReview
+            Self::TabsPanel | Self::ToolsPanel | Self::SshProfiles | Self::CodeReview | Self::Conn
         )
     }
 
@@ -121,7 +125,7 @@ impl HeaderToolbarItemKind {
     }
 
     pub fn default_right() -> Vec<Self> {
-        vec![Self::CodeReview, Self::NotificationsMailbox]
+        vec![Self::CodeReview, Self::Conn, Self::NotificationsMailbox]
     }
 
     /// All toolbar item variants (availability filtering is done at the call site).
@@ -132,6 +136,7 @@ impl HeaderToolbarItemKind {
             Self::SshProfiles,
             Self::AgentManagement,
             Self::CodeReview,
+            Self::Conn,
             Self::NotificationsMailbox,
         ]
     }

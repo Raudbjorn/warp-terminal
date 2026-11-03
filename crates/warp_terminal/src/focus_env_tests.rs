@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 
 use warp_core::channel::ChannelState;
 
@@ -27,4 +27,39 @@ fn focus_env_vars_point_at_session_deeplink() {
             ChannelState::url_scheme()
         )))
     );
+}
+
+/// Launching Warp from inside a Claude Code session used to make every
+/// terminal in it a child of that session, which turns transcript saving off.
+/// The markers describe whatever started Warp, never the shells Warp starts.
+///
+/// Tested on names rather than on the process environment, which parallel tests share.
+#[test]
+fn launcher_agent_markers_are_told_from_user_config() {
+    for marker in [
+        "CLAUDE_CODE_CHILD_SESSION",
+        "CLAUDECODE",
+        "CLAUDE_CODE_ENTRYPOINT",
+        // A launcher marker may arrive in a different case on a platform that folds it.
+        "claude_pid",
+        "AI_AGENT",
+    ] {
+        assert!(
+            super::is_launcher_agent_marker(OsStr::new(marker)),
+            "{marker} is a marker"
+        );
+    }
+    for kept in [
+        // The user's own configuration is not a session marker.
+        "CLAUDE_CONFIG_DIR",
+        // A CLAUDE_CODE_ variable is not a marker unless it is one of the named ones.
+        "CLAUDE_CODE_USE_BEDROCK",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "PATH",
+    ] {
+        assert!(
+            !super::is_launcher_agent_marker(OsStr::new(kept)),
+            "{kept} is the user's"
+        );
+    }
 }

@@ -85,6 +85,7 @@ cloud_objects.workspace = true
 command = { workspace = true }
 command-corrections.workspace = true
 computer_use.workspace = true
+conn.workspace = true
 crc.workspace = true
 content_inspector = "0.2.4"
 concat-idents.workspace = true

@@ -726,13 +726,21 @@ impl PaneNode {
         match self {
             PaneNode::Leaf(view) => {
                 let view = *view;
-                EventHandler::new(view.render(app))
+                let activate = EventHandler::new(view.render(app))
                     .on_left_mouse_down(move |ctx, _, _| {
                         ctx.dispatch_typed_action(PaneGroupAction::Activate(
                             view,
                             ActivationReason::Click,
                         ));
                         DispatchEventResult::StopPropagation
+                    })
+                    .finish();
+                // A pane's content handles most clicks itself, so `activate` misses them.
+                EventHandler::new(activate)
+                    .with_always_handle()
+                    .on_left_mouse_down(|ctx, _, _| {
+                        ctx.dispatch_typed_action(PaneGroupAction::Clicked);
+                        DispatchEventResult::PropagateToParent
                     })
                     .finish()
             }

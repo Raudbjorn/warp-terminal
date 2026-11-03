@@ -45,6 +45,7 @@ cloud_object_persistence = { path = "crates/cloud_object_persistence" }
 cloud_object_models = { path = "crates/cloud_object_models" }
 code_formatters = { path = "crates/code_formatters" }
 computer_use = { path = "crates/computer_use" }
+conn = { path = "crates/conn" }
 field_mask = { path = "crates/field_mask" }
 file_write_guard = { path = "crates/file_write_guard" }
 firebase = { path = "crates/firebase" }

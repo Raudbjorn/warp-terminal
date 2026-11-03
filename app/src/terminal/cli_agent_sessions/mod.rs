@@ -346,6 +346,18 @@ pub enum CLIAgentSessionsModelEvent {
         terminal_view_id: EntityId,
         agent: CLIAgent,
     },
+    /// Every parsed plugin event, forwarded verbatim before the session model
+    /// folds it into a status.
+    ///
+    /// The other variants describe the session's *current* state, which is
+    /// lossy by design: `apply_event` drops events that don't change status and
+    /// `clear_permission_scoped_state` erases permission details once they stop
+    /// being relevant. Conn needs the history those steps discard, so it reads
+    /// this instead.
+    RawEvent {
+        terminal_view_id: EntityId,
+        event: Box<CLIAgentEvent>,
+    },
 }
 
 impl CLIAgentSessionsModelEvent {
@@ -364,6 +376,9 @@ impl CLIAgentSessionsModelEvent {
                 terminal_view_id, ..
             }
             | CLIAgentSessionsModelEvent::SessionUpdated {
+                terminal_view_id, ..
+            }
+            | CLIAgentSessionsModelEvent::RawEvent {
                 terminal_view_id, ..
             } => *terminal_view_id,
         }
@@ -520,6 +535,12 @@ impl CLIAgentSessionsModel {
         if !self.sessions.contains_key(&terminal_view_id) {
             return;
         }
+
+        // Emitted before `apply_event` so subscribers see events it drops.
+        ctx.emit(CLIAgentSessionsModelEvent::RawEvent {
+            terminal_view_id,
+            event: Box::new(event.clone()),
+        });
 
         // Any plugin event other than `IdlePrompt` is evidence the CLI agent
         // process is still alive — an interrupt produces silence instead.
