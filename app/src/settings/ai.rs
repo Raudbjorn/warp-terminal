@@ -3166,6 +3166,15 @@ impl Entity for CompiledCommandsForCodingAgentToolbar {
 
 impl SingletonEntity for CompiledCommandsForCodingAgentToolbar {}
 
+/// Whether the CLI agent footer (coding agent toolbar) should actually show. In Harp mode the
+/// sidebar row already shows agent state, so the footer hides; turning the mode off brings it
+/// back without touching the user's `should_render_cli_agent_footer` setting. Read the raw
+/// setting instead only where the setting itself is shown or synced (settings page, toggle
+/// labels, onboarding).
+pub fn cli_agent_footer_visible(ctx: &AppContext) -> bool {
+    *AISettings::as_ref(ctx).should_render_cli_agent_footer && !crate::tab::harp_mode_enabled(ctx)
+}
+
 #[cfg(test)]
 #[path = "ai_tests.rs"]
 mod tests;
