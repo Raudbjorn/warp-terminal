@@ -30,11 +30,10 @@ There are three separate AI paths, each with its own settings:
 
 - **Natural-language commands, workflow metadata and command prediction:**
   **Settings → Local AI.** Set the base URL (e.g. `http://localhost:11434/v1`),
-  an API key *if your server requires one*, and the model names. In this build
-  the endpoint must be a loopback address (`localhost`, `127.0.0.1`, `::1`) or
-  an IP address you have listed under **Settings → Local AI → Allowed private
-  hosts** (see below). Other host names and public hosts are rejected. A CIDR
-  range can be an allow-list entry, but the endpoint itself is one address.
+  an API key *if your server requires one*, and the model names. The endpoint
+  can be on this machine (`http://` or `https://`), any `https://` host, or a
+  plain-`http://` address you have listed under **Settings → Local AI → Allowed
+  private hosts** (see below).
 - **Warp Agent conversations:** **Settings → Agents → Warp Agent → Custom
   Inference.** Add a custom endpoint that uses the OpenAI Chat Completions
   schema and select one of its models. A request for any other model is
@@ -71,9 +70,16 @@ check the destination against one policy, re-check every redirect, and ignore
   the address it resolves to. Redirects are checked against the same policy: a
   redirect to a destination that is not permitted is refused, while a redirect
   to another permitted host is followed.
-- **The public internet**, including OpenAI and OpenRouter, is denied. An
-  endpoint that has to be reached over the internet needs a proxy or tunnel
-  on a host you have allowed above.
+- **AI endpoints you configured** are allowed over `https://` only: the host
+  of the Local AI base URL, of every custom inference endpoint, and of every
+  Agent Profile *OpenAI Base URL*. Entering the URL is the opt-in; there is no
+  separate list to repeat it in. The match is on scheme, host and port, so
+  `https://api.example.com/v1` allows every path on `api.example.com:443` and
+  nothing on other hosts, subdomains or ports. A plain `http://` URL is never
+  added for a non-local host. Configured endpoints are reached directly, not
+  through `HTTP(S)_PROXY`.
+- **Everything else on the public internet** stays denied, including a
+  redirect from a configured host to one you did not configure.
 
 Changing the list takes effect immediately; the local agent service restarts
 to pick it up.
