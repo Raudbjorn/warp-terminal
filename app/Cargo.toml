@@ -485,7 +485,6 @@ account_first_onboarding = []
 agent_shared_sessions = []
 ask_user_question = []
 async_find = []
-changelog = []
 clear_autosuggestion_on_escape = []
 codebase_index_speedbump = []
 context_line_review_comments = []
@@ -633,7 +632,6 @@ default = [
     "richtext_multiselect",
     "inline_profile_selector",
     "web_fetch_ui",
-    "oz_changelog_updates",
     "skill_arguments",
     "incremental_auto_reload",
     "active_conversation_requires_interaction",
@@ -810,7 +808,6 @@ markdown_mermaid = []
 mcp_server = []
 mcp_oauth = []
 mcp_debugging_ids = []
-oz_changelog_updates = []
 # Remote-backed tty that connects to a PTY-like interface via a server.
 remote_tty = ["warp_terminal/remote_tty"]
 # Fix for cursor reflow bug during window resize, from Alacritty resizing logic.

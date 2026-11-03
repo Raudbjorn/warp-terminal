@@ -196,13 +196,6 @@ fn make_new_app_menu(ctx: &AppContext) -> Menu {
         preferences_menu_items,
     )));
 
-    if online_services_menu_enabled() && FeatureFlag::Changelog.is_enabled() {
-        menu_items.push(updateable_custom_item_without_checkmark(
-            CustomAction::ViewChangelog,
-            ctx,
-        ));
-    }
-
     #[cfg(target_os = "macos")]
     {
         menu_items.push(MenuItem::Services);

@@ -29,11 +29,19 @@ static CLIENT_CONFIG: std::sync::LazyLock<Result<Arc<rustls::ClientConfig>, rust
 /// When `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` environment variables are set,
 /// the connection is tunneled through the specified HTTP proxy using the CONNECT method.
 /// The `NO_PROXY` environment variable is respected to bypass the proxy for specific hosts.
+///
+/// In local-only mode proxies are never used: only loopback targets pass the network policy, and
+/// tunneling one through a proxy would expose the destination off-machine.
 pub async fn connect(request: impl IntoClientRequest + Unpin) -> anyhow::Result<WebSocket> {
     let request = request.into_client_request()?;
     let tls_connector = Some(TlsConnector::from(CLIENT_CONFIG.clone()?));
 
-    if let Some(proxy_info) = proxy::resolve_proxy(request.uri())? {
+    let proxy_info = if network_policy::is_local_only() {
+        None
+    } else {
+        proxy::resolve_proxy(request.uri())?
+    };
+    if let Some(proxy_info) = proxy_info {
         log::debug!(
             "Using HTTP proxy {}:{} for WebSocket connection to {}",
             proxy_info.host,

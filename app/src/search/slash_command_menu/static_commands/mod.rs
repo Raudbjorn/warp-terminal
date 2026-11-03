@@ -87,7 +87,6 @@ pub enum SlashCommandKind {
     OpenProjectRules,
     OpenMcpServers,
     OpenSettingsFile,
-    Changelog,
     Feedback,
     OpenRepo,
     OpenRules,

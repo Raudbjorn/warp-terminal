@@ -27,8 +27,8 @@ use warp::tui_export::{
     BlocklistAIActionModel, BlocklistAIContextModel, BlocklistAIController,
     BlocklistAIHistoryEvent, BlocklistAIHistoryModel, BlocklistAIInputModel,
     BlocklistOrchestrationTelemetryEvent, CLISubagentController, CLISubagentEvent,
-    CLISubagentTarget, COMMAND_REGISTRY, CancellationReason, ChangelogModel, ChangelogRequestType,
-    CloudConversationData, CommandExecutionSource, ConversationFileExport, ConversationSelection,
+    CLISubagentTarget, COMMAND_REGISTRY, CancellationReason, CloudConversationData,
+    CommandExecutionSource, ConversationFileExport, ConversationSelection,
     ConversationSelectionHandle, ExecuteCommandEvent, FORK_PREFIX, ForkConversationError,
     GetRelevantFilesController, GitHubRepoModel, GitRepoStatusModel, LLMId, LLMPreferences,
     LLMPreferencesEvent, LOCAL_SKILLS_REMOTE_EXECUTION_ERROR_MESSAGE, LinkedWorkflowData,
@@ -2105,12 +2105,6 @@ impl TuiTerminalSessionView {
                 | QueuedQueryEvent::Cleared { .. } => {}
             },
         );
-
-        // Trigger the changelog fetch once at startup so `TuiZeroStateView`
-        // has data to display.  The re-render subscription lives in the view.
-        ChangelogModel::handle(ctx).update(ctx, |changelog, ctx| {
-            changelog.check_for_changelog(ChangelogRequestType::WindowLaunch, ctx);
-        });
 
         // Bridge shared shell-tool executor events into terminal-manager PTY intents.
         let shell_command_executor = action_model.as_ref(ctx).shell_command_executor(ctx);
@@ -4926,7 +4920,6 @@ impl TuiTerminalSessionView {
             | SlashCommandKind::OpenProjectRules
             | SlashCommandKind::OpenMcpServers
             | SlashCommandKind::OpenSettingsFile
-            | SlashCommandKind::Changelog
             | SlashCommandKind::Feedback
             | SlashCommandKind::OpenRepo
             | SlashCommandKind::OpenRules

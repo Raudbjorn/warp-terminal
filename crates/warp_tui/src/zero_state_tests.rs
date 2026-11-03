@@ -6,8 +6,6 @@ use ai::api_keys::{
     ApiKeyManager, CustomEndpoint, CustomEndpointDefinitions, CustomEndpointModel,
     CustomEndpointSchema,
 };
-use channel_versions::{Changelog, MarkdownSection, Section};
-use chrono::DateTime;
 use uuid::Uuid;
 use warp::tui_export::{
     TuiMcpConfigDiagnostic, TuiMcpServerId, TuiMcpServerSnapshot, TuiMcpServerSource,
@@ -25,8 +23,8 @@ use warpui_core::{App, AppContext};
 use super::{
     ANIMATION_PANEL_COLS, LEFT_COLUMN_COLS, ZeroStateSectionVisibility, autoupdate_status_label,
     build_zero_state_layout, build_zero_state_overlay, build_zero_state_stack_layout,
-    changelog_bullets_from_changelog, custom_endpoint_status_label, mcp_status_label,
-    render_bottom_section, render_first_run_top_section,
+    custom_endpoint_status_label, mcp_status_label, render_bottom_section,
+    render_first_run_top_section,
 };
 use crate::autoupdate::TuiAutoupdateStatus;
 use crate::tui_builder::TuiUiBuilder;
@@ -51,23 +49,6 @@ fn server(id: u64, status: TuiMcpServerStatus) -> TuiMcpServerSnapshot {
     }
 }
 
-fn changelog(tui_updates: Vec<&str>) -> Changelog {
-    Changelog {
-        date: DateTime::parse_from_rfc3339("2026-07-30T12:00:00+00:00").unwrap(),
-        sections: vec![Section {
-            title: "Improvements".to_owned(),
-            items: vec!["Unrelated GUI improvement".to_owned()],
-        }],
-        markdown_sections: vec![MarkdownSection {
-            title: "Improvements".to_owned(),
-            markdown: "* Unrelated GUI improvement\n".to_owned(),
-        }],
-        image_url: None,
-        oz_updates: vec!["Unrelated Oz improvement".to_owned()],
-        tui_updates: tui_updates.into_iter().map(ToOwned::to_owned).collect(),
-    }
-}
-
 fn endpoint_definitions() -> CustomEndpointDefinitions {
     let endpoints = ["One", "Two"]
         .into_iter()
@@ -87,20 +68,6 @@ fn endpoint_definitions() -> CustomEndpointDefinitions {
     CustomEndpointDefinitions::from_legacy(&endpoints)
         .expect("test endpoints should be valid")
         .0
-}
-
-#[test]
-fn changelog_bullets_use_only_the_first_three_tui_updates() {
-    let changelog = changelog(vec!["First", "Second", "Third", "Fourth"]);
-    assert_eq!(
-        changelog_bullets_from_changelog(&changelog),
-        ["First", "Second", "Third"]
-    );
-}
-
-#[test]
-fn changelog_bullets_are_empty_when_only_other_surfaces_have_updates() {
-    assert!(changelog_bullets_from_changelog(&changelog(Vec::new())).is_empty());
 }
 
 #[test]

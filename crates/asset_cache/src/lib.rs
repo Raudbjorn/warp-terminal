@@ -151,7 +151,17 @@ async fn fetch_file_to_memory(url: Url) -> Result<Bytes, anyhow::Error> {
             // On non-web platforms, reqwest expects that it is operating within
             // a Tokio-compatible runtime, so use async-compat to wrap the call
             // so reqwest's expectations are met.
-            let response = async_compat::Compat::new(async move { reqwest::get(url).await }).await?;
+            //
+            // `reqwest::get` would use the default redirect policy, which follows redirects
+            // without re-checking them against the network policy, and honors proxies.
+            let response = async_compat::Compat::new(async move {
+                network_policy::apply_to_client_builder(reqwest::Client::builder())
+                    .build()?
+                    .get(url)
+                    .send()
+                    .await
+            })
+            .await?;
         }
     }
     let content = response.error_for_status()?.bytes().await?;

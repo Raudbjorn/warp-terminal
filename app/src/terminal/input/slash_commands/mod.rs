@@ -906,12 +906,6 @@ impl Input {
             SlashCommandKind::Init => {
                 ctx.dispatch_typed_action(&TerminalAction::InitProject);
             }
-            SlashCommandKind::Changelog => {
-                if ChannelState::is_local_only() || !FeatureFlag::Changelog.is_enabled() {
-                    return false;
-                }
-                ctx.dispatch_typed_action(&WorkspaceAction::ViewLatestChangelog);
-            }
             SlashCommandKind::Feedback => {
                 if ChannelState::is_local_only() {
                     return false;

@@ -14,12 +14,11 @@ use crate::server::server_api::{FETCH_CHANNEL_VERSIONS_TIMEOUT, ServerApi};
 pub async fn fetch_channel_versions(
     nonce: &str,
     server_api: Arc<ServerApi>,
-    include_changelogs: bool,
     is_daily: bool,
 ) -> Result<ChannelVersions> {
     if let Ok(path) = env::var("WARP_CHANNEL_VERSIONS_PATH") {
-        // Load channel versions from local filesystem. Used for testing both
-        // autoupdate and changelog behavior.
+        // Load channel versions from local filesystem. Used for testing
+        // autoupdate behavior.
         let path = shellexpand::tilde(&path);
         let channel_versions_string = read_to_string::<&str>(&path)?;
         return serde_json::from_str(channel_versions_string.as_str())
@@ -33,7 +32,7 @@ pub async fn fetch_channel_versions(
     }
 
     let channel_versions = server_api
-        .fetch_channel_versions(include_changelogs, is_daily)
+        .fetch_channel_versions(is_daily)
         .await
         .context("Failed to retrieve channel versions from Warp server");
     match channel_versions {

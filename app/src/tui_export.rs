@@ -167,9 +167,6 @@ pub use crate::ai::tui_api_keys::notify_tui_api_keys_changed;
 pub use crate::appearance::Appearance;
 pub use crate::auth::AuthStateProvider;
 pub use crate::banner::BannerState;
-pub use crate::changelog_model::{
-    ChangelogModel, ChangelogRequestType, ChangelogState, Event as ChangelogModelEvent,
-};
 pub use crate::code::DiffResult;
 pub use crate::code_review::git_repo_model::{
     GitRepoModels, GitRepoStatusModel, GitStatusMetadata,

@@ -1,61 +1,45 @@
-use rudder_message::Track;
-use virtual_fs::VirtualFS;
+use std::borrow::Cow;
+
+use chrono::Utc;
 
 use super::*;
 
-// Tests that events with UGC are not persisted to desk.
-#[test]
-fn test_persist_events_doesnt_include_ugc_events() {
-    let telemetry_api = TelemetryApi::new();
-
-    VirtualFS::test(
-        "test_persist_events_doesnt_include_ugc_events",
-        |dirs, _sandbox| {
-            // Add one event without UGC
-            let user_id = Some("user".into());
-            let anonymous_id = "anonymous_id".to_owned();
-
-            warpui::telemetry::record_event(
-                user_id.clone(),
-                anonymous_id.clone(),
-                "non UGC event name".into(),
-                None,  /* payload */
-                false, /* contains_ugc  */
-                warpui::time::get_current_time(),
-            );
-
-            warpui::telemetry::record_event(
-                user_id.clone(),
-                anonymous_id.clone(),
-                "UGC event name".into(),
-                None, /* payload */
-                true, /* contains_ugc  */
-                warpui::time::get_current_time(),
-            );
-
-            let file_path = dirs.root().join("rudderstack");
-
-            telemetry_api
-                .flush_and_persist_events_at_path(10, PrivacySettingsSnapshot::mock(), &file_path)
-                .expect("Should be able to persist events");
-
-            let file_content: Vec<RudderBatchMessage> =
-                serde_json::from_reader(File::open(file_path).expect("Failed to open file"))
-                    .expect("Failed to parse file");
-
-            assert_eq!(file_content.len(), 1);
-
-            let track = file_content[0].unwrap_track();
-            assert_eq!(track.event, "non UGC event name");
+fn named_event(contains_ugc: bool) -> Event {
+    Event {
+        payload: EventPayload::NamedEvent {
+            user_id: Some("user".into()),
+            anonymous_id: "anon".into(),
+            name: Cow::Borrowed("Some Event"),
+            value: Some(json!({ "k": "v" })),
         },
-    );
+        session_created_at: Utc::now(),
+        timestamp: Utc::now(),
+        contains_ugc,
+    }
 }
 
-impl RudderBatchMessage {
-    fn unwrap_track(&self) -> &Track {
-        match self {
-            RudderBatchMessage::Track(track) => track,
-            _ => panic!("Expected a track event"),
-        }
-    }
+#[test]
+fn event_to_json_maps_named_event() {
+    let value = event_to_json(named_event(false));
+    assert_eq!(value["type"], "track");
+    assert_eq!(value["event"], "Some Event");
+    assert_eq!(value["user_id"], "user");
+    assert_eq!(value["anonymous_id"], "anon");
+    assert_eq!(value["payload"]["k"], "v");
+}
+
+#[test]
+fn event_to_json_maps_identify() {
+    let event = Event {
+        payload: EventPayload::IdentifyUser {
+            user_id: "user".into(),
+            anonymous_id: "anon".into(),
+        },
+        session_created_at: Utc::now(),
+        timestamp: Utc::now(),
+        contains_ugc: false,
+    };
+    let value = event_to_json(event);
+    assert_eq!(value["type"], "identify");
+    assert!(value["event"].is_null());
 }

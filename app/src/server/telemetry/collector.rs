@@ -2,14 +2,13 @@ use std::fs::remove_file;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Context;
 use chrono::{LocalResult, TimeZone, Utc};
 use warp_core::execution_mode::AppExecutionMode;
-use warp_errors::{report_error, report_if_error};
+use warp_errors::report_error;
 use warpui::r#async::{FutureExt as _, Timer};
 use warpui::{App, Entity, ModelContext, SingletonEntity};
 
-use super::{RUDDER_TELEMETRY_EVENTS_FILE_NAME, clear_event_queue, rudder_event_file_path};
+use super::{LEGACY_PERSISTED_EVENTS_FILE_NAME, clear_event_queue};
 use crate::auth::AuthStateProvider;
 use crate::channel::ChannelState;
 use crate::features::FeatureFlag;
@@ -19,19 +18,14 @@ use crate::settings::{PrivacySettings, PrivacySettingsChangedEvent};
 // How often we send Active Usage signals.
 const ACTIVE_USAGE_DURATION: Duration = Duration::from_secs(60);
 
-/// Duration to wait before flushing the event queue to Rudderstack.
+/// Duration to wait before draining the event queue.
 const TELEMETRY_FLUSH_DURATION: Duration = Duration::from_secs(30);
 
-/// Max telemetry events to write to disk. This is bounded to limit the size of the file as well
-/// as latency of writing the file.
-const MAX_TELEMETRY_EVENTS_TO_STORE: usize = 20;
-
-/// Maximum time to wait for the telemetry flush network request during shutdown.
-/// If the network is unavailable or slow, we don't want the CLI process to hang indefinitely.
+/// Maximum time to wait for the telemetry flush during shutdown.
 const TELEMETRY_SHUTDOWN_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// App singleton responsible for scheduling periodic background tasks for sending batches of
-/// telemetry events to Rudderstack.  This model respects the user's telemetry enablement setting.
+/// App singleton responsible for periodically draining the telemetry event queue (into the local
+/// debug log when enabled; nothing is sent off-device). Respects the telemetry enablement setting.
 pub struct TelemetryCollector {
     server_api: Arc<ServerApi>,
 }
@@ -47,12 +41,9 @@ impl TelemetryCollector {
             return;
         }
 
-        // Start a background thread to periodically flush events from the telemetry event queue.
-        if ChannelState::is_release_bundle() || FeatureFlag::WithSandboxTelemetry.is_enabled() {
-            // Flush the events to Rudderstack that were persisted into a file the last time the app was
-            // quit.
-            self.flush_persisted_events_from_disk(ctx);
-        }
+        // Upstream persisted unsent events on quit to re-send on the next launch; nothing reads
+        // or writes that file anymore, so just delete any leftovers.
+        Self::remove_legacy_persisted_events_files();
 
         // Send Active App Usage signals
         if FeatureFlag::RecordAppActiveEvents.is_enabled()
@@ -69,12 +60,8 @@ impl TelemetryCollector {
             self.schedule_event_queue_flush(ctx);
         }
 
-        // Clear queued telemetry events when telemetry is enabled or disabled. If telemetry is
-        // enabled, we will start sending Rudderstack requests when the event queue is periodically
-        // flushed. The initial request should not contain any events recorded when the user was
-        // previously opted-out of telemetry. In the case where the user turns the telemetry from
-        // on to off, we should not send another request with any telemetry, even if the event was
-        // initially recorded prior to the user turning telemetry off.`
+        // Clear queued telemetry events when telemetry is enabled or disabled, so events recorded
+        // while opted out are never written out after opting in (and vice versa).
         ctx.subscribe_to_model(&PrivacySettings::handle(ctx), |_me, _, event, _ctx| {
             if let PrivacySettingsChangedEvent::UpdateIsTelemetryEnabled { .. } = event {
                 clear_event_queue();
@@ -82,32 +69,10 @@ impl TelemetryCollector {
         });
     }
 
-    /// Writes all queued but unsent telemetry telemetry events to disk so that they may be sent
-    /// on the next app startup.
-    pub fn write_telemetry_events_to_disk(&self, ctx: &mut ModelContext<TelemetryCollector>) {
-        if ChannelState::is_local_only() {
-            log::info!("Local-only services mode; not persisting telemetry events.");
-            return;
-        }
-
-        match self.server_api.persist_telemetry_events(
-            MAX_TELEMETRY_EVENTS_TO_STORE,
-            PrivacySettings::as_ref(ctx).get_snapshot(ctx),
-        ) {
-            Ok(()) => {
-                log::info!("Successfully wrote telemetry events to disk")
-            }
-            Err(e) => {
-                report_error!(e.context("Failed to write telemetry events to disk"));
-            }
-        }
-    }
-
     /// Flushes telemetry events when the app is shutting down.
     ///
-    /// Depending on the app's execution mode, this will either:
-    /// * Write events to disk, for sending on the next app startup
-    /// * Synchronously send events to rudderstack
+    /// Depending on the app's execution mode, this either drains the queue through the normal
+    /// flush path (with a timeout) or simply discards the queued events.
     pub fn flush_telemetry_events_for_shutdown(&self, ctx: &mut ModelContext<TelemetryCollector>) {
         if ChannelState::is_local_only() {
             log::info!("Local-only services mode; not flushing telemetry events.");
@@ -141,48 +106,28 @@ impl TelemetryCollector {
                 }
             }
         } else {
-            self.write_telemetry_events_to_disk(ctx);
+            clear_event_queue();
         }
     }
 
-    /// Sends rudderstack requests containing events persisted to disk (if telemetry is enabled).
-    /// Events may be written to disk at the end of a session prior to app termination; this
-    /// function should be called on startup to track events that were recorded at the end of the
-    /// last session and were not flushed.
-    fn flush_persisted_events_from_disk(&self, ctx: &mut ModelContext<TelemetryCollector>) {
-        let privacy_settings_snapshot = PrivacySettings::as_ref(ctx).get_snapshot(ctx);
-        let server_api = self.server_api.clone();
-        let _ = ctx.spawn(
-            async move {
-                let new_path = rudder_event_file_path();
-                let old_path =
-                    warp_core::paths::state_dir().join(RUDDER_TELEMETRY_EVENTS_FILE_NAME);
-
-                // Try flushing from both new and legacy locations.
-                for path in [new_path, old_path] {
-                    report_if_error!(
-                        server_api
-                            .flush_persisted_events_to_rudder(&path, privacy_settings_snapshot)
-                            .await
-                            .context("Failed to flush rudder events from disk")
-                    );
-                    // Remove the file regardless of outcome  of flushing the events to avoid the
-                    // case where we accidentally try to re-flush the events on the next app startup.
-                    if let Err(e) = remove_file(&path)
-                        && e.kind() != std::io::ErrorKind::NotFound
-                    {
-                        report_error!(
-                            anyhow::anyhow!(e).context("Failed to remove persisted event file")
-                        );
-                    }
-                }
-            },
-            |_, _, _| (),
-        );
+    fn remove_legacy_persisted_events_files() {
+        let paths = [
+            warp_core::paths::secure_state_dir()
+                .map(|dir| dir.join(LEGACY_PERSISTED_EVENTS_FILE_NAME)),
+            Some(warp_core::paths::state_dir().join(LEGACY_PERSISTED_EVENTS_FILE_NAME)),
+        ];
+        for path in paths.into_iter().flatten() {
+            if let Err(e) = remove_file(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                report_error!(
+                    anyhow::anyhow!(e).context("Failed to remove legacy persisted telemetry file")
+                );
+            }
+        }
     }
 
-    /// Schedules a background task to send an active usage event in a rudderstack request if
-    /// telemetry is enabled. The scheduled task once again schedules itself after
+    /// Schedules a background task to record an active usage event if telemetry is enabled. The scheduled task once again schedules itself after
     /// `ACTIVE_USAGE_DURATION`.
     fn schedule_send_active_usage_event(&self, ctx: &mut ModelContext<TelemetryCollector>) {
         let auth_state = AuthStateProvider::as_ref(ctx).get().clone();
@@ -209,8 +154,7 @@ impl TelemetryCollector {
         );
     }
 
-    /// Flushes events from the in-memory event queue and schedules a background task to send
-    /// them in rudderstack request if telemetry is enabled. The scheduled task once again schedules
+    /// Drains the in-memory event queue and reschedules itself. The scheduled task once again schedules
     /// itself after `TELEMETRY_FLUSH_DURATION`.
     fn schedule_event_queue_flush(&self, ctx: &mut ModelContext<TelemetryCollector>) {
         let server_api = self.server_api.clone();

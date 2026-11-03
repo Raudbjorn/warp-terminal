@@ -289,12 +289,7 @@ impl Args {
         let mut command = <Args as CommandFactory>::command();
 
         if ChannelState::is_local_only() {
-            command = command.about("Local terminal CLI").long_about(
-                "Local terminal CLI for commands that do not require Warp online services.",
-            );
-            for subcommand in LOCAL_ONLY_HIDDEN_SUBCOMMANDS {
-                command = command.mut_subcommand(subcommand, |c| c.hide(true));
-            }
+            command = apply_local_only_help(command);
         }
 
         // Hide the environment subcommands and --environment flags from help text
@@ -504,11 +499,15 @@ const LOCAL_ONLY_DISABLED_SUBCOMMANDS: &[&str] = &[
     "task",
 ];
 
+/// Subcommands hidden from `--help` in local-only mode. These are passed to
+/// [`clap::Command::mut_subcommand`], which panics on any name that isn't a subcommand's canonical
+/// name, so aliases must not be listed here. Notably `task` is an alias of `run`, which hides it
+/// too. It is still in [`LOCAL_ONLY_DISABLED_SUBCOMMANDS`], since that list is matched against raw
+/// argv.
 const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
     "agent",
     "environment",
     "run",
-    "task",
     "model",
     "login",
     "logout",
@@ -521,6 +520,18 @@ const LOCAL_ONLY_HIDDEN_SUBCOMMANDS: &[&str] = &[
     "harness-support",
     "artifact",
 ];
+
+/// Rewrites the help text of `command` for local-only mode, hiding the subcommands that need
+/// Warp online services.
+fn apply_local_only_help(mut command: clap::Command) -> clap::Command {
+    command = command
+        .about("Local terminal CLI")
+        .long_about("Local terminal CLI for commands that do not require Warp online services.");
+    for subcommand in LOCAL_ONLY_HIDDEN_SUBCOMMANDS {
+        command = command.mut_subcommand(subcommand, |c| c.hide(true));
+    }
+    command
+}
 
 #[cfg(not(target_family = "wasm"))]
 const GLOBAL_OPTIONS_WITH_VALUES: &[&str] = &[
@@ -550,11 +561,12 @@ fn disabled_subcommand<'a>(args: &'a [String], disabled_subcommands: &[&str]) ->
         }
 
         if arg.starts_with('-') && arg != "-" {
-            // Skip both long (`--foo`, `--foo=bar`) and short (`-v`, `-o value`,
-            // `-obar`, `-abc`) options. The previous implementation only
-            // skipped long options, which let invocations like
-            // `warp -v agent` misidentify `-v` as the subcommand and bypass
-            // local-only gating entirely.
+            // Skip options so they aren't mistaken for the subcommand. Only
+            // options listed in `GLOBAL_OPTIONS_WITH_VALUES` consume the next
+            // argument; the rest (`--debug`, `-h`, `-obar`, `--foo=bar`) skip
+            // one. A test keeps that list in sync with the clap definition, so
+            // a new value-taking top-level option (long or short) can't slip
+            // past the gate.
             let option_name = arg.split_once('=').map_or(arg, |(name, _)| name);
             index += if GLOBAL_OPTIONS_WITH_VALUES.contains(&option_name) && !arg.contains('=') {
                 2

@@ -100,3 +100,41 @@ fn local_only_remote_asset_policy_rejects_http_and_preserves_file_like_urls() {
         Ok(())
     );
 }
+
+/// Serves a single `302` to `location` on a loopback port and returns the port.
+#[cfg(not(target_family = "wasm"))]
+fn spawn_redirect_server(location: &'static str) -> u16 {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let _ = stream.read(&mut [0; 1024]);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    port
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn local_only_fetch_rejects_redirect_to_public_host() {
+    let port = spawn_redirect_server("https://app.warp.dev/assets/logo.png");
+    let url = Url::parse(&format!("http://127.0.0.1:{port}/logo.png")).unwrap();
+
+    // The only test in this crate that changes the global services mode.
+    network_policy::set_services_mode(network_policy::ServicesMode::LocalOnly);
+    let result = futures::executor::block_on(fetch_file_to_memory(url));
+    network_policy::set_services_mode(network_policy::ServicesMode::Online);
+
+    let err = result.expect_err("redirect to a public host should be denied");
+    assert!(
+        err.chain()
+            .any(|cause| cause.is::<network_policy::NetworkPolicyDenied>()),
+        "unexpected error: {err:#}"
+    );
+}
