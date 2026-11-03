@@ -37,6 +37,8 @@ mod external_secrets;
 mod font_fallback;
 mod global_resource_handles;
 mod gpu_state;
+#[cfg(not(target_family = "wasm"))]
+mod harp_mode;
 mod input_classifier;
 mod interval_timer;
 mod linear;
@@ -1916,6 +1918,8 @@ pub(crate) fn initialize_app(
     }
 
     experiments::init(ctx);
+    #[cfg(not(target_family = "wasm"))]
+    harp_mode::init(ctx);
 
     // Initialize timestamp for session id and last active event
     App::record_last_active_timestamp();

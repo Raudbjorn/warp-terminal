@@ -1248,6 +1248,7 @@ impl<S> TerminalManager<S> {
             honor_ps1: is_honor_ps1_enabled,
             node_version_chip_enabled,
             close_fds: true,
+            claude_code_plugin_dir: crate::harp_mode::claude_plugin_dir(ctx),
         };
 
         let hooks = AppPtySpawnHooks;

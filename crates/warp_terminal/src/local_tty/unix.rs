@@ -242,6 +242,7 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
         honor_ps1,
         node_version_chip_enabled,
         close_fds,
+        claude_code_plugin_dir,
     } = options;
     let shell_starter = match shell_starter {
         ShellStarter::Direct(shell_starter) => shell_starter,
@@ -262,6 +263,7 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
         shell_debug_mode,
         honor_ps1,
         node_version_chip_enabled,
+        claude_code_plugin_dir,
     );
 
     spawn_command_in_pty(command, &size, close_fds)
@@ -307,34 +309,93 @@ fn omw_warpkeep_wrap(
     Some((exe, args))
 }
 
+/// Env var Claude Code reads for extra plugin directories (colon-separated).
+const CLAUDE_CODE_PLUGIN_DIRS_ENV: &str = "CLAUDE_CODE_PLUGIN_DIRS";
+/// The Harp plugin's on-switch: its hooks stay quiet unless this is `1` (see the plugin's
+/// `should-use-structured.sh`), so a copy of the plugin inherited elsewhere does nothing.
+const HARP_AGENT_STATUS_ENV: &str = "HARP_AGENT_STATUS";
+
+/// `CLAUDE_CODE_PLUGIN_DIRS` for a Harp shell: the user's own entries (`existing`), then Harp's
+/// bundled Claude Code plugin. `None` when the plugin path cannot be put into the `:`-separated
+/// list (not UTF-8, or contains `:`), so nothing is injected rather than a broken entry.
+fn harp_claude_plugin_dirs(plugin: &Path, existing: Option<String>) -> Option<String> {
+    match plugin.to_str() {
+        Some(plugin_str) if !plugin_str.contains(':') => {
+            Some(with_plugin_dir(existing, plugin_str))
+        }
+        _ => {
+            log::warn!(
+                "Harp: not adding the Claude Code plugin, its path cannot go into \
+                 {CLAUDE_CODE_PLUGIN_DIRS_ENV} (not UTF-8 or contains ':'): {}",
+                plugin.display()
+            );
+            None
+        }
+    }
+}
+
+/// Appends `plugin` to a colon-separated plugin list, once. Any other copy of the same plugin
+/// (same trailing `<parent>/<name>`, e.g. `claude-plugin/harp` inherited from another Warp install
+/// or resources dir) is dropped, so Claude Code never runs two copies of the hooks.
+fn with_plugin_dir(existing: Option<String>, plugin: &str) -> String {
+    let plugin_tail: Vec<_> = Path::new(plugin)
+        .components()
+        .rev()
+        .take(PLUGIN_IDENTITY_COMPONENTS)
+        .collect();
+    let is_copy_of_plugin = |dir: &str| {
+        dir == plugin
+            || (plugin_tail.len() == PLUGIN_IDENTITY_COMPONENTS
+                && Path::new(dir)
+                    .components()
+                    .rev()
+                    .take(PLUGIN_IDENTITY_COMPONENTS)
+                    .eq(plugin_tail.iter().copied()))
+    };
+    existing
+        .iter()
+        .flat_map(|dirs| dirs.split(':'))
+        .filter(|dir| !dir.is_empty() && !is_copy_of_plugin(dir))
+        .chain(std::iter::once(plugin))
+        .join(":")
+}
+
+/// How many trailing path components identify the plugin across installs (`claude-plugin/harp`).
+const PLUGIN_IDENTITY_COMPONENTS: usize = 2;
+
+/// Sets the Harp plugin env on `builder`: `CLAUDE_CODE_PLUGIN_DIRS` = `existing` + `plugin`, and
+/// `HARP_AGENT_STATUS=1`. With no plugin (Harp mode off) it only removes `HARP_AGENT_STATUS`, so an
+/// on-switch inherited from a Harp-mode Warp that launched this one cannot wake a plugin dir that
+/// was inherited the same way; the shell then matches master.
+fn apply_harp_plugin_env(builder: &mut Command, plugin: Option<&Path>, existing: Option<OsString>) {
+    let plugin_dirs = plugin.and_then(|plugin| match existing.map(OsString::into_string) {
+        Some(Err(_)) => {
+            // Appending would mean rewriting the user's own (non-UTF-8) list; leave it intact.
+            log::warn!(
+                "Harp: not adding the Claude Code plugin, {CLAUDE_CODE_PLUGIN_DIRS_ENV} is not UTF-8"
+            );
+            None
+        }
+        Some(Ok(existing)) => harp_claude_plugin_dirs(plugin, Some(existing)),
+        None => harp_claude_plugin_dirs(plugin, None),
+    });
+    match plugin_dirs {
+        Some(plugin_dirs) => {
+            builder.env(CLAUDE_CODE_PLUGIN_DIRS_ENV, plugin_dirs);
+            builder.env(HARP_AGENT_STATUS_ENV, "1");
+        }
+        None => {
+            builder.env_remove(HARP_AGENT_STATUS_ENV);
+        }
+    }
+}
+
 /// Builds the `Command` for a host-shell PTY session: executable, args,
 /// environment variables, and startup directory.
 ///
 /// Does not perform any PTY-level setup; hand the returned `Command`
 /// to [`spawn_command_in_pty`].
 #[allow(clippy::too_many_arguments)]
-/// `CLAUDE_CODE_PLUGIN_DIRS` for a Harp shell: the user's own entries, then Harp's bundled Claude
-/// Code plugin. `None` when the app has no bundled plugin (a `cargo run` build), so nothing changes.
-fn harp_claude_plugin_dirs(existing: Option<String>) -> Option<String> {
-    let plugin = warp_core::paths::bundled_resources_dir()?
-        .join("bundled")
-        .join("claude-plugin")
-        .join("harp");
-    if !plugin.join("hooks").join("hooks.json").is_file() {
-        return None;
-    }
-    Some(with_plugin_dir(existing, &plugin.to_string_lossy()))
-}
-
-/// Appends `plugin` to a colon-separated plugin list, once.
-fn with_plugin_dir(existing: Option<String>, plugin: &str) -> String {
-    match existing.filter(|dirs| !dirs.is_empty()) {
-        Some(dirs) if dirs.split(':').any(|dir| dir == plugin) => dirs,
-        Some(dirs) => format!("{dirs}:{plugin}"),
-        None => plugin.to_owned(),
-    }
-}
-
 fn build_host_shell_command(
     shell_starter: DirectShellStarter,
     window_id: Option<usize>,
@@ -345,6 +406,7 @@ fn build_host_shell_command(
     shell_debug_mode: bool,
     honor_ps1: bool,
     node_version_chip_enabled: bool,
+    claude_code_plugin_dir: Option<PathBuf>,
 ) -> Command {
     let pw = resolve_current_user();
 
@@ -409,9 +471,11 @@ fn build_host_shell_command(
     // Prevent child processes from inheriting startup notification env.
     // See: https://specifications.freedesktop.org/startup-notification-spec/startup-notification-latest.txt
     builder.env_remove("DESKTOP_STARTUP_ID");
-    // An app launched from inside a tmux pane (e.g. `open` from a shell there) carries that pane's
-    // TMUX/TMUX_PANE; inherited, every new shell believes it already runs in tmux, so wrappers skip
-    // their tmux path and agent plugins route terminal sequences to the launching pane.
+    // An app launched from inside a tmux pane (e.g. `open` or `warp-oss &` from a shell there)
+    // carries that pane's TMUX/TMUX_PANE; inherited, every new shell believes it already runs in
+    // tmux, so wrappers skip their tmux path and agent plugins route terminal sequences to the
+    // launching pane. A Warp pane is never inside that tmux, so this is right for every shell,
+    // not only in Harp mode; a tmux started inside the pane sets both again for its own panes.
     builder.env_remove("TMUX");
     builder.env_remove("TMUX_PANE");
 
@@ -473,16 +537,6 @@ fn build_host_shell_command(
         );
     }
 
-    // Harp: every Claude Code started from this shell (by name, alias, function, npx or an
-    // absolute path) loads Harp's bundled status plugin for that session only, so the sidebar
-    // shows agent status without installing anything into the user's Claude config.
-    if let Some(plugin_dirs) =
-        harp_claude_plugin_dirs(std::env::var("CLAUDE_CODE_PLUGIN_DIRS").ok())
-    {
-        builder.env("CLAUDE_CODE_PLUGIN_DIRS", plugin_dirs);
-        builder.env("HARP_AGENT_STATUS", "1");
-    }
-
     if shell_debug_mode {
         builder.env("WARP_SHELL_DEBUG_MODE", "1");
     }
@@ -530,10 +584,27 @@ fn build_host_shell_command(
         builder.env("WARP_INITIAL_WORKING_DIR", start_dir);
     }
 
+    // Harp mode: every Claude Code started from this shell (by name, alias, function, npx or an
+    // absolute path) loads Harp's bundled status plugin for that session only, so the sidebar
+    // shows agent status without installing anything into the user's Claude config. The base list
+    // is the caller's override if any, else Warp's own env, and is applied after the overrides so
+    // a caller-provided list is extended rather than replacing the plugin. The env reaches the
+    // shell through warpkeep unchanged (its attach and master processes both inherit it).
+    let plugin_dirs_base = env_vars
+        .get(std::ffi::OsStr::new(CLAUDE_CODE_PLUGIN_DIRS_ENV))
+        .cloned()
+        .or_else(|| std::env::var_os(CLAUDE_CODE_PLUGIN_DIRS_ENV));
+
     // Apply any caller-provided environment overrides last, so they win.
     for (key, value) in env_vars {
         builder.env(key, value);
     }
+
+    apply_harp_plugin_env(
+        &mut builder,
+        claude_code_plugin_dir.as_deref(),
+        plugin_dirs_base,
+    );
 
     // Set the initial working directory to the user's home directory.  If
     // `start_dir` is Some, we'll attempt to cd to that directory at the
@@ -886,6 +957,8 @@ fn spawn_docker_sandbox(
         honor_ps1,
         node_version_chip_enabled,
         close_fds,
+        // The plugin lives on the host; the sandbox's Claude Code could not read it.
+        claude_code_plugin_dir: _,
     } = options;
 
     let command = build_docker_sandbox_command(
