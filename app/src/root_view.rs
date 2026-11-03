@@ -369,6 +369,10 @@ pub fn init(app: &mut AppContext) {
         RootView::handle_notification_click,
     );
     app.add_action(
+        "root_view:handle_claude_notification",
+        RootView::handle_claude_notification,
+    );
+    app.add_action(
         "root_view:handle_pane_navigation_event",
         RootView::focus_pane,
     );
@@ -2914,6 +2918,28 @@ impl RootView {
         // Focus the pane that the notification originated from.
         self.focus_pane(pane_view_locator, ctx);
 
+        true
+    }
+
+    /// Harp: Allow, Deny or Open chat on a Claude dialog's notification. Open chat focuses the
+    /// pane as a click on any notification does; Allow and Deny are the workspace's to answer,
+    /// without bringing the app forward.
+    fn handle_claude_notification(
+        &mut self,
+        click: &crate::notification::ClaudeNoticeClick,
+        ctx: &mut ViewContext<Self>,
+    ) -> bool {
+        #[cfg(not(target_family = "wasm"))]
+        if let AuthOnboardingState::Terminal(workspace) = &self.auth_onboarding_state {
+            let open = workspace.update(ctx, |view, ctx| view.claude_notice_clicked(click, ctx));
+            if open {
+                let locator = PaneViewLocator {
+                    pane_group_id: click.pane_group_id,
+                    pane_id: click.pane_id,
+                };
+                self.focus_pane(&locator, ctx);
+            }
+        }
         true
     }
 

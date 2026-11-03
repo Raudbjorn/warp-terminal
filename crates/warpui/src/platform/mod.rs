@@ -29,6 +29,10 @@ pub mod current {
 pub use app::AppBuilder;
 pub use warpui_core::platform::*;
 
+/// One light haptic tick for a drag that snaps to a new slot. Harp drove macOS's
+/// `NSHapticFeedbackManager` here; this fork does not ship that backend, so it is a no-op.
+pub fn perform_alignment_haptic() {}
+
 /// Creates the native system clipboard implementation used by the GUI
 /// platform delegate without requiring a graphical event loop.
 #[cfg(not(target_family = "wasm"))]
