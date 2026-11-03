@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use warp_core::features::FeatureFlag;
-use warpui::{App, EntityId, SingletonEntity};
+use warpui::{App, SingletonEntity};
 
 use super::{
     BlocklistAIStatusBarEvent, ModelInUse, UNNAMED_FALLBACK_MODEL_WARPING_TEXT, WarpingModelInputs,
@@ -92,7 +92,7 @@ fn inactive_exchange_updates_do_not_close_summarization_dialog() {
             ctx.emit(BlocklistAIHistoryEvent::UpdatedStreamingExchange {
                 exchange_id: exchange_ids[1],
                 conversation_id,
-                terminal_surface_id: EntityId::new(),
+                terminal_surface_id,
                 is_hidden: false,
             });
         });

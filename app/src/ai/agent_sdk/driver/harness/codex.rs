@@ -787,10 +787,12 @@ fn resolve_openai_api_key(resolved_env_vars: &HashMap<OsString, OsString>) -> Op
 
 /// Returns the OpenAI base URL from the typed secret, if applicable.
 ///
-/// The base URL is only used when the typed `OpenaiApiKey` secret is the active
-/// source of `OPENAI_API_KEY`. If a worker-injected process env already provides
-/// the API key, the typed-secret base URL is not applied (the worker controls
-/// both the key and endpoint).
+/// The base URL is only used when a typed OpenAI secret (`OpenaiApiKey`, or `LlmProviderApiKey`
+/// with provider `openai`) is the active source of `OPENAI_API_KEY`. If a worker-injected process
+/// env or the assignment's runtime env already provides the API key, the secret was skipped and
+/// its base URL is not applied (the worker controls both the key and endpoint). The secret is
+/// identified by its key matching the resolved one, so a key is never sent to the endpoint of a
+/// different secret.
 fn resolve_openai_base_url_from_secret(
     secrets: &HashMap<String, ManagedSecretValue>,
     resolved_env_vars: &HashMap<OsString, OsString>,
@@ -804,24 +806,31 @@ fn resolve_openai_base_url_from_secret(
         return None;
     }
 
-    // Only apply when the resolved env vars actually contain OPENAI_API_KEY
-    // from the typed secret (i.e. the secret was not skipped).
-    resolved_env_vars.get(OsStr::new(OPENAI_API_KEY_ENV))?;
+    // The runtime env can also supply OPENAI_API_KEY, which makes the resolved map hold a key
+    // that no secret provided. Only a secret carrying that exact key is the active source.
+    let resolved_key = resolved_env_vars
+        .get(OsStr::new(OPENAI_API_KEY_ENV))
+        .and_then(|v| v.to_str())
+        .map(str::trim)
+        .filter(|key| !key.is_empty())?;
 
-    secrets.values().find_map(|secret| match secret {
-        ManagedSecretValue::OpenaiApiKey { base_url, .. } => base_url
+    secrets.values().find_map(|secret| {
+        let (api_key, base_url) = match secret {
+            ManagedSecretValue::OpenaiApiKey { api_key, base_url } => (api_key, base_url),
+            ManagedSecretValue::LlmProviderApiKey {
+                provider_id,
+                api_key,
+                base_url,
+            } if provider_id == "openai" => (api_key, base_url),
+            _ => return None,
+        };
+        if api_key.trim() != resolved_key {
+            return None;
+        }
+        base_url
             .as_ref()
             .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty()),
-        ManagedSecretValue::LlmProviderApiKey {
-            provider_id,
-            base_url,
-            ..
-        } if provider_id == "openai" => base_url
-            .as_ref()
-            .map(|s| s.trim().to_owned())
-            .filter(|s| !s.is_empty()),
-        _ => None,
+            .filter(|s| !s.is_empty())
     })
 }
 

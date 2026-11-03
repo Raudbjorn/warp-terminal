@@ -39,7 +39,7 @@ use super::{
     OZ_MESSAGE_LISTENER_STATE_ROOT_ENV, PlatformErrorCode, PluginInstallError,
     SDKConversationOutputStatus, WARP_MESSAGE_LISTENER_STATE_ROOT_ENV, build_secret_env_vars,
     debug_turn_task_state, harness_idle_action_for_conversation_status,
-    idle_window_for_cli_session_status, idle_window_for_terminal_status,
+    idle_window_for_cli_session_status, idle_window_for_terminal_status, merge_runtime_env,
     setup_failure_status_update, terminal_status_log_outcome,
 };
 use crate::ai::agent::conversation::{AIConversationId, ConversationStatus};
@@ -1066,6 +1066,109 @@ fn llm_provider_keys_only_enter_the_environment_for_env_backed_providers() {
             OsString::from("ANTHROPIC_API_KEY"),
             OsString::from("anthropic-key")
         )])
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn anthropic_provider_key_exports_its_base_url_for_claude() {
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+    }
+    let secrets = HashMap::from([(
+        "ANTHROPIC".to_owned(),
+        ManagedSecretValue::llm_provider_api_key(
+            "anthropic",
+            "anthropic-key",
+            Some(" https://proxy.example ".to_owned()),
+        ),
+    )]);
+
+    assert_eq!(
+        build_secret_env_vars(&secrets, &HashMap::new()).unwrap(),
+        HashMap::from([
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("anthropic-key")
+            ),
+            (
+                OsString::from("ANTHROPIC_BASE_URL"),
+                OsString::from("https://proxy.example")
+            ),
+        ])
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn anthropic_provider_key_is_skipped_whole_when_the_runtime_env_sets_the_endpoint() {
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+    }
+    let secrets = HashMap::from([(
+        "ANTHROPIC".to_owned(),
+        ManagedSecretValue::llm_provider_api_key(
+            "anthropic",
+            "anthropic-key",
+            Some("https://proxy.example".to_owned()),
+        ),
+    )]);
+    let runtime_env = HashMap::from([(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "https://worker.example".to_owned(),
+    )]);
+
+    assert!(
+        build_secret_env_vars(&secrets, &runtime_env)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn empty_runtime_endpoint_does_not_split_an_anthropic_key_from_its_endpoint() {
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+    }
+    let secrets = HashMap::from([(
+        "ANTHROPIC".to_owned(),
+        ManagedSecretValue::llm_provider_api_key(
+            "anthropic",
+            "anthropic-key",
+            Some("https://proxy.example".to_owned()),
+        ),
+    )]);
+    // An empty runtime value counts as unset, so the secret is not skipped for it.
+    let runtime_env = HashMap::from([
+        ("ANTHROPIC_BASE_URL".to_owned(), String::new()),
+        ("UNRELATED_EMPTY".to_owned(), String::new()),
+        ("OTHER".to_owned(), "value".to_owned()),
+    ]);
+
+    let mut env_vars = build_secret_env_vars(&secrets, &runtime_env).unwrap();
+    merge_runtime_env(&mut env_vars, runtime_env);
+
+    assert_eq!(
+        env_vars,
+        HashMap::from([
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("anthropic-key")
+            ),
+            (
+                OsString::from("ANTHROPIC_BASE_URL"),
+                OsString::from("https://proxy.example")
+            ),
+            (OsString::from("UNRELATED_EMPTY"), OsString::new()),
+            (OsString::from("OTHER"), OsString::from("value")),
+        ])
     );
 }
 

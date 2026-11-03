@@ -11,6 +11,9 @@ use chrono::{DateTime, Utc};
 use pathfinder_geometry::vector::vec2f;
 use serde::Deserialize;
 use warpui::{
+    AppContext, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
+    ViewHandle, WeakViewHandle,
+    r#async::FutureExt as _,
     elements::{
         Border, ChildAnchor, ChildView, Clipped, ClippedScrollStateHandle, ClippedScrollable,
         ConstrainedBox, Container, CornerRadius, CrossAxisAlignment, Element, Fill, Flex,
@@ -20,13 +23,10 @@ use warpui::{
     },
     fonts::{Properties, Weight},
     platform::Cursor,
-    r#async::FutureExt as _,
     ui_components::{
         button::ButtonVariant,
         components::{Coords, UiComponent, UiComponentStyles},
     },
-    AppContext, Entity, FocusContext, SingletonEntity, TypedActionView, View, ViewContext,
-    ViewHandle, WeakViewHandle,
 };
 
 use crate::{
@@ -41,7 +41,7 @@ use crate::{
     remote_server::manager::RemoteServerManager,
     terminal::model::session::{ExecuteCommandOptions, Session, SessionType},
     ui_components::icons::Icon,
-    ui_components::menu_button::{icon_button_with_context_menu, MenuDirection},
+    ui_components::menu_button::{MenuDirection, icon_button_with_context_menu},
     util::time_format::format_approx_duration_from_now_utc,
 };
 
