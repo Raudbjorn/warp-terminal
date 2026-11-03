@@ -293,3 +293,56 @@ fn a_session_that_never_planned_has_no_plan_file() {
 
     assert_eq!(parse_transcript(&jsonl).plan_file, None);
 }
+
+fn call(ts: &str, id: &str, description: &str) -> String {
+    format!(
+        r#"{{"type":"assistant","timestamp":"{ts}","message":{{"content":[{{"type":"tool_use","id":"{id}","name":"Bash","input":{{"description":"{description}"}}}}]}}}}"#
+    )
+}
+
+/// A message that grows while it streams can be recorded again with its calls so far. Counting
+/// each record's copy would report work the agent did once as twice.
+#[test]
+fn a_call_recorded_twice_is_one_step() {
+    let jsonl = transcript(&[
+        &typed("2026-09-20T10:00:00Z", "build it"),
+        &call("2026-09-20T10:00:05Z", "call-a", "Check the build"),
+        &call("2026-09-20T10:00:06Z", "call-a", "Check the build"),
+        &call("2026-09-20T10:00:07Z", "call-b", "Run the tests"),
+    ]);
+
+    let story = parse_transcript(&jsonl);
+    assert_eq!(
+        story.turns[0].steps,
+        vec![
+            ConnStep {
+                description: "Check the build".to_owned(),
+                runs: 1
+            },
+            ConnStep {
+                description: "Run the tests".to_owned(),
+                runs: 1
+            },
+        ]
+    );
+}
+
+/// Different calls that happen to read the same are different work, and are still folded into a
+/// count rather than dropped.
+#[test]
+fn distinct_calls_with_one_description_still_count_separately() {
+    let jsonl = transcript(&[
+        &typed("2026-09-20T10:00:00Z", "build it"),
+        &call("2026-09-20T10:00:05Z", "call-a", "Check the build"),
+        &call("2026-09-20T10:00:06Z", "call-b", "Check the build"),
+    ]);
+
+    let story = parse_transcript(&jsonl);
+    assert_eq!(
+        story.turns[0].steps,
+        vec![ConnStep {
+            description: "Check the build".to_owned(),
+            runs: 2
+        }]
+    );
+}

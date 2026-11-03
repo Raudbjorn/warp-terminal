@@ -204,25 +204,48 @@ impl ConnSession {
     /// main thread and resolve off it. A read that resolves after a later one is
     /// stale and is dropped rather than rewinding the panel.
     pub fn adopt_story(&mut self, story: ConnStory, through: DateTime<Utc>) -> bool {
-        // Strictly older, not equal: a finished turn is read twice at the same
-        // boundary, immediately and again once the transcript has had a moment
-        // to flush its closing message. The second read must be able to
-        // replace the first.
-        if self.story_read_at.is_some_and(|current| current > through) {
+        if self.is_stale_read(through) {
             return false;
         }
-        // The transcript is written asynchronously, so a read can land before
-        // the turn's closing message reaches the file. Coverage is computed
-        // against the live entries in `in_flight`, where hook prompts are
-        // matched to transcript prompts rather than compared by timestamp.
-        self.story_through = match story.turns.last() {
+        self.story = Some(story);
+        self.advance_coverage(through);
+        true
+    }
+
+    /// Takes a read that found the transcript unchanged since the story held was read. That story
+    /// is still the transcript's, but the event that triggered this read may have arrived after
+    /// the last one, and its live entries are covered by the story only once the boundary has
+    /// moved to it. A `Stop` hook that follows a read which already saw the closing message is the
+    /// case: nothing was written, so nothing is parsed, and yet the hook's entry repeats the answer.
+    ///
+    /// Returns whether that changed what is in flight, which is what a reader would see change.
+    /// A stale read, or a session with no story, changes nothing.
+    pub fn recheck_story(&mut self, through: DateTime<Utc>) -> bool {
+        if self.story.is_none() || self.is_stale_read(through) {
+            return false;
+        }
+        let before = self.in_flight().len();
+        self.advance_coverage(through);
+        self.in_flight().len() != before
+    }
+
+    /// Strictly older, not equal: a finished turn is read twice at the same boundary,
+    /// immediately and again once the transcript has had a moment to flush its closing message.
+    /// The second read must be able to replace the first.
+    fn is_stale_read(&self, through: DateTime<Utc>) -> bool {
+        self.story_read_at.is_some_and(|current| current > through)
+    }
+
+    /// The transcript is written asynchronously, so a read can land before the turn's closing
+    /// message reaches the file. Coverage is computed against the live entries in `in_flight`,
+    /// where hook prompts are matched to transcript prompts rather than compared by timestamp.
+    fn advance_coverage(&mut self, through: DateTime<Utc>) {
+        self.story_through = match self.story.as_ref().and_then(|story| story.turns.last()) {
             None => None,
             Some(turn) if turn.outcome.is_none() => Some(turn.last_activity()),
             Some(_) => Some(through),
         };
         self.story_read_at = Some(through);
-        self.story = Some(story);
-        true
     }
 
     /// Live entries the story does not yet cover: the turn in flight.
@@ -257,7 +280,10 @@ impl ConnSession {
             let Some(prompt_index) = self.entries[search_from..covered_end]
                 .iter()
                 .position(|entry| match &entry.kind {
-                    ConnEntryKind::Prompt { text } => prompt_matches(text, &turn.prompt),
+                    ConnEntryKind::Prompt { text } => {
+                        prompt_matches(text, &turn.prompt)
+                            && arrived_with(entry.at, turn.started_at)
+                    }
                     _ => false,
                 })
                 .map(|offset| search_from + offset)
@@ -418,6 +444,20 @@ impl ConnSession {
                 _ => None,
             })
     }
+}
+
+/// How long after a turn began its prompt may still reach us, in seconds. The hook fires as the
+/// prompt is submitted, so a prompt that arrived long after a turn began is a different
+/// instruction that happens to read the same, such as `continue` said again after a resume. The
+/// allowance is wide because it only has to tell hours from moments, and a prompt it wrongly
+/// refuses is merely shown live alongside the story rather than hidden by an older turn's answer.
+const PROMPT_ARRIVAL_SLACK_SECONDS: i64 = 120;
+
+/// Whether a live prompt received at `prompt_at` can be the prompt of a turn that began at
+/// `turn_started_at`. The hook can be received a moment before the transcript records the prompt,
+/// so only a prompt received long after the turn began is refused.
+fn arrived_with(prompt_at: DateTime<Utc>, turn_started_at: DateTime<Utc>) -> bool {
+    (prompt_at - turn_started_at).num_seconds() <= PROMPT_ARRIVAL_SLACK_SECONDS
 }
 
 fn prompt_matches(hook: &str, transcript: &str) -> bool {

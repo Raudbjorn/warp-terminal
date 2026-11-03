@@ -265,7 +265,7 @@ use crate::code_review::GlobalCodeReviewModel;
 use crate::code_review::diff_state::DiffStateModel;
 use crate::code_review::telemetry_event::CodeReviewPaneEntrypoint;
 use crate::coding_panel_enablement_state::CodingPanelEnablementState;
-use crate::conn::panel::ConnPanelView;
+use crate::conn::panel::{ConnPanelEvent, ConnPanelView};
 use crate::conn::{ConnModel, ConnModelEvent};
 use crate::context_chips::ChipRuntimeCapabilities;
 use crate::default_terminal::DefaultTerminal;
@@ -3311,6 +3311,9 @@ impl Workspace {
         });
 
         let conn_panel_view = ctx.add_typed_action_view(ConnPanelView::new);
+        ctx.subscribe_to_view(&conn_panel_view, |me, _, event, ctx| {
+            me.handle_conn_panel_event(event, ctx);
+        });
 
         // Get persisted filters from window snapshot if restoring.
         let agent_management_filters = match workspace_setting {
@@ -5820,7 +5823,14 @@ impl Workspace {
 
     fn toggle_conn_panel(&mut self, ctx: &mut ViewContext<Self>) {
         if self.right_panel_content == Some(RightPanelContent::Conn) {
+            // Hiding a panel does not move focus out of it, and what is focused inside a hidden
+            // panel takes the keyboard with it. The plan viewer can hold focus, so it goes back to
+            // the terminal the way closing Code Review does.
+            let had_focus = self.conn_panel_view.is_self_or_child_focused(ctx);
             self.right_panel_content = None;
+            if had_focus {
+                self.focus_active_tab(ctx);
+            }
         } else {
             let pane_group = self.active_tab_pane_group().clone();
             if pane_group.as_ref(ctx).right_panel_open {
@@ -7108,6 +7118,45 @@ impl Workspace {
                 command,
             } => {
                 self.open_docker_container_logs(container_id, container_name, command, ctx);
+            }
+        }
+    }
+
+    /// Opens what a link in the Conn panel's plan viewer points at, the way the same link would
+    /// open from a pane's own viewer.
+    fn handle_conn_panel_event(&mut self, event: &ConnPanelEvent, ctx: &mut ViewContext<Self>) {
+        match event {
+            #[cfg_attr(not(feature = "local_fs"), allow(unused_variables))]
+            ConnPanelEvent::OpenFileInWarp { path, session } => {
+                #[cfg(feature = "local_fs")]
+                {
+                    let layout = *EditorSettings::as_ref(ctx).open_file_layout.value();
+                    self.open_file_notebook(
+                        LocalOrRemotePath::Local(path.clone()),
+                        Some(session.clone()),
+                        layout,
+                        None,
+                        ctx,
+                    );
+                }
+            }
+            #[cfg(feature = "local_fs")]
+            ConnPanelEvent::OpenFileWithTarget {
+                path,
+                target,
+                line_col,
+            } => {
+                self.open_file_with_target(
+                    path.clone(),
+                    target.clone(),
+                    *line_col,
+                    CodeSource::Link {
+                        path: path.clone(),
+                        range_start: *line_col,
+                        range_end: None,
+                    },
+                    ctx,
+                );
             }
         }
     }
@@ -28815,6 +28864,13 @@ impl Workspace {
                 panel.set_active_pane_group(conn_active_pane_group, ctx);
             });
             self.report_focus_to_conn(ctx);
+            // The group arrives with its own Code Review state, while this window's selector
+            // starts on Conn. The two panels are drawn from different fields, so a group that
+            // arrives with Code Review open would show both unless the selector follows it.
+            if new_pane_group.as_ref(ctx).right_panel_open {
+                self.right_panel_content = Some(RightPanelContent::CodeReview);
+                self.remember_right_panel_for_focused_pane(ctx);
+            }
         }
         ctx.dispatch_global_action("workspace:save_app", ());
         ctx.notify();

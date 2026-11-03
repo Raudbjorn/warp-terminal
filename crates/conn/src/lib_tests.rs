@@ -606,3 +606,111 @@ fn a_story_newer_than_its_dispatch_boundary_is_handled() {
     ));
     assert!(session.in_flight().is_empty());
 }
+
+/// A read that sees the closing message before the `Stop` hook arrives leaves the hook's own
+/// `Responded` entry after the story's boundary. The reads the hook triggers find the transcript
+/// as long as it was, and parse nothing, but they must still move the boundary, or the answer
+/// shows twice: once from the story and once from the entry.
+#[test]
+fn an_unchanged_transcript_still_covers_a_later_hook_entry() {
+    let mut session = ConnSession::default();
+    session.push(prompt("fix it", 1));
+    session.push(tool(2));
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(1, Some(5), Some("Done."), "fix it")]),
+        at(5)
+    ));
+    session.push(responded("Done.", 6));
+    assert_eq!(
+        session.in_flight().len(),
+        1,
+        "the hook's entry is after the boundary the story was taken at"
+    );
+
+    assert!(session.recheck_story(at(6)));
+
+    assert!(
+        session.in_flight().is_empty(),
+        "the story already holds this answer"
+    );
+}
+
+#[test]
+fn a_recheck_cannot_rewind_or_invent_a_story() {
+    let mut session = ConnSession::default();
+    assert!(
+        !session.recheck_story(at(1)),
+        "with no story there is nothing to recheck"
+    );
+
+    session.push(prompt("fix it", 1));
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(1, Some(5), Some("Done."), "fix it")]),
+        at(9)
+    ));
+    assert!(
+        !session.recheck_story(at(7)),
+        "a read from before the story's own must not move the boundary back"
+    );
+}
+
+/// The turn is still running when the hook arrives, so the boundary is the transcript's own last
+/// activity and a recheck has nothing to move: the closing message has not been written yet. It
+/// changes nothing a reader sees, so it says so.
+#[test]
+fn a_recheck_does_not_cover_a_turn_the_transcript_has_not_finished() {
+    let mut session = ConnSession::default();
+    session.push(prompt("fix it", 1));
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(1, Some(3), None, "fix it")]),
+        at(4)
+    ));
+    session.push(responded("Done.", 6));
+
+    assert!(!session.recheck_story(at(6)));
+
+    assert_eq!(session.in_flight().len(), 1);
+}
+
+/// A resumed conversation starts with turns this pane never saw. Saying `continue` again must not
+/// be taken for the `continue` of one of them, or the new instruction would vanish from the live
+/// entries and the old turn's answer would be shown as its result.
+#[test]
+fn a_repeated_prompt_is_not_matched_to_an_older_turn_that_reads_the_same() {
+    let mut session = ConnSession::default();
+    session.push(prompt("continue", 100_000));
+    assert!(session.adopt_story(
+        story(vec![
+            turn_with_prompt(1_000, Some(1_060), Some("Old answer."), "continue"),
+            turn_with_prompt(2_000, Some(2_060), Some("Older answer."), "tidy up"),
+        ]),
+        at(100_005)
+    ));
+
+    assert_eq!(
+        session.in_flight().len(),
+        1,
+        "the new prompt has not reached the transcript, and is still live"
+    );
+}
+
+/// The same words, once the transcript has the new turn too: now the prompt does belong to a turn,
+/// and it must be the new one rather than the first that reads the same.
+#[test]
+fn a_repeated_prompt_is_matched_to_the_turn_that_began_when_it_arrived() {
+    let mut session = ConnSession::default();
+    session.push(prompt("continue", 100_000));
+    session.push(responded("All done.", 100_040));
+    assert!(session.adopt_story(
+        story(vec![
+            turn_with_prompt(1_000, Some(1_060), Some("Old answer."), "continue"),
+            turn_with_prompt(100_001, Some(100_040), Some("All done."), "continue"),
+        ]),
+        at(100_041)
+    ));
+
+    assert!(
+        session.in_flight().is_empty(),
+        "the story holds the turn this prompt began"
+    );
+}

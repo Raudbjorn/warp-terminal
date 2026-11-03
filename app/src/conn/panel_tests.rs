@@ -6,7 +6,7 @@ use ::conn::story::{ConnStep, ConnStory, ConnTurn};
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
 use chrono::{DateTime, TimeZone, Utc};
 
-use super::{ConnRow, PREVIEW_CHARS, row_at, row_count, scroll_target, truncate};
+use super::{ConnRow, PREVIEW_CHARS, is_openable_link, row_at, row_count, scroll_target, truncate};
 
 fn at(seconds: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().expect("valid time")
@@ -600,5 +600,29 @@ mod mode {
             panel_mode(Some(EntityId::new()), true, Some(choice)),
             PanelMode::ThisPane
         );
+    }
+}
+
+#[test]
+fn only_web_and_mail_links_in_an_answer_are_opened() {
+    for link in [
+        "https://example.com/a?b=c",
+        "http://example.com",
+        "mailto:someone@example.com",
+    ] {
+        assert!(is_openable_link(link), "{link} should open");
+    }
+    for link in [
+        // A label can say anything, so the target is what decides.
+        "file:///Applications/Calculator.app",
+        "file:///tmp/run.sh",
+        "FILE:///tmp/run.sh",
+        "javascript:alert(1)",
+        "ssh://host/path",
+        "/tmp/run.sh",
+        "not a url",
+        "",
+    ] {
+        assert!(!is_openable_link(link), "{link:?} should not open");
     }
 }

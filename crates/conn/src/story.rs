@@ -15,6 +15,7 @@
 //! Claude Code changes. Anything that fails to parse is skipped rather than
 //! failing the read.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
@@ -100,6 +101,9 @@ pub fn parse_transcript(jsonl: &str) -> ConnStory {
     let plan_file = records.iter().rev().find_map(Record::plan_file);
 
     let mut turns: Vec<ConnTurn> = Vec::new();
+    // A message that grows while it streams can be written more than once, each record holding
+    // the calls so far. A call is one invocation however many records carry it.
+    let mut seen_calls: HashSet<String> = HashSet::new();
     for record in &records {
         if let Some(prompt) = record.typed_prompt() {
             turns.push(ConnTurn {
@@ -120,7 +124,10 @@ pub fn parse_transcript(jsonl: &str) -> ConnStory {
             continue;
         };
         turn.ended_at = record.timestamp;
-        for step in record.tool_steps() {
+        for (call_id, step) in record.tool_calls() {
+            if call_id.is_some_and(|id| !seen_calls.insert(id)) {
+                continue;
+            }
             push_step(&mut turn.steps, step);
         }
         if let Some(text) = record.assistant_text() {
@@ -184,8 +191,8 @@ impl Record {
     }
 
     /// Each tool call as the model described it, falling back to the tool's
-    /// name when it reported no description.
-    fn tool_steps(&self) -> Vec<String> {
+    /// name when it reported no description, with the call's id when it has one.
+    fn tool_calls(&self) -> Vec<(Option<String>, String)> {
         let Some(Content::Blocks(blocks)) = self.message.as_ref().and_then(|m| m.content.as_ref())
         else {
             return Vec::new();
@@ -194,7 +201,7 @@ impl Record {
             .iter()
             .filter(|block| block.kind == "tool_use")
             .filter_map(|block| {
-                block
+                let step = block
                     .input
                     .as_ref()
                     .and_then(|input| input.get("description"))
@@ -202,7 +209,8 @@ impl Record {
                     .map(str::trim)
                     .filter(|description| !description.is_empty())
                     .map(str::to_owned)
-                    .or_else(|| block.name.clone())
+                    .or_else(|| block.name.clone())?;
+                Some((block.id.clone(), step))
             })
             .collect()
     }
@@ -258,6 +266,8 @@ enum Content {
 struct Block {
     #[serde(rename = "type")]
     kind: String,
+    /// The call's id, on `tool_use` blocks. Unique to one invocation.
+    id: Option<String>,
     text: Option<String>,
     name: Option<String>,
     input: Option<serde_json::Value>,

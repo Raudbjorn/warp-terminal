@@ -285,6 +285,40 @@ fn transcript_jsonl() -> String {
     .join("\n")
 }
 
+/// [`transcript_jsonl`] with its timestamps near now. A hook entry is stamped on receipt, so a
+/// transcript that is meant to hold the same turn has to have been written around the same time.
+fn transcript_jsonl_now() -> String {
+    let started = Utc::now() - chrono::Duration::seconds(1);
+    let at = |seconds: i64| (started + chrono::Duration::seconds(seconds)).to_rfc3339();
+    [
+        format!(
+            r#"{{"type":"user","timestamp":"{}","promptSource":"typed","message":{{"content":"wire the ADRs in"}}}}"#,
+            at(0)
+        ),
+        format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"description":"Explore the docs layout"}}}}]}}}}"#,
+            at(0)
+        ),
+        format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"content":[{{"type":"text","text":"ADRs were assumed but never wired in."}}]}}}}"#,
+            at(0)
+        ),
+        r#"{"type":"ai-title","aiTitle":"ADR wiring","sessionId":"session-1"}"#.to_owned(),
+    ]
+    .join("\n")
+}
+
+/// Waits for the lookup of a working directory's project, if one is still running.
+async fn await_project_resolution(app: &mut App, cwd: &str) {
+    let awaiting = ConnModel::handle(&*app).update(app, |me, ctx| {
+        me.project_resolution_in_flight(cwd)
+            .map(|future_id| ctx.await_spawned_future(future_id))
+    });
+    if let Some(awaiting) = awaiting {
+        awaiting.await;
+    }
+}
+
 /// Waits for the transcript read the stop event dispatched.
 async fn await_read(app: &mut App, view_id: EntityId) {
     let awaiting = ConnModel::handle(&*app).update(app, |me, ctx| {
@@ -346,7 +380,7 @@ fn the_story_takes_over_from_the_live_entries() {
         let view_id = setup(&mut app);
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("session.jsonl");
-        std::fs::write(&path, transcript_jsonl()).expect("write transcript");
+        std::fs::write(&path, transcript_jsonl_now()).expect("write transcript");
 
         send(&mut app, view_id, prompt("wire the ADRs in"));
         send(
@@ -1288,6 +1322,10 @@ fn an_unchanged_transcript_is_not_read_again() {
             prompt_with_transcript("wire the ADRs in", &path),
         );
         await_read(&mut app, view_id).await;
+        // The session's working directory is resolved to its project in the background, and that
+        // announces too, whenever it lands. It has to be in before counting, or it is counted as
+        // though the second read had caused it.
+        await_project_resolution(&mut app, "/tmp/proj").await;
         let first = announced_panes(&mut app, &announced).len();
 
         // The same file again: it has not grown, so there is nothing new in it.
@@ -1310,4 +1348,132 @@ fn an_unchanged_transcript_is_not_read_again() {
             "a transcript that has not grown is not read again"
         );
     });
+}
+
+/// A read that has already seen the closing message leaves the `Stop` hook's own entry after the
+/// story's boundary, and the reads the hook triggers find the file as long as it was. They parse
+/// nothing, but must still move the boundary, or the answer is shown twice.
+#[test]
+fn a_stop_after_the_read_that_saw_the_answer_does_not_show_it_twice() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, transcript_jsonl_now()).expect("write transcript");
+
+        send(
+            &mut app,
+            view_id,
+            prompt_with_transcript("wire the ADRs in", &path),
+        );
+        // The re-read while the turn is working gets there first, and finds the answer written.
+        let read = ConnModel::handle(&app).update(&mut app, |me, ctx| {
+            me.dispatch_read(
+                view_id,
+                path.to_str().expect("utf-8 path"),
+                Utc::now(),
+                None,
+                ctx,
+            )
+        });
+        let awaiting =
+            ConnModel::handle(&app).update(&mut app, |_, ctx| ctx.await_spawned_future(read));
+        awaiting.await;
+
+        send(
+            &mut app,
+            view_id,
+            stop("ADRs were assumed...", path.to_str()),
+        );
+        await_read(&mut app, view_id).await;
+
+        let in_flight = ConnModel::handle(&app).read(&app, |me, _| {
+            me.session(view_id)
+                .expect("session recorded")
+                .in_flight()
+                .len()
+        });
+        assert_eq!(in_flight, 0, "the story already holds the answer");
+    });
+}
+
+#[test]
+fn only_an_absolute_local_jsonl_path_is_taken_for_a_transcript() {
+    use std::path::Path;
+
+    for path in [
+        "/home/me/.claude/projects/-home-me-app/0f3c-1.jsonl",
+        // Claude Code can be pointed elsewhere, and the plugin reports where it wrote.
+        "/srv/claude-work/projects/x/session_1.jsonl",
+    ] {
+        assert!(
+            super::is_plausible_transcript_path(Path::new(path)),
+            "{path} should be read"
+        );
+    }
+    for path in [
+        "/home/me/.ssh/id_ed25519",
+        "/etc/shadow",
+        "/home/me/.claude/projects/x/session.json",
+        "/home/me/.claude/projects/x/session.jsonl.bak",
+        "projects/x/session.jsonl",
+        "../session.jsonl",
+        "",
+    ] {
+        assert!(
+            !super::is_plausible_transcript_path(Path::new(path)),
+            "{path:?} should not be read"
+        );
+    }
+}
+
+/// On Windows a path can name a share on another host, and asking the filesystem about it is
+/// enough to start authenticating to that host.
+#[cfg(windows)]
+#[test]
+fn a_network_path_is_not_taken_for_a_transcript() {
+    use std::path::Path;
+
+    for path in [
+        r"\\attacker-host\share\session.jsonl",
+        r"\\?\UNC\attacker-host\share\session.jsonl",
+        r"\\.\pipe\session.jsonl",
+        "//attacker-host/share/session.jsonl",
+    ] {
+        assert!(
+            !super::is_plausible_transcript_path(Path::new(path)),
+            "{path} should not be probed"
+        );
+    }
+    assert!(super::is_plausible_transcript_path(Path::new(
+        r"C:\Users\me\.claude\projects\x\session.jsonl"
+    )));
+}
+
+#[test]
+fn a_session_id_is_only_a_file_name() {
+    for id in ["0f3c9a1e-77b2", "session_1", "ABC123"] {
+        assert!(super::is_plain_id(id), "{id} is an id");
+    }
+    for id in ["", "../x", "a/b", r"a\b", "C:x", "a b", "a.jsonl", "a\0b"] {
+        assert!(!super::is_plain_id(id), "{id:?} is not an id");
+    }
+}
+
+/// The directory is one component however odd the working directory, and is spelt the way Claude
+/// Code spells it, which turns an underscore into a dash as well.
+#[test]
+fn a_project_directory_is_named_the_way_claude_code_names_it() {
+    assert_eq!(
+        super::mangle_project_dir("/home/me/dev/cognitive_construct"),
+        "-home-me-dev-cognitive-construct"
+    );
+    assert_eq!(
+        super::mangle_project_dir("/home/me/my.app"),
+        "-home-me-my-app"
+    );
+    // Separators of any kind are flattened, so the result cannot climb out of the projects root
+    // or replace it.
+    assert_eq!(super::mangle_project_dir(r"C:\Users\me"), "C--Users-me");
+    assert!(!super::mangle_project_dir("/../..//x").contains(['/', '\\']));
 }

@@ -737,7 +737,7 @@ impl ConnModel {
                 }
                 // A transcript that cannot be found or read is not a failure: the
                 // live hook entries still describe the session, just less well.
-                let Some((path, story, len)) = read else {
+                let Some(read) = read else {
                     return;
                 };
                 // A read dispatched before another one can land after it, and would put an older
@@ -753,11 +753,25 @@ impl ConnModel {
                 let Some(session) = me.sessions.get_mut(&terminal_view_id) else {
                     return;
                 };
-                // Remember where it was found so the next read skips the search.
-                session.transcript_path = Some(path.to_string_lossy().into_owned());
-                if session.adopt_story(story, through) {
-                    me.adopted_reads.insert(terminal_view_id, seq);
-                    me.transcript_lengths.insert(terminal_view_id, len);
+                let taken = match read {
+                    StoryRead::Read(path, story, len) => {
+                        // Remember where it was found so the next read skips the search.
+                        session.transcript_path = Some(path.to_string_lossy().into_owned());
+                        let taken = session.adopt_story(story, through);
+                        if taken {
+                            me.adopted_reads.insert(terminal_view_id, seq);
+                            me.transcript_lengths.insert(terminal_view_id, len);
+                        }
+                        taken
+                    }
+                    // Nothing was written, so there is nothing new to parse, but the event that
+                    // asked for this read may be a later one than the story was taken at. Without
+                    // moving the boundary to it, an answer the story already holds would show a
+                    // second time as the hook's own entry. Only a change in what is in flight is
+                    // announced, so a transcript that is still unchanged costs no redraw.
+                    StoryRead::Unchanged => session.recheck_story(through),
+                };
+                if taken {
                     ctx.notify();
                     ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
                     me.mark_seen(ctx);
@@ -798,19 +812,30 @@ struct TranscriptLocator {
     session_id: Option<String>,
 }
 
-/// Runs on a background thread. Returns the file it read, the story in it, and its length.
+/// What reading a session's transcript came to, when it came to anything.
+enum StoryRead {
+    /// The file read, the story in it, and its length.
+    Read(PathBuf, ConnStory, u64),
+    /// The transcript is as long as when it was last read, so it was not read again. The story
+    /// already held is still its story.
+    Unchanged,
+}
+
+/// Runs on a background thread.
 #[cfg(not(target_family = "wasm"))]
 async fn read_story(
     locator: TranscriptLocator,
     after: Option<Duration>,
     known_len: Option<u64>,
-) -> Option<(PathBuf, ConnStory, u64)> {
+) -> Option<StoryRead> {
     if let Some(after) = after {
         Timer::after(after).await;
     }
     let path = locate_transcript(&locator).await?;
-    let (jsonl, len) = read_bounded(&path, known_len).await?;
-    Some((path, parse_transcript(&jsonl), len))
+    Some(match read_bounded(&path, known_len).await? {
+        Bounded::Text(jsonl, len) => StoryRead::Read(path, parse_transcript(&jsonl), len),
+        Bounded::Unchanged => StoryRead::Unchanged,
+    })
 }
 
 /// There is no filesystem to read a transcript from in the browser, so a session there has
@@ -820,7 +845,7 @@ async fn read_story(
     _locator: TranscriptLocator,
     _after: Option<Duration>,
     _known_len: Option<u64>,
-) -> Option<(PathBuf, ConnStory, u64)> {
+) -> Option<StoryRead> {
     None
 }
 
@@ -839,7 +864,7 @@ async fn is_regular_file(path: &Path) -> bool {
 /// `known_len` is the length of the transcript as it was last read. A transcript that has not
 /// grown since then has nothing new to say, so it is not read again.
 #[cfg(not(target_family = "wasm"))]
-async fn read_bounded(path: &Path, known_len: Option<u64>) -> Option<(String, u64)> {
+async fn read_bounded(path: &Path, known_len: Option<u64>) -> Option<Bounded> {
     // Looked at before opening, because opening a FIFO waits for a writer that may never come.
     if !is_regular_file(path).await {
         log::warn!("Conn: not reading {path:?}, which is not a regular file");
@@ -868,7 +893,7 @@ async fn read_bounded(path: &Path, known_len: Option<u64>) -> Option<(String, u6
     // The transcript is appended to, so a length that has not changed means nothing has been
     // written since the last read, and reading it again would parse the same bytes again.
     if known_len == Some(metadata.len()) {
-        return None;
+        return Some(Bounded::Unchanged);
     }
     // The length said above can be out of date or wrong for the file, so the read is bounded
     // too. One byte past the limit is enough to tell that it was exceeded.
@@ -888,7 +913,16 @@ async fn read_bounded(path: &Path, known_len: Option<u64>) -> Option<(String, u6
         );
         return None;
     }
-    Some((String::from_utf8(bytes).ok()?, len))
+    Some(Bounded::Text(String::from_utf8(bytes).ok()?, len))
+}
+
+/// What [`read_bounded`] found worth returning.
+#[cfg(not(target_family = "wasm"))]
+enum Bounded {
+    /// The transcript's text and length.
+    Text(String, u64),
+    /// The transcript is the length it was when last read.
+    Unchanged,
 }
 
 /// Finds a session's transcript.
@@ -902,13 +936,20 @@ async fn read_bounded(path: &Path, known_len: Option<u64>) -> Option<(String, u6
 async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
     if let Some(path) = locator.path.as_deref() {
         let path = PathBuf::from(path);
-        // A path that is not a regular file is no transcript, so the search carries on.
-        if is_regular_file(&path).await {
+        // Everything in the locator comes from the terminal, which a remote host controls, so a
+        // path is judged by its spelling before the filesystem is asked anything about it. On
+        // Windows, even asking whether a network path exists can send the user's credentials to
+        // the host it names.
+        //
+        // A path that does not pass, or is not a regular file, is no transcript, so the search
+        // carries on.
+        if is_plausible_transcript_path(&path) && is_regular_file(&path).await {
             return Some(path);
         }
     }
 
-    let session_id = locator.session_id.as_deref()?;
+    // The session id becomes a file name below, so one that is not a plain id is not looked for.
+    let session_id = locator.session_id.as_deref().filter(|id| is_plain_id(id))?;
     let file_name = format!("{session_id}.jsonl");
     let projects = claude_projects_dir()?;
 
@@ -931,6 +972,43 @@ async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
     None
 }
 
+/// Whether a path the plugin reported can be a transcript, judged without touching the
+/// filesystem: an absolute path to a `.jsonl` file that is not on the network.
+///
+/// This is not a confinement to Claude's own directory. Claude Code writes under
+/// `CLAUDE_CONFIG_DIR`, which a shell can set without Warp having it, so the reported path is
+/// the only reliable way to find transcripts there, and a fixed root would lose them. What it
+/// does keep out is the rest of the machine: a reported path to a key or a token file is not
+/// read, and nothing that is not a regular file of bounded size is read either.
+#[cfg(not(target_family = "wasm"))]
+fn is_plausible_transcript_path(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    path.is_absolute()
+        && path
+            .extension()
+            .is_some_and(|extension| extension == "jsonl")
+        && !path.components().any(|component| {
+            matches!(
+                component,
+                Component::Prefix(prefix)
+                    if matches!(
+                        prefix.kind(),
+                        Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..)
+                    )
+            )
+        })
+}
+
+/// Whether `id` is made only of what a session id is, so that it is a file name and never a path.
+#[cfg(not(target_family = "wasm"))]
+fn is_plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[cfg(not(target_family = "wasm"))]
 fn claude_projects_dir() -> Option<PathBuf> {
     let root = match std::env::var_os("CLAUDE_CONFIG_DIR") {
@@ -940,11 +1018,14 @@ fn claude_projects_dir() -> Option<PathBuf> {
     Some(root.join("projects"))
 }
 
-/// Claude Code names a project directory after the working directory it ran
-/// in, with the path separators flattened.
+/// Claude Code names a project directory after the working directory it ran in, with everything
+/// that is not a letter or a digit replaced by a dash. That includes the separators, so the
+/// result is always one path component, whatever the working directory it is made from.
 #[cfg(not(target_family = "wasm"))]
 fn mangle_project_dir(cwd: &str) -> String {
-    cwd.replace(['/', '.'], "-")
+    cwd.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 fn conn_status(status: &CLIAgentSessionStatus) -> ConnStatus {

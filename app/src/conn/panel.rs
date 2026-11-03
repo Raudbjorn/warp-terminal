@@ -11,6 +11,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use ::conn::overview::{OverviewItem, ProjectGroup, group_by_project, project_label};
 use ::conn::story::ConnTurn;
@@ -40,9 +41,15 @@ use super::{ConnModel, preview};
 use crate::appearance::Appearance;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
 use crate::notebooks::file::FileNotebookView;
+use crate::notebooks::link::LinkEvent;
 use crate::pane_group::PaneGroup;
+use crate::terminal::model::session::Session;
 use crate::terminal::resizable_data::{DEFAULT_RIGHT_PANEL_WIDTH, ModalType, ResizableData};
+#[cfg(feature = "local_fs")]
+use crate::util::openable_file_type::FileTarget;
 use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
+#[cfg(feature = "local_fs")]
+use warp_util::path::LineAndColumnArg;
 
 /// Truncation point for a prompt or a closing message. Long enough to
 /// recognise what you asked for, short enough that the chapters stay
@@ -110,8 +117,27 @@ struct Sync {
     visit: Option<DateTime<Utc>>,
 }
 
+/// What the panel asks of the workspace on behalf of the plan it shows. A plan is a file viewer
+/// with no pane of its own, so the links in it have nobody else to open their targets.
+#[derive(Clone)]
+pub enum ConnPanelEvent {
+    /// Open a Markdown file as a notebook.
+    OpenFileInWarp {
+        path: PathBuf,
+        session: Arc<Session>,
+    },
+    /// Open a file in the viewer or editor already chosen for it, which is never one that would
+    /// run it.
+    #[cfg(feature = "local_fs")]
+    OpenFileWithTarget {
+        path: PathBuf,
+        target: FileTarget,
+        line_col: Option<LineAndColumnArg>,
+    },
+}
+
 impl Entity for ConnPanelView {
-    type Event = ();
+    type Event = ConnPanelEvent;
 }
 
 impl ConnPanelView {
@@ -198,9 +224,7 @@ impl ConnPanelView {
                         .update(ctx, |view, ctx| view.open_local(plan_file, None, ctx));
                 }
                 (Some(_), _) => {}
-                (None, _) => {
-                    self.plans.remove(&pane);
-                }
+                (None, _) => self.close_plan(pane, ctx),
             }
         }
     }
@@ -273,10 +297,38 @@ impl ConnPanelView {
         let Some(path) = self.plan_file(ctx) else {
             return;
         };
+        // A pane reads one plan at a time, and the one it was reading is closed for the new one.
+        self.close_plan(pane, ctx);
         let view = ctx.add_typed_action_view(|ctx| {
             let mut view = FileNotebookView::new(ctx);
             view.open_local(path.clone(), None, ctx);
             view
+        });
+        // A pane forwards these for its own viewer, and this viewer has no pane. Links that open
+        // the target in the viewer itself are handled by the viewer; the rest are the workspace's.
+        let links = view.as_ref(ctx).links();
+        ctx.subscribe_to_model(&links, |_, _, event, ctx| match event {
+            LinkEvent::OpenFileNotebook { path, session } => {
+                ctx.emit(ConnPanelEvent::OpenFileInWarp {
+                    path: path.clone(),
+                    session: session.clone(),
+                });
+            }
+            #[cfg(feature = "local_fs")]
+            LinkEvent::OpenFileWithTarget {
+                path,
+                target,
+                line_col,
+            } => {
+                ctx.emit(ConnPanelEvent::OpenFileWithTarget {
+                    path: path.clone(),
+                    target: target.clone(),
+                    line_col: *line_col,
+                });
+            }
+            LinkEvent::OpenWarpDriveLink { .. }
+            | LinkEvent::StartLocalSession { .. }
+            | LinkEvent::RefreshLinks => {}
         });
         self.plans.insert(pane, OpenPlan { path, view });
         ctx.notify();
@@ -284,9 +336,24 @@ impl ConnPanelView {
 
     fn show_story(&mut self, ctx: &mut ViewContext<Self>) {
         if let Some(pane) = self.focused_terminal_id(ctx) {
-            self.plans.remove(&pane);
+            self.close_plan(pane, ctx);
             ctx.notify();
         }
+    }
+
+    /// Stops showing a pane's plan, and lets go of what its viewer holds.
+    ///
+    /// Opening a file registers it with the shared file model, which watches it and reloads it
+    /// for as long as the registration lasts. The viewer has no teardown of its own, so dropping
+    /// it without releasing leaves the watch behind for the life of the process.
+    fn close_plan(&mut self, pane: EntityId, ctx: &mut ViewContext<Self>) {
+        let Some(open) = self.plans.remove(&pane) else {
+            return;
+        };
+        ctx.unsubscribe_to_model(&open.view.as_ref(ctx).links());
+        #[cfg(feature = "local_fs")]
+        open.view
+            .update(ctx, |view, ctx| view.release_file_model(ctx));
     }
 
     /// The plan file of the focused pane's session, when it has presented a plan.
@@ -1176,10 +1243,26 @@ fn markdown_body(
     .with_heading_to_font_size_multipliers(ANSWER_HEADING_SIZES);
     match link {
         Some(_) => element
-            .register_default_click_handlers(|url, _, app| app.open_url(&url.url))
+            .register_default_click_handlers(|url, _, app| {
+                if is_openable_link(&url.url) {
+                    app.open_url(&url.url);
+                } else {
+                    log::warn!("Conn: not opening a link with an unsupported scheme");
+                }
+            })
             .finish(),
         None => element.disable_mouse_interaction().finish(),
     }
+}
+
+/// Schemes a link in an agent's answer may hand to the system. Anything else, `file:` above all,
+/// is left alone: the label of a link says nothing about its target, and the system's default
+/// handler for a local file may run it. Opening local files safely is the notebook link
+/// machinery's job, which an answer's link does not go through.
+const OPENABLE_LINK_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
+
+fn is_openable_link(link: &str) -> bool {
+    url::Url::parse(link).is_ok_and(|parsed| OPENABLE_LINK_SCHEMES.contains(&parsed.scheme()))
 }
 
 /// A live hook event as a label and a line.
@@ -1301,6 +1384,13 @@ fn tail_preview(text: &str) -> String {
 impl View for ConnPanelView {
     fn ui_name() -> &'static str {
         "ConnPanelView"
+    }
+
+    fn on_window_closed(&mut self, ctx: &mut ViewContext<Self>) {
+        let panes: Vec<EntityId> = self.plans.keys().copied().collect();
+        for pane in panes {
+            self.close_plan(pane, ctx);
+        }
     }
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
