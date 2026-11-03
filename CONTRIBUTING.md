@@ -24,6 +24,8 @@ this repository. For how the fork relates to upstream Warp, see
 
 The Rust toolchain is pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
 The project builds for Linux only. See the README for release bundles.
+Building on a large multi-checkout workstation: see
+[docs/building-on-linux-workstations.md](docs/building-on-linux-workstations.md).
 
 ## Checks to run before you open a pull request
 
