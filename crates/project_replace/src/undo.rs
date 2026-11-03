@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::{fs, io};
 
 use crate::apply::{OpenBuffer, Progress};
-use crate::disk::{read_rewritable, write_atomically};
+use crate::disk::{FileStamp, read_rewritable, write_atomically};
 use crate::journal::{Entry, EntryKind, Journal, Transaction, TransactionDescription, sha256_hex};
 use crate::report::{RefusalReason, RefusedFile, SkipReason};
 
@@ -183,11 +183,14 @@ fn undo_entry(
                 return Err(RefusalReason::EditedSinceReplace);
             }
             if save {
-                read_rewritable(
-                    &entry.path,
-                    crate::journal::JournalLimits::default().max_transaction_bytes,
-                )
-                .map_err(|reason| RefusalReason::WriteFailed(reason.describe()))?;
+                // The editor will write its text over the file, so the file has to hold what
+                // the replace left in it, or what it held before when that save never landed.
+                // Anything else was written by someone else, and saving would discard it.
+                let (bytes, _) = read_for_undo(entry)?;
+                let on_disk = normalized_sha256(&bytes);
+                if on_disk != entry.pre_sha256 && on_disk != entry.post_sha256 {
+                    return Err(RefusalReason::EditedSinceReplace);
+                }
             }
             let restored_text = String::from_utf8(pre_image)
                 .map_err(|err| RefusalReason::JournalDamaged(err.to_string()))?;
@@ -226,37 +229,13 @@ fn restore_on_disk(
     pre_image: &[u8],
     normalize_line_endings: bool,
 ) -> Result<Undone, RefusalReason> {
-    // shortcut: undo reads at most one transaction's budget, raise with journal limits if needed.
-    let max_bytes = crate::journal::JournalLimits::default().max_transaction_bytes;
-    let (bytes, stamp) = read_rewritable(path, max_bytes).map_err(|reason| match reason {
-        SkipReason::Missing => RefusalReason::Missing,
-        SkipReason::ReadFailed(error) => RefusalReason::ReadFailed(error),
-        SkipReason::ChangedSinceSearch
-        | SkipReason::ChangedDuringReplace
-        | SkipReason::Binary
-        | SkipReason::UnsupportedEncoding
-        | SkipReason::Symlink
-        | SkipReason::NotAFile
-        | SkipReason::TooLarge { .. }
-        | SkipReason::ReadOnly
-        | SkipReason::HardLinked
-        | SkipReason::OutOfScope
-        | SkipReason::EditedWhileReplacing
-        | SkipReason::JournalFull
-        | SkipReason::SearchFailed(_)
-        | SkipReason::WriteFailed(_) => RefusalReason::WriteFailed(reason.describe()),
-    })?;
+    let (bytes, stamp) = read_for_undo(entry)?;
 
-    let comparable = if normalize_line_endings {
-        std::borrow::Cow::Owned(
-            String::from_utf8_lossy(&bytes)
-                .replace("\r\n", "\n")
-                .into_bytes(),
-        )
+    let current = if normalize_line_endings {
+        normalized_sha256(&bytes)
     } else {
-        std::borrow::Cow::Borrowed(bytes.as_slice())
+        sha256_hex(&bytes)
     };
-    let current = sha256_hex(&comparable);
     if current == entry.pre_sha256 {
         return Ok(Undone::Restored);
     }
@@ -283,6 +262,51 @@ fn restore_on_disk(
         }
     })?;
     Ok(Undone::Restored)
+}
+
+/// Reads the file an entry was recorded for, if it is still safe to rewrite and still where the
+/// replace left it.
+///
+/// The journal holds the resolved path of the file. A path that now resolves elsewhere has had a
+/// directory above it moved or replaced by a link, and what lies there is not the file the replace
+/// changed, whatever it holds.
+fn read_for_undo(entry: &Entry) -> Result<(Vec<u8>, FileStamp), RefusalReason> {
+    // shortcut: undo reads at most one transaction's budget, raise with journal limits if needed.
+    let max_bytes = crate::journal::JournalLimits::default().max_transaction_bytes;
+    let (bytes, stamp) =
+        read_rewritable(&entry.path, max_bytes).map_err(|reason| match reason {
+            SkipReason::Missing => RefusalReason::Missing,
+            SkipReason::ReadFailed(error) => RefusalReason::ReadFailed(error),
+            SkipReason::ChangedSinceSearch
+            | SkipReason::ChangedDuringReplace
+            | SkipReason::Binary
+            | SkipReason::UnsupportedEncoding
+            | SkipReason::Symlink
+            | SkipReason::NotAFile
+            | SkipReason::TooLarge { .. }
+            | SkipReason::ReadOnly
+            | SkipReason::HardLinked
+            | SkipReason::OutOfScope
+            | SkipReason::EditedWhileReplacing
+            | SkipReason::JournalFull
+            | SkipReason::SearchFailed(_)
+            | SkipReason::WriteFailed(_) => RefusalReason::WriteFailed(reason.describe()),
+        })?;
+    if stamp.resolved_path() != entry.path {
+        return Err(RefusalReason::WriteFailed(
+            "the path no longer leads to the file the replace changed".to_owned(),
+        ));
+    }
+    Ok((bytes, stamp))
+}
+
+/// The hash of `bytes` as the editor sees them, with `\n` line endings.
+fn normalized_sha256(bytes: &[u8]) -> String {
+    sha256_hex(
+        String::from_utf8_lossy(bytes)
+            .replace("\r\n", "\n")
+            .as_bytes(),
+    )
 }
 
 fn canonical(path: &Path) -> PathBuf {

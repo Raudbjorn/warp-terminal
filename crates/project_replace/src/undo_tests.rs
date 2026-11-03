@@ -555,3 +555,128 @@ fn undo_does_not_dispatch_a_buffer_save_after_a_hard_link_was_added() {
         assert!(project.journal.latest().unwrap().is_some());
     }
 }
+
+#[test]
+fn a_buffer_save_is_refused_when_the_file_was_changed_on_disk() {
+    // Replaced and saved, then the editor was edited back to the original text without saving.
+    let project = Project::new();
+    let path = project.write("open.txt", "foo\n");
+    let replaced = replace_foo_in_editor(&project, "open.txt", "foo\n", false);
+    project.write("open.txt", &replaced);
+    project.write("open.txt", "written by another program\n");
+
+    let outcome = undo(&project, &[open_buffer(&path, "foo\n", true)]).unwrap();
+    assert!(outcome.buffer_restores.is_empty());
+    let report = outcome.finish(&[], Vec::new());
+    assert_eq!(
+        refused(&report),
+        [("open.txt".to_string(), RefusalReason::EditedSinceReplace)]
+    );
+    assert_eq!(
+        project.read_text("open.txt"),
+        "written by another program\n"
+    );
+    assert_eq!(project.journal.latest().unwrap().unwrap().entries.len(), 1);
+}
+
+#[test]
+fn a_retried_buffer_save_is_refused_when_the_file_was_changed_on_disk() {
+    // The save of the replace failed, so the editor is dirty and the file still holds the
+    // original, until another program writes to it.
+    let project = Project::new();
+    let path = project.write("open.txt", "foo\n");
+    let replaced = replace_foo_in_editor(&project, "open.txt", "foo\n", false);
+    project.write("open.txt", "written by another program\n");
+
+    let outcome = undo(&project, &[open_buffer(&path, &replaced, true)]).unwrap();
+    assert!(outcome.buffer_restores.is_empty());
+    let report = outcome.finish(&[], Vec::new());
+    assert_eq!(
+        refused(&report),
+        [("open.txt".to_string(), RefusalReason::EditedSinceReplace)]
+    );
+    assert_eq!(
+        project.read_text("open.txt"),
+        "written by another program\n"
+    );
+}
+
+#[test]
+fn a_buffer_save_is_allowed_while_the_file_holds_the_replaced_or_original_text() {
+    for saved in [false, true] {
+        let project = Project::new();
+        let path = project.write("open.txt", "foo\n");
+        let replaced = replace_foo_in_editor(&project, "open.txt", "foo\n", false);
+        if saved {
+            project.write("open.txt", &replaced);
+        }
+
+        let outcome = undo(&project, &[open_buffer(&path, &replaced, !saved)]).unwrap();
+        assert!(outcome.refused.is_empty(), "saved: {saved}");
+        assert_eq!(outcome.buffer_restores.len(), 1, "saved: {saved}");
+        assert!(outcome.buffer_restores[0].save);
+    }
+}
+
+#[cfg(unix)]
+mod redirected_paths {
+    use super::*;
+
+    /// Moves `sub` aside and puts a link to a folder outside the project in its place, holding a
+    /// `file.txt` with `outside_content`.
+    fn redirect_sub(project: &Project, outside_content: &str) -> PathBuf {
+        let outside = project.root().parent().unwrap().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file.txt"), outside_content).unwrap();
+        fs::rename(project.path("sub"), project.path("sub-moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, project.path("sub")).unwrap();
+        outside.join("file.txt")
+    }
+
+    #[test]
+    fn a_file_on_disk_is_not_restored_through_a_redirected_directory() {
+        let project = Project::new();
+        project.write("sub/file.txt", "foo\n");
+        replace_foo(&project, &["sub/file.txt"]);
+        let outside = redirect_sub(&project, "quux\n");
+
+        let report = undo_all(&project);
+        assert!(report.restored.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert!(matches!(
+            report.refused[0].reason,
+            RefusalReason::WriteFailed(_)
+        ));
+        assert_eq!(fs::read_to_string(outside).unwrap(), "quux\n");
+        assert!(project.journal.latest().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_closed_editor_file_is_not_restored_through_a_redirected_directory() {
+        let project = Project::new();
+        project.write("sub/file.txt", "foo\n");
+        let replaced = replace_foo_in_editor(&project, "sub/file.txt", "foo\n", false);
+        project.write("sub/file.txt", &replaced);
+        let outside = redirect_sub(&project, &replaced);
+
+        let report = undo_all(&project);
+        assert!(report.restored.is_empty());
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(fs::read_to_string(outside).unwrap(), replaced);
+    }
+
+    #[test]
+    fn an_open_editor_is_not_saved_through_a_redirected_directory() {
+        let project = Project::new();
+        project.write("sub/file.txt", "foo\n");
+        let replaced = replace_foo_in_editor(&project, "sub/file.txt", "foo\n", false);
+        project.write("sub/file.txt", &replaced);
+        let outside = redirect_sub(&project, &replaced);
+
+        let editor = open_buffer(&project.path("sub/file.txt"), &replaced, false);
+        let outcome = undo(&project, &[editor]).unwrap();
+        assert!(outcome.buffer_restores.is_empty());
+        assert_eq!(outcome.refused.len(), 1);
+        assert_eq!(fs::read_to_string(outside).unwrap(), replaced);
+    }
+}

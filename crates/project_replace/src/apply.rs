@@ -232,6 +232,7 @@ pub fn replace_in_files(
                     plan_buffer_edits(
                         &finder,
                         target,
+                        &resolved_path,
                         buffer,
                         request.max_file_bytes,
                         &mut writer,
@@ -418,6 +419,7 @@ fn replace_on_disk(
 fn plan_buffer_edits(
     finder: &MatchFinder,
     target: &FileTarget,
+    resolved_path: &Path,
     buffer: &OpenBuffer,
     max_file_bytes: u64,
     writer: &mut TransactionWriter,
@@ -458,9 +460,11 @@ fn plan_buffer_edits(
         edit.range = edit.range.start + offset..edit.range.end + offset;
     }
 
+    // The journal keeps the resolved path, as it does for files on disk, so that undo can tell
+    // when the path has since been redirected somewhere else.
     let journal_index = writer
         .record(
-            &target.path,
+            resolved_path,
             if buffer.has_unsaved_changes {
                 EntryKind::Buffer
             } else {
