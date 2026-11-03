@@ -982,22 +982,11 @@ async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
 /// read, and nothing that is not a regular file of bounded size is read either.
 #[cfg(not(target_family = "wasm"))]
 fn is_plausible_transcript_path(path: &Path) -> bool {
-    use std::path::{Component, Prefix};
-
     path.is_absolute()
         && path
             .extension()
             .is_some_and(|extension| extension == "jsonl")
-        && !path.components().any(|component| {
-            matches!(
-                component,
-                Component::Prefix(prefix)
-                    if matches!(
-                        prefix.kind(),
-                        Prefix::UNC(..) | Prefix::VerbatimUNC(..) | Prefix::DeviceNS(..)
-                    )
-            )
-        })
+        && !project::names_network_host(path)
 }
 
 /// Whether `id` is made only of what a session id is, so that it is a file name and never a path.

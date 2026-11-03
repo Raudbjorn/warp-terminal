@@ -39,6 +39,7 @@ use warpui::{
 
 use super::{ConnModel, preview};
 use crate::appearance::Appearance;
+use crate::code::buffer_location::LocalOrRemotePath;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
 use crate::notebooks::file::FileNotebookView;
 use crate::notebooks::link::LinkEvent;
@@ -220,8 +221,9 @@ impl ConnPanelView {
             match (plan_file, self.plans.get_mut(&pane)) {
                 (Some(plan_file), Some(open)) if open.path != plan_file => {
                     open.path = plan_file.clone();
-                    open.view
-                        .update(ctx, |view, ctx| view.open_local(plan_file, None, ctx));
+                    open.view.update(ctx, |view, ctx| {
+                        view.open(LocalOrRemotePath::Local(plan_file), None, ctx)
+                    });
                 }
                 (Some(_), _) => {}
                 (None, _) => self.close_plan(pane, ctx),
@@ -301,7 +303,7 @@ impl ConnPanelView {
         self.close_plan(pane, ctx);
         let view = ctx.add_typed_action_view(|ctx| {
             let mut view = FileNotebookView::new(ctx);
-            view.open_local(path.clone(), None, ctx);
+            view.open(LocalOrRemotePath::Local(path.clone()), None, ctx);
             view
         });
         // A pane forwards these for its own viewer, and this viewer has no pane. Links that open

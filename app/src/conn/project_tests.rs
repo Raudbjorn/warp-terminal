@@ -71,3 +71,33 @@ async fn outside_git_the_directory_names_the_project() {
 async fn the_root_directory_names_nothing() {
     assert_eq!(resolve_project(Path::new("/")).await, None);
 }
+
+#[test]
+fn an_ordinary_directory_names_no_network_host() {
+    for path in ["/home/me/app", "/tmp", "relative/dir", ""] {
+        assert!(
+            !super::names_network_host(std::path::Path::new(path)),
+            "{path:?} is local"
+        );
+    }
+}
+
+/// Windows authenticates to a share it is asked about, so a directory the terminal names on one is
+/// never handed to git, while a WSL distribution, which is spelt the same way, still is.
+#[cfg(windows)]
+#[test]
+fn a_network_share_is_not_a_place_to_run_git() {
+    use std::path::Path;
+
+    for path in [
+        r"\\attacker-host\share\repo",
+        r"\\?\UNC\attacker-host\share\repo",
+        r"\\.\pipe\repo",
+    ] {
+        assert!(super::names_network_host(Path::new(path)), "{path}");
+    }
+    assert!(!super::names_network_host(Path::new(
+        r"\\wsl.localhost\Ubuntu\home\me\repo"
+    )));
+    assert!(!super::names_network_host(Path::new(r"C:\Users\me\repo")));
+}
