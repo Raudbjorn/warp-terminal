@@ -36,10 +36,6 @@ impl SshJumpHost {
         ssh_target(&self.user, &self.host, self.port, false)
     }
 
-    fn host_port(&self) -> String {
-        host_with_port(&self.host, self.port)
-    }
-
     fn push_proxy_command_options(&self, argv: &mut Vec<String>) {
         if let Some(identity_file) = self
             .identity_file
@@ -197,9 +193,10 @@ fn proxy_command_for_jump_hosts(jump_hosts: &[SshJumpHost], destination: Option<
     let mut proxy_command: Option<String> = None;
     for (index, jump_host) in jump_hosts.iter().enumerate() {
         let next_destination = match jump_hosts.get(index + 1) {
-            // The enclosing SSH process resolves its own alias and port before expanding this.
-            Some(next) if next.source_profile_id.is_some() => "[%h]:%p".to_string(),
-            Some(next) => escape_openssh_percent(&next.host_port()),
+            // The next hop's own SSH process resolves its alias, `HostName` and port before it
+            // expands this, so `%h:%p` is that hop's effective endpoint. This holds for imported
+            // hops too, whose alias may carry a `HostName`/`Port` the stored literal would miss.
+            Some(_) => "[%h]:%p".to_string(),
             None => destination
                 .map(escape_openssh_percent)
                 .unwrap_or_else(|| "[%h]:%p".to_string()),
@@ -413,6 +410,22 @@ pub fn profile_for_destination(
     }
     if profile.name != destination.host {
         profile.host_is_explicit = true;
+        // `destination.host` named an existing alias, which OpenSSH resolves through that alias's
+        // stanza. Carry the endpoint it resolves to, so the renamed copy reaches the same place
+        // instead of treating the alias as a literal DNS name. Directives Warp does not model
+        // (e.g. `ProxyCommand`) cannot be carried.
+        if let Some(alias) = existing.iter().find(|other| other.name == destination.host) {
+            profile.host = alias.host.clone();
+            if profile.user.is_none() {
+                profile.user = alias.user.clone();
+            }
+            if !destination.port_is_explicit {
+                profile.port = alias.port;
+                profile.port_is_explicit = alias.port_is_explicit;
+            }
+            profile.identity_file = alias.identity_file.clone();
+            profile.jump_hosts = alias.jump_hosts.clone();
+        }
     }
     profile
 }

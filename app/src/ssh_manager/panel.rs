@@ -1712,14 +1712,42 @@ fn conflicting_profile_fields(
     {
         conflicts.push("identity file");
     }
-    if original.host_is_explicit
-        && current.host_is_explicit
-        && current.host != original.host
-        && edited.host == original.host
+    // Presence matters as much as value: an external `HostName` added to (or removed from) a stanza
+    // that the editor saw without (or with) one would otherwise be silently undone.
+    if host_directive(current) != host_directive(original)
+        && host_directive(edited) == host_directive(original)
     {
         conflicts.push("host");
     }
+    if jump_route(current) != jump_route(original) && jump_route(edited) == jump_route(original) {
+        conflicts.push("jump hosts");
+    }
     conflicts
+}
+
+/// The `HostName` a profile writes: `None` when it is inherited from the alias.
+fn host_directive(profile: &SshHostProfile) -> Option<&str> {
+    profile.host_is_explicit.then_some(profile.host.as_str())
+}
+
+/// The persisted jump route. Source-linked hops follow their source profile, so only the link is
+/// compared; their cached connection details legitimately change when the source is edited.
+fn jump_route(profile: &SshHostProfile) -> Vec<SshJumpHost> {
+    profile
+        .jump_hosts
+        .iter()
+        .map(|hop| match hop.source_profile_id {
+            Some(source_profile_id) => SshJumpHost {
+                source_profile_id: Some(source_profile_id),
+                host: String::new(),
+                user: None,
+                port: 0,
+                port_is_explicit: false,
+                identity_file: None,
+            },
+            None => hop.clone(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1736,6 +1764,66 @@ mod tests {
             conflicting_profile_fields(&original, &edited, &current),
             vec!["user"]
         );
+    }
+
+    #[test]
+    fn an_externally_added_host_name_conflicts_when_the_editor_saw_none() {
+        let original = SshHostProfile::new("work".into(), "work".into());
+        let edited = original.clone();
+        let mut current = original.clone();
+        current.host = "prod.example".into();
+        current.host_is_explicit = true;
+        assert_eq!(
+            conflicting_profile_fields(&original, &edited, &current),
+            vec!["host"]
+        );
+    }
+
+    #[test]
+    fn an_externally_removed_host_name_conflicts() {
+        let mut original = SshHostProfile::new("work".into(), "prod.example".into());
+        original.host_is_explicit = true;
+        let edited = original.clone();
+        let mut current = original.clone();
+        current.host = "work".into();
+        current.host_is_explicit = false;
+        assert_eq!(
+            conflicting_profile_fields(&original, &edited, &current),
+            vec!["host"]
+        );
+    }
+
+    #[test]
+    fn an_external_jump_route_change_conflicts_but_a_linked_hop_refresh_does_not() {
+        let hop = |host: &str| SshJumpHost {
+            source_profile_id: None,
+            host: host.into(),
+            user: None,
+            port: 22,
+            port_is_explicit: false,
+            identity_file: None,
+        };
+        let mut original = SshHostProfile::new("work".into(), "work".into());
+        original.jump_hosts = vec![hop("edge")];
+        let edited = original.clone();
+        let mut current = original.clone();
+        current.jump_hosts = vec![hop("other")];
+        assert_eq!(
+            conflicting_profile_fields(&original, &edited, &current),
+            vec!["jump hosts"]
+        );
+
+        // A linked hop's cached details follow its source and are not an external route change.
+        let id = Uuid::new_v4();
+        let linked = |port: u16| SshJumpHost {
+            source_profile_id: Some(id),
+            port,
+            ..hop("gateway")
+        };
+        original.jump_hosts = vec![linked(2222)];
+        let edited = original.clone();
+        current.jump_hosts = vec![linked(2200)];
+        assert!(conflicting_profile_fields(&original, &edited, &current).is_empty());
     }
 
     #[test]
