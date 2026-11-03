@@ -714,3 +714,61 @@ fn a_repeated_prompt_is_matched_to_the_turn_that_began_when_it_arrived() {
         "the story holds the turn this prompt began"
     );
 }
+
+/// A request that arrives within a millisecond of the read before it has a cutoff older than that
+/// read. The cutoff is only how far the story covers; whether a read is the newer one is the
+/// moment of its event, so the request's reads must still be taken.
+#[test]
+fn a_request_just_after_a_read_is_not_taken_for_an_older_read() {
+    let mut session = ConnSession::default();
+    session.push(prompt("fix it", 1));
+    let first = at(10);
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(1, Some(5), Some("Done."), "fix it")]),
+        first
+    ));
+
+    let request_at = first + chrono::TimeDelta::microseconds(500);
+    let cutoff = request_at - chrono::TimeDelta::milliseconds(1);
+    assert!(cutoff < first, "the cutoff is older than the read before");
+    assert!(
+        session.adopt_story_until(
+            story(vec![turn_with_prompt(
+                1,
+                Some(6),
+                Some("Done, and more."),
+                "fix it"
+            )]),
+            request_at,
+            cutoff
+        ),
+        "the request's read is newer, whatever its cutoff"
+    );
+    assert_eq!(
+        session.story().expect("story kept").turns[0]
+            .outcome
+            .as_deref(),
+        Some("Done, and more.")
+    );
+}
+
+/// The cutoff still does its job: a request at the event's moment is after it, so it stays live.
+#[test]
+fn the_cutoff_keeps_the_request_itself_in_flight() {
+    let mut session = ConnSession::default();
+    session.push(prompt("fix it", 1));
+    let request_at = at(10);
+    session.push(ConnEntry::new(
+        ConnEntryKind::QuestionAsked {
+            summary: Some("Proceed?".to_owned()),
+        },
+        request_at,
+    ));
+    assert!(session.adopt_story_until(
+        story(vec![turn_with_prompt(1, Some(5), Some("Done."), "fix it")]),
+        request_at,
+        request_at - chrono::TimeDelta::milliseconds(1)
+    ));
+
+    assert_eq!(session.in_flight().len(), 1);
+}

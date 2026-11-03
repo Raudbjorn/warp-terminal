@@ -204,11 +204,26 @@ impl ConnSession {
     /// main thread and resolve off it. A read that resolves after a later one is
     /// stale and is dropped rather than rewinding the panel.
     pub fn adopt_story(&mut self, story: ConnStory, through: DateTime<Utc>) -> bool {
-        if self.is_stale_read(through) {
+        self.adopt_story_until(story, through, through)
+    }
+
+    /// [`Self::adopt_story`] for a read whose story is to cover less than the event that
+    /// triggered it. `read_at` orders the read against others; `covered_until` is how far the
+    /// story is taken to cover the live entries. They differ when the triggering event is a
+    /// request the story must not hide: its own entry is told by the live entry alone, so the
+    /// cutoff stops just short of it, and that must not make the read look older than one that
+    /// came a moment before.
+    pub fn adopt_story_until(
+        &mut self,
+        story: ConnStory,
+        read_at: DateTime<Utc>,
+        covered_until: DateTime<Utc>,
+    ) -> bool {
+        if self.is_stale_read(read_at) {
             return false;
         }
         self.story = Some(story);
-        self.advance_coverage(through);
+        self.advance_coverage(read_at, covered_until);
         true
     }
 
@@ -221,11 +236,21 @@ impl ConnSession {
     /// Returns whether that changed what is in flight, which is what a reader would see change.
     /// A stale read, or a session with no story, changes nothing.
     pub fn recheck_story(&mut self, through: DateTime<Utc>) -> bool {
-        if self.story.is_none() || self.is_stale_read(through) {
+        self.recheck_story_until(through, through)
+    }
+
+    /// [`Self::recheck_story`] with the read's order and its coverage cutoff apart, as in
+    /// [`Self::adopt_story_until`].
+    pub fn recheck_story_until(
+        &mut self,
+        read_at: DateTime<Utc>,
+        covered_until: DateTime<Utc>,
+    ) -> bool {
+        if self.story.is_none() || self.is_stale_read(read_at) {
             return false;
         }
         let before = self.in_flight().len();
-        self.advance_coverage(through);
+        self.advance_coverage(read_at, covered_until);
         self.in_flight().len() != before
     }
 
@@ -239,13 +264,13 @@ impl ConnSession {
     /// The transcript is written asynchronously, so a read can land before the turn's closing
     /// message reaches the file. Coverage is computed against the live entries in `in_flight`,
     /// where hook prompts are matched to transcript prompts rather than compared by timestamp.
-    fn advance_coverage(&mut self, through: DateTime<Utc>) {
+    fn advance_coverage(&mut self, read_at: DateTime<Utc>, covered_until: DateTime<Utc>) {
         self.story_through = match self.story.as_ref().and_then(|story| story.turns.last()) {
             None => None,
             Some(turn) if turn.outcome.is_none() => Some(turn.last_activity()),
-            Some(_) => Some(through),
+            Some(_) => Some(covered_until),
         };
-        self.story_read_at = Some(through);
+        self.story_read_at = Some(read_at);
     }
 
     /// Live entries the story does not yet cover: the turn in flight.

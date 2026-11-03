@@ -290,7 +290,7 @@ impl ConnModel {
             cwd: None,
             session_id: None,
         };
-        self.read_transcript(terminal_view_id, locator, through, delay, ctx);
+        self.read_transcript(terminal_view_id, locator, through, false, delay, ctx);
         self.reads_in_flight
             .get(&terminal_view_id)
             .map(|read| read.future_id)
@@ -458,13 +458,19 @@ impl ConnModel {
         );
         // The story covers what led up to the request. The request itself is told only by its
         // live entry, so the boundary stops just short of it.
-        let through = if waiting {
-            at - TimeDelta::milliseconds(1)
-        } else {
-            at
-        };
+        // That is only how far the story covers. Which read is newer is still told by the
+        // event's own moment, or a request a millisecond after a read would look older than it.
+        let hold_back = waiting;
+        let through = at;
         if self.should_read(terminal_view_id, event, at) {
-            self.read_transcript(terminal_view_id, locator.clone(), through, None, ctx);
+            self.read_transcript(
+                terminal_view_id,
+                locator.clone(),
+                through,
+                hold_back,
+                None,
+                ctx,
+            );
         }
         if finished || waiting {
             // One delayed read per pane, always for the latest boundary: the read is of the
@@ -472,7 +478,14 @@ impl ConnModel {
             // and a read left pending for an older boundary would be dropped as stale once this
             // boundary's immediate read lands, leaving nothing to pick up the flushed answer.
             // `read_transcript` replaces the pending one.
-            self.read_transcript(terminal_view_id, locator, through, Some(FLUSH_GRACE), ctx);
+            self.read_transcript(
+                terminal_view_id,
+                locator,
+                through,
+                hold_back,
+                Some(FLUSH_GRACE),
+                ctx,
+            );
         }
         self.record_status(terminal_view_id, event, ctx);
         if let Some(cwd) = unresolved_cwd {
@@ -675,7 +688,7 @@ impl ConnModel {
         let Some(locator) = self.transcript_locator(terminal_view_id) else {
             return;
         };
-        self.read_transcript(terminal_view_id, locator, Utc::now(), None, ctx);
+        self.read_transcript(terminal_view_id, locator, Utc::now(), false, None, ctx);
     }
 
     /// Where the pane's transcript is, as far as is known.
@@ -701,9 +714,17 @@ impl ConnModel {
         terminal_view_id: EntityId,
         locator: TranscriptLocator,
         through: DateTime<Utc>,
+        hold_back: bool,
         after: Option<Duration>,
         ctx: &mut ModelContext<Self>,
     ) -> u64 {
+        // The story covers what led up to a request, not the request, which only its live entry
+        // tells. This is the cutoff for that; `through` stays the read's place in time.
+        let covered_until = if hold_back {
+            through - TimeDelta::milliseconds(1)
+        } else {
+            through
+        };
         self.last_read.insert(terminal_view_id, through);
         let seq = self.next_read_seq;
         self.next_read_seq += 1;
@@ -757,7 +778,7 @@ impl ConnModel {
                     StoryRead::Read(path, story, len) => {
                         // Remember where it was found so the next read skips the search.
                         session.transcript_path = Some(path.to_string_lossy().into_owned());
-                        let taken = session.adopt_story(story, through);
+                        let taken = session.adopt_story_until(story, through, covered_until);
                         if taken {
                             me.adopted_reads.insert(terminal_view_id, seq);
                             me.transcript_lengths.insert(terminal_view_id, len);
@@ -769,7 +790,7 @@ impl ConnModel {
                     // moving the boundary to it, an answer the story already holds would show a
                     // second time as the hook's own entry. Only a change in what is in flight is
                     // announced, so a transcript that is still unchanged costs no redraw.
-                    StoryRead::Unchanged => session.recheck_story(through),
+                    StoryRead::Unchanged => session.recheck_story_until(through, covered_until),
                 };
                 if taken {
                     ctx.notify();

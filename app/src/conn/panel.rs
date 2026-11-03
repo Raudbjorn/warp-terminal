@@ -10,7 +10,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ::conn::overview::{OverviewItem, ProjectGroup, group_by_project, project_label};
@@ -213,17 +213,22 @@ impl ConnPanelView {
                 let plan_file = model
                     .session(*pane)
                     .and_then(|session| session.story())
-                    .and_then(|story| story.plan_file.clone());
+                    .and_then(|story| story.plan_file.clone())
+                    .filter(|plan_file| plan_path_is_plausible(plan_file));
                 (*pane, plan_file)
             })
             .collect();
         for (pane, plan_file) in current {
             match (plan_file, self.plans.get_mut(&pane)) {
                 (Some(plan_file), Some(open)) if open.path != plan_file => {
-                    open.path = plan_file.clone();
-                    open.view.update(ctx, |view, ctx| {
-                        view.open(LocalOrRemotePath::Local(plan_file), None, ctx)
-                    });
+                    if plan_is_openable(&plan_file) {
+                        open.path = plan_file.clone();
+                        open.view.update(ctx, |view, ctx| {
+                            view.open(LocalOrRemotePath::Local(plan_file), None, ctx)
+                        });
+                    } else {
+                        self.close_plan(pane, ctx);
+                    }
                 }
                 (Some(_), _) => {}
                 (None, _) => self.close_plan(pane, ctx),
@@ -296,7 +301,7 @@ impl ConnPanelView {
         let Some(pane) = self.focused_terminal_id(ctx) else {
             return;
         };
-        let Some(path) = self.plan_file(ctx) else {
+        let Some(path) = self.plan_file(ctx).filter(|path| plan_is_openable(path)) else {
             return;
         };
         // A pane reads one plan at a time, and the one it was reading is closed for the new one.
@@ -361,7 +366,10 @@ impl ConnPanelView {
     /// The plan file of the focused pane's session, when it has presented a plan.
     fn plan_file(&self, app: &AppContext) -> Option<PathBuf> {
         self.with_session(app, |session| {
-            session.story().and_then(|story| story.plan_file.clone())
+            session
+                .story()
+                .and_then(|story| story.plan_file.clone())
+                .filter(|path| plan_path_is_plausible(path))
         })
         .flatten()
     }
@@ -1265,6 +1273,30 @@ const OPENABLE_LINK_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
 
 fn is_openable_link(link: &str) -> bool {
     url::Url::parse(link).is_ok_and(|parsed| OPENABLE_LINK_SCHEMES.contains(&parsed.scheme()))
+}
+
+/// The largest plan the panel opens. A plan is a page of Markdown; the viewer reads a whole file
+/// into memory and watches it, so what it is pointed at has to be bounded first.
+const MAX_PLAN_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Whether a plan path from the transcript could be a plan, judged by its spelling alone: an
+/// absolute path to a Markdown file that is not on the network. The transcript is the agent's,
+/// and the agent's terminal may be a remote host's.
+fn plan_path_is_plausible(path: &Path) -> bool {
+    path.is_absolute()
+        && path
+            .extension()
+            .is_some_and(|extension| extension == "md" || extension == "markdown")
+        && !super::project::names_network_host(path)
+}
+
+/// Whether a plan can be opened: a plausible path to a regular file of bounded size. This asks the
+/// filesystem, so it runs when a plan is opened or changes, not on every frame. A file that grows
+/// past the bound after it is open is not caught.
+fn plan_is_openable(path: &Path) -> bool {
+    plan_path_is_plausible(path)
+        && std::fs::metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_PLAN_BYTES)
 }
 
 /// A live hook event as a label and a line.

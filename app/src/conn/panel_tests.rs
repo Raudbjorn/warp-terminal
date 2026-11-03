@@ -6,7 +6,10 @@ use ::conn::story::{ConnStep, ConnStory, ConnTurn};
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
 use chrono::{DateTime, TimeZone, Utc};
 
-use super::{ConnRow, PREVIEW_CHARS, is_openable_link, row_at, row_count, scroll_target, truncate};
+use super::{
+    ConnRow, PREVIEW_CHARS, is_openable_link, plan_is_openable, plan_path_is_plausible, row_at,
+    row_count, scroll_target, truncate,
+};
 
 fn at(seconds: i64) -> DateTime<Utc> {
     Utc.timestamp_opt(seconds, 0).single().expect("valid time")
@@ -625,4 +628,46 @@ fn only_web_and_mail_links_in_an_answer_are_opened() {
     ] {
         assert!(!is_openable_link(link), "{link:?} should not open");
     }
+}
+
+#[test]
+fn only_an_absolute_markdown_path_is_taken_for_a_plan() {
+    use std::path::Path;
+
+    // Unix spellings; an absolute path on Windows needs a drive.
+    #[cfg(unix)]
+    for path in ["/home/me/.claude/plans/plan.md", "/tmp/notes.markdown"] {
+        assert!(plan_path_is_plausible(Path::new(path)), "{path}");
+    }
+    for path in [
+        "/dev/zero",
+        "/etc/shadow",
+        "/home/me/.claude/plans/plan.txt",
+        "plans/plan.md",
+        "",
+    ] {
+        assert!(!plan_path_is_plausible(Path::new(path)), "{path:?}");
+    }
+}
+
+/// A plan that is named like Markdown can still be a link to a device, or too large to be read
+/// whole into the viewer, and neither is opened.
+#[cfg(unix)]
+#[test]
+fn a_plan_must_be_a_regular_file_of_bounded_size() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let plan = dir.path().join("plan.md");
+    std::fs::write(&plan, "# Plan\n").expect("write plan");
+    assert!(plan_is_openable(&plan));
+
+    let link = dir.path().join("device.md");
+    std::os::unix::fs::symlink("/dev/zero", &link).expect("symlink");
+    assert!(!plan_is_openable(&link), "a link to a device is not a file");
+
+    assert!(!plan_is_openable(&dir.path().join("missing.md")));
+
+    let big = dir.path().join("big.md");
+    let file = std::fs::File::create(&big).expect("create");
+    file.set_len(super::MAX_PLAN_BYTES + 1).expect("extend");
+    assert!(!plan_is_openable(&big), "past the bound");
 }

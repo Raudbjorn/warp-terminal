@@ -1397,6 +1397,9 @@ fn a_stop_after_the_read_that_saw_the_answer_does_not_show_it_twice() {
     });
 }
 
+// The accepted paths are Unix spellings; an absolute path on Windows needs a drive, and the
+// Windows test below covers one.
+#[cfg(unix)]
 #[test]
 fn only_an_absolute_local_jsonl_path_is_taken_for_a_transcript() {
     use std::path::Path;

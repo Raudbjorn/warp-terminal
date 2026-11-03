@@ -10164,7 +10164,14 @@ impl Workspace {
         // background tab's focused pane will show when it is switched to.
         if panel_update_params.pane_group.id() == self.active_tab_pane_group().id() {
             if should_open {
+                // Replacing Conn hides it without moving focus, and a hidden panel that keeps
+                // focus keeps the keyboard. Conn hands it back to the terminal the same way.
+                let conn_had_focus = self.right_panel_content == Some(RightPanelContent::Conn)
+                    && self.conn_panel_view.is_self_or_child_focused(ctx);
                 self.right_panel_content = Some(RightPanelContent::CodeReview);
+                if conn_had_focus {
+                    self.focus_active_tab(ctx);
+                }
             } else if self.right_panel_content == Some(RightPanelContent::CodeReview) {
                 self.right_panel_content = None;
             }
