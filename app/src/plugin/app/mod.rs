@@ -120,6 +120,18 @@ impl PluginHost {
         })
     }
 
+    /// A host with no child process, IPC server or client, for tests that build a `Workspace`.
+    /// `new` re-executes the current binary as the plugin host, which in a test would re-run
+    /// the test harness.
+    #[cfg(test)]
+    pub fn new_for_test() -> Self {
+        Self {
+            host_process: None,
+            _server: None,
+            host_client: None,
+        }
+    }
+
     /// Returns an `ipc::ServiceCaller` for the service specified as `S`.
     ///
     /// `S` is assumed to be served by the plugin host process; the returned service caller directs

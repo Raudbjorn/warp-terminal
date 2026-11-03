@@ -168,6 +168,9 @@ pub(crate) fn initialize_app_with_team_client(app: &mut App, team_client: Arc<dy
     app.add_singleton_model(|_| {
         crate::workspace::plugin_status_items::PluginStatusItemsModel::new()
     });
+    // Workspace::new subscribes to PluginHost when the plugin host is built in.
+    #[cfg(feature = "plugin_host")]
+    app.add_singleton_model(|_| crate::plugin::PluginHost::new_for_test());
     // ConnPanelView reads this on construction, so a harness that builds a
     // Workspace needs it registered as production does.
     app.add_singleton_model(crate::conn::ConnModel::new);
