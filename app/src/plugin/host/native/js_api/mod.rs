@@ -516,7 +516,9 @@ fn prompt<'js>(plugin_id: String, ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>
 /// Returns a JS object representing the Keymap namespace for the Warp Plugin API.
 ///
 /// `bind(commandId: string, keys: string)` — binds a key sequence (e.g. `"ctrl-b g"`) to a
-///     command registered via `warp.commands.register`. The user's `keybindings.yaml` overrides it.
+///     command registered via `warp.commands.register`. A user override in `keybindings.yaml`
+///     applies while that binding is the effective one; a later `bind` registers a new binding
+///     that takes precedence over it. See PLUGIN_SPEC.md §6.
 fn keymap<'js>(ctx: Ctx<'js>) -> rquickjs::Result<Object<'js>> {
     let keymap = Object::new(ctx)?;
     keymap.set(
