@@ -1024,8 +1024,9 @@ fn ai_autodetection_defaults_to_opt_in() {
             // NLD is opt-in: a fresh user who never touched the setting has it off.
             // This fails before the default flip (default was `true`) and passes after.
             assert!(!*settings.ai_autodetection_enabled_internal.value());
-            // Harp ships with AI off until the user logs in.
-            assert!(!settings.is_any_ai_enabled(ctx));
+            // Harp also asserted `!is_any_ai_enabled` here because it ships with AI off; the fork
+            // keeps AI's upstream default (the port leaves that flip out), so only the opt-in
+            // autodetection default is checked.
             assert!(!settings.is_ai_autodetection_enabled(ctx));
         });
     });
