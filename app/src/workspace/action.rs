@@ -462,6 +462,14 @@ pub enum WorkspaceAction {
     CopySharedSessionLinkFromTab {
         tab_index: usize,
     },
+    /// Capture a tab's session to a file from its right-click menu. Resolved by
+    /// tab index without activating the tab, so saving does not yank focus.
+    SaveSessionToFileFromTab {
+        tab_index: usize,
+    },
+    StreamSessionToFileFromTab {
+        tab_index: usize,
+    },
     OpenSharedSessionQrCode {
         session_id: SessionId,
     },
@@ -714,6 +722,10 @@ pub enum WorkspaceAction {
     ToggleGlobalSearch,
     ToggleHiddenFiles,
     OpenGlobalSearch,
+    /// Opens global search with its replacement field showing.
+    OpenGlobalSearchReplace,
+    /// Takes back the last replace made from global search.
+    UndoLastProjectReplace,
     ToggleConversationListView,
     OpenConversationListView,
     OpenAgentManagementView,
@@ -1154,6 +1166,8 @@ impl WorkspaceAction {
             | StopSharingSessionFromTabMenu { .. }
             | StopSharingAllSessionsInTab { .. }
             | CopySharedSessionLinkFromTab { .. }
+            | SaveSessionToFileFromTab { .. }
+            | StreamSessionToFileFromTab { .. }
             | OpenSharedSessionQrCode { .. }
             | ReopenClosedSession
             | FocusLeftPanel
@@ -1196,6 +1210,8 @@ impl WorkspaceAction {
             | ToggleGlobalSearch
             | ToggleHiddenFiles
             | OpenGlobalSearch
+            | OpenGlobalSearchReplace
+            | UndoLastProjectReplace
             | ToggleConversationListView
             | OpenConversationListView
             | ToggleNotificationMailbox { .. }

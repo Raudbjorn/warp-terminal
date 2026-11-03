@@ -841,6 +841,98 @@ fn resolve_openai_base_url_from_secret_returns_none_when_api_key_not_in_resolved
     assert_eq!(result, None);
 }
 
+/// Runs `resolve_openai_base_url_from_secret` with `OPENAI_API_KEY` unset in the process env.
+fn resolve_base_url_without_worker_env(
+    secrets: &HashMap<String, ManagedSecretValue>,
+    resolved_key: &str,
+) -> Option<String> {
+    let prev = std::env::var(OPENAI_API_KEY_ENV).ok();
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe { std::env::remove_var(OPENAI_API_KEY_ENV) };
+    let resolved_env = HashMap::from([(
+        OsString::from(OPENAI_API_KEY_ENV),
+        OsString::from(resolved_key),
+    )]);
+
+    let result = resolve_openai_base_url_from_secret(secrets, &resolved_env);
+
+    if let Some(v) = prev {
+        // TODO: Audit that the environment access only happens in single-threaded code.
+        unsafe { std::env::set_var(OPENAI_API_KEY_ENV, v) };
+    }
+    result
+}
+
+#[test]
+#[serial_test::serial]
+fn resolve_openai_base_url_from_secret_ignores_secret_skipped_for_runtime_env_key() {
+    // The assignment's runtime env supplies OPENAI_API_KEY, so the secret is skipped by
+    // `build_secret_env_vars` and the resolved map holds the runtime key. That key must not be
+    // sent to the skipped secret's endpoint, for either secret variant.
+    for secret in [
+        ManagedSecretValue::openai_api_key("sk-secret", Some("https://proxy.example/v1".into())),
+        ManagedSecretValue::llm_provider_api_key(
+            "openai",
+            "sk-secret",
+            Some("https://proxy.example/v1".into()),
+        ),
+    ] {
+        let secrets = HashMap::from([("openai-key".to_string(), secret)]);
+        assert_eq!(
+            resolve_base_url_without_worker_env(&secrets, "sk-runtime"),
+            None
+        );
+    }
+}
+
+#[test]
+#[serial_test::serial]
+fn resolve_openai_base_url_from_secret_reads_openai_llm_provider_secret() {
+    let secrets = HashMap::from([(
+        "openai-key".to_string(),
+        ManagedSecretValue::llm_provider_api_key(
+            "openai",
+            "sk-test",
+            Some(" https://proxy.example/v1 ".into()),
+        ),
+    )]);
+    assert_eq!(
+        resolve_base_url_without_worker_env(&secrets, "sk-test").as_deref(),
+        Some("https://proxy.example/v1")
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn resolve_openai_base_url_from_secret_takes_the_url_of_the_secret_that_supplied_the_key() {
+    let secrets = HashMap::from([
+        (
+            "a".to_string(),
+            ManagedSecretValue::openai_api_key("sk-a", Some("https://a.example/v1".into())),
+        ),
+        (
+            "b".to_string(),
+            ManagedSecretValue::llm_provider_api_key(
+                "openai",
+                "sk-b",
+                Some("https://b.example/v1".into()),
+            ),
+        ),
+        (
+            "other-provider".to_string(),
+            ManagedSecretValue::llm_provider_api_key(
+                "anthropic",
+                "sk-b",
+                Some("https://c.example/v1".into()),
+            ),
+        ),
+    ]);
+    assert_eq!(
+        resolve_base_url_without_worker_env(&secrets, "sk-b").as_deref(),
+        Some("https://b.example/v1")
+    );
+}
+
 #[tokio::test]
 async fn fetch_resume_payload_returns_codex_variant_on_success() {
     let uuid = Uuid::new_v4();

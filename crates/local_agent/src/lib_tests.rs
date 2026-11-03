@@ -14,6 +14,7 @@ fn config_for(server: &ServerGuard) -> LocalEndpointConfig {
         base_url: server.url(),
         api_key: "test-key".to_string(),
         model_slug: "test-model".to_string(),
+        schema: crate::EndpointSchema::ChatCompletions,
     }
 }
 
@@ -429,6 +430,7 @@ async fn sends_chat_completions_request_with_expected_shape() {
                 name: "run_shell_command".to_string(),
                 arguments: json!({ "command": "ls" }),
             }],
+            replay_items: vec![],
         },
         ChatMessage::Tool {
             tool_call_id: "call_prev".to_string(),
@@ -465,6 +467,7 @@ async fn base_url_already_ending_in_chat_completions_is_used_as_is() {
         base_url: format!("{}/chat/completions", server.url()),
         api_key: "test-key".to_string(),
         model_slug: "test-model".to_string(),
+        schema: crate::EndpointSchema::ChatCompletions,
     };
 
     let events = expect_ok(collect_events(user_only_transcript(), vec![], config).await);
@@ -623,4 +626,130 @@ async fn build_system_prompt_includes_environment_details() {
             "prompt is missing {needle:?}:\n{prompt}"
         );
     }
+}
+
+/// Tests that run with the process-wide services mode set to local-only take this lock. Every
+/// other test here talks to a loopback mockito server, which local-only mode allows.
+static LOCAL_ONLY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct LocalOnlyGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl LocalOnlyGuard {
+    fn enter() -> Self {
+        let guard = LOCAL_ONLY_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        network_policy::set_services_mode(network_policy::ServicesMode::LocalOnly);
+        Self(guard)
+    }
+}
+
+impl Drop for LocalOnlyGuard {
+    fn drop(&mut self) {
+        network_policy::set_services_mode(network_policy::ServicesMode::Online);
+    }
+}
+
+#[tokio::test]
+async fn local_only_mode_refuses_a_public_endpoint_before_any_request() {
+    let _local_only = LocalOnlyGuard::enter();
+    for schema in [
+        crate::EndpointSchema::ChatCompletions,
+        crate::EndpointSchema::Responses,
+    ] {
+        let config = LocalEndpointConfig {
+            base_url: "https://api.example.com/v1".to_string(),
+            api_key: "secret".to_string(),
+            model_slug: "test-model".to_string(),
+            schema,
+        };
+
+        let result = complete_text(user_only_transcript(), config).await;
+
+        assert!(
+            matches!(result, Err(LocalAgentError::NetworkPolicyDenied(_))),
+            "{schema:?}: unexpected result: {result:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refused_endpoint_is_reported_without_its_url() {
+    let _local_only = LocalOnlyGuard::enter();
+    for schema in [
+        crate::EndpointSchema::ChatCompletions,
+        crate::EndpointSchema::Responses,
+    ] {
+        let config = LocalEndpointConfig {
+            base_url: "https://user:hunter2@api.example.com/v1?token=hunter2".to_string(),
+            api_key: "secret".to_string(),
+            model_slug: "test-model".to_string(),
+            schema,
+        };
+
+        let result = complete_text(user_only_transcript(), config).await;
+
+        // Still the deterministic-refusal variant, so the host does not retry it.
+        let Err(error @ LocalAgentError::NetworkPolicyDenied(_)) = result else {
+            panic!("{schema:?}: unexpected result: {result:?}");
+        };
+        let message = error.to_string();
+        assert!(!message.contains("hunter2"), "{schema:?}: {message}");
+        assert!(
+            !message.contains("api.example.com"),
+            "{schema:?}: {message}"
+        );
+        assert!(
+            message.contains("local agent request"),
+            "{schema:?}: {message}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_only_mode_refuses_a_redirect_to_a_public_host() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut server = Server::new_async().await;
+    // A 307 keeps the method and the body (the transcript and the API key's request), so following
+    // it would hand both to the public host.
+    let redirect = server
+        .mock("POST", "/chat/completions")
+        .with_status(307)
+        .with_header("location", "https://api.example.com/v1/chat/completions")
+        .create_async()
+        .await;
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        complete_text(user_only_transcript(), config_for(&server)),
+    )
+    .await
+    .expect("the redirect should be refused without waiting on the public host");
+
+    redirect.assert_async().await;
+    let Err(error @ LocalAgentError::NetworkPolicyDenied(_)) = result else {
+        panic!("unexpected result: {result:?}");
+    };
+    // The redirect target can carry credentials too, so the report does not repeat it.
+    assert!(!error.to_string().contains("api.example.com"), "{error}");
+}
+
+#[tokio::test]
+async fn loopback_endpoints_still_work_in_local_only_mode() {
+    let _local_only = LocalOnlyGuard::enter();
+    let mut server = Server::new_async().await;
+    let body = sse_body(
+        &[
+            delta_chunk(json!({ "role": "assistant", "content": "ok" }), None),
+            delta_chunk(json!({}), Some("stop")),
+        ],
+        true,
+    );
+    let _mock = mock_completion(&mut server, body).await;
+
+    let text = complete_text(user_only_transcript(), config_for(&server))
+        .await
+        .expect("a loopback endpoint is allowed in local-only mode");
+
+    assert_eq!(text, "ok");
 }

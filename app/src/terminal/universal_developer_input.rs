@@ -1,4 +1,3 @@
-use warp_core::channel::ChannelState;
 use std::borrow::Cow;
 use std::boxed::Box;
 use std::cell::RefCell;
@@ -8,6 +7,7 @@ use std::sync::Arc;
 use pathfinder_color::ColorU;
 #[cfg(not(target_family = "wasm"))]
 use settings::Setting as _;
+use warp_core::channel::ChannelState;
 use warp_core::features::FeatureFlag;
 use warp_core::ui::appearance::Appearance;
 use warp_core::ui::color::contrast::{

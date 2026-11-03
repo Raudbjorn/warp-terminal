@@ -40,18 +40,18 @@ warp-trash-local-settings:
 		mkdir -p "$$trash_dir"; \
 		paths=( \
 			"$$HOME/.slipstream" \
-			"$${XDG_CONFIG_HOME:-$$HOME/.config}/dev.warp.WarpOss" \
-			"$${XDG_DATA_HOME:-$$HOME/.local/share}/dev.warp.WarpOss" \
-			"$${XDG_STATE_HOME:-$$HOME/.local/state}/dev.warp.WarpOss" \
-			"$${XDG_CACHE_HOME:-$$HOME/.cache}/dev.warp.WarpOss" \
+			"$${XDG_CONFIG_HOME:-$$HOME/.config}/warp-oss" \
+			"$${XDG_DATA_HOME:-$$HOME/.local/share}/warp-oss" \
+			"$${XDG_STATE_HOME:-$$HOME/.local/state}/warp-oss" \
+			"$${XDG_CACHE_HOME:-$$HOME/.cache}/warp-oss" \
 		); \
 		if [ -n "$${WARP_DATA_PROFILE:-}" ]; then \
 			paths+=( \
 				"$$HOME/.slipstream-$${WARP_DATA_PROFILE}" \
-				"$${XDG_CONFIG_HOME:-$$HOME/.config}/dev.warp.WarpOss-$${WARP_DATA_PROFILE}" \
-				"$${XDG_DATA_HOME:-$$HOME/.local/share}/dev.warp.WarpOss-$${WARP_DATA_PROFILE}" \
-				"$${XDG_STATE_HOME:-$$HOME/.local/state}/dev.warp.WarpOss-$${WARP_DATA_PROFILE}" \
-				"$${XDG_CACHE_HOME:-$$HOME/.cache}/dev.warp.WarpOss-$${WARP_DATA_PROFILE}" \
+				"$${XDG_CONFIG_HOME:-$$HOME/.config}/warp-oss-$${WARP_DATA_PROFILE}" \
+				"$${XDG_DATA_HOME:-$$HOME/.local/share}/warp-oss-$${WARP_DATA_PROFILE}" \
+				"$${XDG_STATE_HOME:-$$HOME/.local/state}/warp-oss-$${WARP_DATA_PROFILE}" \
+				"$${XDG_CACHE_HOME:-$$HOME/.cache}/warp-oss-$${WARP_DATA_PROFILE}" \
 			); \
 		fi; \
 		moved=0; \

@@ -33,14 +33,15 @@
 //! drain task prevents the child from blocking on a full pipe and owns the
 //! kill path so the `Drop` impl stays non-blocking.
 
-use futures::io::{AsyncBufReadExt, BufReader};
-use futures::AsyncReadExt;
-use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+use futures::AsyncReadExt;
+use futures::io::{AsyncBufReadExt, BufReader};
+use serde::Deserialize;
 use thiserror::Error;
 /// Default binary name resolved from `$PATH` when the user does not pin one.
 pub const DEFAULT_OPENCODE_BINARY: &str = "opencode";
@@ -52,6 +53,16 @@ pub const DEFAULT_OPENCODE_ARGS: &[&str] = &["serve", "--port", "0"];
 /// Time we wait for the sidecar to print its port after spawn. A cold first
 /// start (database migration) has been observed to take ~20s.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Budget for confirming that the announced port is the sidecar's own. A port
+/// that refuses connections is retried every `VERIFY_RETRY_DELAY`, at most
+/// `VERIFY_ATTEMPTS` times.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const VERIFY_RETRY_DELAY: Duration = Duration::from_millis(200);
+const VERIFY_ATTEMPTS: u32 = 25;
+
+/// Upper bound on one verification request.
+const VERIFY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Longest startup line buffered while waiting for the port announcement. The
 /// announcement itself is a short line, so a sidecar that writes this much
@@ -68,6 +79,10 @@ const SERVER_USERNAME_ENV: &str = "OPENCODE_SERVER_USERNAME";
 const SERVER_PASSWORD_ENVS: [&str; 2] = ["OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD"];
 const SERVER_USERNAME: &str = "opencode";
 
+/// A password no sidecar was given. `verify_sidecar` sends it before the real one, to find out
+/// whether the listener checks the password at all.
+const WRONG_PASSWORD_PROBE: &str = "not-the-password-of-this-sidecar";
+
 /// Longest slice of an unparseable error body we echo into an error message.
 const ERROR_BODY_PREVIEW_CHARS: usize = 200;
 
@@ -81,6 +96,10 @@ pub enum OpenCodeError {
     StartupFailure(#[allow(dead_code)] String),
     #[error("OpenCode sidecar stdout could not be parsed: {0}")]
     BadAnnouncement(String),
+    #[error(
+        "port {port} announced by the OpenCode sidecar does not answer as that sidecar: {reason}"
+    )]
+    PortNotVerified { port: u16, reason: String },
     #[error("No working directory available for OpenCode sidecar")]
     NoWorkingDirectory,
     #[error("OpenCode sidecar I/O failed: {0}")]
@@ -95,89 +114,95 @@ pub enum OpenCodeError {
     EmptyResponse,
 }
 
-/// JSON announcement OpenCode prints once it is bound to a port.
-/// We accept the minimum subset; unknown fields are ignored.
-#[derive(Debug, Deserialize)]
+/// Hosts an announcement may name. `spawn` always connects to `127.0.0.1`
+/// whatever host the sidecar prints, so the host only has to say that the
+/// listener is on this machine: a line about some other address is not ours.
+///
+/// `[::1]` is left out on purpose. A listener that is only on the IPv6 loopback does not
+/// answer on `127.0.0.1`, so accepting its announcement would just fail the verification of
+/// an address the sidecar never claimed.
+const ANNOUNCED_HOSTS: [&str; 4] = ["127.0.0.1", "localhost", "0.0.0.0", "[::]"];
+
+/// Text that precedes the address in OpenCode's own startup line,
+/// `server listening on http://127.0.0.1:43123`.
+const LISTENING_MARKER: &str = "listening on ";
+
+/// The word that has to come right before [`LISTENING_MARKER`] unless the marker starts the
+/// line. OpenCode prints `opencode server listening on <url>`, and a log prefix such as a level
+/// or a timestamp may come before that.
+const LISTENING_SUBJECT: &str = "server";
+
+/// The port a sidecar announced on stdout.
+///
+/// Two forms are accepted, and nothing looser: a JSON object with a numeric
+/// `port` (or a `url`/`address` string holding a loopback URL), and OpenCode's
+/// own `listening on <loopback URL>` line. Startup output is mostly log lines,
+/// so a lenient reading (a `port=` scan, the digits after any `:`) takes
+/// timestamps and documentation links for ports and sends the prompt there.
+/// `spawn` still checks that the port answers as this sidecar before using it.
+#[derive(Debug)]
 struct OpenCodeAnnouncement {
-    /// Listening port. Newer OpenCode versions print a bare JSON number
-    /// (`{"port": 43123}`); the `#[serde(alias)]`s also accept a *numeric*
-    /// `address`/`url` field. String forms (`{"url":"http://127.0.0.1:43123"}`
-    /// or the plain-text `ready:43123`) cannot deserialize into `u16`, so they
-    /// fall through to the URL/heuristic parsing in `from_line`.
-    #[serde(alias = "address", alias = "url")]
     port: u16,
 }
 
 impl OpenCodeAnnouncement {
     fn from_line(line: &str) -> Result<Self, OpenCodeError> {
-        if let Ok(parsed) = serde_json::from_str::<OpenCodeAnnouncement>(line) {
-            // Reject port 0 even in JSON form (bind(2) would assign a random
-            // port, but the announcement should report the actual bound port).
-            if parsed.port == 0 {
-                return Err(OpenCodeError::BadAnnouncement(line.to_string()));
-            }
-            return Ok(parsed);
-        }
-
-        // JSON parse failed; try the most explicit patterns first so
-        // that URL-style addresses (e.g. `http://127.0.0.1:43123`) do
-        // not get the wrong port from the first `:` separator.
-        for marker in ["port=", "\"port\":"] {
-            if let Some(idx) = line.find(marker) {
-                let tail = &line[idx + marker.len()..];
-                let digits: String = tail
-                    .chars()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(port) = digits.parse::<u16>() {
-                    if port > 0 {
-                        return Ok(OpenCodeAnnouncement { port });
-                    }
-                }
-            }
-        }
-
-        // URL pattern: `scheme://host:port` — the port is after the
-        // `:` that follows the host portion, not the `:` in `://`.
-        if line.contains("://") {
-            if let Some(scheme_end) = line.find("://") {
-                let after_scheme = &line[scheme_end + 3..];
-                // Use `rfind` so the port separator is found after the host,
-                // including IPv6 hosts like `[::1]:43123` whose host contains `:`.
-                if let Some(host_end) = after_scheme.rfind(':') {
-                    let port_str: String = after_scheme[host_end + 1..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect();
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        if port > 0 {
-                            return Ok(OpenCodeAnnouncement { port });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Last resort: the whole line is `word:NNNN` (e.g. `ready:43123`).
-        // Anchoring on the whole line keeps the tail of an unrelated log
-        // line, such as the seconds in a `12:34:56Z` timestamp, from being
-        // read as a port.
-        if let Some((word, digits)) = line.split_once(':') {
-            let is_word = !word.is_empty()
-                && word
-                    .chars()
-                    .all(|c| c.is_ascii_alphabetic() || c == '_' || c == '-');
-            if is_word && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-                if let Ok(port) = digits.parse::<u16>() {
-                    if port > 0 {
-                        return Ok(OpenCodeAnnouncement { port });
-                    }
-                }
-            }
-        }
-        Err(OpenCodeError::BadAnnouncement(line.to_string()))
+        Self::parse(line).ok_or_else(|| OpenCodeError::BadAnnouncement(line.to_string()))
     }
+
+    fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        let port = if line.starts_with('{') {
+            port_from_json(line)?
+        } else {
+            port_from_listening_line(line)?
+        };
+        // Port 0 means "pick one for me" to bind(2); an announcement has to
+        // name the port that was actually bound.
+        (port != 0).then_some(Self { port })
+    }
+}
+
+fn port_from_json(line: &str) -> Option<u16> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object()?;
+    if let Some(port) = object.get("port") {
+        return u16::try_from(port.as_u64()?).ok();
+    }
+    ["url", "address"]
+        .into_iter()
+        .find_map(|key| port_from_url(object.get(key)?.as_str()?))
+}
+
+/// The port of OpenCode's `server listening on <url>` line. The marker only counts when it starts
+/// the line or follows the word `server`, so `not listening on http://127.0.0.1:43123` is some
+/// other process's log line and not an announcement.
+fn port_from_listening_line(line: &str) -> Option<u16> {
+    // ASCII lowercasing keeps byte offsets, so a match position indexes `line`.
+    let lowered = line.to_ascii_lowercase();
+    lowered
+        .match_indices(LISTENING_MARKER)
+        .filter(|(marker_at, _)| {
+            lowered[..*marker_at]
+                .split_whitespace()
+                .next_back()
+                .is_none_or(|word| word == LISTENING_SUBJECT)
+        })
+        .find_map(|(marker_at, _)| {
+            let url = line[marker_at + LISTENING_MARKER.len()..]
+                .split_whitespace()
+                .next()?;
+            port_from_url(url)
+        })
+}
+
+/// Port of an `http(s)` URL whose host is one of `ANNOUNCED_HOSTS`.
+fn port_from_url(text: &str) -> Option<u16> {
+    let url = url::Url::parse(text).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || !ANNOUNCED_HOSTS.contains(&url.host_str()?) {
+        return None;
+    }
+    url.port_or_known_default()
 }
 
 #[allow(dead_code)]
@@ -250,7 +275,8 @@ impl OpenCodeSidecar {
 ///
 /// `command` is the binary name or absolute path; `args` is passed verbatim.
 /// The first non-empty, non-`#`-prefixed line of stdout that parses as a
-/// port announcement is treated as the bound port.
+/// port announcement (see `OpenCodeAnnouncement`) is treated as the bound
+/// port, and `spawn` fails unless that port answers as this sidecar.
 pub async fn spawn(
     command: &str,
     args: &[String],
@@ -312,6 +338,27 @@ pub async fn spawn(
     // the sidecar never blocks (or gets EPIPE) writing further stdout.
     discard_in_background(stdout);
 
+    // The announcement is text from a process we do not control. Before any
+    // prompt is sent anywhere, check that the port answers to the password
+    // only this sidecar was given.
+    //
+    // The probe goes straight to loopback: through an ambient `HTTP_PROXY` it would either fail a
+    // healthy sidecar or hand the proxy the Basic-auth password.
+    let verified = tokio::time::timeout(
+        VERIFY_TIMEOUT,
+        verify_sidecar(
+            &http_client::Client::new_external_without_proxy(),
+            &base_url,
+            &password,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_elapsed| Err(format!("no answer within {VERIFY_TIMEOUT:?}")));
+    if let Err(reason) = verified {
+        let _ = process.kill();
+        return Err(OpenCodeError::PortNotVerified { port, reason });
+    }
+
     // Spawn the background task that owns the kill path.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let exited = Arc::new(AtomicBool::new(false));
@@ -326,6 +373,75 @@ pub async fn spawn(
             password,
         }),
     })
+}
+
+/// Check that `base_url` is the sidecar that was just spawned: it must reject
+/// unauthenticated requests and a wrong password, accept the Basic-auth password
+/// generated for it, and answer with an OpenCode session list. A stray listener on
+/// a misread port cannot satisfy all of these. The generated password is sent only
+/// after the listener has refused both, so a listener that accepts any credential
+/// never sees it. Only a refused connection is retried, since that is what a
+/// sidecar that is not yet accepting looks like.
+async fn verify_sidecar(
+    client: &http_client::Client,
+    base_url: &str,
+    password: &str,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    // `limit=1` keeps the reply small for a project with many sessions.
+    let endpoint = format!("{base_url}/api/session?limit=1");
+    'attempts: for attempt in 0..VERIFY_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(VERIFY_RETRY_DELAY).await;
+        }
+        for (credentials, what) in [
+            (None, "an unauthenticated request"),
+            (Some(WRONG_PASSWORD_PROBE), "a wrong password"),
+        ] {
+            let mut probe = client.get(&endpoint).timeout(VERIFY_REQUEST_TIMEOUT);
+            if let Some(wrong_password) = credentials {
+                probe = probe.basic_auth(SERVER_USERNAME, Some(wrong_password));
+            }
+            match probe.send().await {
+                Ok(response) if response.status().is_success() => {
+                    return Err(format!(
+                        "/api/session accepted {what}; the endpoint does not enforce the password"
+                    ));
+                }
+                Ok(response)
+                    if response.status() != http_client::StatusCode::UNAUTHORIZED
+                        && response.status() != http_client::StatusCode::FORBIDDEN =>
+                {
+                    return Err(format!(
+                        "{} from /api/session for {what}",
+                        response.status()
+                    ));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    last_error = err.to_string();
+                    continue 'attempts;
+                }
+            }
+        }
+
+        let request = client
+            .get(&endpoint)
+            .basic_auth(SERVER_USERNAME, Some(password))
+            .timeout(VERIFY_REQUEST_TIMEOUT);
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                return response
+                    .json::<DataEnvelope<Vec<serde::de::IgnoredAny>>>()
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| format!("reply is not an OpenCode session list: {err}"));
+            }
+            Ok(response) => return Err(format!("{} from /api/session", response.status())),
+            Err(err) => last_error = err.to_string(),
+        }
+    }
+    Err(last_error)
 }
 
 /// Read `stdout` line by line until one parses as a port announcement.
@@ -739,600 +855,7 @@ impl OpenCodeSidecarPool {
 fn canonicalize_for_pool(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_json_announcement() {
-        let ann = OpenCodeAnnouncement::from_line("{\"port\":43123}").unwrap();
-        assert_eq!(ann.port, 43123);
-    }
-
-    #[test]
-    fn parses_announcement_with_address_alias() {
-        let ann =
-            OpenCodeAnnouncement::from_line("{\"address\":\"http://127.0.0.1:43123\"}").unwrap();
-        assert_eq!(ann.port, 43123);
-    }
-
-    #[test]
-    fn parses_loose_port_pattern() {
-        let ann = OpenCodeAnnouncement::from_line("listening on port=54321").unwrap();
-        assert_eq!(ann.port, 54321);
-    }
-
-    #[test]
-    fn parses_trailing_colon_pattern() {
-        let ann = OpenCodeAnnouncement::from_line("ready:43123").unwrap();
-        assert_eq!(ann.port, 43123);
-    }
-
-    #[test]
-    fn rejects_zero_port() {
-        let err = OpenCodeAnnouncement::from_line("port=0");
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn parses_url_with_address_field() {
-        // The original regex would have matched the IPv4 octet `127`
-        // instead of `43123`; the URL-aware parser must skip past
-        // the host's `:` and read after it.
-        let ann =
-            OpenCodeAnnouncement::from_line(r#"{"address":"http://127.0.0.1:43123"}"#).unwrap();
-        assert_eq!(ann.port, 43123);
-    }
-
-    #[test]
-    fn parses_plain_text_listening_url() {
-        let ann = OpenCodeAnnouncement::from_line("Listening on http://localhost:9090").unwrap();
-        assert_eq!(ann.port, 9090);
-    }
-
-    #[test]
-    fn parses_url_with_url_field() {
-        let ann = OpenCodeAnnouncement::from_line(r#"{"url":"https://0.0.0.0:8080"}"#).unwrap();
-        assert_eq!(ann.port, 8080);
-    }
-
-    #[test]
-    fn empty_command_is_a_binary_not_found() {
-        let err = OpenCodeError::BinaryNotFound(String::new());
-        assert!(err.to_string().contains("not available"));
-    }
-
-    #[test]
-    fn pool_dedupes_by_canonical_path() {
-        // Use a tempdir to avoid symlink issues with CWD; canonicalize
-        // should return the same path for an already-canonical directory.
-        let tmp = std::env::temp_dir();
-        let canonical = canonicalize_for_pool(&tmp);
-        // Both should resolve to the same canonical form.
-        assert_eq!(canonicalize_for_pool(&tmp), canonical);
-    }
-
-    #[tokio::test]
-    async fn spawn_rejects_empty_command() {
-        let result = spawn("", &[], Path::new(".")).await;
-        assert!(matches!(result, Err(OpenCodeError::BinaryNotFound(_))));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn pool_replaces_exited_sidecar() {
-        // `sh` announces a port and exits straight away, standing in for a
-        // sidecar that crashes after becoming ready.
-        let args = vec![
-            "-c".to_string(),
-            "echo 'server listening on http://127.0.0.1:43123'".to_string(),
-        ];
-        let pool = OpenCodeSidecarPool::new();
-        let dir = std::env::temp_dir();
-
-        let first = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
-        for _ in 0..100 {
-            if !first.is_alive() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        assert!(!first.is_alive());
-
-        let second = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
-        assert!(!Arc::ptr_eq(&first.inner, &second.inner));
-    }
-
-    #[test]
-    fn parse_model_ref_splits_on_first_slash() {
-        assert_eq!(
-            parse_model_ref("ollama/qwen2.5-coder:7b").unwrap(),
-            ("ollama", "qwen2.5-coder:7b")
-        );
-        assert_eq!(
-            parse_model_ref(" openrouter/anthropic/claude ").unwrap(),
-            ("openrouter", "anthropic/claude")
-        );
-    }
-
-    #[test]
-    fn parse_model_ref_rejects_bare_and_empty_halves() {
-        for bad in ["qwen2.5-coder:7b", "", "/model", "provider/", "/"] {
-            assert!(
-                matches!(parse_model_ref(bad), Err(OpenCodeError::InvalidModel(_))),
-                "{bad:?} should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn generated_passwords_are_long_and_distinct() {
-        let first = generate_password();
-        assert!(first.len() >= 64);
-        assert_ne!(first, generate_password());
-    }
-
-    #[test]
-    fn readiness_rule_agrees_with_request_time_parsing() {
-        use crate::settings::LocalProviderKind;
-        for model in [
-            "ollama/m",
-            " ollama/m ",
-            "a/b/c",
-            "",
-            "  ",
-            "bare",
-            "ollama/",
-            "/m",
-            "/",
-        ] {
-            assert_eq!(
-                LocalProviderKind::OpenCode.accepts_model(model),
-                parse_model_ref(model).is_ok(),
-                "{model:?}"
-            );
-        }
-    }
-
-    const TEST_PASSWORD: &str = "test-password";
-    // base64("opencode:test-password")
-    const TEST_BASIC_AUTH: &str = "Basic b3BlbmNvZGU6dGVzdC1wYXNzd29yZA==";
-    const JSON: &str = "application/json";
-
-    async fn run_generate(
-        server: &mockito::ServerGuard,
-        model: &str,
-    ) -> Result<String, OpenCodeError> {
-        generate_via_session(
-            &http_client::Client::new(),
-            &server.url(),
-            TEST_PASSWORD,
-            Path::new("/work/repo"),
-            model,
-            "list files",
-            Duration::from_secs(5),
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn generate_creates_session_generates_and_deletes() {
-        let mut server = mockito::Server::new_async().await;
-        let create = server
-            .mock("POST", "/api/session")
-            .match_header("authorization", TEST_BASIC_AUTH)
-            .match_body(mockito::Matcher::Json(serde_json::json!({
-                "location": { "directory": "/work/repo" },
-                "model": { "id": "qwen2.5-coder:7b", "providerID": "ollama" },
-                "permissions": [{ "action": "*", "resource": "*", "effect": "deny" }],
-            })))
-            .with_header("content-type", JSON)
-            .with_body(r#"{"data":{"id":"ses_1"}}"#)
-            .create_async()
-            .await;
-        let generate = server
-            .mock("POST", "/api/session/ses_1/generate")
-            .match_header("authorization", TEST_BASIC_AUTH)
-            .match_body(mockito::Matcher::Json(
-                serde_json::json!({ "prompt": "list files" }),
-            ))
-            .with_header("content-type", JSON)
-            .with_body(r#"{"data":{"text":"ls -la"}}"#)
-            .create_async()
-            .await;
-        let delete = server
-            .mock("DELETE", "/api/session/ses_1")
-            .match_header("authorization", TEST_BASIC_AUTH)
-            .with_status(204)
-            .create_async()
-            .await;
-
-        let text = run_generate(&server, "ollama/qwen2.5-coder:7b")
-            .await
-            .unwrap();
-
-        assert_eq!(text, "ls -la");
-        create.assert_async().await;
-        generate.assert_async().await;
-        delete.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn generate_failure_surfaces_message_and_still_deletes_session() {
-        let mut server = mockito::Server::new_async().await;
-        server
-            .mock("POST", "/api/session")
-            .with_header("content-type", JSON)
-            .with_body(r#"{"data":{"id":"ses_2"}}"#)
-            .create_async()
-            .await;
-        server
-            .mock("POST", "/api/session/ses_2/generate")
-            .with_status(503)
-            .with_header("content-type", JSON)
-            .with_body(
-                r#"{"_tag":"ServiceUnavailableError","message":"Free usage limit reached","service":"session generation"}"#,
-            )
-            .create_async()
-            .await;
-        let delete = server
-            .mock("DELETE", "/api/session/ses_2")
-            .with_status(204)
-            .create_async()
-            .await;
-
-        let err = run_generate(&server, "opencode/flint-40b-free")
-            .await
-            .unwrap_err();
-
-        match err {
-            OpenCodeError::Request(message) => {
-                assert!(message.contains("503"), "{message}");
-                assert!(message.contains("Free usage limit reached"), "{message}");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-        delete.assert_async().await;
-    }
-
-    #[tokio::test]
-    async fn unauthorized_create_reports_opencode_message() {
-        let mut server = mockito::Server::new_async().await;
-        server
-            .mock("POST", "/api/session")
-            .with_status(401)
-            .with_header("content-type", JSON)
-            .with_body(r#"{"_tag":"UnauthorizedError","message":"Authentication required"}"#)
-            .create_async()
-            .await;
-
-        let err = run_generate(&server, "ollama/m").await.unwrap_err();
-
-        assert!(
-            matches!(&err, OpenCodeError::Request(m) if m.contains("Authentication required")),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn empty_generated_text_is_an_error() {
-        let mut server = mockito::Server::new_async().await;
-        server
-            .mock("POST", "/api/session")
-            .with_header("content-type", JSON)
-            .with_body(r#"{"data":{"id":"ses_3"}}"#)
-            .create_async()
-            .await;
-        server
-            .mock("POST", "/api/session/ses_3/generate")
-            .with_header("content-type", JSON)
-            .with_body(r#"{"data":{"text":"  \n"}}"#)
-            .create_async()
-            .await;
-        server
-            .mock("DELETE", "/api/session/ses_3")
-            .with_status(204)
-            .create_async()
-            .await;
-
-        let err = run_generate(&server, "ollama/m").await.unwrap_err();
-
-        assert!(matches!(err, OpenCodeError::EmptyResponse), "{err:?}");
-    }
-
-    #[tokio::test]
-    async fn bare_model_is_rejected_before_any_request() {
-        // No mocks registered: any request would fail the test with a 501.
-        let server = mockito::Server::new_async().await;
-        let err = run_generate(&server, "qwen2.5-coder:7b").await.unwrap_err();
-        assert!(matches!(err, OpenCodeError::InvalidModel(_)), "{err:?}");
-    }
-
-    #[test]
-    fn timestamp_in_a_log_line_is_not_a_port() {
-        for line in [
-            "2026-04-22T12:34:56Z starting",
-            "12:34:56Z",
-            "INFO 2026-04-22 12:34:56",
-        ] {
-            assert!(
-                OpenCodeAnnouncement::from_line(line).is_err(),
-                "{line:?} must not parse as an announcement"
-            );
-        }
-    }
-
-    // Shell one-liners standing in for a sidecar: announce, then stay alive.
-    #[cfg(unix)]
-    fn announce_then_sleep(prelude: &str) -> Vec<String> {
-        vec![
-            "-c".to_string(),
-            format!("{prelude} echo 'server listening on http://127.0.0.1:43123'; sleep 30"),
-        ]
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn pool_reuses_a_live_sidecar() {
-        let args = announce_then_sleep("");
-        let pool = OpenCodeSidecarPool::new();
-        let dir = std::env::temp_dir();
-
-        let first = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
-        let second = pool.get_or_spawn("sh", &args, &dir).await.unwrap();
-
-        assert!(Arc::ptr_eq(&first.inner, &second.inner));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn pool_does_not_keep_a_sidecar_spawned_before_clear() {
-        let args = announce_then_sleep("sleep 0.3;");
-        let pool = OpenCodeSidecarPool::new();
-        let dir = std::env::temp_dir();
-
-        // `clear()` lands while the sidecar is still starting, as when the
-        // settings change mid-spawn.
-        let (spawned, ()) = tokio::join!(pool.get_or_spawn("sh", &args, &dir), async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            pool.clear();
-        });
-
-        // The caller still gets a working sidecar for its in-flight request...
-        assert!(spawned.unwrap().is_alive());
-        // ...but it is not pooled for later requests to reuse.
-        assert!(pool.inner.lock().sidecars.is_empty());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn startup_survives_a_flood_of_stderr() {
-        // 200 KB on stderr is well over a pipe buffer; if stderr is not
-        // drained during startup the child blocks and never announces.
-        let args = announce_then_sleep("head -c 200000 /dev/zero >&2;");
-        let dir = std::env::temp_dir();
-
-        let spawned = tokio::time::timeout(Duration::from_secs(10), spawn("sh", &args, &dir))
-            .await
-            .expect("startup must not hang on an undrained stderr pipe");
-
-        assert!(spawned.unwrap().is_alive());
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn sidecar_password_is_set_under_both_env_names() {
-        // OpenCode reads OPENCODE_PASSWORD before OPENCODE_SERVER_PASSWORD, so
-        // setting only the second lets an inherited first one win.
-        let out = std::env::temp_dir().join(format!("opencode-env-{}", uuid::Uuid::new_v4()));
-        let args = announce_then_sleep(&format!(
-            "printf '%s\\n%s' \"$OPENCODE_PASSWORD\" \"$OPENCODE_SERVER_PASSWORD\" > '{}';",
-            out.display()
-        ));
-
-        let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
-
-        let written = std::fs::read_to_string(&out).unwrap();
-        let _ = std::fs::remove_file(&out);
-        let password = &sidecar.inner.password;
-        assert_eq!(written, format!("{password}\n{password}"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn startup_rejects_a_line_that_never_ends() {
-        // Twice the cap with no newline, then the process stays alive. Without
-        // a cap the buffer grows until READY_TIMEOUT instead of failing fast.
-        let args = vec![
-            "-c".to_string(),
-            "head -c 140000 /dev/zero | tr '\\0' x; sleep 30".to_string(),
-        ];
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(10),
-            spawn("sh", &args, &std::env::temp_dir()),
-        )
-        .await
-        .expect("an unterminated line must fail startup instead of waiting for the timeout");
-
-        assert!(
-            matches!(&result, Err(OpenCodeError::BadAnnouncement(m)) if m.contains("longer than")),
-            "{:?}",
-            result.err()
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn non_utf8_working_dir_is_rejected_before_any_request() {
-        use std::os::unix::ffi::OsStrExt;
-        // No mocks registered: any request would fail the test with a 501.
-        let server = mockito::Server::new_async().await;
-        let dir = Path::new(std::ffi::OsStr::from_bytes(b"/work/\xff"));
-
-        let err = generate_via_session(
-            &http_client::Client::new(),
-            &server.url(),
-            TEST_PASSWORD,
-            dir,
-            "ollama/m",
-            "list files",
-            Duration::from_secs(5),
-        )
-        .await
-        .unwrap_err();
-
-        assert!(
-            matches!(&err, OpenCodeError::Request(m) if m.contains("UTF-8")),
-            "{err:?}"
-        );
-    }
-
-    /// Minimal HTTP server for what mockito cannot produce: a generate call
-    /// that never answers, and DELETEs that fail before one succeeds.
-    struct RawServer {
-        url: String,
-        generate_started: Arc<tokio::sync::Notify>,
-        deletes: Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    async fn raw_server(hang_on_generate: bool, failing_deletes: usize) -> RawServer {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server = RawServer {
-            url: format!("http://{}", listener.local_addr().unwrap()),
-            generate_started: Arc::default(),
-            deletes: Arc::default(),
-        };
-        let started = Arc::clone(&server.generate_started);
-        let deletes = Arc::clone(&server.deletes);
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let started = Arc::clone(&started);
-                let deletes = Arc::clone(&deletes);
-                tokio::spawn(async move {
-                    // Read the headers, then the body they announce, so closing
-                    // the socket never resets a request that is still arriving.
-                    let mut request = Vec::new();
-                    let mut chunk = [0u8; 4096];
-                    let (head_len, body_len) = loop {
-                        match socket.read(&mut chunk).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => request.extend_from_slice(&chunk[..n]),
-                        }
-                        if let Some(at) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                            let head = String::from_utf8_lossy(&request[..at]).to_lowercase();
-                            let body_len = head
-                                .lines()
-                                .find_map(|l| l.strip_prefix("content-length:"))
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                                .unwrap_or(0);
-                            break (at + 4, body_len);
-                        }
-                    };
-                    while request.len() < head_len + body_len {
-                        match socket.read(&mut chunk).await {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => request.extend_from_slice(&chunk[..n]),
-                        }
-                    }
-
-                    let text = String::from_utf8_lossy(&request).into_owned();
-                    let request_line = text.lines().next().unwrap_or_default();
-                    let (status, body) = if request_line.starts_with("POST /api/session ") {
-                        (200, r#"{"data":{"id":"ses_1"}}"#)
-                    } else if request_line.contains("/generate") {
-                        started.notify_one();
-                        if hang_on_generate {
-                            std::future::pending::<()>().await;
-                        }
-                        (200, r#"{"data":{"text":"ls"}}"#)
-                    } else if request_line.starts_with("DELETE ") {
-                        let seen = deletes.fetch_add(1, Ordering::SeqCst);
-                        if seen < failing_deletes {
-                            (500, r#"{"message":"boom"}"#)
-                        } else {
-                            (204, "")
-                        }
-                    } else {
-                        (404, "")
-                    };
-                    let response = format!(
-                        "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = socket.write_all(response.as_bytes()).await;
-                });
-            }
-        });
-        server
-    }
-
-    async fn wait_for_deletes(server: &RawServer, count: usize) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while server.deletes.load(Ordering::SeqCst) < count {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "expected {count} DELETE(s), saw {}",
-                server.deletes.load(Ordering::SeqCst)
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    }
-
-    async fn run_raw_generate(server: &RawServer) -> Result<String, OpenCodeError> {
-        let client = http_client::Client::new();
-        generate_via_session(
-            &client,
-            &server.url,
-            TEST_PASSWORD,
-            Path::new("/work/repo"),
-            "ollama/m",
-            "list files",
-            Duration::from_secs(30),
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn cancelled_request_still_deletes_its_session() {
-        let server = raw_server(true, 0).await;
-
-        // Drop the request once the generate call is in flight, as aborting a
-        // superseded prediction does.
-        tokio::select! {
-            _ = run_raw_generate(&server) => panic!("generate never answers"),
-            _ = server.generate_started.notified() => {}
-        }
-
-        wait_for_deletes(&server, 1).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(server.deletes.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn failed_delete_is_retried_once_in_the_background() {
-        let server = raw_server(false, 1).await;
-
-        // The request succeeds even though its inline DELETE got a 500.
-        assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
-
-        wait_for_deletes(&server, 2).await;
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(server.deletes.load(Ordering::SeqCst), 2);
-    }
-
-    #[tokio::test]
-    async fn successful_delete_is_not_repeated() {
-        let server = raw_server(false, 0).await;
-
-        assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(server.deletes.load(Ordering::SeqCst), 1);
-    }
-}
+#[path = "local_opencode_tests.rs"]
+mod tests;

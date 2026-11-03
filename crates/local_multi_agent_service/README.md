@@ -28,6 +28,17 @@ Common settings:
 - `HOST`
 - `PORT`
 
+### Network policy
+
+When Warp starts the service itself it passes its own network policy down, so the service refuses the same hosts Warp does: loopback is always reachable, and a private-network host only if it is in the allowed private hosts list in Settings.
+
+A service you start yourself has no such parent and defaults to unrestricted. To make it enforce the policy, set these in the shell or in `.env` (shell values win):
+
+- `WARP_SERVICES_MODE=local_only`
+- `WARP_ALLOWED_PRIVATE_HOSTS`: comma-separated IP addresses or CIDR ranges inside private space, for example `192.168.1.0/24,100.64.0.0/10`. Host names are not accepted.
+
+The service reports its policy on `/health`. Warp only attaches to a running service whose policy matches its own, and otherwise shows an error naming the difference. Warp cannot change the policy of a service it did not start, so after changing the allowed private hosts in Settings, restart that service with the new list.
+
 Point Warp's local multi-agent server URL at:
 
 ```text

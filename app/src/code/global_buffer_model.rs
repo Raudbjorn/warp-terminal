@@ -1,5 +1,6 @@
 #![cfg_attr(not(feature = "local_fs"), allow(dead_code))]
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -299,6 +300,26 @@ impl GlobalBufferModelEvent {
             | GlobalBufferModelEvent::ServerLocalBufferUpdated { file_id, .. } => *file_id,
         }
     }
+}
+
+/// A local file whose content is loaded in a buffer.
+pub struct LoadedLocalBuffer {
+    pub path: PathBuf,
+    pub file_id: FileId,
+    pub buffer: ModelHandle<Buffer>,
+    /// Whether the buffer holds changes that were never saved to the file.
+    pub has_unsaved_changes: bool,
+}
+
+/// Why edits were not applied to the buffer of a file.
+#[derive(thiserror::Error, Debug)]
+pub enum BufferTextEditError {
+    #[error("the file is not loaded in a buffer")]
+    NotLoaded,
+    #[error("the buffer no longer holds the text the edits were made for")]
+    TextChanged,
+    #[error("a previous save for this file is still pending")]
+    PendingWrite,
 }
 
 /// A text edit using 1-indexed character offsets (matching `CharOffset`).
@@ -920,6 +941,94 @@ impl GlobalBufferModel {
         self.buffers
             .get(&file_id)
             .and_then(|state| state.base_content_version())
+    }
+
+    /// Every local file whose content is loaded in a buffer.
+    pub fn loaded_local_buffers(&self, ctx: &warpui::AppContext) -> Vec<LoadedLocalBuffer> {
+        self.location_to_id
+            .iter()
+            .filter_map(|(location, file_id)| {
+                let LocalOrRemotePath::Local(path) = location else {
+                    return None;
+                };
+                let state = self.buffers.get(file_id)?;
+                let base_content_version = match &state.source {
+                    BufferSource::Local {
+                        base_content_version,
+                        ..
+                    } => (*base_content_version)?,
+                    BufferSource::Remote { .. } | BufferSource::ServerLocal { .. } => return None,
+                };
+                let buffer = state.buffer.upgrade(ctx)?;
+                let has_unsaved_changes = !buffer.as_ref(ctx).version_match(&base_content_version);
+                Some(LoadedLocalBuffer {
+                    path: path.clone(),
+                    file_id: *file_id,
+                    buffer,
+                    has_unsaved_changes,
+                })
+            })
+            .collect()
+    }
+
+    /// Applies `edits` to the loaded buffer of a file, provided the buffer still holds
+    /// `expected_text`. Each edit pairs a byte range of that text with its replacement, and the
+    /// edits are in the order of the text and apart. With `save`, the result is then written to
+    /// the file; if that fails the edits stay in the buffer, unsaved. Returns the changed text
+    /// and a per-request completion future, which must succeed before reporting persistence.
+    ///
+    /// The edits go through the buffer so that every editor showing the file shows them, and so
+    /// that changes the buffer holds beyond what is on disk are kept. The undo history of the
+    /// buffer does not survive them.
+    #[cfg(feature = "local_fs")]
+    pub fn apply_text_edits(
+        &mut self,
+        file_id: FileId,
+        expected_text: &str,
+        edits: Vec<(Range<usize>, String)>,
+        save: Option<&file_write_guard::WriteGuard>,
+        ctx: &mut ModelContext<Self>,
+    ) -> Result<(String, warp_files::SaveFuture), BufferTextEditError> {
+        let path = FileModel::as_ref(ctx)
+            .file_path(file_id)
+            .ok_or(BufferTextEditError::NotLoaded)?;
+        if let Some(guard) = save {
+            if !guard.authorizes(&path) {
+                return Err(BufferTextEditError::PendingWrite);
+            }
+        } else if file_write_guard::is_quarantined(&path) {
+            return Err(BufferTextEditError::PendingWrite);
+        }
+        let buffer = self
+            .buffer_handle_for_id(file_id, ctx)
+            .ok_or(BufferTextEditError::NotLoaded)?;
+        if buffer.as_ref(ctx).text().into_string() != expected_text {
+            return Err(BufferTextEditError::TextChanged);
+        }
+        let new_version = ContentVersion::new();
+        if !edits.is_empty() {
+            buffer.update(ctx, |buffer, ctx| {
+                let char_edits = TextDiff { edits }.to_char_offset_edits(buffer);
+                buffer.insert_at_char_offset_ranges(char_edits, new_version, ctx);
+            });
+        }
+
+        let text = buffer.as_ref(ctx).text().into_string();
+        let completion: warp_files::SaveFuture = if let Some(guard) = save {
+            let content = buffer.as_ref(ctx).text_with_line_ending().into_string();
+            let version = buffer.as_ref(ctx).version();
+            // Project replacement only supplies local buffers. Keep the per-request future
+            // instead of the fire-and-forget editor save path.
+            match FileModel::handle(ctx).update(ctx, |model, ctx| {
+                model.save_with_guard(file_id, content, version, Some(guard), ctx)
+            }) {
+                Ok(completion) => completion,
+                Err(error) => Box::pin(async move { Err(Arc::new(error)) }),
+            }
+        } else {
+            Box::pin(async { Ok(()) })
+        };
+        Ok((text, completion))
     }
 
     /// Discard any in progress changes and reload the buffer with the canonical version from the file system.

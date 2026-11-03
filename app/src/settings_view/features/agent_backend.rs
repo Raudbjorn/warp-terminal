@@ -4,14 +4,11 @@
 //! `agent_backends.toml` (see [`crate::util::agent_backends`]). Selecting one
 //! persists the choice; it takes effect on the next launch.
 
-use warpui::{
-    presenter::ChildView, Element, Entity, TypedActionView, View, ViewContext, ViewHandle,
-};
+use warpui::presenter::ChildView;
+use warpui::{Element, Entity, TypedActionView, View, ViewContext, ViewHandle};
 
-use crate::{
-    util::agent_backends::{self, DEFAULT_BACKEND_ID, DEFAULT_BACKEND_LABEL},
-    view_components::{Dropdown, DropdownItem},
-};
+use crate::util::agent_backends::{self, DEFAULT_BACKEND_ID, DEFAULT_BACKEND_LABEL};
+use crate::view_components::{Dropdown, DropdownItem};
 
 /// A view wrapping a dropdown that selects the active backend.
 pub struct BackendSelectorView {

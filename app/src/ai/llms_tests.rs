@@ -69,6 +69,55 @@ fn should_not_clear_preference_requires_upgrade_with_byok() {
     assert!(!DisableReason::RequiresUpgrade.should_clear_preference(true));
 }
 
+// -- effective_disable_reason tests --
+
+#[test]
+fn effective_disable_reason_clears_requires_upgrade_when_using_byo_credentials() {
+    assert_eq!(
+        effective_disable_reason(Some(&DisableReason::RequiresUpgrade), || true),
+        None,
+    );
+}
+
+#[test]
+fn effective_disable_reason_keeps_requires_upgrade_without_byo_credentials() {
+    assert_eq!(
+        effective_disable_reason(Some(&DisableReason::RequiresUpgrade), || false),
+        Some(DisableReason::RequiresUpgrade),
+    );
+}
+
+#[test]
+fn effective_disable_reason_preserves_other_reasons_even_with_byo_credentials() {
+    // A key cannot unlock a model the admin disabled or the provider cannot serve.
+    for reason in [
+        DisableReason::AdminDisabled,
+        DisableReason::OutOfRequests,
+        DisableReason::ProviderOutage,
+        DisableReason::Unavailable,
+    ] {
+        assert_eq!(
+            effective_disable_reason(Some(&reason), || true),
+            Some(reason),
+        );
+    }
+}
+
+#[test]
+fn effective_disable_reason_only_looks_up_credentials_for_requires_upgrade() {
+    // The lookup reads app singletons, so it must not run for models it cannot affect.
+    assert_eq!(
+        effective_disable_reason(None, || panic!("no reason to unlock")),
+        None,
+    );
+    assert_eq!(
+        effective_disable_reason(Some(&DisableReason::AdminDisabled), || {
+            panic!("an admin-disabled model cannot be unlocked")
+        }),
+        Some(DisableReason::AdminDisabled),
+    );
+}
+
 #[test]
 fn llm_info_deserializes_without_base_model_name() {
     let raw = r#"{
@@ -1075,6 +1124,74 @@ fn reconcile_clears_requires_upgrade_base_model_preference_without_byok() {
             let profile = profiles.default_profile(ctx);
             assert_eq!(profile.data().base_model, None);
             assert_eq!(profile.data().context_window_limit, None);
+        });
+    });
+}
+
+/// The provider key unlocks `RequiresUpgrade` models of its own provider only, for a signed-in
+/// user with no workspace and with `SoloUserByok` off: BYOK does not hinge on the flag.
+#[test]
+fn effective_disable_reason_for_model_follows_the_provider_key() {
+    let _flag = FeatureFlag::SoloUserByok.override_enabled(false);
+
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        app.add_singleton_model(|_| AuthStateProvider::new_for_test());
+        app.add_singleton_model(UserWorkspaces::default_mock);
+        app.add_singleton_model(|_| LLMPreferences::for_test(Vec::new()));
+
+        let model_with = |id: &str, provider: LLMProvider, reason: DisableReason| LLMInfo {
+            provider,
+            ..server_llm(id, Some(reason))
+        };
+        let openai_upgrade = model_with(
+            "gpt-upgrade",
+            LLMProvider::OpenAI,
+            DisableReason::RequiresUpgrade,
+        );
+        let anthropic_upgrade = model_with(
+            "claude-upgrade",
+            LLMProvider::Anthropic,
+            DisableReason::RequiresUpgrade,
+        );
+        let openai_admin_disabled = model_with(
+            "gpt-admin",
+            LLMProvider::OpenAI,
+            DisableReason::AdminDisabled,
+        );
+
+        app.read(|ctx| {
+            assert_eq!(
+                effective_disable_reason_for_model(
+                    &openai_upgrade,
+                    None,
+                    &TeamlessScopeForTest,
+                    ctx
+                ),
+                Some(DisableReason::RequiresUpgrade),
+                "without a key the model still requires an upgrade",
+            );
+        });
+
+        ApiKeyManager::handle(&app).update(&mut app, |manager, ctx| {
+            manager.set_provider_key(LLMProvider::OpenAI, Some("test-key".to_string()), ctx);
+        });
+
+        app.read(|ctx| {
+            let reason = |llm: &LLMInfo| {
+                effective_disable_reason_for_model(llm, None, &TeamlessScopeForTest, ctx)
+            };
+            assert_eq!(reason(&openai_upgrade), None);
+            assert_eq!(
+                reason(&anthropic_upgrade),
+                Some(DisableReason::RequiresUpgrade),
+                "an OpenAI key must not unlock an Anthropic model",
+            );
+            assert_eq!(
+                reason(&openai_admin_disabled),
+                Some(DisableReason::AdminDisabled),
+                "a key must not override an admin-disabled model",
+            );
         });
     });
 }

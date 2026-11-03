@@ -1,13 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
-use diesel::{
-    QueryableByName, RunQueryDsl,
-    connection::SimpleConnection,
-    prelude::*,
-    sql_query,
-    sql_types::{Bool, Text},
-    sqlite::SqliteConnection,
-};
+use diesel::connection::SimpleConnection;
+use diesel::prelude::*;
+use diesel::sql_types::{Bool, Text};
+use diesel::sqlite::SqliteConnection;
+use diesel::{QueryableByName, RunQueryDsl, sql_query};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 

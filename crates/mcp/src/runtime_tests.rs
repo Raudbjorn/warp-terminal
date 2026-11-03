@@ -1196,3 +1196,46 @@ async fn credential_header_contents_are_not_parsed_as_template_references() {
 
     server.abort();
 }
+
+/// Sets local-only mode for a test and restores online mode afterwards. Only loopback servers
+/// are reached by the other tests in this crate, and loopback is allowed in both modes.
+struct LocalOnlyMode;
+
+impl LocalOnlyMode {
+    fn enter() -> Self {
+        network_policy::set_services_mode(network_policy::ServicesMode::LocalOnly);
+        Self
+    }
+}
+
+impl Drop for LocalOnlyMode {
+    fn drop(&mut self) {
+        network_policy::set_services_mode(network_policy::ServicesMode::Online);
+    }
+}
+
+#[tokio::test]
+async fn a_preflight_request_rechecks_the_policy_and_never_names_the_url() {
+    let _local_only = LocalOnlyMode::enter();
+    let protocol = super::NegotiatedProtocol {
+        version: rmcp::model::ProtocolVersion::LATEST,
+        discover: true,
+    };
+
+    // Refused before anything is sent, so the host is never contacted.
+    let result = super::send_preflight_request(
+        "https://user:hunter2@mcp.example.com/mcp?token=hunter2",
+        &HashMap::new(),
+        None,
+        protocol,
+    )
+    .await;
+
+    let error = result
+        .err()
+        .expect("a public host must be refused in local-only mode");
+    let message = super::error_to_user_message(&error);
+    assert!(message.contains("network policy"), "{message}");
+    assert!(!message.contains("hunter2"), "{message}");
+    assert!(!message.contains("mcp.example.com"), "{message}");
+}

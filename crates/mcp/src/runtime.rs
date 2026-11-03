@@ -28,8 +28,22 @@ use uuid::Uuid;
 use warp_errors::report_error;
 
 use super::TemplatableMCPServerInfo;
+use crate::policy_http_client::PolicyCheckedClient;
 
 type ReqwestHttpTransport = rmcp::transport::StreamableHttpClientTransport<reqwest::Client>;
+
+/// Reported when the network policy refuses an MCP server. Names the rule, never the URL.
+const MCP_CONNECTION_DENIED_MESSAGE: &str = "the network policy refused this MCP server: local-only services mode only allows loopback addresses and the private hosts listed in Settings";
+
+/// Checks the network policy as it is now. Called before every request this module sends itself,
+/// because the allow-list can change while a connection waits, for example for the user to finish
+/// signing in. The error names the rule and never the URL, which can carry credentials.
+#[allow(clippy::result_large_err)]
+fn check_current_policy(url: &str, purpose: &str) -> Result<(), rmcp::RmcpError> {
+    network_policy::check_url_str(url, purpose).map_err(|_| {
+        rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(MCP_CONNECTION_DENIED_MESSAGE)
+    })
+}
 type ReqwestSseTransport = crate::sse_transport::SseClientTransport<reqwest::Client>;
 
 /// Convert an rmcp error to a user-friendly error message.
@@ -174,6 +188,16 @@ fn challenge_parameter_names(www_authenticate: &str) -> Vec<&str> {
     names
 }
 
+/// A client builder that follows the network policy: redirects are re-checked against it and, in
+/// local-only mode, system proxies are not used. MCP requests carry user-supplied headers (often
+/// credentials), so they must not be redirected to a host the policy would have refused.
+pub(crate) fn policy_client_builder() -> reqwest::ClientBuilder {
+    let builder = reqwest::Client::builder();
+    #[cfg(not(target_family = "wasm"))]
+    let builder = network_policy::apply_to_client_builder(builder);
+    builder
+}
+
 /// Builds a reqwest client with custom headers for MCP HTTP/SSE connections.
 #[allow(clippy::result_large_err)]
 pub fn build_client_with_headers(
@@ -181,7 +205,7 @@ pub fn build_client_with_headers(
 ) -> Result<reqwest::Client, rmcp::RmcpError> {
     let header_map = build_header_map(headers);
 
-    reqwest::Client::builder()
+    policy_client_builder()
         .default_headers(header_map)
         .build()
         .map_err(|e| {
@@ -322,6 +346,12 @@ pub async fn spawn_server(
             )
         }
         TransportType::ServerSentEvents(sse_server) => {
+            if let Err(denied) = check_current_policy(&sse_server.url, "MCP server connection") {
+                logger.log(
+                    "[error] MCP: Network policy refused the MCP server connection".to_string(),
+                );
+                return Err(denied);
+            }
             let headers: HashMap<String, String> = sse_server
                 .headers
                 .iter()
@@ -336,7 +366,7 @@ pub async fn spawn_server(
 
                     logger.log("[info] MCP: Using Streaming HTTP transport".to_string());
                     let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
-                        client,
+                        PolicyCheckedClient(client),
                         rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                             sse_server.url.clone(),
                         ),
@@ -353,19 +383,13 @@ pub async fn spawn_server(
                 }
                 Ok(Transport::Http(None, protocol)) => {
                     logger.log("[info] MCP: Using Streaming HTTP transport".to_string());
-                    let transport = if headers.is_empty() {
-                        rmcp::transport::StreamableHttpClientTransport::from_uri(
+                    let client = build_client_with_headers(&headers)?;
+                    let transport = rmcp::transport::StreamableHttpClientTransport::with_client(
+                        PolicyCheckedClient(client),
+                        rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
                             sse_server.url.clone(),
-                        )
-                    } else {
-                        let client = build_client_with_headers(&headers)?;
-                        rmcp::transport::StreamableHttpClientTransport::with_client(
-                            client,
-                            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(
-                                sse_server.url.clone(),
-                            ),
-                        )
-                    };
+                        ),
+                    );
                     let transport = TransportLoggingWrapper {
                         transport,
                         logger: logger.clone(),
@@ -777,6 +801,9 @@ async fn send_preflight_request(
         request = request.bearer_auth(access_token);
     }
 
+    // Checked here, after the token above was awaited (which can take as long as an interactive
+    // sign-in), so a host removed from the allow-list in the meantime is not sent the token.
+    check_current_policy(url, "MCP preflight request")?;
     let response = request
         .send()
         .await

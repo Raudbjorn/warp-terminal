@@ -5261,6 +5261,15 @@ impl PaneGroup {
         self.custom_title(ctx).unwrap_or_else(|| self.title(ctx))
     }
 
+    /// Whether the focused session has run anything worth saving.
+    ///
+    /// Used to hide "Save session to file..." on a session that only holds the
+    /// shell bootstrap block.
+    pub fn session_has_content(&self, ctx: &AppContext) -> bool {
+        self.focused_session_view(ctx)
+            .is_some_and(|view| view.as_ref(ctx).session_has_captured_content())
+    }
+
     /// The tab-level custom title, if one has been set via the rename-tab flow.
     pub fn custom_title(&self, _ctx: &AppContext) -> Option<String> {
         self.custom_title.clone()

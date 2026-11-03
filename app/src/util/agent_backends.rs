@@ -22,8 +22,9 @@
 //! ws_url = "wss://rtc.warp.my-company.dev/graphql/v2"
 //! ```
 
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 use warp_core::channel::ChannelState;
 
 /// Reserved id for the built-in Warp backend (no override applied).

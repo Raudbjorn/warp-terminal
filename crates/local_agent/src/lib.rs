@@ -1,5 +1,5 @@
 //! A local agent loop that talks directly to an OpenAI-compatible API
-//! (Chat Completions), independent of the Warp API server.
+//! (Chat Completions or Responses), independent of the Warp API server.
 //!
 //! This crate is deliberately free of `warp_multi_agent_api` (protobuf) types:
 //! it operates on its own neutral model. The conversion between Warp's
@@ -14,20 +14,36 @@
 mod engine;
 mod openai;
 mod prompt;
+mod responses;
 
 use futures::stream::BoxStream;
 pub use prompt::{EnvironmentInfo, build_suggestion_system_prompt, build_system_prompt};
+
+/// Wire protocol spoken by a custom endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EndpointSchema {
+    /// `POST {base}/chat/completions`.
+    #[default]
+    ChatCompletions,
+    /// `POST {base}/responses` (OpenAI Responses API).
+    Responses,
+}
 
 /// Connection parameters for one OpenAI-compatible endpoint, resolved by the
 /// host from the user's custom endpoint configuration.
 #[derive(Debug, Clone)]
 pub struct LocalEndpointConfig {
     /// Base URL of the endpoint, e.g. `https://api.example.com/v1`. A URL
-    /// already ending in `/chat/completions` is used as-is.
+    /// already ending in `/chat/completions` (or, for the Responses schema,
+    /// `/responses`) is used as-is.
     pub base_url: String,
     pub api_key: String,
-    /// Model name as the provider knows it (e.g. `llama-3.3-70b`).
+    /// Model name as the provider knows it (e.g. `llama-3.3-70b`). For the
+    /// Responses schema a recognized OpenAI reasoning model may carry a
+    /// reasoning-effort suffix (`gpt-5.3-codex-high`); see
+    /// `responses/model.rs` for the grammar.
     pub model_slug: String,
+    pub schema: EndpointSchema,
 }
 
 /// One entry of the LLM transcript, in provider-neutral form.
@@ -38,6 +54,11 @@ pub enum ChatMessage {
     Assistant {
         text: String,
         tool_calls: Vec<ToolCallRequest>,
+        /// Provider items the next request must replay verbatim, e.g. the
+        /// Responses API's reasoning items (with `encrypted_content`) emitted
+        /// as [`AgentEvent::ReplayItem`] earlier in the same turn. Ignored by
+        /// the Chat Completions engine.
+        replay_items: Vec<serde_json::Value>,
     },
     Tool {
         tool_call_id: String,
@@ -70,12 +91,30 @@ pub enum AgentEvent {
     ReasoningDelta(String),
     /// Emitted once a streamed tool call is fully accumulated.
     ToolCall(ToolCallRequest),
+    /// An opaque provider item (a Responses reasoning item) the host must
+    /// persist and hand back via [`ChatMessage::Assistant::replay_items`] on
+    /// the follow-up turn. Emitted in stream order, before the turn's
+    /// [`AgentEvent::ToolCall`]s.
+    ReplayItem(serde_json::Value),
     Usage {
         input_tokens: u64,
         output_tokens: u64,
     },
     /// Always the final event of a successful turn.
     Done,
+}
+
+/// Stands in for the URL of a policy denial that leaves this crate.
+const REDACTED_URL: &str = "<redacted>";
+
+/// Keeps what a denial says about the rule (its purpose) and drops the URL it refused. The
+/// endpoint is user-configured and can carry credentials, and the host renders this error in its
+/// UI and logs. The result is still a [`network_policy::NetworkPolicyDenied`], so the host keeps
+/// treating it as a deterministic refusal rather than a transient transport failure.
+pub(crate) fn redact_denial(
+    denied: &network_policy::NetworkPolicyDenied,
+) -> network_policy::NetworkPolicyDenied {
+    network_policy::NetworkPolicyDenied::new(denied.purpose(), REDACTED_URL)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +132,11 @@ pub enum LocalAgentError {
     /// Network/transport failure, including mid-stream disconnects.
     #[error("transport error: {0}")]
     Transport(String),
+    /// The network policy refused the endpoint, or a redirect it returned. Deterministic, so the
+    /// host should not retry it. Build it with [`redact_denial`]: the denial's own text embeds the
+    /// URL, which can carry credentials in its userinfo or query.
+    #[error(transparent)]
+    NetworkPolicyDenied(#[from] network_policy::NetworkPolicyDenied),
     /// The endpoint returned something we could not parse.
     #[error("malformed response: {0}")]
     Parse(String),

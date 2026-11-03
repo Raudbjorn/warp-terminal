@@ -850,11 +850,7 @@ fn split_run_options(
             });
 
     let mut env_vars = build_secret_env_vars(&secrets, &environment_variables)?;
-    env_vars.extend(
-        environment_variables
-            .into_iter()
-            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
-    );
+    merge_runtime_env(&mut env_vars, environment_variables);
 
     // Inject cloud provider env vars.
     cloud_provider::collect_env_vars(&cloud_providers, &mut env_vars)?;
@@ -1367,7 +1363,11 @@ impl From<PrepareEnvironmentError> for AgentDriverError {
                     output,
                 }
             }
-            PrepareEnvironmentError::SetupCommandTimedOut { .. } => {
+            // The checkout helper runs in the terminal like a setup command, and dropping its
+            // wait on timeout does not stop it. Classify both alike so the failure-linger
+            // window never retains a terminal whose helper may still be modifying repositories.
+            PrepareEnvironmentError::SetupCommandTimedOut { .. }
+            | PrepareEnvironmentError::CheckoutHelperTimedOut { .. } => {
                 AgentDriverError::SetupCommandTimedOut { message }
             }
             _ => AgentDriverError::EnvironmentSetupFailed(message),
@@ -4905,6 +4905,24 @@ pub(super) fn build_secret_env_vars(
     Ok(env_vars)
 }
 
+/// Applies the terminal's runtime environment on top of the secret-derived `env_vars`.
+///
+/// [`build_secret_env_vars`] treats an empty runtime value as unset, so a secret is not skipped
+/// for it. The merge must agree: an empty value does not blank one a secret supplied, which would
+/// otherwise leave a key without the endpoint stored beside it.
+fn merge_runtime_env(
+    env_vars: &mut HashMap<OsString, OsString>,
+    runtime_env: HashMap<String, String>,
+) {
+    for (name, value) in runtime_env {
+        let name = OsString::from(name);
+        if value.is_empty() && env_vars.contains_key(&name) {
+            continue;
+        }
+        env_vars.insert(name, OsString::from(value));
+    }
+}
+
 /// The env-var names that any typed auth secret in `secrets` will populate.
 /// Used for phase-3 collision detection and by the suffix resolver.
 fn typed_secret_env_names(secrets: &HashMap<String, ManagedSecretValue>) -> HashSet<&'static str> {
@@ -4957,9 +4975,22 @@ fn typed_secret_entries(secret: &ManagedSecretValue) -> Vec<(&'static str, &str)
         ManagedSecretValue::LlmProviderApiKey {
             provider_id,
             api_key,
-            ..
+            base_url,
         } => match provider_id.as_str() {
-            "anthropic" => vec![("ANTHROPIC_API_KEY", api_key.as_str())],
+            // Claude Code reads its endpoint from the environment. The URL is part of the same
+            // typed secret, so a worker-set `ANTHROPIC_BASE_URL` skips the key too and the key is
+            // never sent to an endpoint other than the one it was stored with.
+            "anthropic" => {
+                let mut entries = vec![("ANTHROPIC_API_KEY", api_key.as_str())];
+                if let Some(url) = base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                {
+                    entries.push(("ANTHROPIC_BASE_URL", url));
+                }
+                entries
+            }
             "openai" => vec![("OPENAI_API_KEY", api_key.as_str())],
             // Pi reads every other provider's key from its auth.json.
             _ => vec![],

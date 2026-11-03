@@ -31,8 +31,10 @@ There are three separate AI paths, each with its own settings:
 - **Natural-language commands, workflow metadata and command prediction:**
   **Settings → Local AI.** Set the base URL (e.g. `http://localhost:11434/v1`),
   an API key *if your server requires one*, and the model names. In this build
-  the endpoint must be a loopback address (`localhost`, `127.0.0.1`, `::1`);
-  LAN, Tailscale and public hosts are rejected.
+  the endpoint must be a loopback address (`localhost`, `127.0.0.1`, `::1`) or
+  an IP address you have listed under **Settings → Local AI → Allowed private
+  hosts** (see below). Other host names and public hosts are rejected. A CIDR
+  range can be an allow-list entry, but the endpoint itself is one address.
 - **Warp Agent conversations:** **Settings → Agents → Warp Agent → Custom
   Inference.** Add a custom endpoint that uses the OpenAI Chat Completions
   schema and select one of its models. A request for any other model is
@@ -45,6 +47,166 @@ There are three separate AI paths, each with its own settings:
 See [docs/local-ai.md](docs/local-ai.md) for every setting, the OpenCode
 provider, and exactly what the local-only network policy does and does not
 cover.
+
+### Which hosts the app can reach
+
+This build runs in *local-only* mode. The clients that carry AI requests,
+model-list lookups, the local agent service, MCP servers and asset downloads
+check the destination against one policy, re-check every redirect, and ignore
+`HTTP_PROXY`/`HTTPS_PROXY`:
+
+- **This machine** (`localhost`, `127.0.0.0/8`, `::1`) is always allowed.
+- **Other machines on your network** (a GPU box on the LAN, a tailnet peer) are
+  denied until you list them under **Settings → Local AI → Allowed private
+  hosts**, or in `settings.toml`:
+
+  ```toml
+  [agents.local_openai]
+  allowed_private_hosts = "192.168.1.50, 100.64.0.0/10"
+  ```
+
+  Entries are IP addresses or CIDR ranges inside the private ranges (`10/8`,
+  `172.16/12`, `192.168/16`, `100.64/10` for Tailscale, link-local, IPv6
+  `fc00::/7`). Host names cannot be listed, because a name says nothing about
+  the address it resolves to. Redirects are checked against the same policy: a
+  redirect to a destination that is not permitted is refused, while a redirect
+  to another permitted host is followed.
+- **The public internet**, including OpenAI and OpenRouter, is denied. An
+  endpoint that has to be reached over the internet needs a proxy or tunnel
+  on a host you have allowed above.
+
+Changing the list takes effect immediately; the local agent service restarts
+to pick it up.
+
+### Editor and source-control additions from Hako
+
+This fork selectively integrates the following features from
+[egehakan/hako](https://github.com/egehakan/hako), inspected at
+`fff676a033aeb7423b27cad3bfb3076b1a125edc`:
+
+- **Syntax highlighting:** Svelte (`.svelte`), SCSS (`.scss`), Prisma (`.prisma`),
+  and Typst (`.typ`), including their language names in fenced code blocks.
+- **Material file and folder icons:** full-color icons in the file tree, file
+  pickers, and global search. The bundled artwork retains its MIT license.
+- **Project-wide replace:** use **Replace in files** in the command palette, or
+  expand the replacement field in Global Search. Preview replacements, restrict
+  files with include/exclude patterns, and replace a match, a file, or all matches.
+  Regex captures, whole-word matching, and case preservation are supported.
+  **Undo last replace in files** restores the most recent replacement while
+  refusing to overwrite subsequent edits. Replacement operates on local files;
+  remote search remains available.
+- **Project formatters:** **Format document** (`Shift-Alt-F`) and format-on-save
+  use a formatter selected by the project, falling back to the existing language
+  server where applicable. Configure **Format on save** and **Use project
+  formatters** in **Settings → Code → Editor & Code Review**. Project formatting
+  runs installed tools; it does not download formatters. Before using a project's
+  tools, plugins, or executable configuration, invoke **Format document** and
+  approve that project for the current application session. Ordinary saves use
+  the existing language-server path until approval; the global setting does not
+  grant permission. Approved projects also work when opened through a symlink.
+  Prettier receives an explicit in-project configuration or disables configuration
+  lookup. Its implicit EditorConfig lookup is disabled; put those settings in
+  the project's Prettier configuration instead. Discovery runs off the UI thread
+  with a bounded wait. A failed or stale result cannot replace newer editor text.
+  Typing-triggered autosave skips formatting;
+  saves during tab closure flush immediately without waiting for a formatter.
+- **Multi-repository Git:** open source control from a terminal in a local folder
+  containing repositories or linked worktrees. Each repository has its own
+  changes, inline file diffs, commit/push/publish, fetch/sync, and discard actions.
+  Sync only fast-forwards or pushes; divergent histories are left for you to
+  reconcile. Push respects the branch's configured upstream. Discard requires
+  confirmation and removes untracked files as well as tracked changes.
+
+Replacement skips unsafe or unsupported files (including binary files and files
+or open buffers over 16 MiB). Selected replacement output and edit allocations
+are bounded by the same per-file budget. Its undo journal stores copies under the app's local state directory,
+including unsaved buffer contents, and keeps up to five transactions within a
+512 MiB total budget. Unix journals use owner-only permissions; on Windows they
+inherit the state directory's ACL. Project replacement clears ordinary buffer
+undo history; use the replacement journal to undo it. Undo refuses files that
+have grown beyond its 256 MiB read limit.
+
+Replacement and undo wait up to 30 seconds for each batch of required buffer saves,
+and cancellation stops that wait promptly. Pending writes keep their files and
+undo copies protected until their actual completion is known, while unrelated
+files can be replaced subject to the journal limits. At most 32 guarded saves can
+be retained at once; additional clean buffers in a batch are skipped and can be
+retried after the batch finishes. A lost completion signal keeps protection in place until application
+restart. Failed saves are reported and retain their journal entries for retry;
+intentionally dirty buffers stay unsaved. These protections are local to this
+application and do not serialize external filesystem changes. Disk replacement
+checks resolved containment and rechecks file
+identity and content after preparing the temporary file. A concurrent filesystem
+change in the final check-to-rename interval is still possible.
+
+Repository discovery searches up to six levels, skips `node_modules` and symlinked
+directories, and avoids scanning the home directory or its ancestors. The overview
+is for native local sessions, not SSH or WSL sessions. Its refresh control can
+rescan the folder and reload all repository statuses. Git metadata changes outside
+the watched folder (for linked worktrees) are picked up within the next 30-second
+status refresh, subject to the bounded status-load queue.
+
+The feature ports retain their existing crate boundaries: `languages` and
+`syntax_tree` for highlighting, `project_replace` shared with `warp_ripgrep`,
+`code_formatters` for project formatting, and the application's `code_review`
+modules for multi-repository Git. Source commits include `16e680f6`, `9ae545c0`,
+`4294a071`, `5afec9a8`, `93b08676`, `f240fe03`, `1f772d13`, `455fbde5`, and
+`abad4863` through `8e2a9b7b` for the Git integration.
+
+### Save and stream command output to files
+
+Block and session context menus offer local file capture in place of cloud
+sharing, adapted from [thikone/warp-terminal](https://github.com/thikone/warp-terminal).
+Choose a destination in the native save dialog:
+
+| Command | Content | Default shortcut |
+|---|---|---|
+| Save output to file | Selected blocks' output | `Ctrl+Shift+S` |
+| Stream output to file | Output, updated while the command runs | `Ctrl+Alt+Shift+S` |
+| Save block to file | Working directory, command and output | Unbound |
+| Stream block to file | Working directory, command and live output | Unbound |
+| Save session to file | Retained commands and output in the current pane | Unbound |
+| Stream session to file | Retained history and subsequent commands in the pane | Unbound |
+
+On macOS, Save Output uses `Cmd+Shift+S`. Without a block selection, block captures
+use the latest command. Block streams
+finish with the command; session streams can start at an empty prompt and continue
+across commands until the pane closes. Starting another session stream replaces
+that pane's previous session stream. The tab context menu captures its focused
+pane without switching tabs. Captures contain rendered text: progress-line
+redraws replace the current tail instead of appending every intermediate frame.
+Live capture mirrors the terminal's retained output: if the active command exceeds
+the configured grid limit, older lines can also disappear from its captured tail.
+Use shell redirection or a PTY recording when a complete byte log is required.
+
+File operations run in the background. The app allows up to eight open or pending
+file captures at a time; a stalled destination retains its place until its I/O finishes.
+Closing a pane or clearing its history drains the last available snapshot. If the
+file is still opening, capture stops with an incomplete-snapshot warning. Abrupt
+application termination can leave the final write incomplete.
+
+All six actions are listed in the Resource Center's **Terminal** shortcuts and
+can be assigned keys in **Settings → Keyboard Shortcuts**. Filename patterns live
+under **Settings → Features → Session** and are stored locally:
+
+| TOML key | Default |
+|---|---|
+| `terminal.file_capture.output_pattern` | `{command}_{timestamp}.log` |
+| `terminal.file_capture.block_pattern` | `{command}_{timestamp}.log` |
+| `terminal.file_capture.session_pattern` | `{session-or-command}_{timestamp}.log` |
+
+Patterns support `{command}`, `{timestamp}`, `{finished-timestamp}` and
+`{session-or-command}`. For session captures, `{session-or-command}` uses the
+custom tab name from any capture entry point, falling back to the first command.
+For output and block captures, it uses the target command.
+Command and tab-name tokens are sanitized and limited to 64 UTF-8 bytes without
+splitting characters. Custom pattern text can still make a filename too long.
+Clearing a settings field restores its default. The pattern suggests a filename;
+the save dialog lets you change it.
+
+**Captured files include secrets in plaintext, even if the terminal masks them.**
+New files are created with owner-only permissions on Unix; overwriting an
+existing file preserves that file's permissions.
 
 ### SSH profiles
 

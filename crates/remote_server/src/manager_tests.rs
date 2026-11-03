@@ -1,10 +1,9 @@
 use futures::channel::oneshot;
 use warp_core::SessionId;
-use warp_util::standardized_path::StandardizedPath;
-use warpui_core::App;
-
 #[cfg(not(target_family = "wasm"))]
 use warp_core::channel::Channel;
+use warp_util::standardized_path::StandardizedPath;
+use warpui_core::App;
 
 #[cfg(not(target_family = "wasm"))]
 use super::version_is_compatible_for_channel;
@@ -102,6 +101,8 @@ fn start_ripgrep_search_without_connected_host_resolves_immediately() {
                     ignore_case: false,
                     multiline: false,
                     max_matches: 100,
+                    scope_include: String::new(),
+                    scope_exclude: String::new(),
                 },
             )
         });

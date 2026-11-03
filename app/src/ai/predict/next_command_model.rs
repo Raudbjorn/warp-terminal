@@ -68,21 +68,31 @@ pub fn is_next_command_enabled(app: &warpui::AppContext) -> bool {
 }
 
 /// Fetches AI input suggestions, routing to the user's custom endpoint when one
-/// was resolved (local agent loop) and otherwise to the Warp server. Resolution
-/// happens on the main thread before spawning; `local_endpoint` carries the
-/// result into the async task.
+/// was resolved (local agent loop) and otherwise to the Warp server. Unsupported
+/// endpoint schemas return an error rather than silently switching providers.
 async fn fetch_input_suggestions(
     server_api: &ServerApi,
-    #[cfg(not(target_family = "wasm"))] local_endpoint: &Option<local_agent::LocalEndpointConfig>,
+    #[cfg(not(target_family = "wasm"))] local_route: &super::generate_ai_input_suggestions::local::LocalInputRoute,
     request: &GenerateAIInputSuggestionsRequest,
     team_scope: RequestTeamScope,
 ) -> Result<GenerateAIInputSuggestionsResponseV2, AIApiError> {
     #[cfg(not(target_family = "wasm"))]
-    if let Some(endpoint) = local_endpoint {
-        return super::generate_ai_input_suggestions::local::generate_local_input_suggestions(
-            request, endpoint,
-        )
-        .await;
+    {
+        use super::generate_ai_input_suggestions::local::LocalInputRoute;
+        match local_route {
+            LocalInputRoute::Custom(endpoint) => {
+                return super::generate_ai_input_suggestions::local::generate_local_input_suggestions(
+                    request, endpoint,
+                )
+                .await;
+            }
+            LocalInputRoute::UnsupportedSchema(reason) => {
+                return Err(AIApiError::Other(anyhow::anyhow!(
+                    "Next-command suggestion was not sent to the Warp server: {reason}"
+                )));
+            }
+            LocalInputRoute::Server => {}
+        }
     }
     server_api
         .generate_ai_input_suggestions(request, team_scope)
@@ -403,18 +413,18 @@ impl NextCommandModel {
         ctx: &mut ModelContext<Self>,
     ) {
         let server_api = self.server_api.clone();
-        let team_scope =
-            RequestTeamScope::from_scope(&self.ai_controller.as_ref(ctx).team_context(ctx));
+        let team_context = self.ai_controller.as_ref(ctx).team_context(ctx);
+        let team_scope = RequestTeamScope::from_scope(&team_context);
 
         // Resolve whether this prediction should run against the user's custom
         // endpoint instead of the Warp server. Must happen here (with `ctx`)
         // before spawning the request task.
         #[cfg(not(target_family = "wasm"))]
-        let local_endpoint =
+        let local_route =
             super::generate_ai_input_suggestions::local::resolve_local_input_endpoint(
                 ctx,
                 terminal_view_id,
-                &team_scope,
+                &team_context,
             );
         let terminal_model = self.model.clone();
         let cached_next_command_context = self.cached_zerostate_next_command_context.clone();
@@ -542,7 +552,7 @@ impl NextCommandModel {
                             fetch_input_suggestions(
                                 &server_api,
                                 #[cfg(not(target_family = "wasm"))]
-                                &local_endpoint,
+                                &local_route,
                                 &request,
                                 team_scope,
                             )
@@ -629,7 +639,7 @@ impl NextCommandModel {
                     let response = fetch_input_suggestions(
                         &server_api,
                         #[cfg(not(target_family = "wasm"))]
-                        &local_endpoint,
+                        &local_route,
                         &request,
                                 team_scope,
                     )

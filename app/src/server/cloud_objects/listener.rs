@@ -1,11 +1,11 @@
 use std::sync::Arc;
 use std::time::Duration;
-use warp_core::channel::ChannelState;
 
 use async_channel::Sender;
 pub use cloud_object_client::ObjectUpdateMessage;
 use futures_util::stream::AbortHandle;
 use instant::Instant;
+use warp_core::channel::ChannelState;
 use warp_errors::report_error;
 use warpui::r#async::Timer;
 use warpui::{Entity, ModelContext, ModelHandle, RequestState, SingletonEntity};
@@ -396,15 +396,15 @@ impl SingletonEntity for Listener {}
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::sync::Arc;
+
     use cloud_object_client::MockObjectClient;
     use serial_test::serial;
-    use std::sync::Arc;
-    use warp_core::{
-        AppId,
-        channel::{Channel, ChannelConfig, OzConfig, ServicesMode, WarpServerConfig},
-    };
+    use warp_core::AppId;
+    use warp_core::channel::{Channel, ChannelConfig, OzConfig, ServicesMode, WarpServerConfig};
     use warpui::App;
+
+    use super::*;
 
     struct ChannelStateGuard;
 

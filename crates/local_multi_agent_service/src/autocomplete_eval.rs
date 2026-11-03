@@ -1,4 +1,6 @@
-use std::{env, fs, path::PathBuf, time::Instant};
+use std::path::PathBuf;
+use std::time::Instant;
+use std::{env, fs};
 
 use local_multi_agent_service::autocomplete::{
     AutocompleteBlockContext, LocalCommandAutocompleteRequest, LocalCommandAutocompleteResponse,
@@ -68,6 +70,9 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("No autocomplete eval cases matched.");
     }
 
+    // Exempt from the network policy: this is the standalone `warp-local-autocomplete-eval`
+    // developer tool, which posts to a service URL the developer passes on the command line and
+    // runs outside the app.
     let client = reqwest::Client::new();
     let endpoint = format!(
         "{}/ai/local-command-autocomplete",
