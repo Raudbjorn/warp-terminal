@@ -893,13 +893,16 @@ impl LocalMultiAgentManager {
     /// one, so it may succeed now. A failure under the current list is not retried, which keeps
     /// unrelated setting changes from restarting a service that cannot start.
     fn allow_list_needs_restart(&self) -> bool {
-        policy_needs_restart(&self.applied_private_hosts)
-            || self.failed_with_hosts.as_ref().is_some_and(|failed_with| {
-                !network_policy::same_private_hosts(
-                    failed_with,
-                    &network_policy::allowed_private_hosts(),
-                )
-            })
+        match &self.failed_with_hosts {
+            // Nothing validated is running, so `applied_private_hosts` (the last service that
+            // was) no longer says anything about now. Judge against the list the failure
+            // happened under: a different one may succeed, the same one will fail again.
+            Some(failed_with) => !network_policy::same_private_hosts(
+                failed_with,
+                &network_policy::allowed_private_hosts(),
+            ),
+            None => policy_needs_restart(&self.applied_private_hosts),
+        }
     }
 
     /// Records the private hosts the running service enforces and reports whether the service
@@ -1023,7 +1026,10 @@ async fn start_service(
         .with_context(|| format!("Failed to spawn {}", service_binary.display()))?;
     let pid = Some(child.id());
 
-    wait_until_healthy(root_url.clone()).await?;
+    let health = wait_until_healthy(root_url.clone()).await?;
+    // Dropping `child` on this error kills it (`kill_on_drop`), so a service that does not
+    // enforce the policy is never left running.
+    ensure_spawned_service_policy(&service_binary, &applied_private_hosts, &health)?;
 
     Ok(StartServiceResult {
         child: Some(child),
@@ -1048,12 +1054,33 @@ fn reported_private_hosts(
         .unwrap_or_default()
 }
 
-async fn wait_until_healthy(root_url: Url) -> Result<()> {
+/// Checks that a service this process just started enforces the policy it was given. Health only
+/// shows that something Warp-shaped answers. The binary can be an older build (the app prefers an
+/// existing `target/` build) that ignores the policy environment, and would otherwise be published
+/// as if it enforced it. The comparison is against `given`, the allow-list the service was handed,
+/// not the current one: if that changed meanwhile, the caller restarts the service.
+fn ensure_spawned_service_policy(
+    service_binary: &Path,
+    given: &[network_policy::PrivateNetwork],
+    health: &LocalMultiAgentHealthResponse,
+) -> Result<()> {
+    network_policy::check_service_policy_against(given, health.network_policy.as_ref()).map_err(
+        |mismatch| {
+            anyhow!(
+                "The local multi-agent service at {} does not enforce the network policy it was \
+                 given: {mismatch}. It may be a build from before the policy existed; rebuild it.",
+                service_binary.display()
+            )
+        },
+    )
+}
+
+async fn wait_until_healthy(root_url: Url) -> Result<LocalMultiAgentHealthResponse> {
     let started = std::time::Instant::now();
     let mut last_error = None;
     while started.elapsed() < Duration::from_secs(10) {
-        match health_check(root_url.clone()).await {
-            Ok(()) => return Ok(()),
+        match fetch_health(root_url.clone()).await {
+            Ok(health) => return Ok(health),
             Err(error) => last_error = Some(error),
         }
         Timer::after(Duration::from_millis(150)).await;
@@ -1122,7 +1149,11 @@ async fn fetch_health(root_url: Url) -> Result<LocalMultiAgentHealthResponse> {
 async fn fetch_provider_models(base_url: &str, api_key: Option<&str>) -> Result<Vec<String>> {
     validate_absolute_http_url(base_url)?;
     let models_url = format!("{}/models", base_url.trim_end_matches('/'));
-    network_policy::check_url_str(&models_url, "provider model list request")?;
+    // The base URL is user-configured and can carry credentials in its userinfo or query. The
+    // error is shown in the UI and logged, so it keeps the typed denial but not the URL.
+    network_policy::check_url_str(&models_url, "provider model list request").map_err(
+        |denied| network_policy::NetworkPolicyDenied::new(denied.purpose(), "<redacted>"),
+    )?;
     let mut request = policy_client()?
         .get(models_url)
         .timeout(HEALTH_TIMEOUT)

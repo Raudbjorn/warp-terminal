@@ -25,7 +25,7 @@ mod private_hosts;
 
 pub use private_hosts::{
     ENV_ALLOWED_PRIVATE_HOSTS, ENV_SERVICES_MODE, PolicyMismatch, PolicyReport, PrivateHostsError,
-    PrivateNetwork, allowed_private_hosts, check_service_policy, env_for_child,
+    PrivateNetwork, allowed_private_hosts, check_service_policy, check_service_policy_against, env_for_child,
     env_for_child_with_hosts, init_from_env, parse_allowed_private_hosts, same_private_hosts,
     set_allowed_private_hosts,
 };

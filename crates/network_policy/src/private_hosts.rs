@@ -266,7 +266,18 @@ fn covers(outer: &[PrivateNetwork], inner: &[PrivateNetwork]) -> bool {
 /// entry of either list must lie inside an entry of the other. Order and redundant entries do not
 /// matter; a range written as several smaller ones is reported as different.
 pub fn check_service_policy(reported: Option<&PolicyReport>) -> Result<(), PolicyMismatch> {
-    check_policy(crate::services_mode(), &allowed_private_hosts(), reported)
+    check_service_policy_against(&allowed_private_hosts(), reported)
+}
+
+/// Like [`check_service_policy`], against `hosts` instead of the current allow-list. For a service
+/// this process started: it was handed `hosts` through [`env_for_child_with_hosts`], and the
+/// current list may have changed while it was starting. That is the caller's to handle (by
+/// restarting), so it is not reported here as a service that enforces the wrong policy.
+pub fn check_service_policy_against(
+    hosts: &[PrivateNetwork],
+    reported: Option<&PolicyReport>,
+) -> Result<(), PolicyMismatch> {
+    check_policy(crate::services_mode(), hosts, reported)
 }
 
 fn check_policy(

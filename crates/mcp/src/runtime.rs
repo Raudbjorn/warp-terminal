@@ -34,6 +34,16 @@ type ReqwestHttpTransport = rmcp::transport::StreamableHttpClientTransport<reqwe
 
 /// Reported when the network policy refuses an MCP server. Names the rule, never the URL.
 const MCP_CONNECTION_DENIED_MESSAGE: &str = "the network policy refused this MCP server: local-only services mode only allows loopback addresses and the private hosts listed in Settings";
+
+/// Checks the network policy as it is now. Called before every request this module sends itself,
+/// because the allow-list can change while a connection waits, for example for the user to finish
+/// signing in. The error names the rule and never the URL, which can carry credentials.
+#[allow(clippy::result_large_err)]
+fn check_current_policy(url: &str, purpose: &str) -> Result<(), rmcp::RmcpError> {
+    network_policy::check_url_str(url, purpose).map_err(|_| {
+        rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(MCP_CONNECTION_DENIED_MESSAGE)
+    })
+}
 type ReqwestSseTransport = crate::sse_transport::SseClientTransport<reqwest::Client>;
 
 /// Convert an rmcp error to a user-friendly error message.
@@ -336,15 +346,11 @@ pub async fn spawn_server(
             )
         }
         TransportType::ServerSentEvents(sse_server) => {
-            if network_policy::check_url_str(&sse_server.url, "MCP server connection").is_err() {
+            if let Err(denied) = check_current_policy(&sse_server.url, "MCP server connection") {
                 logger.log(
                     "[error] MCP: Network policy refused the MCP server connection".to_string(),
                 );
-                // The denial's text embeds the URL, which can carry credentials in its userinfo
-                // or query. This error reaches the UI and logs, so it states the rule instead.
-                return Err(rmcp::RmcpError::transport_creation::<ReqwestHttpTransport>(
-                    MCP_CONNECTION_DENIED_MESSAGE,
-                ));
+                return Err(denied);
             }
             let headers: HashMap<String, String> = sse_server
                 .headers
@@ -795,6 +801,9 @@ async fn send_preflight_request(
         request = request.bearer_auth(access_token);
     }
 
+    // Checked here, after the token above was awaited (which can take as long as an interactive
+    // sign-in), so a host removed from the allow-list in the meantime is not sent the token.
+    check_current_policy(url, "MCP preflight request")?;
     let response = request
         .send()
         .await
