@@ -57,7 +57,8 @@ use crate::workspace::tab_settings::{
     TabCloseButtonPosition, TabSettings, VerticalTabsDisplayGranularity,
 };
 use crate::workspace::{
-    PaneViewLocator, TabBarDropTargetData, TabBarLocation, TabContextMenuAnchor, WorkspaceAction,
+    PaneViewLocator, TabBarDropTargetData, TabBarLocation, TabContextMenuAnchor, Workspace,
+    WorkspaceAction,
 };
 
 pub const TAB_BAR_BORDER_HEIGHT: f32 = 1.0;
@@ -283,10 +284,16 @@ pub fn harp_mode_enabled(ctx: &AppContext) -> bool {
     *TabSettings::as_ref(ctx).harp_mode
 }
 
-/// True when vertical tabs show the short tab and group menus instead of Warp's full ones
-/// (`appearance.vertical_tabs.full_tab_menu = false`).
+/// True when Harp's sidebar shows the short tab and group menus instead of Warp's full ones
+/// (`appearance.vertical_tabs.full_tab_menu = false`). Plain vertical tabs keep Warp's menus.
 pub fn uses_slim_sidebar_menu(ctx: &AppContext) -> bool {
-    uses_vertical_tabs(ctx) && !*TabSettings::as_ref(ctx).vertical_tabs_full_tab_menu
+    uses_harp_sidebar_menus(ctx) && !*TabSettings::as_ref(ctx).vertical_tabs_full_tab_menu
+}
+
+/// True when the tab menu takes the Harp sidebar's entries (its own Pin, "Move to group" with
+/// "New group…", read/unread and active/inactive) rather than Warp's.
+pub(crate) fn uses_harp_sidebar_menus(ctx: &AppContext) -> bool {
+    harp_mode_enabled(ctx) && uses_vertical_tabs(ctx)
 }
 
 const WARP_2_TAB_COLOR_OPACITY: Opacity = 25;
@@ -445,9 +452,7 @@ impl TabData {
         self.group_id.is_some()
             && uses_vertical_tabs(ctx)
             && matches!(
-                *TabSettings::as_ref(ctx)
-                    .vertical_tabs_display_granularity
-                    .value(),
+                Workspace::vertical_tabs_display_granularity(ctx),
                 VerticalTabsDisplayGranularity::Panes
             )
     }
@@ -492,17 +497,18 @@ impl TabData {
             return self.sidebar_menu_items(index, tabs_len, ctx);
         }
 
-        // In vertical tabs the "Move to group" submenu always shows and carries "New group…" and
+        // In Harp's sidebar the "Move to group" submenu always shows and carries "New group…" and
         // "Other", so Warp's separate new/remove entries would only repeat it.
-        let group_items = if uses_vertical_tabs(ctx) {
+        let harp_sidebar_menus = uses_harp_sidebar_menus(ctx);
+        let group_items = if harp_sidebar_menus {
             self.sidebar_group_menu_items()
         } else {
             self.tab_group_menu_items(index, tab_groups, is_only_member_of_group)
         };
         let appearance = Appearance::as_ref(ctx);
         let terminal_colors = appearance.theme().terminal_colors().normal;
-        // Vertical tabs put their own "Pin" first (`Workspace::add_sidebar_pin_menu_item`).
-        let pin_items = if uses_vertical_tabs(ctx) {
+        // Harp's sidebar puts its own "Pin" first (`Workspace::add_sidebar_pin_menu_item`).
+        let pin_items = if harp_sidebar_menus {
             Vec::new()
         } else {
             self.pin_menu_items(index)
@@ -727,9 +733,7 @@ impl TabData {
             return menu_items;
         }
 
-        let vertical_tabs_display_granularity = *TabSettings::as_ref(ctx)
-            .vertical_tabs_display_granularity
-            .value();
+        let vertical_tabs_display_granularity = Workspace::vertical_tabs_display_granularity(ctx);
         let (title_label, title, terminal_view) = if matches!(
             vertical_tabs_display_granularity,
             VerticalTabsDisplayGranularity::Panes
@@ -955,10 +959,10 @@ impl TabData {
         ]
     }
 
-    /// Unread, inactive and divider entries for the per-tab right-click menu. Only the vertical
-    /// tab rows show these marks, so other layouts get no entries.
+    /// Unread, inactive and divider entries for the per-tab right-click menu. Only Harp's sidebar
+    /// rows show these marks, so other layouts get no entries.
     fn unread_menu_items(&self, ctx: &AppContext) -> Vec<MenuItem<WorkspaceAction>> {
-        if !uses_vertical_tabs(ctx) {
+        if !uses_harp_sidebar_menus(ctx) {
             return vec![];
         }
         let pane_group_id = self.pane_group.id();

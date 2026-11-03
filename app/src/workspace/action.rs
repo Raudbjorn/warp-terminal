@@ -405,6 +405,9 @@ pub enum WorkspaceAction {
     /// Toggles the vertical tabs panel. This happens as an explicit action from the user.
     ToggleVerticalTabsPanel,
     OpenVerticalTabsPanel,
+    /// Flips Harp mode (`modes.harp.enabled`). Turning it on also turns vertical tabs on and opens
+    /// the sidebar; turning it off leaves vertical tabs as they are.
+    ToggleHarpMode,
     SshManager(crate::ssh_manager::SshManagerAction),
     ToggleVerticalTabsSettingsPopup,
     SetVerticalTabsDisplayGranularity(VerticalTabsDisplayGranularity),
@@ -1059,7 +1062,9 @@ impl WorkspaceAction {
             | OpenRepository { .. }
             | SelectTabConfig(_)
             | ToggleVerticalTabsPanel
-            | OpenVerticalTabsPanel => true, // actions that actually change a state of the state of user's
+            | OpenVerticalTabsPanel
+            // Turning Harp mode on opens the sidebar, which the saved window state records.
+            | ToggleHarpMode => true, // actions that actually change a state of the state of user's
             // workspace would most likely require a save, so that if the app gets
             // restarted, the user can continue working
             AutoupdateFailureLink
