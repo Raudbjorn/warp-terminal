@@ -88,6 +88,15 @@ and keep this file current.
    `crates/warp_cli/src/lib.rs`, `app/src/server/server_api.rs` and
    `app/src/settings/ai.rs`. Upstream APIs that the fork's code calls change
    often; fix the fallout rather than reverting the fork's code.
+
+   Harp mode adds more conflict-prone files: `app/src/workspace/view/vertical_tabs.rs`,
+   `app/src/workspace/view/tab_grouping.rs`, `app/src/workspace/view.rs` and
+   `app/src/terminal/cli_agent_sessions/`. Its code came from
+   [dominikmartn/harp](https://github.com/dominikmartn/harp) 0.1.8 (commit
+   `54c52860`), whose upstream base was `ae60375e`. `git diff ae60375e 54c52860`
+   shows what Harp changed against upstream, which helps to tell Harp's lines
+   from upstream's when they conflict. Keep Harp's behavior behind
+   `modes.harp.enabled`.
 6. Build and test (`cargo check -p warp --lib`, the targeted crate tests, and
    `./script/presubmit` as far as it passes on `master`) and put what you ran,
    and what you did not, in the PR description.
@@ -100,3 +109,7 @@ and keep this file current.
   [docs/local-ai.md](docs/local-ai.md)).
 - Linux only: Windows and macOS assets and scripts were removed.
 - No GitHub Actions workflows. Run `./script/presubmit` locally.
+- Harp mode: an optional agent sidebar ported from
+  [dominikmartn/harp](https://github.com/dominikmartn/harp). It is off by
+  default (`modes.harp.enabled`); with it off the app looks and behaves as it
+  does without the port. See [docs/harp-mode.md](docs/harp-mode.md).
