@@ -3,6 +3,14 @@ use std::path::Path;
 use lazy_static::lazy_static;
 use regex::Regex;
 
+pub fn split_ssh_destination(destination: &str) -> (Option<&str>, &str) {
+    match destination.rsplit_once('@') {
+        Some((user, host)) if !user.is_empty() => (Some(user), host),
+        Some((_, host)) => (None, host),
+        None => (None, destination),
+    }
+}
+
 /// Converts a multiline bash or zsh script to one line by turning newlines into semicolons or
 /// deleting them, as appropriate.
 ///
@@ -86,6 +94,7 @@ pub fn check_ssh_login_state(block_output: &str) -> SshLoginState {
 pub struct InteractiveSshCommand {
     pub host: Option<String>,
     pub port: Option<String>,
+    pub user: Option<String>,
 }
 
 impl InteractiveSshCommand {
@@ -100,6 +109,7 @@ impl InteractiveSshCommand {
         let tokens = parse_ssh_command_tokens(command)?;
         let mut host: Option<String> = None;
         let mut port: Option<String> = None;
+        let mut login_name: Option<String> = None;
 
         let mut i = 1;
         while i < tokens.len() {
@@ -116,9 +126,18 @@ impl InteractiveSshCommand {
                     }
                 }
 
+                "-l" => {
+                    i += 1;
+                    if i < tokens.len() {
+                        login_name = Some(tokens[i].clone());
+                    } else {
+                        return None;
+                    }
+                }
+
                 // SSH option that doesn't change interactivity and require an argument: Skip the next item.
                 "-B" | "-b" | "-c" | "-D" | "-E" | "-e" | "-F" | "-I" | "-i" | "-J" | "-L"
-                | "-l" | "-m" | "-O" | "-o" | "-P" | "-Q" | "-R" | "-S" | "-w" => {
+                | "-m" | "-O" | "-o" | "-P" | "-Q" | "-R" | "-S" | "-w" => {
                     i += 1;
                 }
 
@@ -137,7 +156,12 @@ impl InteractiveSshCommand {
             i += 1;
         }
 
-        Some(InteractiveSshCommand { host, port })
+        let user = host
+            .as_deref()
+            .and_then(|destination| split_ssh_destination(destination).0)
+            .map(ToString::to_string)
+            .or(login_name);
+        Some(InteractiveSshCommand { host, port, user })
     }
 }
 

@@ -29,6 +29,7 @@ use crate::workspace::tab_settings::TabSettings;
 pub enum HeaderToolbarItemKind {
     TabsPanel,
     ToolsPanel,
+    SshProfiles,
     AgentManagement,
     CodeReview,
     NotificationsMailbox,
@@ -39,6 +40,7 @@ impl HeaderToolbarItemKind {
         match self {
             Self::TabsPanel => "Tabs Panel",
             Self::ToolsPanel => "Tools Panel",
+            Self::SshProfiles => "SSH Profiles",
             Self::AgentManagement => "Agent Management",
             Self::CodeReview => "Code Review",
             Self::NotificationsMailbox => "Notifications",
@@ -49,6 +51,7 @@ impl HeaderToolbarItemKind {
         match self {
             Self::TabsPanel => Icon::Menu,
             Self::ToolsPanel => Icon::Tool2,
+            Self::SshProfiles => Icon::Globe,
             Self::AgentManagement => Icon::Grid,
             Self::CodeReview => Icon::Diff,
             Self::NotificationsMailbox => Icon::Inbox,
@@ -65,6 +68,7 @@ impl HeaderToolbarItemKind {
                     && *TabSettings::as_ref(app).use_vertical_tabs
             }
             Self::ToolsPanel => true,
+            Self::SshProfiles => true,
             Self::AgentManagement => {
                 if ChannelState::is_local_only() {
                     return false;
@@ -101,11 +105,19 @@ impl HeaderToolbarItemKind {
     /// Whether this item opens a side panel (as opposed to replacing the content
     /// area or opening a popover).
     pub fn is_panel(&self) -> bool {
-        matches!(self, Self::TabsPanel | Self::ToolsPanel | Self::CodeReview)
+        matches!(
+            self,
+            Self::TabsPanel | Self::ToolsPanel | Self::SshProfiles | Self::CodeReview
+        )
     }
 
     pub fn default_left() -> Vec<Self> {
-        vec![Self::TabsPanel, Self::ToolsPanel, Self::AgentManagement]
+        vec![
+            Self::TabsPanel,
+            Self::ToolsPanel,
+            Self::SshProfiles,
+            Self::AgentManagement,
+        ]
     }
 
     pub fn default_right() -> Vec<Self> {
@@ -117,6 +129,7 @@ impl HeaderToolbarItemKind {
         vec![
             Self::TabsPanel,
             Self::ToolsPanel,
+            Self::SshProfiles,
             Self::AgentManagement,
             Self::CodeReview,
             Self::NotificationsMailbox,

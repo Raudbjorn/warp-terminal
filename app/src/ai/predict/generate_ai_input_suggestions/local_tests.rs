@@ -1,9 +1,15 @@
 //! Unit tests for the pure parts of the local next-command adapter: transcript
 //! building, model-output parsing, and custom-endpoint resolution.
 
-use ai::api_keys::{CustomEndpoint, CustomEndpointModel};
+use ai::api_keys::{CustomEndpoint, CustomEndpointModel, CustomEndpointSchema};
 
 use super::*;
+fn resolved(route: LocalInputRoute) -> LocalEndpointConfig {
+    match route {
+        LocalInputRoute::Custom(endpoint) => endpoint,
+        other => panic!("expected a custom endpoint, got {other:?}"),
+    }
+}
 
 fn request_with_prefix(prefix: Option<&str>) -> GenerateAIInputSuggestionsRequest {
     GenerateAIInputSuggestionsRequest {
@@ -135,7 +141,7 @@ fn picks_endpoint_by_active_model_config_key() {
         &[("qwen3:8b", "cfg-123")],
     )];
 
-    let resolved = pick_custom_endpoint("cfg-123", &endpoints).expect("should resolve");
+    let resolved = resolved(pick_custom_endpoint("cfg-123", &endpoints));
     assert_eq!(resolved.base_url, "http://localhost:11434/v1");
     assert_eq!(resolved.api_key, "ollama");
     assert_eq!(resolved.model_slug, "qwen3:8b");
@@ -149,7 +155,10 @@ fn returns_none_for_builtin_model() {
         "ollama",
         &[("qwen3:8b", "cfg-123")],
     )];
-    assert!(pick_custom_endpoint("claude-4-sonnet", &endpoints).is_none());
+    assert!(matches!(
+        pick_custom_endpoint("claude-4-sonnet", &endpoints),
+        LocalInputRoute::Server
+    ));
 }
 
 #[test]
@@ -163,6 +172,71 @@ fn skips_endpoints_with_empty_url() {
             &[("m", "cfg-2")],
         ),
     ];
-    assert!(pick_custom_endpoint("cfg-1", &endpoints).is_none());
-    assert!(pick_custom_endpoint("cfg-2", &endpoints).is_some());
+    assert!(matches!(
+        pick_custom_endpoint("cfg-1", &endpoints),
+        LocalInputRoute::Server
+    ));
+    assert!(matches!(
+        pick_custom_endpoint("cfg-2", &endpoints),
+        LocalInputRoute::Custom(_)
+    ));
+}
+
+fn endpoint_with_schema(schema: CustomEndpointSchema, config_key: &str) -> CustomEndpoint {
+    CustomEndpoint {
+        schema,
+        ..endpoint(
+            "Provider",
+            "https://llm.example.com/v1",
+            "sk-test",
+            &[("gpt-5", config_key)],
+        )
+    }
+}
+
+#[test]
+fn chat_completions_endpoints_resolve_to_the_chat_schema() {
+    let endpoints = vec![endpoint_with_schema(
+        CustomEndpointSchema::OpenaiChatCompletions,
+        "cfg-1",
+    )];
+
+    let resolved = resolved(pick_custom_endpoint("cfg-1", &endpoints));
+    assert_eq!(resolved.schema, EndpointSchema::ChatCompletions);
+}
+
+#[test]
+fn responses_endpoints_resolve_to_the_responses_schema() {
+    let endpoints = vec![endpoint_with_schema(
+        CustomEndpointSchema::OpenaiResponses,
+        "cfg-1",
+    )];
+
+    let resolved = resolved(pick_custom_endpoint("cfg-1", &endpoints));
+    assert_eq!(resolved.schema, EndpointSchema::Responses);
+    assert_eq!(resolved.model_slug, "gpt-5");
+}
+
+#[test]
+fn schema_follows_the_matched_endpoint_not_the_first_one() {
+    let endpoints = vec![
+        endpoint_with_schema(CustomEndpointSchema::OpenaiChatCompletions, "cfg-chat"),
+        endpoint_with_schema(CustomEndpointSchema::OpenaiResponses, "cfg-responses"),
+    ];
+
+    let resolved = resolved(pick_custom_endpoint("cfg-responses", &endpoints));
+    assert_eq!(resolved.schema, EndpointSchema::Responses);
+}
+
+#[test]
+fn anthropic_messages_endpoints_are_reported_as_unsupported() {
+    let endpoints = vec![endpoint_with_schema(
+        CustomEndpointSchema::AnthropicMessages,
+        "cfg-1",
+    )];
+
+    assert!(matches!(
+        pick_custom_endpoint("cfg-1", &endpoints),
+        LocalInputRoute::UnsupportedSchema(_)
+    ));
 }
