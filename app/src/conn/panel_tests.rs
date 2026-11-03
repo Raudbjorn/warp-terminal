@@ -7,8 +7,8 @@ use ::conn::{ConnEntry, ConnEntryKind, ConnSession};
 use chrono::{DateTime, TimeZone, Utc};
 
 use super::{
-    ConnRow, PREVIEW_CHARS, is_openable_link, plan_is_openable, plan_path_is_plausible, row_at,
-    row_count, scroll_target, truncate,
+    ConnRow, PREVIEW_CHARS, is_openable_link, plan_is_openable_blocking, plan_path_is_plausible,
+    row_at, row_count, scroll_target, truncate,
 };
 
 fn at(seconds: i64) -> DateTime<Utc> {
@@ -658,16 +658,19 @@ fn a_plan_must_be_a_regular_file_of_bounded_size() {
     let dir = tempfile::tempdir().expect("temp dir");
     let plan = dir.path().join("plan.md");
     std::fs::write(&plan, "# Plan\n").expect("write plan");
-    assert!(plan_is_openable(&plan));
+    assert!(plan_is_openable_blocking(&plan));
 
     let link = dir.path().join("device.md");
     std::os::unix::fs::symlink("/dev/zero", &link).expect("symlink");
-    assert!(!plan_is_openable(&link), "a link to a device is not a file");
+    assert!(
+        !plan_is_openable_blocking(&link),
+        "a link to a device is not a file"
+    );
 
-    assert!(!plan_is_openable(&dir.path().join("missing.md")));
+    assert!(!plan_is_openable_blocking(&dir.path().join("missing.md")));
 
     let big = dir.path().join("big.md");
     let file = std::fs::File::create(&big).expect("create");
     file.set_len(super::MAX_PLAN_BYTES + 1).expect("extend");
-    assert!(!plan_is_openable(&big), "past the bound");
+    assert!(!plan_is_openable_blocking(&big), "past the bound");
 }

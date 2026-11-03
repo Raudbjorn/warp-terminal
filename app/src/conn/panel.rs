@@ -12,6 +12,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ::conn::overview::{OverviewItem, ProjectGroup, group_by_project, project_label};
 use ::conn::story::ConnTurn;
@@ -21,6 +22,7 @@ use markdown_parser::parse_markdown_with_gfm_tables;
 use warp_core::ui::theme::WarpTheme;
 use warp_core::ui::theme::color::internal_colors;
 use warp_errors::report_error;
+use warpui::r#async::FutureExt as _;
 use warpui::color::ColorU;
 use warpui::elements::new_scrollable::{NewScrollableElement, SingleAxisConfig};
 use warpui::elements::{
@@ -41,13 +43,14 @@ use super::{ConnModel, preview};
 use crate::appearance::Appearance;
 use crate::code::buffer_location::LocalOrRemotePath;
 use crate::drive::panel::{MAX_SIDEBAR_WIDTH_RATIO, MIN_SIDEBAR_WIDTH};
-use crate::notebooks::file::FileNotebookView;
+use crate::notebooks::file::{FileNotebookEvent, FileNotebookView};
 use crate::notebooks::link::LinkEvent;
 use crate::pane_group::PaneGroup;
+use crate::pane_group::pane::PaneEvent;
 use crate::terminal::model::session::Session;
 use crate::terminal::resizable_data::{DEFAULT_RIGHT_PANEL_WIDTH, ModalType, ResizableData};
 #[cfg(feature = "local_fs")]
-use crate::util::openable_file_type::FileTarget;
+use crate::util::openable_file_type::{EditorLayout, FileTarget};
 use crate::workspace::{WorkspaceAction, WorkspaceRegistry};
 #[cfg(feature = "local_fs")]
 use warp_util::path::LineAndColumnArg;
@@ -86,6 +89,9 @@ pub struct ConnPanelView {
     /// The plan each pane is reading in place of its story, keyed by terminal view. A pane keeps
     /// its entry while focus is elsewhere, so coming back to it shows the plan again.
     plans: HashMap<EntityId, OpenPlan>,
+    /// The plan path each pane is having looked at, so a model update does not start the same
+    /// look again while it is still out.
+    checking_plans: HashMap<EntityId, PathBuf>,
     show_plan_link: MouseStateHandle,
     show_story_link: MouseStateHandle,
     open_in_pane_link: MouseStateHandle,
@@ -179,6 +185,7 @@ impl ConnPanelView {
             resizable_state_handle,
             answer_link: HighlightedHyperlink::default(),
             plans: HashMap::new(),
+            checking_plans: HashMap::new(),
             show_plan_link: MouseStateHandle::default(),
             show_story_link: MouseStateHandle::default(),
             open_in_pane_link: MouseStateHandle::default(),
@@ -221,14 +228,7 @@ impl ConnPanelView {
         for (pane, plan_file) in current {
             match (plan_file, self.plans.get_mut(&pane)) {
                 (Some(plan_file), Some(open)) if open.path != plan_file => {
-                    if plan_is_openable(&plan_file) {
-                        open.path = plan_file.clone();
-                        open.view.update(ctx, |view, ctx| {
-                            view.open(LocalOrRemotePath::Local(plan_file), None, ctx)
-                        });
-                    } else {
-                        self.close_plan(pane, ctx);
-                    }
+                    self.admit_plan(pane, plan_file, false, ctx);
                 }
                 (Some(_), _) => {}
                 (None, _) => self.close_plan(pane, ctx),
@@ -262,10 +262,18 @@ impl ConnPanelView {
             PanelMode::ThisPane => PanelMode::All,
             PanelMode::All => PanelMode::ThisPane,
         };
+        // The overview replaces a plan on screen without taking focus out of it, and a hidden
+        // viewer that keeps focus keeps the keyboard.
+        let plan_has_focus = self
+            .open_plan(ctx)
+            .is_some_and(|open| open.view.is_self_or_child_focused(ctx));
         self.mode_choice.set(Some(ModeChoice {
             pane: self.focused_terminal_id(ctx),
             mode,
         }));
+        if plan_has_focus && matches!(mode, PanelMode::All) {
+            self.focus_terminal(ctx);
+        }
         ctx.notify();
     }
 
@@ -301,11 +309,74 @@ impl ConnPanelView {
         let Some(pane) = self.focused_terminal_id(ctx) else {
             return;
         };
-        let Some(path) = self.plan_file(ctx).filter(|path| plan_is_openable(path)) else {
+        let Some(path) = self.plan_file(ctx) else {
             return;
         };
-        // A pane reads one plan at a time, and the one it was reading is closed for the new one.
-        self.close_plan(pane, ctx);
+        self.admit_plan(pane, path, true, ctx);
+    }
+
+    /// Has a plan looked at off the main thread, then shows it if it can be opened.
+    ///
+    /// The look asks the filesystem, which may be a mount that answers slowly, so it must not
+    /// hold up the frame. `open_if_absent` is for a plan the reader asked for; without it the plan
+    /// is only moved on if the pane is still showing one.
+    fn admit_plan(
+        &mut self,
+        pane: EntityId,
+        path: PathBuf,
+        open_if_absent: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if !open_if_absent && self.checking_plans.get(&pane) == Some(&path) {
+            return;
+        }
+        self.checking_plans.insert(pane, path.clone());
+        let probe = path.clone();
+        ctx.spawn(
+            async move { plan_is_openable(probe).await },
+            move |me, openable, ctx| {
+                if me.checking_plans.get(&pane) == Some(&path) {
+                    me.checking_plans.remove(&pane);
+                }
+                me.finish_admitting_plan(pane, path, openable, open_if_absent, ctx);
+            },
+        );
+    }
+
+    fn finish_admitting_plan(
+        &mut self,
+        pane: EntityId,
+        path: PathBuf,
+        openable: bool,
+        open_if_absent: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        // The session can have moved on to another plan, or lost it, while the file was looked at.
+        let current = ConnModel::as_ref(ctx)
+            .session(pane)
+            .and_then(|session| session.story())
+            .and_then(|story| story.plan_file.clone());
+        if current.as_ref() != Some(&path) {
+            return;
+        }
+        match (openable, self.plans.get_mut(&pane)) {
+            (true, Some(open)) => {
+                if open.path != path {
+                    open.path = path.clone();
+                    open.view.update(ctx, |view, ctx| {
+                        view.open(LocalOrRemotePath::Local(path), None, ctx)
+                    });
+                }
+            }
+            (true, None) if open_if_absent => self.create_plan(pane, path, ctx),
+            (true, None) => {}
+            (false, Some(_)) => self.close_plan(pane, ctx),
+            (false, None) => {}
+        }
+        ctx.notify();
+    }
+
+    fn create_plan(&mut self, pane: EntityId, path: PathBuf, ctx: &mut ViewContext<Self>) {
         let view = ctx.add_typed_action_view(|ctx| {
             let mut view = FileNotebookView::new(ctx);
             view.open(LocalOrRemotePath::Local(path.clone()), None, ctx);
@@ -337,8 +408,48 @@ impl ConnPanelView {
             | LinkEvent::StartLocalSession { .. }
             | LinkEvent::RefreshLinks => {}
         });
+        // The viewer's own shortcuts say what they want of the pane that holds it. This is no
+        // pane, so the ones that make sense here are answered, and the rest, such as running a
+        // workflow found in a plan, are left unanswered.
+        ctx.subscribe_to_view(&view, |me, _, event, ctx| match event {
+            FileNotebookEvent::Pane(PaneEvent::FocusActiveSession) => me.focus_terminal(ctx),
+            #[cfg(feature = "local_fs")]
+            FileNotebookEvent::Pane(PaneEvent::ReplaceWithCodePane {
+                path: LocalOrRemotePath::Local(path),
+                ..
+            }) => {
+                ctx.emit(ConnPanelEvent::OpenFileWithTarget {
+                    path: path.clone(),
+                    target: FileTarget::CodeEditor(EditorLayout::SplitPane),
+                    line_col: None,
+                });
+            }
+            #[cfg(feature = "local_fs")]
+            FileNotebookEvent::OpenFileWithTarget {
+                path,
+                target,
+                line_col,
+            } => {
+                ctx.emit(ConnPanelEvent::OpenFileWithTarget {
+                    path: path.clone(),
+                    target: target.clone(),
+                    line_col: *line_col,
+                });
+            }
+            _ => {}
+        });
         self.plans.insert(pane, OpenPlan { path, view });
-        ctx.notify();
+    }
+
+    /// Gives the keyboard back to the terminal the panel follows.
+    fn focus_terminal(&self, ctx: &mut ViewContext<Self>) {
+        if let Some(group) = self
+            .active_pane_group
+            .as_ref()
+            .and_then(|group| group.upgrade(ctx))
+        {
+            group.update(ctx, |group, ctx| group.focus_active_session(ctx));
+        }
     }
 
     fn show_story(&mut self, ctx: &mut ViewContext<Self>) {
@@ -358,6 +469,7 @@ impl ConnPanelView {
             return;
         };
         ctx.unsubscribe_to_model(&open.view.as_ref(ctx).links());
+        ctx.unsubscribe_to_view(&open.view);
         #[cfg(feature = "local_fs")]
         open.view
             .update(ctx, |view, ctx| view.release_file_model(ctx));
@@ -1290,13 +1402,28 @@ fn plan_path_is_plausible(path: &Path) -> bool {
         && !super::project::names_network_host(path)
 }
 
-/// Whether a plan can be opened: a plausible path to a regular file of bounded size. This asks the
-/// filesystem, so it runs when a plan is opened or changes, not on every frame. A file that grows
-/// past the bound after it is open is not caught.
-fn plan_is_openable(path: &Path) -> bool {
+/// How long a plan may take to be looked at before it is taken as unopenable.
+const PLAN_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Whether a plan can be opened: a plausible path to a regular file of bounded size. A file that
+/// grows past the bound after it is open is not caught.
+///
+/// This asks the filesystem and may wait on it, so it is only ever called through
+/// [`plan_is_openable`], off the main thread.
+fn plan_is_openable_blocking(path: &Path) -> bool {
     plan_path_is_plausible(path)
         && std::fs::metadata(path)
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() <= MAX_PLAN_BYTES)
+}
+
+/// [`plan_is_openable_blocking`] on a thread of its own, given up on after
+/// [`PLAN_PROBE_TIMEOUT`]. A plan that cannot be looked at in time is not opened.
+async fn plan_is_openable(path: PathBuf) -> bool {
+    if !plan_path_is_plausible(&path) {
+        return false;
+    }
+    let probe = tokio::task::spawn_blocking(move || plan_is_openable_blocking(&path));
+    matches!(probe.with_timeout(PLAN_PROBE_TIMEOUT).await, Ok(Ok(true)))
 }
 
 /// A live hook event as a label and a line.
