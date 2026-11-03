@@ -66,8 +66,15 @@ impl PluginRunner {
 
         // Apply declarative `contributes.keybindings` (PLUGIN_SPEC.md §6) — no plugin code runs for
         // these. A binding resolves its command id at key-press time, so it works regardless of
-        // whether/when `activate()` registers the matching command handler.
-        for keybinding in &manifest.contributes.keybindings {
+        // whether/when `activate()` registers the matching command handler. They need the
+        // `commands` permission, like `warp.keymap.bind`.
+        let declared = manifest.contributes.keybindings.len();
+        if declared > 0 && manifest.permitted_keybindings().is_empty() {
+            log::warn!(
+                "Plugin {plugin_id:?} declares {declared} keybinding(s) but not the `commands` permission; ignoring them"
+            );
+        }
+        for keybinding in manifest.permitted_keybindings() {
             super::app_request::send_app_request(PluginAppRequest::BindKey {
                 keys: keybinding.key.clone(),
                 command_id: keybinding.command.clone(),

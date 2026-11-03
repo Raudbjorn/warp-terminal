@@ -52,6 +52,26 @@ fn setup_timeout_reports_failed_with_command_and_duration() {
 }
 
 #[test]
+fn checkout_helper_timeout_is_classified_like_a_setup_command_timeout() {
+    // The helper may still be running in the terminal, so this must take the same
+    // no-retention path as a timed-out setup command.
+    let error = AgentDriverError::from(PrepareEnvironmentError::CheckoutHelperTimedOut {
+        timeout_seconds: 1800,
+    });
+    assert!(matches!(
+        &error,
+        AgentDriverError::SetupCommandTimedOut { .. }
+    ));
+    let (state, update) = classify_driver_error(&error);
+    assert_eq!(state, AgentTaskState::Failed);
+    assert_eq!(
+        update.error_code,
+        Some(PlatformErrorCode::EnvironmentSetupFailed)
+    );
+    assert!(update.message.contains("1800s"));
+}
+
+#[test]
 fn retryable_dependency_credentials_failure_is_error_with_structured_metadata() {
     let info = PlatformErrorInfo {
         error_message: Some("GitHub is temporarily unavailable.".to_string()),

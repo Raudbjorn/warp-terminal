@@ -13,21 +13,104 @@ fn parses_announcement_with_address_alias() {
 }
 
 #[test]
-fn parses_loose_port_pattern() {
-    let ann = OpenCodeAnnouncement::from_line("listening on port=54321").unwrap();
-    assert_eq!(ann.port, 54321);
-}
-
-#[test]
-fn parses_trailing_colon_pattern() {
-    let ann = OpenCodeAnnouncement::from_line("ready:43123").unwrap();
-    assert_eq!(ann.port, 43123);
-}
-
-#[test]
 fn rejects_zero_port() {
-    let err = OpenCodeAnnouncement::from_line("port=0");
-    assert!(err.is_err());
+    for line in [
+        r#"{"port":0}"#,
+        r#"{"url":"http://127.0.0.1:0"}"#,
+        "server listening on http://127.0.0.1:0",
+    ] {
+        assert!(
+            OpenCodeAnnouncement::from_line(line).is_err(),
+            "{line:?} must not parse as an announcement"
+        );
+    }
+}
+
+fn announced_port(line: &str) -> Option<u16> {
+    OpenCodeAnnouncement::from_line(line)
+        .ok()
+        .map(|ann| ann.port)
+}
+
+#[test]
+fn only_the_listening_line_of_a_noisy_startup_is_an_announcement() {
+    // The lines from the bug report: each of the last four used to be read
+    // as a port (33, 33, 5, 443).
+    assert_eq!(
+        announced_port("opencode server listening on http://127.0.0.1:43123"),
+        Some(43123)
+    );
+    for line in [
+        "2026-10-31T11:22:33",
+        "INFO  starting at 11:22:33",
+        "ETA 00:05",
+        "see https://opencode.ai/docs:443 for help",
+    ] {
+        assert_eq!(announced_port(line), None, "{line:?}");
+    }
+}
+
+#[test]
+fn loose_port_forms_are_not_announcements() {
+    for line in [
+        "listening on port=54321",
+        "port=43123",
+        "ready:43123",
+        r#"{"msg":"started","detail":"\"port\":43123"}"#,
+        r#"{"port":"43123"}"#,
+        r#"{"port":70000}"#,
+        "{not json, port: 43123}",
+    ] {
+        assert_eq!(announced_port(line), None, "{line:?}");
+    }
+}
+
+#[test]
+fn listening_marker_only_counts_in_the_announcement_form() {
+    // Text before the marker that is not the word `server` makes it some other line.
+    for line in [
+        "not listening on http://127.0.0.1:43123",
+        "proxy listening on http://127.0.0.1:43123",
+        "observer listening on http://127.0.0.1:43123",
+        "INFO not listening on http://127.0.0.1:43123",
+        "server not listening on http://127.0.0.1:43123",
+    ] {
+        assert_eq!(announced_port(line), None, "{line:?}");
+    }
+    for line in [
+        "listening on http://127.0.0.1:43123",
+        "server listening on http://127.0.0.1:43123",
+        "Opencode Server Listening On http://127.0.0.1:43123",
+        "2026-11-03T04:04:00 INFO server listening on http://127.0.0.1:43123",
+    ] {
+        assert_eq!(announced_port(line), Some(43123), "{line:?}");
+    }
+}
+
+#[test]
+fn announcement_must_name_this_machine() {
+    for line in [
+        "server listening on http://example.com:8080",
+        "server listening on http://10.0.0.5:4096",
+        "server listening on ftp://127.0.0.1:4096",
+        "server listening on",
+        // `spawn` connects to 127.0.0.1, which a listener on the IPv6 loopback alone
+        // does not answer on.
+        "server listening on http://[::1]:4096",
+        r#"{"url":"http://[::1]:4096"}"#,
+        r#"{"url":"http://example.com:8080"}"#,
+    ] {
+        assert_eq!(announced_port(line), None, "{line:?}");
+    }
+    for (line, port) in [
+        (
+            "INFO server listening on http://127.0.0.1:4096/ (pid 7)",
+            4096,
+        ),
+        (r#"{"url":"http://127.0.0.1:43123"}"#, 43123),
+    ] {
+        assert_eq!(announced_port(line), Some(port), "{line:?}");
+    }
 }
 
 #[test]
@@ -78,9 +161,13 @@ async fn spawn_rejects_empty_command() {
 async fn pool_replaces_exited_sidecar() {
     // `sh` announces a port and exits straight away, standing in for a
     // sidecar that crashes after becoming ready.
+    let server = raw_server(RawOptions::default()).await;
     let args = vec![
         "-c".to_string(),
-        "echo 'server listening on http://127.0.0.1:43123'".to_string(),
+        format!(
+            "echo 'server listening on http://127.0.0.1:{}'",
+            server.port
+        ),
     ];
     let pool = OpenCodeSidecarPool::new();
     let dir = std::env::temp_dir();
@@ -314,19 +401,22 @@ fn timestamp_in_a_log_line_is_not_a_port() {
     }
 }
 
-// Shell one-liners standing in for a sidecar: announce, then stay alive.
+// Shell one-liners standing in for a sidecar: announce `port`, then stay
+// alive. `spawn` checks the announced port, so it has to be a live
+// `raw_server`'s.
 #[cfg(unix)]
-fn announce_then_sleep(prelude: &str) -> Vec<String> {
+fn announce_then_sleep(port: u16, prelude: &str) -> Vec<String> {
     vec![
         "-c".to_string(),
-        format!("{prelude} echo 'server listening on http://127.0.0.1:43123'; sleep 30"),
+        format!("{prelude} echo 'server listening on http://127.0.0.1:{port}'; sleep 30"),
     ]
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn pool_reuses_a_live_sidecar() {
-    let args = announce_then_sleep("");
+    let server = raw_server(RawOptions::default()).await;
+    let args = announce_then_sleep(server.port, "");
     let pool = OpenCodeSidecarPool::new();
     let dir = std::env::temp_dir();
 
@@ -339,7 +429,8 @@ async fn pool_reuses_a_live_sidecar() {
 #[cfg(unix)]
 #[tokio::test]
 async fn pool_does_not_keep_a_sidecar_spawned_before_clear() {
-    let args = announce_then_sleep("sleep 0.3;");
+    let server = raw_server(RawOptions::default()).await;
+    let args = announce_then_sleep(server.port, "sleep 0.3;");
     let pool = OpenCodeSidecarPool::new();
     let dir = std::env::temp_dir();
 
@@ -361,7 +452,8 @@ async fn pool_does_not_keep_a_sidecar_spawned_before_clear() {
 async fn startup_survives_a_flood_of_stderr() {
     // 200 KB on stderr is well over a pipe buffer; if stderr is not
     // drained during startup the child blocks and never announces.
-    let args = announce_then_sleep("head -c 200000 /dev/zero >&2;");
+    let server = raw_server(RawOptions::default()).await;
+    let args = announce_then_sleep(server.port, "head -c 200000 /dev/zero >&2;");
     let dir = std::env::temp_dir();
 
     let spawned = tokio::time::timeout(Duration::from_secs(10), spawn("sh", &args, &dir))
@@ -373,14 +465,34 @@ async fn startup_survives_a_flood_of_stderr() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn verification_ends_with_the_generated_password() {
+    use base64::Engine as _;
+    let server = raw_server(RawOptions::default()).await;
+    let args = announce_then_sleep(server.port, "");
+
+    let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
+
+    let expected = base64::engine::general_purpose::STANDARD
+        .encode(format!("{SERVER_USERNAME}:{}", sidecar.inner.password));
+    let seen = server.credentials_seen.lock().unwrap();
+    assert_eq!(seen.first(), Some(&wrong_password_credentials()));
+    assert_eq!(seen.last(), Some(&expected), "{seen:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn sidecar_password_is_set_under_both_env_names() {
     // OpenCode reads OPENCODE_PASSWORD before OPENCODE_SERVER_PASSWORD, so
     // setting only the second lets an inherited first one win.
     let out = std::env::temp_dir().join(format!("opencode-env-{}", uuid::Uuid::new_v4()));
-    let args = announce_then_sleep(&format!(
-        "printf '%s\\n%s' \"$OPENCODE_PASSWORD\" \"$OPENCODE_SERVER_PASSWORD\" > '{}';",
-        out.display()
-    ));
+    let server = raw_server(RawOptions::default()).await;
+    let args = announce_then_sleep(
+        server.port,
+        &format!(
+            "printf '%s\\n%s' \"$OPENCODE_PASSWORD\" \"$OPENCODE_SERVER_PASSWORD\" > '{}';",
+            out.display()
+        ),
+    );
 
     let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
 
@@ -444,21 +556,85 @@ async fn non_utf8_working_dir_is_rejected_before_any_request() {
 /// that never answers, and DELETEs that fail before one succeeds.
 struct RawServer {
     url: String,
+    port: u16,
     generate_started: Arc<tokio::sync::Notify>,
     deletes: Arc<std::sync::atomic::AtomicUsize>,
+    /// The Basic credentials (base64, as sent) of every `GET /api/session`, in order.
+    credentials_seen: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
-async fn raw_server(hang_on_generate: bool, failing_deletes: usize) -> RawServer {
+/// How the raw server answers `GET /api/session`, which `spawn` uses to
+/// check that an announced port belongs to the sidecar.
+#[derive(Clone, Copy, Default)]
+enum ProbeReply {
+    /// A real sidecar: 401 without Basic auth, an empty session list with it.
+    #[default]
+    Sidecar,
+    /// Some other service that does not know our password.
+    Unauthorized,
+    /// A listener that ignores authentication and returns a valid session list.
+    IgnoresAuth,
+    /// A listener that wants some Basic credential but accepts any password.
+    AcceptsAnyPassword,
+    /// A server that requires authentication but answers with a malformed session list.
+    InvalidSessionList,
+    /// A web server that answers every path with 200 and an HTML page.
+    CatchAll,
+}
+
+#[derive(Default)]
+struct RawOptions {
+    hang_on_generate: bool,
+    failing_deletes: usize,
+    probe: ProbeReply,
+}
+
+/// The base64 `user:password` of a request's `Authorization: Basic` header, if it has one.
+fn basic_credentials(request: &str) -> Option<String> {
+    request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.eq_ignore_ascii_case("authorization") {
+            return None;
+        }
+        let value = value.trim();
+        let (scheme, credentials) = value.split_once(' ')?;
+        scheme
+            .eq_ignore_ascii_case("basic")
+            .then(|| credentials.to_string())
+    })
+}
+
+/// `basic_credentials` of the request `verify_sidecar` sends with a wrong password.
+fn wrong_password_credentials() -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD
+        .encode(format!("{SERVER_USERNAME}:{WRONG_PASSWORD_PROBE}"))
+}
+
+async fn raw_server(options: RawOptions) -> RawServer {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    raw_server_on(listener, options)
+}
+
+fn raw_server_on(listener: tokio::net::TcpListener, options: RawOptions) -> RawServer {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let RawOptions {
+        hang_on_generate,
+        failing_deletes,
+        probe,
+    } = options;
+    let local_addr = listener.local_addr().unwrap();
     let server = RawServer {
-        url: format!("http://{}", listener.local_addr().unwrap()),
+        url: format!("http://{local_addr}"),
+        port: local_addr.port(),
         generate_started: Arc::default(),
         deletes: Arc::default(),
+        credentials_seen: Arc::default(),
     };
     let started = Arc::clone(&server.generate_started);
     let deletes = Arc::clone(&server.deletes);
+    let credentials_seen = Arc::clone(&server.credentials_seen);
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -466,6 +642,7 @@ async fn raw_server(hang_on_generate: bool, failing_deletes: usize) -> RawServer
             };
             let started = Arc::clone(&started);
             let deletes = Arc::clone(&deletes);
+            let credentials_seen = Arc::clone(&credentials_seen);
             tokio::spawn(async move {
                 // Read the headers, then the body they announce, so closing
                 // the socket never resets a request that is still arriving.
@@ -503,6 +680,36 @@ async fn raw_server(hang_on_generate: bool, failing_deletes: usize) -> RawServer
                         std::future::pending::<()>().await;
                     }
                     (200, r#"{"data":{"text":"ls"}}"#)
+                } else if request_line.starts_with("GET /api/session") {
+                    let credentials = basic_credentials(&text);
+                    if let Some(credentials) = &credentials {
+                        credentials_seen.lock().unwrap().push(credentials.clone());
+                    }
+                    // The password `spawn` generated is not known here, but the one it
+                    // probes with first is: refuse that one, accept any other.
+                    let authorized = credentials
+                        .as_ref()
+                        .is_some_and(|sent| *sent != wrong_password_credentials());
+                    match probe {
+                        ProbeReply::Sidecar if authorized => (200, r#"{"data":[]}"#),
+                        ProbeReply::Sidecar | ProbeReply::Unauthorized => {
+                            (401, r#"{"message":"Authentication required"}"#)
+                        }
+                        ProbeReply::IgnoresAuth => (200, r#"{"data":[]}"#),
+                        ProbeReply::AcceptsAnyPassword if credentials.is_some() => {
+                            (200, r#"{"data":[]}"#)
+                        }
+                        ProbeReply::AcceptsAnyPassword => {
+                            (401, r#"{"message":"Authentication required"}"#)
+                        }
+                        ProbeReply::InvalidSessionList if authorized => {
+                            (200, "<!doctype html><html></html>")
+                        }
+                        ProbeReply::InvalidSessionList => {
+                            (401, r#"{"message":"Authentication required"}"#)
+                        }
+                        ProbeReply::CatchAll => (200, "<!doctype html><html></html>"),
+                    }
                 } else if request_line.starts_with("DELETE ") {
                     let seen = deletes.fetch_add(1, Ordering::SeqCst);
                     if seen < failing_deletes {
@@ -552,7 +759,11 @@ async fn run_raw_generate(server: &RawServer) -> Result<String, OpenCodeError> {
 
 #[tokio::test]
 async fn cancelled_request_still_deletes_its_session() {
-    let server = raw_server(true, 0).await;
+    let server = raw_server(RawOptions {
+        hang_on_generate: true,
+        ..Default::default()
+    })
+    .await;
 
     // Drop the request once the generate call is in flight, as aborting a
     // superseded prediction does.
@@ -568,7 +779,11 @@ async fn cancelled_request_still_deletes_its_session() {
 
 #[tokio::test]
 async fn failed_delete_is_retried_once_in_the_background() {
-    let server = raw_server(false, 1).await;
+    let server = raw_server(RawOptions {
+        failing_deletes: 1,
+        ..Default::default()
+    })
+    .await;
 
     // The request succeeds even though its inline DELETE got a 500.
     assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
@@ -580,10 +795,150 @@ async fn failed_delete_is_retried_once_in_the_background() {
 
 #[tokio::test]
 async fn successful_delete_is_not_repeated() {
-    let server = raw_server(false, 0).await;
+    let server = raw_server(RawOptions::default()).await;
 
     assert_eq!(run_raw_generate(&server).await.unwrap(), "ls");
 
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(server.deletes.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn json_port_after_a_timestamped_log_line_is_the_one_used() {
+    // A sidecar whose first stdout line is a log line with a timestamp.
+    let server = raw_server(RawOptions::default()).await;
+    let args = vec![
+        "-c".to_string(),
+        format!(
+            "echo '2026-10-31T11:22:33 starting'; echo '{{\"port\": {}}}'; sleep 30",
+            server.port
+        ),
+    ];
+
+    let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
+
+    assert_eq!(sidecar.inner.base_url, server.url);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn announced_port_that_is_not_our_sidecar_is_refused() {
+    for (probe, expected) in [
+        (ProbeReply::Unauthorized, "401"),
+        (
+            ProbeReply::InvalidSessionList,
+            "not an OpenCode session list",
+        ),
+        (ProbeReply::CatchAll, "does not enforce the password"),
+    ] {
+        let server = raw_server(RawOptions {
+            probe,
+            ..Default::default()
+        })
+        .await;
+        let args = announce_then_sleep(server.port, "");
+
+        let Err(err) = spawn("sh", &args, &std::env::temp_dir()).await else {
+            panic!("a port that does not answer as the sidecar must be refused");
+        };
+
+        assert!(
+            matches!(
+                &err,
+                OpenCodeError::PortNotVerified { port, reason }
+                    if *port == server.port && reason.contains(expected)
+            ),
+            "{err:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sidecar_that_ignores_authentication_is_refused() {
+    let server = raw_server(RawOptions {
+        probe: ProbeReply::IgnoresAuth,
+        ..Default::default()
+    })
+    .await;
+    let args = announce_then_sleep(server.port, "");
+
+    let Err(err) = spawn("sh", &args, &std::env::temp_dir()).await else {
+        panic!("a port that accepts unauthenticated requests must be refused");
+    };
+
+    assert!(
+        matches!(
+            &err,
+            OpenCodeError::PortNotVerified { port, reason }
+                if *port == server.port && reason.contains("does not enforce the password")
+        ),
+        "{err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn listener_that_accepts_any_password_never_sees_the_generated_one() {
+    let server = raw_server(RawOptions {
+        probe: ProbeReply::AcceptsAnyPassword,
+        ..Default::default()
+    })
+    .await;
+    let args = announce_then_sleep(server.port, "");
+
+    let Err(err) = spawn("sh", &args, &std::env::temp_dir()).await else {
+        panic!("a listener that accepts any password must be refused");
+    };
+
+    assert!(
+        matches!(
+            &err,
+            OpenCodeError::PortNotVerified { port, reason }
+                if *port == server.port && reason.contains("accepted a wrong password")
+        ),
+        "{err:?}"
+    );
+    // Every credential it was sent was the throwaway one.
+    let seen = server.credentials_seen.lock().unwrap();
+    assert!(!seen.is_empty());
+    assert!(
+        seen.iter()
+            .all(|sent| *sent == wrong_password_credentials()),
+        "the generated password reached the listener: {seen:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn listening_line_of_another_process_before_the_announcement_is_ignored() {
+    let server = raw_server(RawOptions::default()).await;
+    // A port nothing answers on, named by a line that is not the sidecar's announcement.
+    let args = announce_then_sleep(server.port, "echo 'not listening on http://127.0.0.1:1';");
+
+    let sidecar = spawn("sh", &args, &std::env::temp_dir()).await.unwrap();
+
+    assert_eq!(sidecar.inner.base_url, server.url);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sidecar_that_starts_listening_late_is_still_accepted() {
+    // Announce a port nothing serves yet, and start serving half a second later. The socket
+    // is bound but not listening, so the port stays ours in between and connections to it
+    // are refused (which is what the retry in `verify_sidecar` is for) until `listen`.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let args = announce_then_sleep(port, "");
+
+    let dir = std::env::temp_dir();
+    let (spawned, ()) = tokio::join!(spawn("sh", &args, &dir), async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let listener = socket.listen(1024).unwrap();
+        raw_server_on(listener, RawOptions::default());
+    });
+
+    assert!(spawned.unwrap().is_alive());
 }

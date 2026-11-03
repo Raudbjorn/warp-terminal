@@ -107,7 +107,7 @@ where
         "{}{}/graphql/v2?op={}",
         ChannelState::server_root_url(),
         options.path_prefix.unwrap_or_default(),
-        &operation_name
+        operation_name
     );
 
     let mut req = client.post(&graphql_endpoint).json(&operation);

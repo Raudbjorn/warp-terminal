@@ -54,6 +54,16 @@ pub const DEFAULT_OPENCODE_ARGS: &[&str] = &["serve", "--port", "0"];
 /// start (database migration) has been observed to take ~20s.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Budget for confirming that the announced port is the sidecar's own. A port
+/// that refuses connections is retried every `VERIFY_RETRY_DELAY`, at most
+/// `VERIFY_ATTEMPTS` times.
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+const VERIFY_RETRY_DELAY: Duration = Duration::from_millis(200);
+const VERIFY_ATTEMPTS: u32 = 25;
+
+/// Upper bound on one verification request.
+const VERIFY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Longest startup line buffered while waiting for the port announcement. The
 /// announcement itself is a short line, so a sidecar that writes this much
 /// without a newline is not announcing anything.
@@ -69,6 +79,10 @@ const SERVER_USERNAME_ENV: &str = "OPENCODE_SERVER_USERNAME";
 const SERVER_PASSWORD_ENVS: [&str; 2] = ["OPENCODE_PASSWORD", "OPENCODE_SERVER_PASSWORD"];
 const SERVER_USERNAME: &str = "opencode";
 
+/// A password no sidecar was given. `verify_sidecar` sends it before the real one, to find out
+/// whether the listener checks the password at all.
+const WRONG_PASSWORD_PROBE: &str = "not-the-password-of-this-sidecar";
+
 /// Longest slice of an unparseable error body we echo into an error message.
 const ERROR_BODY_PREVIEW_CHARS: usize = 200;
 
@@ -82,6 +96,10 @@ pub enum OpenCodeError {
     StartupFailure(#[allow(dead_code)] String),
     #[error("OpenCode sidecar stdout could not be parsed: {0}")]
     BadAnnouncement(String),
+    #[error(
+        "port {port} announced by the OpenCode sidecar does not answer as that sidecar: {reason}"
+    )]
+    PortNotVerified { port: u16, reason: String },
     #[error("No working directory available for OpenCode sidecar")]
     NoWorkingDirectory,
     #[error("OpenCode sidecar I/O failed: {0}")]
@@ -96,89 +114,95 @@ pub enum OpenCodeError {
     EmptyResponse,
 }
 
-/// JSON announcement OpenCode prints once it is bound to a port.
-/// We accept the minimum subset; unknown fields are ignored.
-#[derive(Debug, Deserialize)]
+/// Hosts an announcement may name. `spawn` always connects to `127.0.0.1`
+/// whatever host the sidecar prints, so the host only has to say that the
+/// listener is on this machine: a line about some other address is not ours.
+///
+/// `[::1]` is left out on purpose. A listener that is only on the IPv6 loopback does not
+/// answer on `127.0.0.1`, so accepting its announcement would just fail the verification of
+/// an address the sidecar never claimed.
+const ANNOUNCED_HOSTS: [&str; 4] = ["127.0.0.1", "localhost", "0.0.0.0", "[::]"];
+
+/// Text that precedes the address in OpenCode's own startup line,
+/// `server listening on http://127.0.0.1:43123`.
+const LISTENING_MARKER: &str = "listening on ";
+
+/// The word that has to come right before [`LISTENING_MARKER`] unless the marker starts the
+/// line. OpenCode prints `opencode server listening on <url>`, and a log prefix such as a level
+/// or a timestamp may come before that.
+const LISTENING_SUBJECT: &str = "server";
+
+/// The port a sidecar announced on stdout.
+///
+/// Two forms are accepted, and nothing looser: a JSON object with a numeric
+/// `port` (or a `url`/`address` string holding a loopback URL), and OpenCode's
+/// own `listening on <loopback URL>` line. Startup output is mostly log lines,
+/// so a lenient reading (a `port=` scan, the digits after any `:`) takes
+/// timestamps and documentation links for ports and sends the prompt there.
+/// `spawn` still checks that the port answers as this sidecar before using it.
+#[derive(Debug)]
 struct OpenCodeAnnouncement {
-    /// Listening port. Newer OpenCode versions print a bare JSON number
-    /// (`{"port": 43123}`); the `#[serde(alias)]`s also accept a *numeric*
-    /// `address`/`url` field. String forms (`{"url":"http://127.0.0.1:43123"}`
-    /// or the plain-text `ready:43123`) cannot deserialize into `u16`, so they
-    /// fall through to the URL/heuristic parsing in `from_line`.
-    #[serde(alias = "address", alias = "url")]
     port: u16,
 }
 
 impl OpenCodeAnnouncement {
     fn from_line(line: &str) -> Result<Self, OpenCodeError> {
-        if let Ok(parsed) = serde_json::from_str::<OpenCodeAnnouncement>(line) {
-            // Reject port 0 even in JSON form (bind(2) would assign a random
-            // port, but the announcement should report the actual bound port).
-            if parsed.port == 0 {
-                return Err(OpenCodeError::BadAnnouncement(line.to_string()));
-            }
-            return Ok(parsed);
-        }
-
-        // JSON parse failed; try the most explicit patterns first so
-        // that URL-style addresses (e.g. `http://127.0.0.1:43123`) do
-        // not get the wrong port from the first `:` separator.
-        for marker in ["port=", "\"port\":"] {
-            if let Some(idx) = line.find(marker) {
-                let tail = &line[idx + marker.len()..];
-                let digits: String = tail
-                    .chars()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(port) = digits.parse::<u16>() {
-                    if port > 0 {
-                        return Ok(OpenCodeAnnouncement { port });
-                    }
-                }
-            }
-        }
-
-        // URL pattern: `scheme://host:port` — the port is after the
-        // `:` that follows the host portion, not the `:` in `://`.
-        if line.contains("://") {
-            if let Some(scheme_end) = line.find("://") {
-                let after_scheme = &line[scheme_end + 3..];
-                // Use `rfind` so the port separator is found after the host,
-                // including IPv6 hosts like `[::1]:43123` whose host contains `:`.
-                if let Some(host_end) = after_scheme.rfind(':') {
-                    let port_str: String = after_scheme[host_end + 1..]
-                        .chars()
-                        .take_while(|c| c.is_ascii_digit())
-                        .collect();
-                    if let Ok(port) = port_str.parse::<u16>() {
-                        if port > 0 {
-                            return Ok(OpenCodeAnnouncement { port });
-                        }
-                    }
-                }
-            }
-        }
-
-        // Last resort: the whole line is `word:NNNN` (e.g. `ready:43123`).
-        // Anchoring on the whole line keeps the tail of an unrelated log
-        // line, such as the seconds in a `12:34:56Z` timestamp, from being
-        // read as a port.
-        if let Some((word, digits)) = line.split_once(':') {
-            let is_word = !word.is_empty()
-                && word
-                    .chars()
-                    .all(|c| c.is_ascii_alphabetic() || c == '_' || c == '-');
-            if is_word && !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()) {
-                if let Ok(port) = digits.parse::<u16>() {
-                    if port > 0 {
-                        return Ok(OpenCodeAnnouncement { port });
-                    }
-                }
-            }
-        }
-        Err(OpenCodeError::BadAnnouncement(line.to_string()))
+        Self::parse(line).ok_or_else(|| OpenCodeError::BadAnnouncement(line.to_string()))
     }
+
+    fn parse(line: &str) -> Option<Self> {
+        let line = line.trim();
+        let port = if line.starts_with('{') {
+            port_from_json(line)?
+        } else {
+            port_from_listening_line(line)?
+        };
+        // Port 0 means "pick one for me" to bind(2); an announcement has to
+        // name the port that was actually bound.
+        (port != 0).then_some(Self { port })
+    }
+}
+
+fn port_from_json(line: &str) -> Option<u16> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let object = value.as_object()?;
+    if let Some(port) = object.get("port") {
+        return u16::try_from(port.as_u64()?).ok();
+    }
+    ["url", "address"]
+        .into_iter()
+        .find_map(|key| port_from_url(object.get(key)?.as_str()?))
+}
+
+/// The port of OpenCode's `server listening on <url>` line. The marker only counts when it starts
+/// the line or follows the word `server`, so `not listening on http://127.0.0.1:43123` is some
+/// other process's log line and not an announcement.
+fn port_from_listening_line(line: &str) -> Option<u16> {
+    // ASCII lowercasing keeps byte offsets, so a match position indexes `line`.
+    let lowered = line.to_ascii_lowercase();
+    lowered
+        .match_indices(LISTENING_MARKER)
+        .filter(|(marker_at, _)| {
+            lowered[..*marker_at]
+                .split_whitespace()
+                .next_back()
+                .is_none_or(|word| word == LISTENING_SUBJECT)
+        })
+        .find_map(|(marker_at, _)| {
+            let url = line[marker_at + LISTENING_MARKER.len()..]
+                .split_whitespace()
+                .next()?;
+            port_from_url(url)
+        })
+}
+
+/// Port of an `http(s)` URL whose host is one of `ANNOUNCED_HOSTS`.
+fn port_from_url(text: &str) -> Option<u16> {
+    let url = url::Url::parse(text).ok()?;
+    if !matches!(url.scheme(), "http" | "https") || !ANNOUNCED_HOSTS.contains(&url.host_str()?) {
+        return None;
+    }
+    url.port_or_known_default()
 }
 
 #[allow(dead_code)]
@@ -251,7 +275,8 @@ impl OpenCodeSidecar {
 ///
 /// `command` is the binary name or absolute path; `args` is passed verbatim.
 /// The first non-empty, non-`#`-prefixed line of stdout that parses as a
-/// port announcement is treated as the bound port.
+/// port announcement (see `OpenCodeAnnouncement`) is treated as the bound
+/// port, and `spawn` fails unless that port answers as this sidecar.
 pub async fn spawn(
     command: &str,
     args: &[String],
@@ -313,6 +338,27 @@ pub async fn spawn(
     // the sidecar never blocks (or gets EPIPE) writing further stdout.
     discard_in_background(stdout);
 
+    // The announcement is text from a process we do not control. Before any
+    // prompt is sent anywhere, check that the port answers to the password
+    // only this sidecar was given.
+    //
+    // The probe goes straight to loopback: through an ambient `HTTP_PROXY` it would either fail a
+    // healthy sidecar or hand the proxy the Basic-auth password.
+    let verified = tokio::time::timeout(
+        VERIFY_TIMEOUT,
+        verify_sidecar(
+            &http_client::Client::new_external_without_proxy(),
+            &base_url,
+            &password,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_elapsed| Err(format!("no answer within {VERIFY_TIMEOUT:?}")));
+    if let Err(reason) = verified {
+        let _ = process.kill();
+        return Err(OpenCodeError::PortNotVerified { port, reason });
+    }
+
     // Spawn the background task that owns the kill path.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let exited = Arc::new(AtomicBool::new(false));
@@ -327,6 +373,75 @@ pub async fn spawn(
             password,
         }),
     })
+}
+
+/// Check that `base_url` is the sidecar that was just spawned: it must reject
+/// unauthenticated requests and a wrong password, accept the Basic-auth password
+/// generated for it, and answer with an OpenCode session list. A stray listener on
+/// a misread port cannot satisfy all of these. The generated password is sent only
+/// after the listener has refused both, so a listener that accepts any credential
+/// never sees it. Only a refused connection is retried, since that is what a
+/// sidecar that is not yet accepting looks like.
+async fn verify_sidecar(
+    client: &http_client::Client,
+    base_url: &str,
+    password: &str,
+) -> Result<(), String> {
+    let mut last_error = String::new();
+    // `limit=1` keeps the reply small for a project with many sessions.
+    let endpoint = format!("{base_url}/api/session?limit=1");
+    'attempts: for attempt in 0..VERIFY_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(VERIFY_RETRY_DELAY).await;
+        }
+        for (credentials, what) in [
+            (None, "an unauthenticated request"),
+            (Some(WRONG_PASSWORD_PROBE), "a wrong password"),
+        ] {
+            let mut probe = client.get(&endpoint).timeout(VERIFY_REQUEST_TIMEOUT);
+            if let Some(wrong_password) = credentials {
+                probe = probe.basic_auth(SERVER_USERNAME, Some(wrong_password));
+            }
+            match probe.send().await {
+                Ok(response) if response.status().is_success() => {
+                    return Err(format!(
+                        "/api/session accepted {what}; the endpoint does not enforce the password"
+                    ));
+                }
+                Ok(response)
+                    if response.status() != http_client::StatusCode::UNAUTHORIZED
+                        && response.status() != http_client::StatusCode::FORBIDDEN =>
+                {
+                    return Err(format!(
+                        "{} from /api/session for {what}",
+                        response.status()
+                    ));
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    last_error = err.to_string();
+                    continue 'attempts;
+                }
+            }
+        }
+
+        let request = client
+            .get(&endpoint)
+            .basic_auth(SERVER_USERNAME, Some(password))
+            .timeout(VERIFY_REQUEST_TIMEOUT);
+        match request.send().await {
+            Ok(response) if response.status().is_success() => {
+                return response
+                    .json::<DataEnvelope<Vec<serde::de::IgnoredAny>>>()
+                    .await
+                    .map(|_| ())
+                    .map_err(|err| format!("reply is not an OpenCode session list: {err}"));
+            }
+            Ok(response) => return Err(format!("{} from /api/session", response.status())),
+            Err(err) => last_error = err.to_string(),
+        }
+    }
+    Err(last_error)
 }
 
 /// Read `stdout` line by line until one parses as a port announcement.
