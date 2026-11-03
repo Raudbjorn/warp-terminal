@@ -1368,7 +1368,11 @@ impl From<PrepareEnvironmentError> for AgentDriverError {
                     output,
                 }
             }
-            PrepareEnvironmentError::SetupCommandTimedOut { .. } => {
+            // The checkout helper runs in the terminal like a setup command, and dropping its
+            // wait on timeout does not stop it. Classify both alike so the failure-linger
+            // window never retains a terminal whose helper may still be modifying repositories.
+            PrepareEnvironmentError::SetupCommandTimedOut { .. }
+            | PrepareEnvironmentError::CheckoutHelperTimedOut { .. } => {
                 AgentDriverError::SetupCommandTimedOut { message }
             }
             _ => AgentDriverError::EnvironmentSetupFailed(message),
@@ -4992,9 +4996,22 @@ fn typed_secret_entries(secret: &ManagedSecretValue) -> Vec<(&'static str, &str)
         ManagedSecretValue::LlmProviderApiKey {
             provider_id,
             api_key,
-            ..
+            base_url,
         } => match provider_id.as_str() {
-            "anthropic" => vec![("ANTHROPIC_API_KEY", api_key.as_str())],
+            // Claude Code reads its endpoint from the environment. The URL is part of the same
+            // typed secret, so a worker-set `ANTHROPIC_BASE_URL` skips the key too and the key is
+            // never sent to an endpoint other than the one it was stored with.
+            "anthropic" => {
+                let mut entries = vec![("ANTHROPIC_API_KEY", api_key.as_str())];
+                if let Some(url) = base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|url| !url.is_empty())
+                {
+                    entries.push(("ANTHROPIC_BASE_URL", url));
+                }
+                entries
+            }
             "openai" => vec![("OPENAI_API_KEY", api_key.as_str())],
             // Pi reads every other provider's key from its auth.json.
             _ => vec![],

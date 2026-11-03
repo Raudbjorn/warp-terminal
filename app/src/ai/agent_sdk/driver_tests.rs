@@ -1071,6 +1071,66 @@ fn llm_provider_keys_only_enter_the_environment_for_env_backed_providers() {
 
 #[test]
 #[serial_test::serial]
+fn anthropic_provider_key_exports_its_base_url_for_claude() {
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+    }
+    let secrets = HashMap::from([(
+        "ANTHROPIC".to_owned(),
+        ManagedSecretValue::llm_provider_api_key(
+            "anthropic",
+            "anthropic-key",
+            Some(" https://proxy.example ".to_owned()),
+        ),
+    )]);
+
+    assert_eq!(
+        build_secret_env_vars(&secrets, &HashMap::new()).unwrap(),
+        HashMap::from([
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from("anthropic-key")
+            ),
+            (
+                OsString::from("ANTHROPIC_BASE_URL"),
+                OsString::from("https://proxy.example")
+            ),
+        ])
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn anthropic_provider_key_is_skipped_whole_when_the_runtime_env_sets_the_endpoint() {
+    // TODO: Audit that the environment access only happens in single-threaded code.
+    unsafe {
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("ANTHROPIC_BASE_URL");
+    }
+    let secrets = HashMap::from([(
+        "ANTHROPIC".to_owned(),
+        ManagedSecretValue::llm_provider_api_key(
+            "anthropic",
+            "anthropic-key",
+            Some("https://proxy.example".to_owned()),
+        ),
+    )]);
+    let runtime_env = HashMap::from([(
+        "ANTHROPIC_BASE_URL".to_owned(),
+        "https://worker.example".to_owned(),
+    )]);
+
+    assert!(
+        build_secret_env_vars(&secrets, &runtime_env)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+#[serial_test::serial]
 fn raw_value_only_writes_under_secret_name() {
     // TODO: Audit that the environment access only happens in single-threaded code.
     unsafe { std::env::remove_var("MY_SECRET") };

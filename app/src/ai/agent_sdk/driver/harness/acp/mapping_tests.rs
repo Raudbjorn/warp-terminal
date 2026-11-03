@@ -539,6 +539,37 @@ fn mcp_tool_names_match_servers_by_their_normalized_names() {
 }
 
 #[test]
+fn mcp_tool_names_matching_colliding_server_names_are_not_attributed() {
+    let spaced = McpServerIdentity {
+        display_name: "warp factory".to_owned(),
+        ..Default::default()
+    };
+    let underscored = McpServerIdentity {
+        display_name: "warp_factory".to_owned(),
+        ..Default::default()
+    };
+    let mut mapper = AcpTurnMapper::new(
+        "task-1".to_owned(),
+        "req-1".to_owned(),
+        HashMap::from([
+            ("warp factory".to_owned(), spaced),
+            ("warp_factory".to_owned(), underscored),
+        ]),
+    );
+    let events = mapper.map_update(update(json!({
+        "sessionUpdate": "tool_call",
+        "toolCallId": "a",
+        "title": "mcp__warp_factory__send_task",
+        "kind": "other",
+        "status": "pending"
+    })));
+    match announced_tool(&events[0]).1 {
+        Tool::CallMcpTool(mcp) => assert_eq!(mcp.server_identity, None),
+        other => panic!("expected CallMcpTool, got {other:?}"),
+    }
+}
+
+#[test]
 fn read_tool_calls_with_a_path_project_to_read_files() {
     let mut mapper = mapper();
     let call = mapper.map_update(update(json!({
