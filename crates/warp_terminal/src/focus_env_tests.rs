@@ -38,7 +38,7 @@ fn launcher_agent_markers_are_dropped_but_user_config_is_kept() {
     // it spawns; nextest gives each test its own process.
     unsafe {
         std::env::set_var("CLAUDE_CODE_CHILD_SESSION", "1");
-        std::env::set_var("CLAUDECODE", "1");
+        std::env::set_var("claudecode", "1");
         std::env::set_var("CLAUDE_PID", "123");
         std::env::set_var("CLAUDE_CONFIG_DIR", "/somewhere/.claude");
         std::env::set_var("CLAUDE_CODE_USE_BEDROCK", "1");
@@ -46,7 +46,7 @@ fn launcher_agent_markers_are_dropped_but_user_config_is_kept() {
     }
 
     assert!(std::env::var_os("CLAUDE_CODE_CHILD_SESSION").is_none());
-    assert!(std::env::var_os("CLAUDECODE").is_none());
+    assert!(std::env::var_os("claudecode").is_none());
     assert!(std::env::var_os("CLAUDE_PID").is_none());
     assert_eq!(
         std::env::var_os("CLAUDE_CONFIG_DIR"),

@@ -7000,7 +7000,23 @@ fn conn_session_story_lines(session: &ConnSession, is_running: bool) -> Option<C
             progress: None,
         });
     }
-    conn_story_lines(session.story()?.latest_turn()?, is_running)
+    if let Some(turn) = session.story().and_then(ConnStory::latest_turn) {
+        return conn_story_lines(turn, is_running);
+    }
+    let prompt = conn_preview::head(session.prompts().last()?, DETAIL_SIDECAR_PROMPT_CHARS);
+    if prompt.is_empty() {
+        return None;
+    }
+    let progress = (!is_running)
+        .then(|| session.last_response())
+        .flatten()
+        .map(|response| {
+            (
+                "said",
+                conn_preview::tail(response, DETAIL_SIDECAR_BODY_CHARS),
+            )
+        });
+    Some(ConnStoryLines { prompt, progress })
 }
 
 /// The story so far for a pane's CLI agent session: what was asked, and either
@@ -7072,7 +7088,12 @@ fn conn_running_step(
         return None;
     }
     let session = session?;
-    if conn_live_prompt(session).is_some() {
+    if session.in_flight().iter().any(|entry| {
+        matches!(
+            entry.kind,
+            ConnEntryKind::Prompt { .. } | ConnEntryKind::ToolCompleted { .. }
+        )
+    }) {
         return None;
     }
     let turn = session.story()?.latest_turn()?;

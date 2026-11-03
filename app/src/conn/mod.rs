@@ -12,15 +12,20 @@ pub(crate) mod preview;
 mod project;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+#[cfg(not(target_family = "wasm"))]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ::conn::seen::{SEEN_AFTER, advance_watermark};
-use ::conn::story::{ConnStory, parse_transcript};
+use ::conn::story::ConnStory;
+#[cfg(not(target_family = "wasm"))]
+use ::conn::story::parse_transcript;
 use ::conn::{ConnEntry, ConnEntryKind, ConnSession, ConnStatus, is_harness_prompt, tidy_prompt};
 use chrono::{DateTime, TimeDelta, Utc};
+#[cfg(not(target_family = "wasm"))]
 use tokio::io::AsyncReadExt as _;
-use warpui::r#async::{FutureId, Timer};
+use warpui::r#async::{FutureId, SpawnedFutureHandle, Timer};
 use warpui::{Entity, EntityId, ModelContext, SingletonEntity, WindowId};
 
 use crate::terminal::cli_agent_sessions::event::{CLIAgentEvent, CLIAgentEventType};
@@ -46,12 +51,23 @@ pub struct ConnModel {
     /// Numbers reads in dispatch order, so that a read finishing is only taken to mean its pane
     /// has no read in flight if no later read has been dispatched since.
     next_read_seq: u64,
+    /// The last read adopted for each pane, in dispatch order. A read that lands after a later
+    /// one was adopted is stale: it would put an older story back in place of a newer one.
+    adopted_reads: HashMap<EntityId, u64>,
     /// How many times a different agent has taken over each pane. A read is only adopted by the
     /// agent it was dispatched for, which this tells apart.
     session_epochs: HashMap<EntityId, u64>,
     /// When a read was last dispatched for each pane, so a busy turn re-reads
     /// at a steady rate instead of once per tool call.
     last_read: HashMap<EntityId, DateTime<Utc>>,
+    /// The length of the transcript as of the last read, per pane. A transcript that has not
+    /// grown since then has nothing new to say, so it is not read again.
+    transcript_lengths: HashMap<EntityId, u64>,
+    /// The paced re-read scheduled for each pane whose turn is running.
+    paced_reads: HashMap<EntityId, SpawnedFutureHandle>,
+    /// The delayed read still to come for each pane, by dispatch order, so that a burst of
+    /// events does not each start a whole-transcript read of the same file.
+    delayed_reads: HashMap<EntityId, u64>,
     /// Project names by working directory. Resolving one runs git, so each directory is resolved
     /// once per process.
     /// `None` when the directory names nothing, which leaves the plugin's name in place.
@@ -85,7 +101,13 @@ struct Visit {
 /// away and comes back, so the account of it cannot wait for the turn to
 /// finish. Re-reading is a whole-file parse — tens of milliseconds on a
 /// background thread — so it is paced rather than done per tool call.
+#[cfg(not(test))]
 const READ_INTERVAL: TimeDelta = TimeDelta::seconds(3);
+
+/// The same cadence, shortened for tests: a test cannot wait three seconds for a paced
+/// read, and the reads it waits for are of a real file, so they still do the work.
+#[cfg(test)]
+const READ_INTERVAL: TimeDelta = TimeDelta::milliseconds(200);
 
 /// How long to wait before re-reading a finished turn.
 ///
@@ -102,7 +124,16 @@ const FLUSH_GRACE: Duration = Duration::from_millis(1500);
 /// allowed to grow the process without bound. Real transcripts are a few megabytes, and tens of
 /// megabytes once a long session has pasted images into it. A transcript over the bound is
 /// skipped, and the live entries keep describing the session.
+#[cfg(not(target_family = "wasm"))]
 const MAX_TRANSCRIPT_BYTES: u64 = 128 * 1024 * 1024;
+
+/// How many project directories the search for a transcript looks through.
+///
+/// Claude Code writes one directory per project, and the session's own project is
+/// usually found by name. This is the fallback for when it is not, and it must not
+/// cost a filesystem walk of the whole directory every time a pane is re-read.
+#[cfg(not(target_family = "wasm"))]
+const MAX_SCANNED_PROJECTS: usize = 256;
 
 /// Emitted whenever a pane's history changes.
 ///
@@ -232,6 +263,40 @@ impl ConnModel {
             .map(|read| read.future_id)
     }
 
+    /// The paced re-read scheduled for a pane, if any. Tests await it.
+    #[cfg(test)]
+    pub fn paced_read_in_flight(&self, terminal_view_id: EntityId) -> Option<FutureId> {
+        self.paced_reads
+            .get(&terminal_view_id)
+            .map(|handle| handle.future_id())
+    }
+
+    /// Dispatches a transcript read of `path` that lands after `delay`, at the boundary
+    /// `through`.
+    ///
+    /// A test uses it to land two reads of one pane in an order the hook events do not
+    /// produce, which is the order that shows whether a stale read is dropped.
+    #[cfg(test)]
+    pub fn dispatch_read(
+        &mut self,
+        terminal_view_id: EntityId,
+        path: &str,
+        through: DateTime<Utc>,
+        delay: Option<Duration>,
+        ctx: &mut ModelContext<Self>,
+    ) -> FutureId {
+        let locator = TranscriptLocator {
+            path: Some(path.to_owned()),
+            cwd: None,
+            session_id: None,
+        };
+        self.read_transcript(terminal_view_id, locator, through, delay, ctx);
+        self.reads_in_flight
+            .get(&terminal_view_id)
+            .map(|read| read.future_id)
+            .expect("the read was just dispatched")
+    }
+
     fn handle_cli_session_event(
         &mut self,
         event: &CLIAgentSessionsModelEvent,
@@ -282,6 +347,7 @@ impl ConnModel {
         session.status = status;
         ctx.notify();
         ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+        self.sync_paced_read(terminal_view_id, ctx);
     }
 
     /// Discards a pane's history, on the pane being closed for good.
@@ -293,10 +359,18 @@ impl ConnModel {
     ///
     /// A transcript read already in flight for this pane is left to land and
     /// find nothing, which is what its callback does with a pane it cannot
-    /// find. Forgetting the id is enough; there is nothing to cancel.
+    /// find. Forgetting the id is enough; there is nothing to cancel. The
+    /// paced re-read is cancelled, though, since it would otherwise keep
+    /// waking up for a pane that is gone.
     pub fn forget_pane(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        if let Some(handle) = self.paced_reads.remove(&terminal_view_id) {
+            handle.abort();
+        }
         self.reads_in_flight.remove(&terminal_view_id);
         self.last_read.remove(&terminal_view_id);
+        self.adopted_reads.remove(&terminal_view_id);
+        self.transcript_lengths.remove(&terminal_view_id);
+        self.delayed_reads.remove(&terminal_view_id);
         self.session_epochs.remove(&terminal_view_id);
         if self
             .visit
@@ -338,12 +412,16 @@ impl ConnModel {
             .cwd
             .as_deref()
             .and_then(|cwd| self.projects.get(cwd));
+        let project_before = session.project.clone();
         if let Some(Some(project)) = resolved {
             session.project = Some(project.clone());
         } else if event.project.is_some() {
             session.project = event.project.clone();
         }
         let unresolved_cwd = session.cwd.clone().filter(|_| resolved.is_none());
+        // The overview groups sessions by project, so a session that changes project has to
+        // say so even when the event that changed it carries no history of its own.
+        let project_changed = session.project != project_before;
 
         // The plugin only sends the path on `stop`, so it is kept once known.
         if let Some(path) = event.payload.transcript_path.as_deref() {
@@ -351,10 +429,10 @@ impl ConnModel {
         }
 
         let at = Utc::now();
-        if let Some(kind) = entry_kind(event) {
+        let kind = entry_kind(event);
+        let recorded = kind.is_some();
+        if let Some(kind) = kind {
             session.push(ConnEntry::new(kind, at));
-            ctx.notify();
-            ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
         }
 
         let locator = TranscriptLocator {
@@ -362,6 +440,10 @@ impl ConnModel {
             cwd: session.cwd.clone(),
             session_id: session.session_id.clone(),
         };
+        if recorded || project_changed {
+            ctx.notify();
+            ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+        }
         let finished = matches!(
             event.event,
             CLIAgentEventType::Stop | CLIAgentEventType::StopFailure
@@ -384,13 +466,49 @@ impl ConnModel {
         if self.should_read(terminal_view_id, event, at) {
             self.read_transcript(terminal_view_id, locator.clone(), through, None, ctx);
         }
-        if finished || waiting {
-            self.read_transcript(terminal_view_id, locator, through, Some(FLUSH_GRACE), ctx);
+        if (finished || waiting) && !self.delayed_reads.contains_key(&terminal_view_id) {
+            // One delayed read per pane: the read is of the whole transcript, and a burst of
+            // events would otherwise each start one over the same file.
+            let seq =
+                self.read_transcript(terminal_view_id, locator, through, Some(FLUSH_GRACE), ctx);
+            self.delayed_reads.insert(terminal_view_id, seq);
         }
+        self.record_status(terminal_view_id, event, ctx);
         if let Some(cwd) = unresolved_cwd {
             self.resolve_project(cwd, ctx);
         }
         self.mark_seen(ctx);
+    }
+
+    /// Keeps Conn's own status in step with what the plugin's events say.
+    ///
+    /// Warp reports a session that needs input as blocked only for an unattended run, so an
+    /// interactive one says nothing about its status. Conn records the question in the
+    /// session's history, and a panel that says "Working" beside its own "asked you" entry
+    /// tells the reader two things at once. Conn says the session needs them instead, and
+    /// takes it back once the agent does something again.
+    fn record_status(
+        &mut self,
+        terminal_view_id: EntityId,
+        event: &CLIAgentEvent,
+        ctx: &mut ModelContext<Self>,
+    ) {
+        match event.event {
+            CLIAgentEventType::NeedsInput => {
+                self.set_status(terminal_view_id, ConnStatus::NeedsYou, ctx);
+            }
+            CLIAgentEventType::ToolComplete | CLIAgentEventType::PermissionReplied => {
+                // The agent did something, so it is working again.
+                if self
+                    .sessions
+                    .get(&terminal_view_id)
+                    .is_some_and(|session| session.status == ConnStatus::NeedsYou)
+                {
+                    self.set_status(terminal_view_id, ConnStatus::Working, ctx);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Whether `event` comes from a different agent session than the one the pane has been
@@ -432,6 +550,11 @@ impl ConnModel {
         // The new session is owed a read of its own, whatever the old one was doing.
         self.reads_in_flight.remove(&terminal_view_id);
         self.last_read.remove(&terminal_view_id);
+        // The new session has a transcript of its own, so what the old one's read left
+        // behind says nothing about it.
+        self.transcript_lengths.remove(&terminal_view_id);
+        self.adopted_reads.remove(&terminal_view_id);
+        self.delayed_reads.remove(&terminal_view_id);
         ctx.notify();
         ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
     }
@@ -503,11 +626,75 @@ impl ConnModel {
             .is_none_or(|last| now - *last >= READ_INTERVAL)
     }
 
+    /// Whether the pane's agent is working, so that its transcript is worth re-reading.
+    fn turn_running(&self, terminal_view_id: EntityId) -> bool {
+        self.sessions
+            .get(&terminal_view_id)
+            .is_some_and(|session| session.status == ConnStatus::Working)
+    }
+
+    /// Starts or stops the paced re-read for a pane.
+    ///
+    /// A turn that is running is re-read every [`READ_INTERVAL`], because it can run for
+    /// minutes without another hook event and the transcript keeps growing meanwhile. A turn
+    /// that has ended, or that waits on the reader, is not: nothing more will be written to
+    /// it until they answer.
+    fn sync_paced_read(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        if self.turn_running(terminal_view_id) {
+            self.schedule_paced_read(terminal_view_id, ctx);
+        } else if let Some(handle) = self.paced_reads.remove(&terminal_view_id) {
+            handle.abort();
+        }
+    }
+
+    /// Schedules the next paced re-read for a pane.
+    fn schedule_paced_read(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        if self.paced_reads.contains_key(&terminal_view_id) {
+            return;
+        }
+        let interval = READ_INTERVAL.to_std().expect("a positive duration");
+        let handle = ctx.spawn(Timer::after(interval), move |me, _, ctx| {
+            me.paced_reads.remove(&terminal_view_id);
+            // The turn ended while the timer was running, so there is nothing to re-read.
+            if !me.turn_running(terminal_view_id) {
+                return;
+            }
+            // A read already running for this pane will pick up what has been written
+            // since, so a second one would only read the same file twice.
+            if !me.reads_in_flight.contains_key(&terminal_view_id) {
+                me.read_transcript_now(terminal_view_id, ctx);
+            }
+            me.schedule_paced_read(terminal_view_id, ctx);
+        });
+        self.paced_reads.insert(terminal_view_id, handle);
+    }
+
+    /// Reads the transcript of a pane whose turn is running.
+    fn read_transcript_now(&mut self, terminal_view_id: EntityId, ctx: &mut ModelContext<Self>) {
+        let Some(locator) = self.transcript_locator(terminal_view_id) else {
+            return;
+        };
+        self.read_transcript(terminal_view_id, locator, Utc::now(), None, ctx);
+    }
+
+    /// Where the pane's transcript is, as far as is known.
+    fn transcript_locator(&self, terminal_view_id: EntityId) -> Option<TranscriptLocator> {
+        let session = self.sessions.get(&terminal_view_id)?;
+        Some(TranscriptLocator {
+            path: session.transcript_path.clone(),
+            cwd: session.cwd.clone(),
+            session_id: session.session_id.clone(),
+        })
+    }
+
     /// Reads and parses the transcript off the main thread.
     ///
     /// The parse is tens of milliseconds on a long session and grows with it,
     /// so it must never run on the thread that draws frames. Locating the file
     /// touches the filesystem too, so that happens in the same place.
+    ///
+    /// Returns the read's place in the dispatch order, which is what orders it against the
+    /// other reads of the same pane.
     fn read_transcript(
         &mut self,
         terminal_view_id: EntityId,
@@ -515,42 +702,63 @@ impl ConnModel {
         through: DateTime<Utc>,
         after: Option<Duration>,
         ctx: &mut ModelContext<Self>,
-    ) {
+    ) -> u64 {
         self.last_read.insert(terminal_view_id, through);
         let seq = self.next_read_seq;
         self.next_read_seq += 1;
         let epoch = self.session_epoch(terminal_view_id);
-        let handle = ctx.spawn(read_story(locator, after), move |me, read, ctx| {
-            // A finished turn dispatches two reads, and the one that lands first must not
-            // clear the tracking of the one still to come.
-            if me
-                .reads_in_flight
-                .get(&terminal_view_id)
-                .is_some_and(|in_flight| in_flight.seq == seq)
-            {
-                me.reads_in_flight.remove(&terminal_view_id);
-            }
-            // The agent this was read for has been replaced in the pane: the transcript is its,
-            // not the new one's.
-            if me.session_epoch(terminal_view_id) != epoch {
-                return;
-            }
-            // A transcript that cannot be found or read is not a failure: the
-            // live hook entries still describe the session, just less well.
-            let Some((path, story)) = read else {
-                return;
-            };
-            let Some(session) = me.sessions.get_mut(&terminal_view_id) else {
-                return;
-            };
-            // Remember where it was found so the next read skips the search.
-            session.transcript_path = Some(path.to_string_lossy().into_owned());
-            if session.adopt_story(story, through) {
-                ctx.notify();
-                ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
-                me.mark_seen(ctx);
-            }
-        });
+        let delayed = after.is_some();
+        let known_len = self.transcript_lengths.get(&terminal_view_id).copied();
+        let handle = ctx.spawn(
+            read_story(locator, after, known_len),
+            move |me, read, ctx| {
+                // A finished turn dispatches two reads, and the one that lands first must not
+                // clear the tracking of the one still to come.
+                if me
+                    .reads_in_flight
+                    .get(&terminal_view_id)
+                    .is_some_and(|in_flight| in_flight.seq == seq)
+                {
+                    me.reads_in_flight.remove(&terminal_view_id);
+                }
+                // The delayed read this pane was waiting for has landed.
+                if delayed && me.delayed_reads.get(&terminal_view_id) == Some(&seq) {
+                    me.delayed_reads.remove(&terminal_view_id);
+                }
+                // The agent this was read for has been replaced in the pane: the transcript is its,
+                // not the new one's.
+                if me.session_epoch(terminal_view_id) != epoch {
+                    return;
+                }
+                // A transcript that cannot be found or read is not a failure: the
+                // live hook entries still describe the session, just less well.
+                let Some((path, story, len)) = read else {
+                    return;
+                };
+                // A read dispatched before another one can land after it, and would put an older
+                // story back in place of a newer one. The dispatch order is what says which is
+                // which: the two reads of one event share a timestamp, so it cannot.
+                if me
+                    .adopted_reads
+                    .get(&terminal_view_id)
+                    .is_some_and(|adopted| *adopted > seq)
+                {
+                    return;
+                }
+                let Some(session) = me.sessions.get_mut(&terminal_view_id) else {
+                    return;
+                };
+                // Remember where it was found so the next read skips the search.
+                session.transcript_path = Some(path.to_string_lossy().into_owned());
+                if session.adopt_story(story, through) {
+                    me.adopted_reads.insert(terminal_view_id, seq);
+                    me.transcript_lengths.insert(terminal_view_id, len);
+                    ctx.notify();
+                    ctx.emit(ConnModelEvent::SessionUpdated { terminal_view_id });
+                    me.mark_seen(ctx);
+                }
+            },
+        );
         self.reads_in_flight.insert(
             terminal_view_id,
             InFlightRead {
@@ -558,6 +766,7 @@ impl ConnModel {
                 future_id: handle.future_id(),
             },
         );
+        seq
     }
 }
 
@@ -570,20 +779,34 @@ struct TranscriptLocator {
     session_id: Option<String>,
 }
 
-/// Runs on a background thread. Returns the file it read and the story in it.
+/// Runs on a background thread. Returns the file it read, the story in it, and its length.
+#[cfg(not(target_family = "wasm"))]
 async fn read_story(
     locator: TranscriptLocator,
     after: Option<Duration>,
-) -> Option<(PathBuf, ConnStory)> {
+    known_len: Option<u64>,
+) -> Option<(PathBuf, ConnStory, u64)> {
     if let Some(after) = after {
         Timer::after(after).await;
     }
     let path = locate_transcript(&locator).await?;
-    let jsonl = read_bounded(&path).await?;
-    Some((path, parse_transcript(&jsonl)))
+    let (jsonl, len) = read_bounded(&path, known_len).await?;
+    Some((path, parse_transcript(&jsonl), len))
+}
+
+/// There is no filesystem to read a transcript from in the browser, so a session there has
+/// only the entries its hook events told about.
+#[cfg(target_family = "wasm")]
+async fn read_story(
+    _locator: TranscriptLocator,
+    _after: Option<Duration>,
+    _known_len: Option<u64>,
+) -> Option<(PathBuf, ConnStory, u64)> {
+    None
 }
 
 /// Whether `path` names a regular file, following links.
+#[cfg(not(target_family = "wasm"))]
 async fn is_regular_file(path: &Path) -> bool {
     tokio::fs::metadata(path)
         .await
@@ -593,7 +816,11 @@ async fn is_regular_file(path: &Path) -> bool {
 /// Reads a transcript, refusing anything that is not a regular file of at most
 /// [`MAX_TRANSCRIPT_BYTES`]. `None` for a refusal, which is logged: it is not the user's problem,
 /// but something named a path that is not a transcript.
-async fn read_bounded(path: &Path) -> Option<String> {
+///
+/// `known_len` is the length of the transcript as it was last read. A transcript that has not
+/// grown since then has nothing new to say, so it is not read again.
+#[cfg(not(target_family = "wasm"))]
+async fn read_bounded(path: &Path, known_len: Option<u64>) -> Option<(String, u64)> {
     // Looked at before opening, because opening a FIFO waits for a writer that may never come.
     if !is_regular_file(path).await {
         log::warn!("Conn: not reading {path:?}, which is not a regular file");
@@ -619,6 +846,11 @@ async fn read_bounded(path: &Path) -> Option<String> {
         );
         return None;
     }
+    // The transcript is appended to, so a length that has not changed means nothing has been
+    // written since the last read, and reading it again would parse the same bytes again.
+    if known_len == Some(metadata.len()) {
+        return None;
+    }
     // The length said above can be out of date or wrong for the file, so the read is bounded
     // too. One byte past the limit is enough to tell that it was exceeded.
     let mut bytes = Vec::new();
@@ -630,13 +862,14 @@ async fn read_bounded(path: &Path) -> Option<String> {
         log::warn!("Conn: could not read transcript {path:?}: {err}");
         return None;
     }
-    if bytes.len() as u64 > MAX_TRANSCRIPT_BYTES {
+    let len = bytes.len() as u64;
+    if len > MAX_TRANSCRIPT_BYTES {
         log::warn!(
             "Conn: not reading transcript {path:?}: it grew past the {MAX_TRANSCRIPT_BYTES} byte limit"
         );
         return None;
     }
-    String::from_utf8(bytes).ok()
+    Some((String::from_utf8(bytes).ok()?, len))
 }
 
 /// Finds a session's transcript.
@@ -646,6 +879,7 @@ async fn read_bounded(path: &Path) -> Option<String> {
 /// still running — would otherwise have no account at all until it ended.
 /// Claude Code writes transcripts to a known place, so the path is derived
 /// until the plugin confirms one.
+#[cfg(not(target_family = "wasm"))]
 async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
     if let Some(path) = locator.path.as_deref() {
         let path = PathBuf::from(path);
@@ -669,7 +903,20 @@ async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
     // The directory name is a guess; the session id is not. When the guess is
     // wrong, look for the file itself rather than give up on the session.
     let mut entries = tokio::fs::read_dir(&projects).await.ok()?;
+    let mut scanned = 0;
     while let Ok(Some(entry)) = entries.next_entry().await {
+        // A plain file cannot hold a transcript, and the listing already says what each
+        // entry is, so one among them costs nothing to skip. A link is followed, since it
+        // may lead to a directory.
+        if matches!(entry.file_type().await, Ok(file_type) if file_type.is_file()) {
+            continue;
+        }
+        // ponytail: the search looks through a bounded number of project directories; raise the
+        // bound or index the projects directory if a user has more projects than that.
+        scanned += 1;
+        if scanned > MAX_SCANNED_PROJECTS {
+            break;
+        }
         let candidate = entry.path().join(&file_name);
         if is_regular_file(&candidate).await {
             return Some(candidate);
@@ -678,6 +925,7 @@ async fn locate_transcript(locator: &TranscriptLocator) -> Option<PathBuf> {
     None
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn claude_projects_dir() -> Option<PathBuf> {
     let root = match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(dir) => PathBuf::from(dir),
@@ -688,6 +936,7 @@ fn claude_projects_dir() -> Option<PathBuf> {
 
 /// Claude Code names a project directory after the working directory it ran
 /// in, with the path separators flattened.
+#[cfg(not(target_family = "wasm"))]
 fn mangle_project_dir(cwd: &str) -> String {
     cwd.replace(['/', '.'], "-")
 }

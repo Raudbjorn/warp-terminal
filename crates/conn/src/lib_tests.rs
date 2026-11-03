@@ -56,11 +56,8 @@ fn history_preserves_order() {
 }
 
 #[test]
-fn eviction_drops_volume_entries_and_keeps_every_prompt() {
+fn eviction_drops_oldest_entries_and_keeps_history_bounded() {
     let mut session = ConnSession::default();
-    session.push(prompt("the original ask", 0));
-    // Alternate so the entries don't coalesce, otherwise this never reaches
-    // the cap at all.
     for i in 0..MAX_ENTRIES as i64 + 50 {
         if i % 2 == 0 {
             session.push(tool(i + 1));
@@ -69,29 +66,24 @@ fn eviction_drops_volume_entries_and_keeps_every_prompt() {
         }
     }
 
-    assert_eq!(
-        session.entries().len(),
-        MAX_ENTRIES,
-        "history must stay bounded"
-    );
-    assert_eq!(session.dropped(), 51);
-    assert_eq!(
-        session.prompts().collect::<Vec<_>>(),
-        vec!["the original ask"],
-        "the earliest prompt is the session's intent and must survive any \
-         amount of tool traffic"
-    );
+    assert_eq!(session.entries().len(), MAX_ENTRIES);
+    assert_eq!(session.dropped(), 50);
 }
 
 #[test]
-fn a_session_of_only_prompts_is_never_evicted() {
+fn eviction_keeps_history_bounded_including_prompts() {
     let mut session = ConnSession::default();
     for i in 0..MAX_ENTRIES as i64 + 10 {
         session.push(prompt(&format!("ask {i}"), i));
     }
 
-    assert_eq!(session.entries().len(), MAX_ENTRIES + 10);
-    assert_eq!(session.dropped(), 0);
+    assert_eq!(session.entries().len(), MAX_ENTRIES);
+    assert_eq!(session.dropped(), 10);
+    assert_eq!(
+        session.prompts().next(),
+        Some("ask 10"),
+        "old prompts must be evicted once the bounded history is full"
+    );
 }
 
 #[test]
@@ -194,6 +186,21 @@ fn turn(started: i64, ended: Option<i64>, outcome: Option<&str>) -> ConnTurn {
     }
 }
 
+fn turn_with_prompt(
+    started: i64,
+    ended: Option<i64>,
+    outcome: Option<&str>,
+    prompt: &str,
+) -> ConnTurn {
+    ConnTurn {
+        started_at: at(started),
+        ended_at: ended.map(at),
+        prompt: prompt.to_owned(),
+        steps: vec![],
+        outcome: outcome.map(str::to_owned),
+    }
+}
+
 fn story(turns: Vec<ConnTurn>) -> ConnStory {
     ConnStory {
         title: None,
@@ -290,6 +297,52 @@ fn a_story_without_the_final_response_leaves_the_live_entry_visible() {
             text: Some("done".to_owned())
         }]
     );
+}
+
+#[test]
+fn a_transcript_story_does_not_hide_a_failure_entry() {
+    let mut session = ConnSession::default();
+    session.push(prompt("do the thing", 1));
+    session.push(ConnEntry::new(
+        ConnEntryKind::Failed {
+            error_type: Some("rate_limit".to_owned()),
+            message: Some("try again".to_owned()),
+        },
+        at(9),
+    ));
+
+    assert!(session.adopt_story(story(vec![turn(1, Some(3), Some("partial"))]), at(9)));
+    assert_eq!(session.in_flight().len(), 1);
+    assert!(matches!(session.in_flight()[0].kind, ConnEntryKind::Failed { .. }));
+}
+
+#[test]
+fn a_truncated_hook_prompt_matches_the_full_transcript_prompt() {
+    let mut session = ConnSession::default();
+    let full = "x".repeat(240);
+    session.push(prompt(&full[..200], 100));
+
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(1, Some(2), Some("done"), &full)]),
+        at(100)
+    ));
+    assert!(session.in_flight().is_empty());
+}
+
+#[test]
+fn repeated_prompts_are_matched_one_at_a_time() {
+    let mut session = ConnSession::default();
+    session.push(prompt("repeat this", 10));
+    session.push(prompt("repeat this", 20));
+
+    assert!(session.adopt_story(
+        story(vec![
+            turn_with_prompt(1, Some(2), Some("first"), "repeat this"),
+            turn_with_prompt(3, Some(4), Some("second"), "repeat this"),
+        ]),
+        at(20)
+    ));
+    assert!(session.in_flight().is_empty());
 }
 
 /// Pasted text arrives wrapped in a tag addressed to the agent. Left in, it
@@ -396,7 +449,10 @@ fn a_story_behind_a_newer_live_prompt_does_not_hide_it() {
     session.push(prompt("second", 10));
     session.push(tool(11));
 
-    assert!(session.adopt_story(story(vec![turn(1, Some(5), Some("done"))]), at(11)));
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(1, Some(5), Some("done"), "first")]),
+        at(11)
+    ));
 
     let kinds: Vec<_> = session
         .in_flight()
@@ -424,8 +480,8 @@ fn a_story_that_reaches_the_newer_prompt_covers_it() {
 
     assert!(session.adopt_story(
         story(vec![
-            turn(1, Some(5), Some("done")),
-            turn(10, Some(10), None)
+            turn_with_prompt(1, Some(5), Some("done"), "first"),
+            turn_with_prompt(10, Some(10), None, "second"),
         ]),
         at(11)
     ));
@@ -441,7 +497,10 @@ fn the_previous_turn_counts_as_unseen_while_a_new_prompt_is_live_only() {
     session.push(responded("done", 9));
     session.push(prompt("second", 10));
     session.status = super::ConnStatus::Working;
-    assert!(session.adopt_story(story(vec![turn(1, Some(5), Some("done"))]), at(11)));
+    assert!(session.adopt_story(
+        story(vec![turn_with_prompt(1, Some(5), Some("done"), "first")]),
+        at(11)
+    ));
 
     assert_eq!(session.unseen_turns(), 1);
     assert_eq!(

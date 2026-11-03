@@ -468,10 +468,11 @@ use crate::util::file::external_editor::EditorSettings;
 #[cfg(feature = "local_fs")]
 use crate::util::file::external_editor::settings::OpenConversationPreference;
 use crate::util::links;
+use crate::util::openable_file_type::EditorLayout;
 use crate::util::openable_file_type::FileTarget;
 #[cfg(feature = "local_fs")]
 use crate::util::openable_file_type::{
-    EditorLayout, resolve_file_target_to_open_in_warp, resolve_file_target_with_editor_choice,
+    resolve_file_target_to_open_in_warp, resolve_file_target_with_editor_choice,
 };
 use crate::util::traffic_lights::{TrafficLightMouseStates, TrafficLightSide, traffic_light_data};
 use crate::util::truncation::truncate_from_end;
@@ -5282,7 +5283,10 @@ impl Workspace {
         if self.left_panel_view.is_self_or_child_focused(app) {
             return FocusRegion::LeftPanel;
         }
-        if self.right_panel_view.is_self_or_child_focused(app) {
+        if self.right_panel_view.is_self_or_child_focused(app)
+            || (self.right_panel_content == Some(RightPanelContent::Conn)
+                && self.conn_panel_view.is_self_or_child_focused(app))
+        {
             return FocusRegion::RightPanel;
         }
 
@@ -5301,7 +5305,9 @@ impl Workspace {
 
     fn has_right_region(&self, app: &AppContext) -> bool {
         let group = self.active_tab_pane_group().as_ref(app);
-        group.right_panel_open || self.current_workspace_state.is_right_panel_open()
+        group.right_panel_open
+            || self.right_panel_content == Some(RightPanelContent::Conn)
+            || self.current_workspace_state.is_right_panel_open()
     }
 
     fn focus_next_pane_in_group(&mut self, ctx: &mut ViewContext<Self>) -> bool {
@@ -5338,7 +5344,9 @@ impl Workspace {
             ctx.focus(&self.right_panel_view);
             return;
         }
-        if self.current_workspace_state.is_ai_assistant_panel_open {
+        if self.right_panel_content == Some(RightPanelContent::Conn) {
+            ctx.focus(&self.conn_panel_view);
+        } else if self.current_workspace_state.is_ai_assistant_panel_open {
             ctx.focus(&self.ai_assistant_panel);
         } else if self.current_workspace_state.is_resource_center_open {
             ctx.focus(&self.resource_center_view);
@@ -6416,7 +6424,35 @@ impl Workspace {
                     &locator,
                 );
             }
+            if let Some((_, workspace)) = WorkspaceRegistry::as_ref(ctx)
+                .all_workspaces(ctx)
+                .into_iter()
+                .find(|(id, _)| *id == window_id)
+            {
+                workspace.update(ctx, |workspace, ctx| {
+                    workspace.focus_pane(locator, ctx);
+                    workspace
+                        .conn_panel_view
+                        .update(ctx, |panel, ctx| panel.follow_focused_pane(ctx));
+                });
+            }
         }
+    }
+
+    fn prune_right_panel_by_pane(&mut self, ctx: &AppContext) {
+        let live_panes: HashSet<EntityId> = self
+            .tabs
+            .iter()
+            .flat_map(|tab| {
+                tab.pane_group
+                    .as_ref(ctx)
+                    .terminal_views(ctx)
+                    .into_iter()
+                    .map(|terminal| terminal.id())
+            })
+            .collect();
+        self.right_panel_by_pane
+            .retain(|pane, _| live_panes.contains(pane));
     }
 
     /// Shows the notification error in the specific pane.
@@ -12700,6 +12736,8 @@ impl Workspace {
             });
         }
 
+        self.prune_right_panel_by_pane(ctx);
+
         match index.cmp(&self.active_tab_index) {
             Ordering::Equal => {
                 // Activate the tab that was immediately after the closed one — to the
@@ -16606,6 +16644,7 @@ impl Workspace {
         event: &pane_group::Event,
         ctx: &mut ViewContext<Self>,
     ) {
+        self.prune_right_panel_by_pane(ctx);
         match event {
             pane_group::Event::AppStateChanged => {
                 ctx.dispatch_global_action("workspace:save_app", ());
@@ -25757,6 +25796,8 @@ impl TypedActionView for Workspace {
                 } else if self.right_panel_view.is_self_or_child_focused(ctx) {
                     let pane_group_handle = self.active_tab_pane_group().clone();
                     self.close_right_panel(&pane_group_handle, ctx);
+                } else if self.conn_panel_view.is_self_or_child_focused(ctx) {
+                    self.toggle_conn_panel(ctx);
                 }
             }
             OpenInExplorer { path } => {

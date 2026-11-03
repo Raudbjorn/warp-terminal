@@ -6005,3 +6005,29 @@ fn test_right_panel_content_follows_focus_between_split_panes() {
         });
     });
 }
+
+#[test]
+fn test_right_panel_state_is_pruned_when_a_tab_closes() {
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            let pane = workspace.tabs[1]
+                .pane_group
+                .as_ref(ctx)
+                .focused_session_view(ctx)
+                .expect("new tab has a terminal")
+                .id();
+            workspace
+                .right_panel_by_pane
+                .insert(pane, Some(RightPanelContent::CodeReview));
+            workspace.remove_tab_without_undo(1, ctx);
+            assert!(
+                !workspace.right_panel_by_pane.contains_key(&pane),
+                "closed tabs must not leave per-pane panel state behind"
+            );
+        });
+    });
+}

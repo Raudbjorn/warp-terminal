@@ -98,3 +98,19 @@ fn a_project_ranks_by_its_unseen_done_session() {
     let order: Vec<&str> = groups.iter().map(|(project, _)| project.as_str()).collect();
     assert_eq!(order, ["beta", "alpha"]);
 }
+
+#[test]
+fn same_basename_projects_remain_separate_groups_with_one_display_label() {
+    let groups = shape(vec![
+        item(1, "/work/acme/backend", ConnStatus::Working),
+        item(2, "/work/other/backend", ConnStatus::Working),
+    ]);
+
+    assert_eq!(
+        groups,
+        [
+            ("backend".to_owned(), vec![1]),
+            ("backend".to_owned(), vec![2]),
+        ]
+    );
+}

@@ -1,12 +1,14 @@
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ::conn::{ConnEntryKind, ConnStatus};
 use chrono::Utc;
+use warp_core::execution_mode::{AppExecutionMode, ExecutionMode};
 use warp_util::git::run_git_command;
 use warpui::r#async::Timer;
 use warpui::{App, EntityId, SingletonEntity};
 
-use super::{ConnModel, MAX_TRANSCRIPT_BYTES, conn_status};
+use super::{ConnModel, ConnModelEvent, MAX_TRANSCRIPT_BYTES, conn_status};
 use crate::terminal::CLIAgent;
 use crate::terminal::cli_agent_sessions::event::{
     CLIAgentEvent, CLIAgentEventPayload, CLIAgentEventSource, CLIAgentEventType,
@@ -82,6 +84,32 @@ fn send(app: &mut App, view_id: EntityId, event: CLIAgentEvent) {
     CLIAgentSessionsModel::handle(&*app).update(app, |m, ctx| {
         m.update_from_event(view_id, &event, ctx);
     });
+}
+
+/// Captures the panes the model announces, so a test can see what the panel would be told.
+fn capture_announced_panes(app: &mut App) -> Arc<Mutex<Vec<EntityId>>> {
+    let announced = Arc::new(Mutex::new(Vec::new()));
+    let captured = announced.clone();
+    app.update(|ctx| {
+        let model = ConnModel::handle(ctx);
+        ctx.subscribe_to_model(&model, move |_, event, _| {
+            if let ConnModelEvent::SessionUpdated { terminal_view_id } = event {
+                captured
+                    .lock()
+                    .expect("the capture is not poisoned")
+                    .push(*terminal_view_id);
+            }
+        });
+    });
+    announced
+}
+
+/// The panes the model has announced so far.
+///
+/// An announcement is an effect, so it reaches the subscribers when the app next updates.
+fn announced_panes(app: &mut App, capture: &Arc<Mutex<Vec<EntityId>>>) -> Vec<EntityId> {
+    app.update(|_| {});
+    capture.lock().expect("the capture is not poisoned").clone()
 }
 
 #[test]
@@ -960,5 +988,308 @@ fn a_transcript_over_the_size_limit_is_not_read() {
         drop(file);
 
         assert_unreadable_transcript_is_ignored(&mut app, view_id, &path).await;
+    });
+}
+
+/// Two transcripts of the same session, one with a turn the other has not.
+fn transcript_with_a_second_turn() -> String {
+    let mut jsonl = transcript_jsonl();
+    jsonl.push('\n');
+    jsonl.push_str(
+        r#"{"type":"user","timestamp":"2026-09-20T10:05:00Z","promptSource":"typed","message":{"content":"now the tests"}}"#,
+    );
+    jsonl.push('\n');
+    jsonl.push_str(
+        r#"{"type":"assistant","timestamp":"2026-09-20T10:05:05Z","message":{"content":[{"type":"text","text":"And the tests."}]}}"#,
+    );
+    jsonl
+}
+
+/// The two reads of a finished turn share a boundary, so the dispatch order is what tells
+/// them apart. A read that lands after a later one was adopted is stale, and must not put
+/// the older story back.
+#[test]
+fn an_earlier_read_does_not_replace_a_later_story() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let older = dir.path().join("older.jsonl");
+        let newer = dir.path().join("newer.jsonl");
+        std::fs::write(&older, transcript_jsonl()).expect("write transcript");
+        std::fs::write(
+            &newer,
+            transcript_jsonl().replace("ADR wiring", "ADR wiring, revisited"),
+        )
+        .expect("write transcript");
+
+        // The first read is dispatched first and lands last, having seen less of the
+        // transcript than the second.
+        let through = Utc::now();
+        let stale = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+            me.dispatch_read(
+                view_id,
+                older.to_str().expect("utf-8 path"),
+                through,
+                Some(Duration::from_millis(200)),
+                ctx,
+            )
+        });
+        let fresh = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+            me.dispatch_read(
+                view_id,
+                newer.to_str().expect("utf-8 path"),
+                through,
+                None,
+                ctx,
+            )
+        });
+
+        // The later read lands first.
+        let awaiting =
+            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(fresh));
+        awaiting.await;
+        // The earlier read lands after it, and must not put its story back.
+        let awaiting =
+            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(stale));
+        awaiting.await;
+
+        let (title, path) = ConnModel::handle(&app).read(&app, |me, _| {
+            let session = me.session(view_id).expect("session recorded");
+            (
+                session.story().and_then(|story| story.title.clone()),
+                session.transcript_path.clone(),
+            )
+        });
+        assert_eq!(
+            title.as_deref(),
+            Some("ADR wiring, revisited"),
+            "the story of the read that landed last is the one that is kept"
+        );
+        assert_eq!(path.as_deref(), newer.to_str());
+    });
+}
+
+/// The read dispatched later is the one that saw more of the transcript, so it replaces the
+/// earlier one even when it lands after it.
+#[test]
+fn a_later_read_replaces_an_earlier_story() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let older = dir.path().join("older.jsonl");
+        let newer = dir.path().join("newer.jsonl");
+        std::fs::write(&older, transcript_jsonl()).expect("write transcript");
+        std::fs::write(
+            &newer,
+            transcript_jsonl().replace("ADR wiring", "ADR wiring, revisited"),
+        )
+        .expect("write transcript");
+
+        let through = Utc::now();
+        let early = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+            me.dispatch_read(
+                view_id,
+                older.to_str().expect("utf-8 path"),
+                through,
+                None,
+                ctx,
+            )
+        });
+        let late = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+            me.dispatch_read(
+                view_id,
+                newer.to_str().expect("utf-8 path"),
+                through,
+                Some(Duration::from_millis(200)),
+                ctx,
+            )
+        });
+
+        let awaiting =
+            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(early));
+        awaiting.await;
+        let awaiting =
+            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(late));
+        awaiting.await;
+
+        let title = ConnModel::handle(&app).read(&app, |me, _| {
+            me.session(view_id)
+                .and_then(|session| session.story())
+                .and_then(|story| story.title.clone())
+        });
+        assert_eq!(
+            title.as_deref(),
+            Some("ADR wiring, revisited"),
+            "the read that saw more of the transcript is the one that is kept"
+        );
+    });
+}
+
+/// A turn can run for minutes without another hook event, and the transcript keeps growing
+/// meanwhile, so it is re-read on a timer while it runs.
+#[test]
+fn a_running_turn_is_re_read() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, transcript_jsonl()).expect("write transcript");
+
+        // The prompt starts the turn and names the transcript.
+        send(
+            &mut app,
+            view_id,
+            prompt_with_transcript("wire the ADRs in", &path),
+        );
+        await_read(&mut app, view_id).await;
+
+        // The agent writes more of the transcript without sending an event.
+        std::fs::write(&path, transcript_with_a_second_turn()).expect("write transcript");
+
+        // The paced read picks the turn up.
+        let mut turns = None;
+        for _ in 0..3 {
+            let paced = ConnModel::handle(&app)
+                .read(&app, |me, _| me.paced_read_in_flight(view_id))
+                .expect("a running turn schedules a paced read");
+            let awaiting =
+                ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(paced));
+            awaiting.await;
+            // The read the timer dispatched may have landed already.
+            let read = ConnModel::handle(&app).read(&app, |me, _| me.read_in_flight(view_id));
+            if let Some(read) = read {
+                let awaiting = ConnModel::handle(&*app)
+                    .update(&mut app, |_, ctx| ctx.await_spawned_future(read));
+                awaiting.await;
+            }
+            turns = ConnModel::handle(&app).read(&app, |me, _| {
+                me.session(view_id)
+                    .and_then(|session| session.story())
+                    .map(|story| story.turns.len())
+            });
+            if turns == Some(2) {
+                break;
+            }
+        }
+        assert_eq!(
+            turns,
+            Some(2),
+            "the turn that ran while the agent worked is told"
+        );
+    });
+}
+
+/// A burst of events must not each start a whole-transcript read of the same file.
+#[test]
+fn a_burst_of_events_starts_one_delayed_read() {
+    with_session(|app, view_id| {
+        send(app, view_id, stop("done", Some("/tmp/session.jsonl")));
+        let after_stop = ConnModel::handle(&*app).read(app, |me, _| me.next_read_seq);
+
+        send(app, view_id, stop("done again", Some("/tmp/session.jsonl")));
+        let after_second = ConnModel::handle(&*app).read(app, |me, _| me.next_read_seq);
+
+        assert_eq!(
+            after_second - after_stop,
+            1,
+            "the second event reads at once, but the delayed read is already pending"
+        );
+    });
+}
+
+/// An agent that needs input is waiting on the reader, and the panel has to say so beside
+/// its own "asked you" entry.
+#[test]
+fn a_session_that_needs_input_needs_you() {
+    App::test((), |mut app| async move {
+        // An interactive run, where the plugin reports no status change for the request.
+        app.add_singleton_model(|ctx| AppExecutionMode::new(ExecutionMode::App, false, ctx));
+        let view_id = setup(&mut app);
+
+        send(&mut app, view_id, prompt("do the thing"));
+        send(
+            &mut app,
+            view_id,
+            event(
+                CLIAgentEventType::NeedsInput,
+                CLIAgentEventPayload::default(),
+            ),
+        );
+
+        assert_eq!(
+            status(&app, view_id),
+            Some(ConnStatus::NeedsYou),
+            "the panel says the reader is needed"
+        );
+
+        // The agent works again, and the session says so.
+        send(&mut app, view_id, tool_complete("Bash"));
+        assert_eq!(status(&app, view_id), Some(ConnStatus::Working));
+    });
+}
+
+/// The overview groups sessions by project, so a session that changes project has to be
+/// announced even when the event that changed it carries no history of its own.
+#[test]
+fn a_changed_project_is_announced() {
+    with_session(|app, view_id| {
+        let announced = capture_announced_panes(app);
+
+        // A session start names the project and carries no history of its own.
+        send(
+            app,
+            view_id,
+            event(
+                CLIAgentEventType::SessionStart,
+                CLIAgentEventPayload::default(),
+            ),
+        );
+
+        assert_eq!(
+            announced_panes(app, &announced),
+            vec![view_id],
+            "the panel is told which project the session belongs to"
+        );
+    });
+}
+
+/// A transcript that has not grown since the last read has nothing new to say, so it is not
+/// read and parsed again.
+#[test]
+fn an_unchanged_transcript_is_not_read_again() {
+    App::test((), |mut app| async move {
+        let view_id = setup(&mut app);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("session.jsonl");
+        std::fs::write(&path, transcript_jsonl()).expect("write transcript");
+
+        let announced = capture_announced_panes(&mut app);
+        send(
+            &mut app,
+            view_id,
+            prompt_with_transcript("wire the ADRs in", &path),
+        );
+        await_read(&mut app, view_id).await;
+        let first = announced_panes(&mut app, &announced).len();
+
+        // The same file again: it has not grown, so there is nothing new in it.
+        let read = ConnModel::handle(&*app).update(&mut app, |me, ctx| {
+            me.dispatch_read(
+                view_id,
+                path.to_str().expect("utf-8 path"),
+                Utc::now(),
+                None,
+                ctx,
+            )
+        });
+        let awaiting =
+            ConnModel::handle(&*app).update(&mut app, |_, ctx| ctx.await_spawned_future(read));
+        awaiting.await;
+
+        assert_eq!(
+            announced_panes(&mut app, &announced).len(),
+            first,
+            "a transcript that has not grown is not read again"
+        );
     });
 }

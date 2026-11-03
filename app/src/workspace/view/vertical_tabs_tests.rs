@@ -1519,6 +1519,48 @@ fn conn_session(turn: ConnTurn) -> ConnSession {
 }
 
 #[test]
+fn hover_card_falls_back_to_live_entries_without_a_story() {
+    let mut session = ConnSession::default();
+    session.push(ConnEntry::new(
+        ConnEntryKind::Prompt {
+            text: "recover the session".to_owned(),
+        },
+        Utc::now(),
+    ));
+    session.push(ConnEntry::new(
+        ConnEntryKind::Responded {
+            text: Some("the session recovered".to_owned()),
+        },
+        Utc::now(),
+    ));
+
+    let lines = conn_session_story_lines(&session, false).expect("live entries are visible");
+    assert_eq!(lines.prompt, "recover the session");
+    assert_eq!(
+        lines.progress,
+        Some(("said", "the session recovered".to_owned()))
+    );
+}
+
+#[test]
+fn a_live_tool_completion_hides_the_stale_story_step() {
+    let mut session = conn_session(conn_turn("elevate this repo", &["Read README"], None));
+    session.push(ConnEntry::new(
+        ConnEntryKind::ToolCompleted {
+            tool_name: Some("Bash".to_owned()),
+            target: None,
+            runs: 1,
+        },
+        Utc::now(),
+    ));
+
+    assert_eq!(
+        conn_running_step(Some(&CLIAgentSessionStatus::InProgress), Some(&session)),
+        None
+    );
+}
+
+#[test]
 fn a_running_pane_says_what_it_is_doing() {
     let session = conn_session(conn_turn(
         "elevate this repo",

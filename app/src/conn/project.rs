@@ -16,22 +16,21 @@ pub(crate) async fn resolve_project(cwd: &Path) -> Option<String> {
     common_dir
         .as_deref()
         .map(str::trim)
-        .and_then(|dir| repository_name(Path::new(dir)))
-        .or_else(|| file_name(cwd))
+        .and_then(|dir| repository_key(Path::new(dir)))
+        .or_else(|| project_key(cwd))
 }
 
-/// `<repo>/.git` for a checkout, `<repo>.git` for a bare repository, and
-/// `.git/modules/<repo>` for a submodule.
-fn repository_name(common_dir: &Path) -> Option<String> {
+/// Returns a stable grouping key while leaving the display label to the overview.
+fn repository_key(common_dir: &Path) -> Option<String> {
     if common_dir.file_name()? == ".git" {
-        return file_name(common_dir.parent()?);
+        return Some(common_dir.parent()?.to_string_lossy().into_owned());
     }
-    let name = file_name(common_dir)?;
-    Some(name.strip_suffix(".git").map(str::to_owned).unwrap_or(name))
+    Some(common_dir.to_string_lossy().into_owned())
 }
 
-fn file_name(path: &Path) -> Option<String> {
-    Some(path.file_name()?.to_string_lossy().into_owned())
+fn project_key(path: &Path) -> Option<String> {
+    path.file_name()?;
+    Some(path.to_string_lossy().into_owned())
 }
 
 #[cfg(test)]

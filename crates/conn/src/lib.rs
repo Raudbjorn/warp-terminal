@@ -64,10 +64,10 @@ pub fn is_harness_prompt(text: &str) -> bool {
     HARNESS_PROMPT_TAGS.iter().any(|tag| text.starts_with(tag))
 }
 
-/// Entries retained per session before the oldest evictable one is dropped.
+/// Entries retained per session before the oldest entry is dropped.
 ///
 /// Bounds memory and keeps the panel readable on a long session. Prompts are
-/// exempt (see [`ConnSession::push`]).
+/// bounded too: an unattended or automated session must not grow without limit.
 pub const MAX_ENTRIES: usize = 500;
 
 /// One thing that happened in a session, in the vocabulary of someone
@@ -111,12 +111,8 @@ pub enum ConnEntryKind {
 
 impl ConnEntryKind {
     /// Whether this entry may be dropped to stay under [`MAX_ENTRIES`].
-    ///
-    /// Prompts are not evictable: they are the reason Conn exists, they are
-    /// bounded by how fast a person can type, and losing the earliest one
-    /// loses the session's original intent.
     pub fn is_evictable(&self) -> bool {
-        !matches!(self, ConnEntryKind::Prompt { .. })
+        true
     }
 }
 
@@ -216,10 +212,9 @@ impl ConnSession {
             return false;
         }
         // The transcript is written asynchronously, so a read can land before
-        // the turn's closing message reaches the file. Trust the story only as
-        // far as it actually goes, so the live entry carrying the response is
-        // still shown rather than hidden behind a story that lacks it. A story
-        // with no turns tells nothing, so it covers nothing.
+        // the turn's closing message reaches the file. Coverage is computed
+        // against the live entries in `in_flight`, where hook prompts are
+        // matched to transcript prompts rather than compared by timestamp.
         self.story_through = match story.turns.last() {
             None => None,
             Some(turn) if turn.outcome.is_none() => Some(turn.last_activity()),
@@ -232,27 +227,57 @@ impl ConnSession {
 
     /// Live entries the story does not yet cover: the turn in flight.
     ///
-    /// Entries are appended as events arrive, so `at` is non-decreasing and
-    /// the boundary is a partition rather than a scan. A finished turn's
-    /// coverage runs up to the read that found it, but a prompt typed after the
-    /// story's latest turn is not in the story however late the read was
-    /// dispatched, so coverage stops short of the first such prompt.
+    /// Transcript timestamps and hook receipt timestamps are different clocks
+    /// for this purpose. Match prompts in order, allowing the hook's truncated
+    /// text to be a prefix of the transcript prompt, and consume repeated
+    /// prompts one at a time.
     pub fn in_flight(&self) -> &[ConnEntry] {
         let Some(through) = self.story_through else {
             return &self.entries;
         };
-        let covered = self.entries.partition_point(|entry| entry.at <= through);
-        let told = self
-            .story
-            .as_ref()
-            .and_then(|story| story.latest_turn())
-            .map_or(through, |turn| turn.last_activity().min(through));
-        let start = self.entries.partition_point(|entry| entry.at <= told);
-        let start = self.entries[start..covered]
-            .iter()
-            .position(|entry| matches!(entry.kind, ConnEntryKind::Prompt { .. }))
-            .map_or(covered, |offset| start + offset);
-        &self.entries[start..]
+        let covered_end = self.entries.partition_point(|entry| entry.at <= through);
+        let Some(story) = self.story.as_ref() else {
+            return &self.entries;
+        };
+        let mut covered = vec![false; covered_end];
+        let mut search_from = 0;
+
+        for turn in &story.turns {
+            let Some(prompt_index) = self.entries[search_from..covered_end]
+                .iter()
+                .position(|entry| match &entry.kind {
+                    ConnEntryKind::Prompt { text } => prompt_matches(text, &turn.prompt),
+                    _ => false,
+                })
+                .map(|offset| search_from + offset)
+            else {
+                break;
+            };
+
+            let next_prompt = self.entries[prompt_index + 1..covered_end]
+                .iter()
+                .position(|entry| matches!(entry.kind, ConnEntryKind::Prompt { .. }))
+                .map(|offset| prompt_index + 1 + offset)
+                .unwrap_or(covered_end);
+            let end = if turn.outcome.is_some() {
+                through
+            } else {
+                turn.last_activity().min(through)
+            };
+            for (index, entry) in self.entries[prompt_index..next_prompt].iter().enumerate() {
+                if entry.at <= end {
+                    covered[prompt_index + index] =
+                        !matches!(entry.kind, ConnEntryKind::Failed { .. });
+                }
+            }
+            search_from = next_prompt;
+            if search_from == covered_end {
+                break;
+            }
+        }
+
+        let first_uncovered = covered.iter().position(|is_covered| !is_covered);
+        &self.entries[first_uncovered.unwrap_or(covered_end)..]
     }
 
     /// The time of the latest thing that happened, told by the story or still in flight.
@@ -372,6 +397,14 @@ impl ConnSession {
                 _ => None,
             })
     }
+}
+
+fn prompt_matches(hook: &str, transcript: &str) -> bool {
+    !hook.is_empty()
+        && !transcript.is_empty()
+        && (hook == transcript
+            || transcript.starts_with(hook)
+            || hook.starts_with(transcript))
 }
 
 #[cfg(test)]

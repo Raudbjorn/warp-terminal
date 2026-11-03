@@ -407,12 +407,6 @@ impl PaneContent for TerminalPane {
                 );
             });
             self.delete_blocks(ctx);
-
-            // Conn's history outlives the agent on purpose, but not the pane.
-            let terminal_view_id = self.terminal_view(ctx).id();
-            ConnModel::handle(ctx).update(ctx, |conn, ctx| {
-                conn.forget_pane(terminal_view_id, ctx);
-            });
         }
 
         // Unsubscribe from all views in the pane stack.
@@ -422,6 +416,13 @@ impl PaneContent for TerminalPane {
             .iter()
             .map(|(_, view)| view.id())
             .collect::<Vec<_>>();
+        if matches!(detach_type, DetachType::Closed) {
+            ConnModel::handle(ctx).update(ctx, |conn, ctx| {
+                for terminal_view_id in &terminal_view_ids {
+                    conn.forget_pane(*terminal_view_id, ctx);
+                }
+            });
+        }
         for (manager, view) in contents {
             // Notify the view that it's being detached so it can react appropriately
             // (e.g. the shared-session viewer tears down its network only when the detach

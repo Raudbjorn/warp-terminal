@@ -49,7 +49,9 @@ pub unsafe fn clear_launcher_agent_env() {
             let Some(name) = name.to_str() else {
                 return false;
             };
-            LAUNCHER_AGENT_ENV_VARS.contains(&name)
+            LAUNCHER_AGENT_ENV_VARS
+                .iter()
+                .any(|marker| name.eq_ignore_ascii_case(marker))
         })
         .collect();
     for name in doomed {
