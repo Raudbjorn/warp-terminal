@@ -9,7 +9,8 @@ You can find this information on language specific documentation and style guide
 
 Another place to look is at Zed's config.toml files, e.g.: https://github.com/zed-industries/zed/blob/85bdd9329b550475aae34340e50abd4e79f2dd82/crates/languages/src/python/config.toml
 
-**Note:** We don't use custom highlights.scm files - we use arborium's bundled highlighting queries instead.
+## highlights.scm
+Highlighting normally uses arborium's bundled queries. An optional local `highlights.scm` is appended to those queries; for standalone grammars such as Prisma, it supplies the complete query.
 
 ## indents.scm
 This controls how we know when a cursor should be indented relative to the previous line.

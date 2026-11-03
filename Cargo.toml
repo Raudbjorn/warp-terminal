@@ -43,8 +43,10 @@ cloud_objects = { path = "crates/cloud_objects" }
 cloud_object_client = { path = "crates/cloud_object_client" }
 cloud_object_persistence = { path = "crates/cloud_object_persistence" }
 cloud_object_models = { path = "crates/cloud_object_models" }
+code_formatters = { path = "crates/code_formatters" }
 computer_use = { path = "crates/computer_use" }
 field_mask = { path = "crates/field_mask" }
+file_write_guard = { path = "crates/file_write_guard" }
 firebase = { path = "crates/firebase" }
 fuzzy_match = { path = "crates/fuzzy_match" }
 handlebars = { path = "crates/handlebars" }
@@ -67,6 +69,7 @@ node_runtime = { path = "crates/node_runtime" }
 onboarding = { path = "crates/onboarding" }
 persistence = { path = "crates/persistence" }
 prevent_sleep = { path = "crates/prevent_sleep" }
+project_replace = { path = "crates/project_replace" }
 regex_dfas = { path = "crates/regex_dfas" }
 remote_server = { path = "crates/remote_server" }
 repo_metadata = { path = "crates/repo_metadata" }
@@ -317,6 +320,9 @@ tracing-subscriber = { version = "0.3.22", default-features = false, features = 
 # `handshake` is the only feature needed for a ws:// localhost client (no TLS).
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
 arborium = { version = "2", default-features = false, features = [
+  "lang-scss",
+  "lang-svelte",
+  "lang-typst",
   "lang-rust",
   "lang-go",
   "lang-yaml",
@@ -352,6 +358,7 @@ arborium = { version = "2", default-features = false, features = [
   "lang-dockerfile",
   "lang-markdown",
 ] }
+tree-sitter-prisma-io = "1.6.0"
 unicode-general-category = "1.1.0"
 unicode-linebreak = "0.1.5"
 unicode-segmentation = "1.11.0"

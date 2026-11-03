@@ -222,6 +222,52 @@ fn selected_review_repo_is_cleared_when_pane_group_is_removed() {
     });
 }
 
+#[test]
+fn non_repo_directories_are_told_apart_from_repository_roots() {
+    App::test((), |mut app| async move {
+        let detected_repos_handle = app.add_singleton_model(|_| DetectedRepositories::default());
+
+        let temp_dir = tempfile::TempDir::new().expect("temp dir");
+        let folder = temp_dir.path().join("folder");
+        let repo = temp_dir.path().join("repo");
+        fs::create_dir_all(&folder).expect("create folder");
+        fs::create_dir_all(&repo).expect("create repo");
+        let folder = dunce::canonicalize(&folder).expect("canonical folder");
+        let repo = dunce::canonicalize(&repo).expect("canonical repo");
+        detected_repos_handle.update(&mut app, |repos, _| {
+            let canonical =
+                warp_util::standardized_path::StandardizedPath::from_local_canonicalized(&repo)
+                    .expect("canonicalized path");
+            repos.insert_test_repo_root(canonical);
+        });
+
+        let pane_group_id = EntityId::new();
+        let other_pane_group_id = EntityId::new();
+        let terminal_1 = EntityId::new();
+        let terminal_2 = EntityId::new();
+
+        let working_directories_handle = app.add_model(|_| WorkingDirectoriesModel::new());
+        working_directories_handle.update(&mut app, |model, ctx| {
+            model.refresh_working_directories_for_pane_group(
+                pane_group_id,
+                vec![(terminal_1, local(&folder)), (terminal_2, local(&repo))],
+                vec![],
+                Some(terminal_1),
+                ctx,
+            );
+
+            assert!(model.is_non_repo_directory(pane_group_id, &folder));
+            assert!(!model.is_non_repo_directory(pane_group_id, &repo));
+            assert!(!model.is_non_repo_directory(other_pane_group_id, &folder));
+            assert!(model.is_non_repo_directory_of_any_pane_group(&folder));
+            assert!(!model.is_non_repo_directory_of_any_pane_group(&repo));
+
+            model.remove_pane_group(pane_group_id, ctx);
+            assert!(!model.is_non_repo_directory_of_any_pane_group(&folder));
+        });
+    });
+}
+
 // ── PaneGroupRepositoryRoots unit tests ──────────────────────────
 
 #[test]

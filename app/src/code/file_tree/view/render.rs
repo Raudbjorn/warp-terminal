@@ -1,10 +1,9 @@
+use warpui::Element;
 use warpui::elements::{DraggableState, MouseStateHandle};
 
 use super::FileTreeItem;
 use crate::appearance::Appearance;
-use crate::code::icon_from_file_path;
-use crate::ui_components::icons::Icon;
-use crate::ui_components::item_highlight::ImageOrIcon;
+use crate::code::{default_file_icon, icon_from_file_path, icon_from_folder_path};
 
 impl FileTreeItem {
     pub(super) fn to_render_state(
@@ -25,12 +24,10 @@ impl FileTreeItem {
                     .map(ToOwned::to_owned)
                     .unwrap_or_else(|| String::from("File"));
 
-                let icon_from_file_path =
-                    icon_from_file_path(metadata.path.as_str(), appearance).map(ImageOrIcon::Image);
-
                 RenderState {
                     display_name,
-                    icon: icon_from_file_path.unwrap_or(ImageOrIcon::Icon(Icon::File)),
+                    icon: icon_from_file_path(metadata.path.as_str(), appearance)
+                        .unwrap_or_else(default_file_icon),
                     is_expanded,
                     depth: *depth,
                     mouse_state: mouse_state_handle.clone(),
@@ -51,7 +48,10 @@ impl FileTreeItem {
                     .unwrap_or_else(|| String::from("Folder"));
                 RenderState {
                     display_name,
-                    icon: ImageOrIcon::Icon(Icon::Folder),
+                    icon: icon_from_folder_path(
+                        directory.path.as_str(),
+                        is_expanded.unwrap_or(false),
+                    ),
                     is_expanded,
                     depth: *depth,
                     mouse_state: mouse_state_handle.clone(),
@@ -65,7 +65,7 @@ impl FileTreeItem {
 
 pub(super) struct RenderState {
     pub display_name: String,
-    pub icon: ImageOrIcon,
+    pub icon: Box<dyn Element>,
     pub is_expanded: Option<bool>,
     pub depth: usize,
     pub mouse_state: MouseStateHandle,

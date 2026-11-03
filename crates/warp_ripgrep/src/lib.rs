@@ -3,6 +3,8 @@
 pub mod search;
 #[cfg(not(target_family = "wasm"))]
 mod types;
+#[cfg(not(target_family = "wasm"))]
+pub mod walk;
 
 /// On Unix, monitor the parent PID and exit this process if it changes.
 ///

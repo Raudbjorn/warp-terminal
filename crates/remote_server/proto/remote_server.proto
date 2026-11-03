@@ -483,6 +483,10 @@ message RipgrepSearchRequest {
   // Maximum number of matched lines to return. The server also applies its
   // own match and approximate payload caps.
   uint32 max_matches = 5;
+  // Comma-separated patterns for files to include, exactly as entered by the user.
+  string scope_include = 6;
+  // Comma-separated patterns for files to exclude, exactly as entered by the user.
+  string scope_exclude = 7;
 }
 
 // Server → client: result of a RipgrepSearchRequest.
