@@ -733,6 +733,9 @@ const KEYBINDINGS_TO_CACHE: [&str; 4] = [
 
 const WORKFLOW_AND_ENV_VAR_SPLIT_RATIO: f32 = 0.56;
 const NOTEBOOK_SMART_SPLIT_RATIO: f32 = 0.42;
+/// Plain vertical tabs' default panel width in logical px (master's `vertical_tabs::PANEL_WIDTH`).
+/// Harp mode swaps it for the framed sidebar's wider default.
+const UPSTREAM_VERTICAL_TABS_PANEL_WIDTH: f32 = 248.;
 
 #[cfg(target_family = "wasm")]
 const MOBILE_OVERLAY_PANEL_WIDTH_RATIO: f32 = 0.9;
@@ -1336,16 +1339,11 @@ impl Workspace {
     }
     fn tab_rename_editor_font_size(ctx: &AppContext, appearance: &Appearance) -> f32 {
         if FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs {
-            // The framed sidebar (vertical tabs on the left) renames in place at its rows' 13 px.
-            if Self::tabs_panel_side(&TabSettings::as_ref(ctx).header_toolbar_chip_selection)
-                == PanelPosition::Left
-            {
+            // The framed sidebar renames in place at its rows' 13 px.
+            if Self::framed_sidebar_configured(ctx) {
                 return vertical_tabs::sidebar::ROW_TITLE_SIZE;
             }
-            match *TabSettings::as_ref(ctx)
-                .vertical_tabs_display_granularity
-                .value()
-            {
+            match Self::vertical_tabs_display_granularity(ctx) {
                 VerticalTabsDisplayGranularity::Panes => 10.,
                 VerticalTabsDisplayGranularity::Tabs => 12.,
             }
@@ -3946,6 +3944,7 @@ impl Workspace {
             }
         });
         ws.limit_rings.refresh(ctx);
+        ws.sync_vertical_tabs_panel_width_to_mode(ctx);
         ws.schedule_sidebar_time_refresh(ctx);
         #[cfg(not(target_family = "wasm"))]
         ws.schedule_tmux_agent_poll(ctx);
@@ -4232,10 +4231,11 @@ impl Workspace {
                 self.limit_rings.refresh(ctx);
                 ctx.notify();
             }
-            // Harp mode switches the sidebar layout; every renderer reads the setting, so a
-            // repaint is enough here.
+            // Harp mode switches the sidebar layout. Renderers read the setting; the state the
+            // layout keeps (open panel, tab order, width, titlebar) follows here, so a
+            // settings.toml edit acts like the toggle (minus turning vertical tabs on).
             TabSettingsChangedEvent::HarpMode { .. } => {
-                ctx.notify();
+                self.apply_harp_mode_change(ctx);
             }
             // The next tmux poll (every 10 s) reads the new values.
             TabSettingsChangedEvent::TmuxSyncEnabled { .. }
@@ -8776,7 +8776,12 @@ impl Workspace {
             self.sidebar_tab_group_menu_items(group_id)
         } else {
             let terminal_colors = Appearance::as_ref(ctx).theme().terminal_colors().normal;
-            self.tab_group_menu_items(group_id, uses_vertical_tabs(ctx), terminal_colors)
+            self.tab_group_menu_items(
+                group_id,
+                uses_vertical_tabs(ctx),
+                sidebar_style.is_some(),
+                terminal_colors,
+            )
         };
         // The tab menu shares this view and sets its own look, so both are set every time.
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
@@ -10888,11 +10893,13 @@ impl Workspace {
     }
 
     /// Move/close directional labels read "up/down/above/below" in vertical
-    /// tabs and "left/right" in horizontal tabs; actions are unchanged.
+    /// tabs and "left/right" in horizontal tabs; actions are unchanged. `framed` (Harp's sidebar)
+    /// names the rename entry "Rename group", matching its short group menu.
     fn tab_group_menu_items(
         &self,
         group_id: TabGroupId,
         is_vertical: bool,
+        framed: bool,
         terminal_colors: AnsiColors,
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let Some((first, last)) = group_member_index_range(&self.tabs, group_id) else {
@@ -11018,7 +11025,7 @@ impl Workspace {
             ],
             move_section,
             vec![
-                MenuItemFields::new("Rename group")
+                MenuItemFields::new(if framed { "Rename group" } else { "Rename" })
                     .with_on_select_action(WorkspaceAction::RenameTabGroup(group_id))
                     .into_item(),
             ],
@@ -22398,15 +22405,98 @@ impl Workspace {
             || self.current_workspace_state.is_any_modal_open(app)
     }
 
-    pub(super) fn uses_framed_sidebar_layout(&self, ctx: &AppContext) -> bool {
+    /// Whether the settings ask for the framed sidebar: Harp mode on, vertical tabs on, and the
+    /// tabs panel on the left. Needs no `Workspace`, so tab menus and row rendering can ask too;
+    /// [`Self::uses_framed_sidebar_layout`] also excludes a tab-drag preview window.
+    pub(crate) fn framed_sidebar_configured(ctx: &AppContext) -> bool {
         let vertical_tabs_active =
             FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs;
         let config = &TabSettings::as_ref(ctx).header_toolbar_chip_selection;
         // Deliberately independent of `tab_bar_mode`: in fullscreen with hide-on-hover that
         // flips with the mouse, and the layout must not flip with it.
-        vertical_tabs_active
+        crate::tab::harp_mode_enabled(ctx)
+            && vertical_tabs_active
             && Self::tabs_panel_side(config) == PanelPosition::Left
-            && !self.is_tab_drag_preview
+    }
+
+    pub(super) fn uses_framed_sidebar_layout(&self, ctx: &AppContext) -> bool {
+        Self::framed_sidebar_configured(ctx) && !self.is_tab_drag_preview
+    }
+
+    /// The vertical tabs' display granularity as rendered. The framed sidebar shows one row per
+    /// tab (Harp shipped with Tabs as the default), but the fork keeps Panes as the default for
+    /// plain vertical tabs, so the framed layout forces Tabs instead of changing the setting.
+    pub(crate) fn vertical_tabs_display_granularity(
+        ctx: &AppContext,
+    ) -> VerticalTabsDisplayGranularity {
+        if Self::framed_sidebar_configured(ctx) {
+            VerticalTabsDisplayGranularity::Tabs
+        } else {
+            *TabSettings::as_ref(ctx)
+                .vertical_tabs_display_granularity
+                .value()
+        }
+    }
+
+    /// Gives the vertical tabs panel the current layout's default width (the framed sidebar is
+    /// wider than plain vertical tabs). A width the user dragged is kept: only a panel still at
+    /// the other layout's default is resized.
+    fn sync_vertical_tabs_panel_width_to_mode(&self, ctx: &AppContext) {
+        let (other_default, mode_default) = if Self::framed_sidebar_configured(ctx) {
+            (
+                UPSTREAM_VERTICAL_TABS_PANEL_WIDTH,
+                vertical_tabs::sidebar::SIDEBAR_WIDTH,
+            )
+        } else {
+            (
+                vertical_tabs::sidebar::SIDEBAR_WIDTH,
+                UPSTREAM_VERTICAL_TABS_PANEL_WIDTH,
+            )
+        };
+        let Ok(mut state) = self.vertical_tabs_panel.resizable_state.lock() else {
+            log::warn!("vertical tabs panel width lock is poisoned; keeping its width");
+            return;
+        };
+        if state.size() == other_default {
+            state.set_size(mode_default);
+        }
+    }
+
+    /// Brings this window in line with Harp mode after it changed (the HarpMode settings event,
+    /// so the toggle command, the Settings switch and a settings.toml edit all land here): the
+    /// framed layout's titlebar, rename font and panel width, and on turning on, an open sidebar
+    /// with its tab order and limit rings.
+    fn apply_harp_mode_change(&mut self, ctx: &mut ViewContext<Self>) {
+        if crate::tab::harp_mode_enabled(ctx) && *TabSettings::as_ref(ctx).use_vertical_tabs {
+            // The UseVerticalTabs event places the tabs panel too, but it may arrive after this
+            // one (the toggles set both settings at once); the framed checks below need it now.
+            Self::ensure_tabs_panel_in_config(ctx);
+            self.open_vertical_tabs_panel_if_enabled(ctx);
+            // The framed sidebar has no settings popup button, so an open popup would be orphaned.
+            self.close_vertical_tabs_settings_popup();
+            self.keep_grouped_tabs_first(ctx);
+            self.limit_rings.refresh(ctx);
+        }
+        self.sync_vertical_tabs_panel_width_to_mode(ctx);
+        let appearance = Appearance::as_ref(ctx);
+        let font_size = Self::tab_rename_editor_font_size(ctx, appearance);
+        self.tab_rename_editor
+            .update(ctx, |editor, ctx| editor.set_font_size(font_size, ctx));
+        self.update_titlebar_height(ctx);
+        ctx.notify();
+    }
+
+    /// Flips Harp mode, for the "Toggle Harp Mode" command and the Settings switch alike. Turning
+    /// it on also turns vertical tabs on (the sidebar is built on them, and the mode would show
+    /// nothing otherwise); turning it off only clears Harp mode, so vertical tabs stay as they
+    /// are. Each window then follows through its HarpMode settings event.
+    pub(crate) fn toggle_harp_mode_setting(ctx: &mut AppContext) {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.harp_mode.toggle_and_save_value(ctx));
+            if *settings.harp_mode && !*settings.use_vertical_tabs {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+            }
+        });
     }
 
     /// Wakes the tab holding `terminal_view_id` when its agent gets a new prompt.
@@ -24464,6 +24554,9 @@ impl Workspace {
         if *tab_settings.vertical_tabs_full_tab_menu.value() {
             context.set.insert(flags::VERTICAL_TABS_FULL_TAB_MENU_FLAG);
         }
+        if *tab_settings.harp_mode.value() {
+            context.set.insert(flags::HARP_MODE_FLAG);
+        }
         if *tab_settings
             .show_vertical_tab_panel_in_restored_windows
             .value()
@@ -26102,6 +26195,7 @@ impl Workspace {
                     self.toggle_vertical_tabs_panel(ctx);
                 }
             }
+            ToggleHarpMode => Self::toggle_harp_mode_setting(ctx),
             SshManager(action) => self.handle_ssh_manager_action(action, ctx),
             ToggleNotificationMailbox { select_first } => {
                 if FeatureFlag::HOANotifications.is_enabled()

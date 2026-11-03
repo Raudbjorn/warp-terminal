@@ -812,6 +812,15 @@ pub fn init(app: &mut AppContext) {
         .with_group(bindings::BindingGroup::Navigation.as_str())
         .with_enabled(|| FeatureFlag::VerticalTabs.is_enabled())
         .with_key_binding(cmd_or_ctrl_shift("b")),
+        // No default key: reachable from the command palette and bindable in Settings.
+        EditableBinding::new(
+            "workspace:toggle_harp_mode",
+            "Toggle Harp Mode",
+            WorkspaceAction::ToggleHarpMode,
+        )
+        .with_context_predicate(id!("Workspace"))
+        .with_group(bindings::BindingGroup::Navigation.as_str())
+        .with_enabled(|| FeatureFlag::VerticalTabs.is_enabled()),
         EditableBinding::new(
             LEFT_PANEL_PROJECT_EXPLORER_BINDING_NAME,
             BindingDescription::new("Left Panel: Project explorer"),

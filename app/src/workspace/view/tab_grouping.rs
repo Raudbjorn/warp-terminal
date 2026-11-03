@@ -1433,7 +1433,8 @@ impl Workspace {
         menu_items: &mut Vec<MenuItem<WorkspaceAction>>,
         ctx: &warpui::AppContext,
     ) {
-        if !crate::tab::uses_vertical_tabs(ctx) {
+        // Plain vertical tabs (Harp mode off) keep Warp's "Pin tab" entry from `TabData`.
+        if !crate::tab::uses_harp_sidebar_menus(ctx) {
             return;
         }
         let Some(tab) = self.tabs.get(tab_index) else {

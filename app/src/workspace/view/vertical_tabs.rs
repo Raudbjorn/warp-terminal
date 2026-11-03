@@ -766,7 +766,9 @@ impl VerticalTabsDetailHoverState {
 
 pub(super) struct VerticalTabsPanelState {
     scroll_state: ClippedScrollStateHandle,
-    resizable_state: ResizableStateHandle,
+    /// The workspace resets the width when Harp mode switches (see
+    /// `Workspace::sync_vertical_tabs_panel_width_to_mode`).
+    pub(super) resizable_state: ResizableStateHandle,
     group_mouse_states: RefCell<HashMap<EntityId, PaneGroupStateHandles>>,
     /// Hover states per tab group, keyed by `TabGroupId`.
     tab_group_mouse_states: RefCell<HashMap<TabGroupId, TabGroupMouseStates>>,
@@ -1096,7 +1098,8 @@ struct TabGroupDragState {
 
 fn resolve_vertical_tabs_mode(app: &AppContext) -> VerticalTabsResolvedMode {
     let settings = TabSettings::as_ref(app);
-    match *settings.vertical_tabs_display_granularity.value() {
+    // Tabs while framed, whatever the setting says (see the helper).
+    match Workspace::vertical_tabs_display_granularity(app) {
         VerticalTabsDisplayGranularity::Panes => VerticalTabsResolvedMode::Panes,
         VerticalTabsDisplayGranularity::Tabs => match *settings.vertical_tabs_tab_item_mode.value()
         {
@@ -8293,9 +8296,7 @@ fn detail_pane_props<'a>(
             badge_mouse_states,
         },
         state.detail_hover_state(workspace.window_id),
-        *TabSettings::as_ref(app)
-            .vertical_tabs_display_granularity
-            .value(),
+        Workspace::vertical_tabs_display_granularity(app),
         false,
         None,
         None,
