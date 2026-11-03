@@ -5,6 +5,7 @@
 //! filtering across both top-level pages and umbrella subpages — so that
 //! refactors of the settings page model cannot silently regress them.
 
+use warp::features::FeatureFlag;
 use warp::integration_testing::settings::{
     assert_settings_nav_page_visible, assert_settings_nav_subpage_visible, assert_settings_section,
     assert_settings_widget_rendered, assert_umbrella_expanded, clear_settings_search,
@@ -12,7 +13,7 @@ use warp::integration_testing::settings::{
     press_settings_nav_down, press_settings_nav_up, type_settings_search,
 };
 use warp::integration_testing::terminal::wait_until_bootstrapped_single_pane_for_tab;
-use warp::settings_view::{SettingsSection, cli_agent_settings_widget_id};
+use warp::settings_view::{SettingsSection, cli_agent_settings_widget_id, ssh_settings_widget_id};
 
 use super::{Builder, new_builder};
 
@@ -226,6 +227,36 @@ pub fn test_settings_agent_mcp_servers_renders_standalone_page() -> Builder {
         .with_step(assert_umbrella_expanded(AGENTS_UMBRELLA, true))
         .with_step(assert_settings_nav_subpage_visible(
             SettingsSection::AgentMCPServers,
+            true,
+        ))
+}
+
+// ---------------------------------------------------------------------------
+// Page rendering
+// ---------------------------------------------------------------------------
+
+/// Opening the Warpify page lays out and paints its SSH section, including the
+/// SSH extension download URL text input.
+///
+/// This previously panicked on the first frame ("we don't yet handle an
+/// infinite width constraint on buffer elements"): the URL input was placed in
+/// the trailing, non-flexible slot of a settings row, so the row handed it an
+/// unbounded width.
+pub fn test_settings_warpify_page_renders() -> Builder {
+    // The download URL input only renders behind this flag, and the
+    // integration channel does not enable it by default.
+    FeatureFlag::SshRemoteServer.set_enabled(true);
+
+    new_builder()
+        .with_step(wait_until_bootstrapped_single_pane_for_tab(0))
+        .with_step(assert_settings_widget_rendered(
+            ssh_settings_widget_id(),
+            false,
+        ))
+        .with_step(open_settings_page(SettingsSection::Warpify))
+        .with_step(assert_settings_section(SettingsSection::Warpify))
+        .with_step(assert_settings_widget_rendered(
+            ssh_settings_widget_id(),
             true,
         ))
 }
