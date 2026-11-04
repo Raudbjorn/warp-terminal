@@ -1083,15 +1083,18 @@ impl Workspace {
             .and_then(|group| group.name.clone())
             .unwrap_or_default();
         let pane_group_id = tab.pane_group.id();
-        // A split tab follows its first tmux terminal, the same one the sync follows; the other
-        // panes' sessions keep their own names.
-        let Some((_, shell_pid)) =
+        // A split tab follows its first tmux terminal, the same one the sync follows (a plain
+        // shell in front of it does not count); the other panes' sessions keep their own names.
+        // Which terminal that is takes a tmux query, so `rename_session` picks it off the UI
+        // thread from all of the tab's shells.
+        let shell_pids: Vec<u32> =
             super::vertical_tabs::tab_terminal_shell_pids(tab.pane_group.as_ref(ctx), ctx)
                 .into_iter()
-                .next()
-        else {
+                .map(|(_, pid)| pid)
+                .collect();
+        if shell_pids.is_empty() {
             return;
-        };
+        }
         // Until the session carries the new name, the sync would put the old one back.
         self.tmux_rename_settle.insert(
             pane_group_id,
@@ -1101,7 +1104,7 @@ impl Workspace {
                 warned: false,
             },
         );
-        tmux_agents::rename_session(tmux_session_script(ctx), shell_pid, &group, title);
+        tmux_agents::rename_session(tmux_session_script(ctx), shell_pids, &group, title);
     }
 
     /// Keeps every tmux tab in step with its session: the tab shows the session's name (so a
@@ -2372,27 +2375,46 @@ mod tmux_agents {
         sessions
     }
 
-    /// Renames the session whose client is `shell_pid` (or a child of it). With a script:
-    /// `<script> rename <shell_pid> <group> <title>`; without: `tmux rename-session` to the title.
-    /// Detached; the lookup runs off the UI thread.
+    /// The first of a tab's shells that has a tmux client: the terminal the tab's sync follows.
+    /// A plain shell in front of it does not count.
+    pub(in crate::workspace::view) fn first_tmux_shell<V>(
+        shell_pids: &[u32],
+        sessions: &HashMap<u32, V>,
+    ) -> Option<u32> {
+        shell_pids
+            .iter()
+            .copied()
+            .find(|pid| sessions.contains_key(pid))
+    }
+
+    /// Renames the session of the tab's first tmux terminal, found among `shell_pids` (see
+    /// `first_tmux_shell`). With a script: `<script> rename <shell_pid> <group> <title>`;
+    /// without: `tmux rename-session` to the title. Detached; the lookup runs off the UI thread.
     pub(in crate::workspace::view) fn rename_session(
         script: Option<PathBuf>,
-        shell_pid: u32,
+        shell_pids: Vec<u32>,
         group: &str,
         title: &str,
     ) {
-        if let Some(script) = script {
-            spawn_detached(Command::new(script).args([
-                "rename",
-                &shell_pid.to_string(),
-                group,
-                title,
-            ]));
-            return;
-        }
-        let title = title.to_owned();
+        let (group, title) = (group.to_owned(), title.to_owned());
         std::thread::spawn(move || {
-            if let Some(session) = tmux_client_sessions().remove(&shell_pid) {
+            let sessions = tmux_client_sessions();
+            let matched = first_tmux_shell(&shell_pids, &sessions);
+            if let Some(script) = script {
+                // With no client found (tmux not answering) the script still gets the first
+                // shell and may know better, as it did before the lookup.
+                let Some(shell_pid) = matched.or_else(|| shell_pids.first().copied()) else {
+                    return;
+                };
+                spawn_detached(Command::new(script).args([
+                    "rename",
+                    &shell_pid.to_string(),
+                    &group,
+                    &title,
+                ]));
+                return;
+            }
+            if let Some(session) = matched.and_then(|pid| sessions.get(&pid)) {
                 spawn_detached(Command::new(tmux_binary()).args([
                     "rename-session",
                     "-t",
@@ -2645,6 +2667,10 @@ mod tmux_agents {
                 })
         }
     }
+
+    #[cfg(test)]
+    #[path = "tmux_agents_tests.rs"]
+    mod tests;
 }
 
 /// The sidebar order as stored in tmux, so another tmux client (a phone bridge) can show and
