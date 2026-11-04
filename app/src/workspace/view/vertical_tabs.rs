@@ -1925,12 +1925,6 @@ fn render_vertical_tabs_panel(
 
     let framed = workspace.uses_framed_sidebar_layout(app);
     let list = render_groups(state, workspace, app);
-    let content_height = overflow_fade::ContentHeight::default();
-    let list = if framed {
-        content_height.probe(list)
-    } else {
-        list
-    };
     let scrollable_groups = ClippedScrollable::vertical(
         state.scroll_state.clone(),
         list,
@@ -1990,10 +1984,9 @@ fn render_vertical_tabs_panel(
             .with_height(sidebar::HEADER_HEIGHT)
             .finish(),
         );
-        // The list scrolls under a fixed footer; when it overflows, rows fade out at its foot.
-        let list = content_height.fade_when_overflowing(scrollable_groups, sidebar::FADE_HEIGHT);
+        // The list scrolls under a fixed footer.
         let panel_content = panel_content
-            .with_child(Expanded::new(1., list).finish())
+            .with_child(Expanded::new(1., scrollable_groups).finish())
             .with_child(sidebar::footer(workspace, app))
             .finish();
         return finish_vertical_tabs_panel(state, workspace, side, panel_content, framed, app);
@@ -2009,167 +2002,6 @@ fn render_vertical_tabs_panel(
         .with_child(Shrinkable::new(1., scrollable_groups).finish())
         .finish();
     finish_vertical_tabs_panel(state, workspace, side, panel_content, framed, app)
-}
-
-/// The framed sidebar's bottom fade, decided in the same frame as the list it covers: the list's
-/// content reports its laid-out height, and the rows fade out only when that height exceeds the
-/// viewport.
-mod overflow_fade {
-    use std::any::Any;
-    use std::sync::{Arc, Mutex};
-
-    use warpui::elements::Point;
-    use warpui::event::DispatchedEvent;
-    use warpui::geometry::vector::Vector2F;
-    use warpui::scene::BottomFade;
-    use warpui::{
-        AfterLayoutContext, AppContext, ClipBounds, Element, EventContext, LayoutContext,
-        PaintContext, SizeConstraint,
-    };
-
-    #[derive(Clone, Default)]
-    pub(super) struct ContentHeight(Arc<Mutex<f32>>);
-
-    impl ContentHeight {
-        fn get(&self) -> f32 {
-            *self.0.lock().expect("content height lock poisoned")
-        }
-
-        pub(super) fn probe(&self, child: Box<dyn Element>) -> Box<dyn Element> {
-            Box::new(Probe {
-                child,
-                height: self.clone(),
-            })
-        }
-
-        pub(super) fn fade_when_overflowing(
-            &self,
-            viewport: Box<dyn Element>,
-            fade_height: f32,
-        ) -> Box<dyn Element> {
-            Box::new(Fade {
-                viewport,
-                fade_height,
-                content: self.clone(),
-                size: None,
-                origin: None,
-            })
-        }
-    }
-
-    struct Probe {
-        child: Box<dyn Element>,
-        height: ContentHeight,
-    }
-
-    impl Element for Probe {
-        fn layout(
-            &mut self,
-            constraint: SizeConstraint,
-            ctx: &mut LayoutContext,
-            app: &AppContext,
-        ) -> Vector2F {
-            let size = self.child.layout(constraint, ctx, app);
-            *self.height.0.lock().expect("content height lock poisoned") = size.y();
-            size
-        }
-
-        fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
-            self.child.after_layout(ctx, app);
-        }
-
-        fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
-            self.child.paint(origin, ctx, app);
-        }
-
-        fn size(&self) -> Option<Vector2F> {
-            self.child.size()
-        }
-
-        fn origin(&self) -> Option<Point> {
-            self.child.origin()
-        }
-
-        fn parent_data(&self) -> Option<&dyn Any> {
-            self.child.parent_data()
-        }
-
-        fn dispatch_event(
-            &mut self,
-            event: &DispatchedEvent,
-            ctx: &mut EventContext,
-            app: &AppContext,
-        ) -> bool {
-            self.child.dispatch_event(event, ctx, app)
-        }
-    }
-
-    struct Fade {
-        viewport: Box<dyn Element>,
-        fade_height: f32,
-        content: ContentHeight,
-        size: Option<Vector2F>,
-        origin: Option<Point>,
-    }
-
-    impl Fade {
-        fn overflows(&self) -> bool {
-            self.size
-                .is_some_and(|size| self.content.get() > size.y() + 1.)
-        }
-    }
-
-    impl Element for Fade {
-        fn layout(
-            &mut self,
-            constraint: SizeConstraint,
-            ctx: &mut LayoutContext,
-            app: &AppContext,
-        ) -> Vector2F {
-            let size = self.viewport.layout(constraint, ctx, app);
-            self.size = Some(size);
-            size
-        }
-
-        fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
-            self.viewport.after_layout(ctx, app);
-        }
-
-        /// The rows themselves fade out (a layer alpha, not a color laid over them), so the
-        /// bottom runs into whatever the glass shows instead of a second coat of tint.
-        fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
-            self.origin = Some(Point::from_vec2f(origin, ctx.scene.z_index()));
-            if !self.overflows() {
-                self.viewport.paint(origin, ctx, app);
-                return;
-            }
-            let bottom = origin.y() + self.size.unwrap_or_default().y();
-            ctx.scene.start_layer(ClipBounds::ActiveLayer);
-            ctx.scene.set_active_layer_bottom_fade(BottomFade {
-                start: bottom - self.fade_height,
-                end: bottom,
-            });
-            self.viewport.paint(origin, ctx, app);
-            ctx.scene.stop_layer();
-        }
-
-        fn size(&self) -> Option<Vector2F> {
-            self.size
-        }
-
-        fn origin(&self) -> Option<Point> {
-            self.origin
-        }
-
-        fn dispatch_event(
-            &mut self,
-            event: &DispatchedEvent,
-            ctx: &mut EventContext,
-            app: &AppContext,
-        ) -> bool {
-            self.viewport.dispatch_event(event, ctx, app)
-        }
-    }
 }
 
 /// Drop target, window drag, menus and resizing around the panel's content.
@@ -9391,7 +9223,6 @@ pub(super) mod sidebar {
     const GROUP_BADGE_MAX_WIDTH: f32 = 96.;
     pub(super) const SECTION_HEADER_HEIGHT: f32 = 28.;
     pub(in crate::workspace::view) const SECTION_TITLE_SIZE: f32 = 11.5;
-    pub(super) const FADE_HEIGHT: f32 = 56.;
     pub(in crate::workspace::view) const CARD_HEADER_HEIGHT: f32 = 40.;
     /// The card header's text starts here, clear of the traffic lights, when the sidebar is closed.
     pub(in crate::workspace::view) const CARD_HEADER_PAD_CLOSED: f32 = 84.;
@@ -9516,32 +9347,9 @@ pub(super) mod sidebar {
         colors::GLASS_TINT()
     }
 
-    /// Background blur behind the window while the framed sidebar is on (the user's own setting
-    /// wins when it is stronger).
-    pub(in crate::workspace::view) const GLASS_BLUR_RADIUS: u8 = 30;
-
-    static SIDEBAR_FONT: OnceLock<FamilyId> = OnceLock::new();
-
-    /// Loads the macOS system font (SF) for the sidebar once; the rest of Warp keeps its UI font.
-    pub(in crate::workspace::view) fn load_font(ctx: &mut AppContext) {
-        if SIDEBAR_FONT.get().is_some() {
-            return;
-        }
-        let loaded = warpui::fonts::Cache::handle(ctx).update(ctx, |cache, _| {
-            [".AppleSystemUIFont", "SF Pro Text", "Helvetica Neue"]
-                .into_iter()
-                .find_map(|name| cache.load_system_font(name).ok())
-        });
-        if let Some(family) = loaded {
-            let _ = SIDEBAR_FONT.set(family);
-        }
-    }
-
+    /// The sidebar uses the UI font like the rest of the app.
     pub(in crate::workspace::view) fn font(app: &AppContext) -> FamilyId {
-        SIDEBAR_FONT
-            .get()
-            .copied()
-            .unwrap_or_else(|| Appearance::as_ref(app).ui_font_family())
+        Appearance::as_ref(app).ui_font_family()
     }
 
     fn text(

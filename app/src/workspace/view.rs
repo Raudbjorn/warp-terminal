@@ -235,7 +235,7 @@ use crate::app_state::{
     PaneNodeSnapshot, PaneUuid, RightPanelSnapshot, SettingsPaneSnapshot, TabGroupSnapshot,
     TabSnapshot, TerminalPaneSnapshot, WindowSnapshot, WorkflowPaneSnapshot,
 };
-use crate::appearance::{Appearance, AppearanceEvent, AppearanceManager};
+use crate::appearance::{Appearance, AppearanceManager};
 use crate::auth::AuthStateProvider;
 use crate::auth::auth_manager::{AuthManager, AuthManagerEvent};
 use crate::auth::auth_override_warning_modal::{
@@ -3935,15 +3935,6 @@ impl Workspace {
         ws.sync_panel_positions_from_config(ctx);
         ws.sync_window_button_visibility(ctx);
         ws.update_titlebar_height(ctx);
-        vertical_tabs::sidebar::load_font(ctx);
-        // Deferred a tick so the new window's platform window exists.
-        ctx.spawn(async {}, |ws, _, ctx| ws.update_titlebar_height(ctx));
-        // The glass material switches between light and dark with the theme.
-        ctx.subscribe_to_model(&Appearance::handle(ctx), |ws, _, event, ctx| {
-            if matches!(event, AppearanceEvent::ThemeChanged) {
-                ws.update_titlebar_height(ctx);
-            }
-        });
         ws.limit_rings.refresh(ctx);
         ws.sync_vertical_tabs_panel_width_to_mode(ctx);
         ws.schedule_sidebar_time_refresh(ctx);
@@ -15334,14 +15325,6 @@ impl Workspace {
             platform_window
                 .as_ref()
                 .set_titlebar_height(scaled_tab_bar_height);
-            // Only this window's own layout decides its glass: see-through, frosted and with the
-            // traffic lights inset to the sidebar. Other windows keep their look.
-            vertical_tabs::sidebar::colors::sync(ctx);
-            platform_window.as_ref().set_framed_sidebar_layout(
-                self.uses_framed_sidebar_layout(ctx),
-                vertical_tabs::sidebar::GLASS_BLUR_RADIUS,
-                vertical_tabs::sidebar::colors::is_dark(),
-            );
         }
     }
 
@@ -28080,15 +28063,6 @@ impl View for Workspace {
             let framed = self.uses_framed_sidebar_layout(app);
             if framed {
                 vertical_tabs::sidebar::colors::sync(app);
-                // The glass takes its light or dark material from the same switch the palette
-                // just read, so the two never disagree (a no-op when nothing changed).
-                if let Some(platform_window) = app.windows().platform_window(self.window_id) {
-                    platform_window.as_ref().set_framed_sidebar_layout(
-                        true,
-                        vertical_tabs::sidebar::GLASS_BLUR_RADIUS,
-                        vertical_tabs::sidebar::colors::is_dark(),
-                    );
-                }
             }
             let mut outer_column = Flex::column();
             if tab_bar_mode == ShowTabBar::Stacked && !framed {
@@ -30224,10 +30198,6 @@ impl Workspace {
         if self.uses_framed_sidebar_layout(ctx) {
             let target = self.sidebar_drop_target_at(current_index, position.center().y(), ctx);
             if self.sidebar_drop_target != target {
-                // One tick per slot the drop target moves to (back to the row's own slot
-                // included). The target starts as "unchanged" at pick-up, so picking up and
-                // holding still never ticks.
-                warpui::platform::perform_alignment_haptic();
                 self.sidebar_drop_target = target;
                 ctx.notify();
             }

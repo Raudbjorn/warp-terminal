@@ -47,23 +47,17 @@ fn allow_and_deny_only_on_a_permission() {
         act(Some(ALLOW), Some(&other), true),
         Act::Refuse(dialog::DIALOG_CHANGED)
     );
-    assert_eq!(content(&other, true).0, OPEN_ONLY);
     let waiting = Card::Waiting("Claude needs your input".to_owned());
+    assert_eq!(content(&waiting), "Claude needs your input");
     assert_eq!(
-        content(&waiting, true),
-        (OPEN_ONLY, "Claude needs your input".to_owned())
-    );
-    let (category, body) = content(&permission(OTHER), true);
-    assert_eq!(
-        (category, body.as_str()),
-        (APPROVAL, "Needs you: Allow rm -rf build?")
+        content(&permission(OTHER)),
+        "Needs you: Allow rm -rf build?"
     );
 }
 
 #[test]
 fn a_dialog_behind_a_full_screen_program_only_opens_the_chat() {
     let card = permission(PERMISSION);
-    assert_eq!(content(&card, false).0, OPEN_ONLY);
     assert_eq!(
         act(Some(ALLOW), Some(&card), false),
         Act::Refuse(dialog::DIALOG_CHANGED)

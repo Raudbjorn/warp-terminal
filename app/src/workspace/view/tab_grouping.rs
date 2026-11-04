@@ -1844,10 +1844,10 @@ impl Workspace {
             let Some(entry) = self.claude_notices.entries.get(&terminal) else {
                 continue;
             };
-            let (category, body) = notify::content(&entry.card, entry.target.answerable);
+            let body = notify::content(&entry.card);
             let (id, target) = (entry.id.clone(), entry.target.clone());
-            log::info!("Claude dialog notification {id}: {category}");
-            self.send_claude_notice(terminal, &target, id, category, body, ctx);
+            log::info!("Claude dialog notification {id}");
+            self.send_claude_notice(terminal, &target, id, body, ctx);
         }
     }
 
@@ -1898,7 +1898,6 @@ impl Workspace {
         terminal: EntityId,
         target: &NoticeTarget,
         id: String,
-        category: &str,
         body: String,
         ctx: &mut ViewContext<Self>,
     ) {
@@ -1919,8 +1918,7 @@ impl Workspace {
             .play_notification_sound;
         let content =
             UserNotification::new_with_sound(target.title.clone(), body, Some(data), play_sound)
-                .with_identifier(id)
-                .with_category(category);
+                .with_identifier(id);
         let failed = |_: &mut Self,
                       error: warpui::notification::NotificationSendError,
                       _: &mut ViewContext<Self>| {
@@ -2060,15 +2058,7 @@ impl Workspace {
         reason: &str,
         ctx: &mut ViewContext<Self>,
     ) {
-        let category = claude_waits::notify::OPEN_ONLY;
-        self.send_claude_notice(
-            terminal,
-            target,
-            next_notice_id(),
-            category,
-            reason.to_owned(),
-            ctx,
-        );
+        self.send_claude_notice(terminal, target, next_notice_id(), reason.to_owned(), ctx);
     }
 }
 
@@ -3376,10 +3366,6 @@ pub(in crate::workspace::view) mod claude_waits {
 
         use super::dialog::{self, Card};
 
-        /// Registered at startup with Allow, Deny and Open chat (warpui's notifications.m).
-        pub(in crate::workspace::view) const APPROVAL: &str = "HARP_APPROVAL";
-        /// Open chat only.
-        pub(in crate::workspace::view) const OPEN_ONLY: &str = "HARP_QUESTION";
         const ALLOW: &str = "approve-0";
         const DENY: &str = "approve-deny";
 
@@ -3528,28 +3514,15 @@ pub(in crate::workspace::view) mod claude_waits {
             }
         }
 
-        /// The category (its buttons) and body of a dialog's notification.
-        pub(in crate::workspace::view) fn content(
-            card: &Card,
-            answerable: bool,
-        ) -> (&'static str, String) {
+        /// The body of a dialog's notification.
+        pub(in crate::workspace::view) fn content(card: &Card) -> String {
             match card {
-                Card::Approval(dialog) => (
-                    if is_permission(card, answerable) {
-                        APPROVAL
-                    } else {
-                        OPEN_ONLY
-                    },
-                    format!(
-                        "Needs you: Allow {}?",
-                        cut(dialog::approval_subject(dialog), 200)
-                    ),
+                Card::Approval(dialog) => format!(
+                    "Needs you: Allow {}?",
+                    cut(dialog::approval_subject(dialog), 200)
                 ),
-                Card::Dialog(dialog) => (
-                    OPEN_ONLY,
-                    cut(dialog.body.last().unwrap_or(&dialog.title), 300),
-                ),
-                Card::Waiting(message) => (OPEN_ONLY, cut(message, 300)),
+                Card::Dialog(dialog) => cut(dialog.body.last().unwrap_or(&dialog.title), 300),
+                Card::Waiting(message) => cut(message, 300),
             }
         }
 

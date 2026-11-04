@@ -15,13 +15,9 @@ pub struct UserNotification {
     data: Option<String>,
     // Whether to play sound with the notification.
     play_sound: bool,
-    /// A line between title and body (macOS).
-    subtitle: Option<String>,
     /// The OS identifier, so the notification can be taken back; `None` = one fixed identifier,
     /// a newer notification replaces the older (macOS).
     identifier: Option<String>,
-    /// The registered category whose action buttons it shows (macOS).
-    category: Option<String>,
 }
 
 impl UserNotification {
@@ -39,9 +35,7 @@ impl UserNotification {
             body,
             data,
             play_sound: true,
-            subtitle: None,
             identifier: None,
-            category: None,
         }
     }
 
@@ -56,9 +50,7 @@ impl UserNotification {
             body,
             data,
             play_sound,
-            subtitle: None,
             identifier: None,
-            category: None,
         }
     }
 
@@ -67,31 +59,13 @@ impl UserNotification {
         self
     }
 
-    pub fn with_subtitle(mut self, subtitle: impl Into<String>) -> Self {
-        self.subtitle = Some(subtitle.into());
-        self
-    }
-
     pub fn with_identifier(mut self, identifier: impl Into<String>) -> Self {
         self.identifier = Some(identifier.into());
         self
     }
 
-    pub fn with_category(mut self, category: impl Into<String>) -> Self {
-        self.category = Some(category.into());
-        self
-    }
-
-    pub fn subtitle(&self) -> Option<&str> {
-        self.subtitle.as_deref()
-    }
-
     pub fn identifier(&self) -> Option<&str> {
         self.identifier.as_deref()
-    }
-
-    pub fn category(&self) -> Option<&str> {
-        self.category.as_deref()
     }
 
     pub fn title(&self) -> &str {
