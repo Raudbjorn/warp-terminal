@@ -2602,3 +2602,43 @@ fn an_answered_question_leaves_needs_you() {
         assert_eq!(status(&app), CLIAgentSessionStatus::InProgress);
     });
 }
+
+/// The plugin sends no transcript text unless the user opts in, so a Stop arrives with an empty
+/// query: the row must keep the prompt the turn began with. Fails if a Stop without a prompt
+/// clears the title.
+#[test]
+fn a_stop_without_a_prompt_keeps_the_turns_prompt() {
+    let mut session = blocked_claude_session_with_permission_state();
+    session.session_context.query = Some("write a haiku".to_owned());
+
+    let stop = |query: Option<&str>| CLIAgentEvent {
+        source: CLIAgentEventSource::RichPlugin,
+        v: 1,
+        agent: CLIAgent::Claude,
+        event: CLIAgentEventType::Stop,
+        session_id: Some("abc".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            query: query.map(str::to_owned),
+            response: Some(String::new()),
+            ..Default::default()
+        },
+    };
+    session.apply_event(&stop(Some("")));
+    assert_eq!(
+        session.session_context.query.as_deref(),
+        Some("write a haiku")
+    );
+    session.apply_event(&stop(None));
+    assert_eq!(
+        session.session_context.query.as_deref(),
+        Some("write a haiku")
+    );
+    // A prompt that does arrive still replaces it.
+    session.apply_event(&stop(Some("and a limerick")));
+    assert_eq!(
+        session.session_context.query.as_deref(),
+        Some("and a limerick")
+    );
+}

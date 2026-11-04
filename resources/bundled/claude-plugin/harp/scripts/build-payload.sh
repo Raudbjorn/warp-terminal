@@ -27,6 +27,16 @@ negotiate_protocol_version() {
     fi
 }
 
+# Whether the stop notifications may carry text from the transcript (the last prompt and answer).
+# Off unless HARP_STOP_TRANSCRIPT_TEXT is 1, true or yes: that text reaches the desktop notification,
+# the sidebar and the app's logs, so it is the user's to opt in to.
+include_transcript_text() {
+    case "${HARP_STOP_TRANSCRIPT_TEXT:-}" in
+        1 | true | TRUE | True | yes | YES | Yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 build_payload() {
     local input="$1"
     local event="$2"

@@ -21,14 +21,17 @@ if [ "$STOP_HOOK_ACTIVE" = "true" ]; then
     exit 0
 fi
 
-# Extract the last user prompt and assistant response from the transcript.
-# Small delay to allow Claude Code to flush the current turn to the transcript file.
-# The Stop hook fires before the transcript is fully written.
+# The transcript's last prompt and answer go into the notification only when the user opted in
+# (HARP_STOP_TRANSCRIPT_TEXT, see build-payload.sh); by default the payload carries just the path.
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
-sleep 0.3
 QUERY=""
 RESPONSE=""
-if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+if include_transcript_text && [ -n "$TRANSCRIPT_PATH" ]; then
+    # Small delay to allow Claude Code to flush the current turn to the transcript file.
+    # The Stop hook fires before the transcript is fully written.
+    sleep 0.3
+fi
+if include_transcript_text && [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
     # Get the last human prompt from the transcript.
     # "user" type messages include both human prompts and tool-result messages.
     # Human prompts have content that is either a plain string or an array

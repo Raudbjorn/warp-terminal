@@ -75,6 +75,18 @@ from outside the session); the tab opens on the next poll.
   them to the pane's tty wrapped in tmux's passthrough sequence, and tmux drops
   that unless passthrough is allowed.
 
+## Transcript text
+
+By default the Claude Code plugin's stop notifications carry no text from the
+conversation: the row keeps the prompt of the turn it began with, and the
+desktop notification says "Task completed." That text is what leaves the
+transcript and reaches the notification, the sidebar and the app's logs, so it
+is opt-in. Set `HARP_STOP_TRANSCRIPT_TEXT=1` in the environment Claude Code
+starts in (your shell's startup file, or `env` in Claude Code's settings) and
+the stop hooks add the last prompt and the start of the last answer, each cut to
+200 characters. The prompt shown as the row's title when you submit it is not
+affected.
+
 The app logs a warning at startup and when Harp mode or tmux sync is turned
 on if the bundled plugin is not found, `jq` is missing, or tmux sync is on and
 `tmux` is missing. It checks the app's own `PATH`, which can differ from the

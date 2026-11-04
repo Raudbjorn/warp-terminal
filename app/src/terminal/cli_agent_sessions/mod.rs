@@ -440,7 +440,11 @@ impl CLIAgentSession {
                 }
             }
             CLIAgentEventType::Stop => {
-                self.session_context.query = event.payload.query.clone();
+                // WarpOss: a turn's end that carries no prompt (the plugin sends the transcript's
+                // text only when the user opts in) keeps the one the turn began with.
+                if event.payload.query.as_deref().is_some_and(|q| !q.is_empty()) {
+                    self.session_context.query = event.payload.query.clone();
+                }
                 self.session_context.response = event.payload.response.clone();
                 if self.has_background_permission_dialog() {
                     self.session_context.background_reported_this_turn = false;
@@ -488,7 +492,11 @@ impl CLIAgentSession {
                 CLIAgentSessionStatus::Success
             }
             CLIAgentEventType::StopFailure => {
-                self.session_context.query = event.payload.query.clone();
+                // WarpOss: a turn's end that carries no prompt (the plugin sends the transcript's
+                // text only when the user opts in) keeps the one the turn began with.
+                if event.payload.query.as_deref().is_some_and(|q| !q.is_empty()) {
+                    self.session_context.query = event.payload.query.clone();
+                }
                 self.session_context.response = event.payload.response.clone();
                 self.clear_permission_scoped_state();
                 CLIAgentSessionStatus::Failed {

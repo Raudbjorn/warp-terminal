@@ -14266,7 +14266,16 @@ impl TerminalView {
         let description = if let CLIAgentSessionStatus::Blocked { message, .. } = status {
             message.clone().unwrap_or_default()
         } else {
-            session_context.response.clone().unwrap_or_default()
+            // The plugin sends the answer's text only when the user opts in.
+            session_context
+                .response
+                .clone()
+                .filter(|response| !response.is_empty())
+                .unwrap_or_else(|| match status {
+                    CLIAgentSessionStatus::Failed { .. } => "The agent encountered an error.",
+                    _ => "Task completed.",
+                }
+                .to_owned())
         };
 
         let trigger = if matches!(status, CLIAgentSessionStatus::Blocked { .. }) {

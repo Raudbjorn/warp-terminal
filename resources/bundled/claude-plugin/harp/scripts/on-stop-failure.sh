@@ -20,11 +20,11 @@ INPUT=$(cat)
 ERROR_TYPE=$(echo "$INPUT" | jq -r '.error // empty' 2>/dev/null)
 ERROR_MESSAGE=$(echo "$INPUT" | jq -r '.last_assistant_message // empty' 2>/dev/null)
 
-# Also try to extract the last user query from the transcript so Warp can
-# show it as the notification title, matching the Stop hook behaviour.
+# With HARP_STOP_TRANSCRIPT_TEXT on (see build-payload.sh), also extract the last user query from
+# the transcript so Warp can show it as the notification title, as the Stop hook does.
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 QUERY=""
-if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+if include_transcript_text && [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
     QUERY=$(jq -rs '
         [
             .[] | select(.type == "user") |
