@@ -409,16 +409,14 @@ impl CLIAgentSession {
                         if !pending.is_empty() {
                             // Without a target on either side (an older plugin) the name decides.
                             let target = event.payload.tool_input_preview.as_ref();
-                            let Some(index) = event.payload.tool_name.as_ref().and_then(|tool| {
+                            let index = event.payload.tool_name.as_ref().and_then(|tool| {
                                 pending.iter().position(|(name, asked)| {
                                     name == tool
                                         && (asked.is_none()
                                             || target.is_none()
                                             || asked.as_ref() == target)
                                 })
-                            }) else {
-                                return None;
-                            };
+                            })?;
                             pending.remove(index);
                             if !pending.is_empty() {
                                 return None;

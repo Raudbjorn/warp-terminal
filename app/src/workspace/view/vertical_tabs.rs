@@ -64,9 +64,7 @@ use crate::tab::{
     tab_position_id,
 };
 use crate::terminal::cli_agent_sessions::event::codex_action_required_prefix;
-use crate::terminal::cli_agent_sessions::{
-    BackgroundTasks, CLIAgentSessionStatus, CLIAgentSessionsModel,
-};
+use crate::terminal::cli_agent_sessions::{CLIAgentSessionStatus, CLIAgentSessionsModel};
 use crate::terminal::session_settings::SessionSettings;
 use crate::terminal::view::TerminalViewState;
 use crate::terminal::{CLIAgent, TerminalView};
@@ -1241,18 +1239,6 @@ fn strip_group_prefix<'a>(title: &'a str, group_name: Option<&str>) -> &'a str {
     } else {
         stripped
     }
-}
-
-/// The work that keeps the row working; background shells are the row's dot, not this count.
-fn background_tasks_label(tasks: BackgroundTasks) -> String {
-    let count = tasks.count.saturating_sub(tasks.shells);
-    let noun = match (tasks.only_subagents, count) {
-        (true, 1) => "background agent",
-        (true, _) => "background agents",
-        (false, 1) => "background task",
-        (false, _) => "background tasks",
-    };
-    format!("{count} {noun}")
 }
 
 /// The framed layout has no search field, so a query typed before switching to it must not keep
@@ -3912,6 +3898,7 @@ fn render_framed_other_section(
 /// Renders a tab group: pane-like header followed by indented member rows. A colored group tints the
 /// container (and header) with the group's color as a backdrop; member rows carry their own colors and
 /// layer on top. An uncolored group only paints its background on hover or when a member is active.
+#[allow(clippy::too_many_arguments)]
 fn render_grouped_tab_container(
     state: &VerticalTabsPanelState,
     workspace: &Workspace,
@@ -8927,9 +8914,10 @@ impl Workspace {
 /// reports a width that eases between 0 and full and clips to it, so the card beside it grows or
 /// shrinks along. Repaints only while the slide runs.
 pub(super) mod sidebar_reveal {
+    use instant::Instant;
     use std::any::Any;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use warpui::elements::Point;
     use warpui::event::DispatchedEvent;
@@ -9098,9 +9086,10 @@ pub(super) mod sidebar_reveal {
 /// is on screen to the new value and texts cross-fade, instead of one card replacing another.
 /// Repaints only while a morph runs.
 pub(in crate::workspace::view) mod morph {
+    use instant::Instant;
     use std::any::Any;
     use std::sync::{Arc, Mutex};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use pathfinder_color::ColorU;
     use warpui::elements::{ParentElement, Point, Stack};
@@ -9275,9 +9264,11 @@ pub(in crate::workspace::view) mod morph {
         }
     }
 
+    type MorphBuildFn<V> = Box<dyn Fn(&Frame<V>) -> Box<dyn Element>>;
+
     struct MorphElement<V> {
         morph: Morph<V>,
-        build: Box<dyn Fn(&Frame<V>) -> Box<dyn Element>>,
+        build: MorphBuildFn<V>,
         child: Option<Box<dyn Element>>,
         animating: bool,
     }
@@ -9475,7 +9466,6 @@ pub(super) mod sidebar {
             GRAY: rgb(0x6e6e73), rgb(0x8e8e93);
             // Dark: 7.5:1 on the dark sidebar surface (#2c2c2e).
             NEEDS_TEXT: rgb(0x9a5700), rgb(0xf0b35c);
-            NEEDS_RING: rgb(0xc98314), rgb(0xc98314);
             NEEDS_DOT: rgb(0xe8a33d), rgb(0xe8a33d);
             RING: rgb(0xa1a1a6), rgb(0x636366);
             TRACK: rgb(0xe0e0e4), rgb(0x3a3a3e);
@@ -10209,8 +10199,9 @@ pub(super) mod sidebar {
         let Some(id) = terminal_view_id else {
             return;
         };
+        type LastRow = (String, RowStatus, bool, bool, bool);
         thread_local! {
-            static LAST: RefCell<HashMap<EntityId, (String, RowStatus, bool, bool, bool)>> =
+            static LAST: RefCell<HashMap<EntityId, LastRow>> =
                 RefCell::new(HashMap::new());
         }
         let shown = (title.to_owned(), status, unread, background, time.is_some());

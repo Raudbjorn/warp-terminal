@@ -858,13 +858,13 @@ const TMUX_FLAG_WRITE_SETTLE: std::time::Duration = std::time::Duration::from_se
 /// A tab's group as last agreed with its tmux session (@warp_group).
 pub(super) struct TmuxTabGroup {
     name: String,
-    written_at: Option<std::time::Instant>,
+    written_at: Option<instant::Instant>,
 }
 
 /// Whether a tmux read that started at `read_at` can see the app's last write: one that started
 /// before (or right after) it may still show the old value.
 #[cfg(not(target_family = "wasm"))]
-fn read_sees_write(written_at: Option<std::time::Instant>, read_at: std::time::Instant) -> bool {
+fn read_sees_write(written_at: Option<instant::Instant>, read_at: instant::Instant) -> bool {
     written_at.is_none_or(|written| read_at > written + TMUX_FLAG_WRITE_SETTLE)
 }
 
@@ -874,7 +874,7 @@ fn read_sees_write(written_at: Option<std::time::Instant>, read_at: std::time::I
 pub(super) struct TmuxLayoutState {
     rev: Option<u64>,
     agreed: Option<LayoutSnapshot>,
-    written_at: Option<std::time::Instant>,
+    written_at: Option<instant::Instant>,
     /// A write is on its way; no read is trusted and no second write starts until it returns.
     writing: bool,
 }
@@ -891,7 +891,7 @@ struct LayoutSnapshot {
 pub(super) struct TmuxTabFlags {
     inactive: bool,
     unread: bool,
-    written_at: Option<std::time::Instant>,
+    written_at: Option<instant::Instant>,
 }
 
 /// A tab's pin as last read from its tmux session (@warp_pin, contract in `sidebar_pins`), and
@@ -899,7 +899,7 @@ pub(super) struct TmuxTabFlags {
 pub(super) struct TmuxTabPin {
     session_id: String,
     pinned_at: Option<u64>,
-    written_at: Option<std::time::Instant>,
+    written_at: Option<instant::Instant>,
 }
 
 impl Workspace {
@@ -1080,7 +1080,7 @@ impl Workspace {
             pane_group_id,
             TmuxRenameSettle {
                 old_session_name: self.tmux_tab_session_names.get(&pane_group_id).cloned(),
-                started: std::time::Instant::now(),
+                started: instant::Instant::now(),
                 warned: false,
             },
         );
@@ -1105,7 +1105,7 @@ impl Workspace {
         if shells.is_empty() {
             return;
         }
-        let read_at = std::time::Instant::now();
+        let read_at = instant::Instant::now();
         ctx.spawn(
             async move {
                 tokio::task::spawn_blocking(|| {
@@ -1136,7 +1136,7 @@ impl Workspace {
         shells: &[(EntityId, u32)],
         sessions: &std::collections::HashMap<u32, tmux_agents::ClientSession>,
         layout: Option<(Option<u64>, Vec<String>)>,
-        read_at: std::time::Instant,
+        read_at: instant::Instant,
         ctx: &mut ViewContext<Self>,
     ) {
         let open_tabs: HashSet<EntityId> =
@@ -1234,7 +1234,7 @@ impl Workspace {
         &mut self,
         tab_sessions: &std::collections::HashMap<EntityId, tmux_agents::ClientSession>,
         (read_rev, tmux_groups): (Option<u64>, Vec<String>),
-        read_at: std::time::Instant,
+        read_at: instant::Instant,
         ctx: &mut ViewContext<Self>,
     ) {
         // Mid-drag the sidebar shows a drop target over a still order; leave it alone.
@@ -1297,7 +1297,7 @@ impl Workspace {
             return;
         }
         self.tmux_layout.writing = true;
-        self.tmux_layout.written_at = Some(std::time::Instant::now());
+        self.tmux_layout.written_at = Some(instant::Instant::now());
         ctx.spawn(
             async move {
                 tokio::task::spawn_blocking(move || {
@@ -1307,7 +1307,7 @@ impl Workspace {
             },
             move |me, written, _| {
                 me.tmux_layout.writing = false;
-                me.tmux_layout.written_at = Some(std::time::Instant::now());
+                me.tmux_layout.written_at = Some(instant::Instant::now());
                 // Not written (another client changed the order first): the next poll adopts.
                 if let Ok(Some(rev)) = written {
                     me.tmux_layout.rev = Some(rev);
@@ -1347,7 +1347,7 @@ impl Workspace {
         &mut self,
         index: usize,
         session: &tmux_agents::ClientSession,
-        read_at: std::time::Instant,
+        read_at: instant::Instant,
     ) -> bool {
         let tab = &mut self.tabs[index];
         let pane_group_id = tab.pane_group.id();
@@ -1393,7 +1393,7 @@ impl Workspace {
             }
         }
         if wrote {
-            agreed.written_at = Some(std::time::Instant::now());
+            agreed.written_at = Some(instant::Instant::now());
         }
         changed
     }
@@ -1405,7 +1405,7 @@ impl Workspace {
         &mut self,
         pane_group_id: EntityId,
         session: &tmux_agents::ClientSession,
-        read_at: std::time::Instant,
+        read_at: instant::Instant,
     ) -> bool {
         let pin = self
             .tmux_tab_pins
@@ -1445,7 +1445,7 @@ impl Workspace {
             pinned_at.map(|at| at.to_string()).as_deref(),
         );
         pin.pinned_at = pinned_at;
-        pin.written_at = Some(std::time::Instant::now());
+        pin.written_at = Some(instant::Instant::now());
         ctx.notify();
     }
 
@@ -1504,7 +1504,7 @@ impl Workspace {
         &mut self,
         index: usize,
         session: &tmux_agents::ClientSession,
-        read_at: std::time::Instant,
+        read_at: instant::Instant,
         ctx: &mut ViewContext<Self>,
     ) -> bool {
         let pane_group_id = self.tabs[index].pane_group.id();
@@ -1538,7 +1538,7 @@ impl Workspace {
                     &current,
                 );
                 agreed.name = current;
-                agreed.written_at = Some(std::time::Instant::now());
+                agreed.written_at = Some(instant::Instant::now());
             }
             return false;
         }
@@ -1562,10 +1562,10 @@ impl Workspace {
         if let Some(target) = target {
             self.move_tab_to_index(index, target, ctx);
         }
-        if let Some(previous) = previous_group_id {
-            if existing != Some(previous) {
-                self.prune_empty_tab_group(previous, ctx);
-            }
+        if let Some(previous) = previous_group_id
+            && existing != Some(previous)
+        {
+            self.prune_empty_tab_group(previous, ctx);
         }
         self.tmux_tab_groups.insert(
             pane_group_id,
@@ -2141,7 +2141,7 @@ impl Workspace {
         // ever adopted.
         let own_tabs = self
             .uses_framed_sidebar_layout(ctx)
-            .then(|| self.tabs.len());
+            .then_some(self.tabs.len());
         tmux_adopt::count_own_window(&mut windows, self.window_id, own_tabs);
         tmux_adopt::pick_adopter(&windows) == Some(self.window_id)
     }
@@ -2169,7 +2169,7 @@ impl Workspace {
         // A new terminal queues focus for itself; the tab opens behind whatever the user is in.
         // Focus effects run after this update, so the suppression is lifted one tick later.
         ctx.set_suppress_focus_for_window(Some(self.window_id));
-        let now = std::time::Instant::now();
+        let now = instant::Instant::now();
         let mut adopted = false;
         for candidate in candidates {
             let Some(command) = tmux_adopt::attach_command(&candidate.id) else {
@@ -2210,7 +2210,7 @@ impl Workspace {
 pub(super) struct TmuxRenameSettle {
     /// The session's name before the rename, if a poll had seen it.
     old_session_name: Option<String>,
-    started: std::time::Instant,
+    started: instant::Instant,
     warned: bool,
 }
 
@@ -2224,9 +2224,9 @@ const TMUX_RENAME_WARN: std::time::Duration = std::time::Duration::from_secs(30)
 
 #[cfg(not(target_family = "wasm"))]
 mod tmux_agents {
+    use command::blocking::Command;
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
-    use std::process::Command;
 
     const AGENT_PROCESS_NAMES: [&str; 2] = ["claude", "codex"];
 
@@ -2848,8 +2848,9 @@ pub(in crate::workspace::view) mod tmux_layout {
 /// Focus, the integration switch and the unset-after-tab order are covered in `view_tests.rs`.
 #[cfg(not(target_family = "wasm"))]
 pub(in crate::workspace::view) mod tmux_adopt {
+    use instant::Instant;
     use std::collections::HashMap;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::tmux_layout::LayoutTab;
 
