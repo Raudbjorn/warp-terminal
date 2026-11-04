@@ -70,6 +70,10 @@ from outside the session); the tab opens on the next poll.
 - `jq`. The bundled Claude Code plugin's scripts use it. Without it the plugin
   reports nothing.
 - `tmux`, only if `integrations.tmux.enabled` is on.
+- Inside tmux, the Claude Code plugin's reports reach the app only with
+  `set -g allow-passthrough on` in your tmux configuration: the plugin writes
+  them to the pane's tty wrapped in tmux's passthrough sequence, and tmux drops
+  that unless passthrough is allowed.
 
 The app logs a warning at startup and when Harp mode or tmux sync is turned
 on if the bundled plugin is not found, `jq` is missing, or tmux sync is on and

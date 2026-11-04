@@ -8,6 +8,7 @@
 # write to /dev/tty instead.
 #
 # Decision tree:
+#   0. inside tmux with a usable pane tty    → tmux passthrough written to that tty
 #   1. CLAUDE_CODE_VERSION known, >= 2.1.141 → emit terminalSequence JSON
 #   2. CLAUDE_CODE_VERSION known, <  2.1.141 → write /dev/tty; give up if missing
 #   3. CLAUDE_CODE_VERSION unknown            → try /dev/tty, fall back to JSON
@@ -58,6 +59,18 @@ _supports_terminal_sequence() {
 emit_terminal_sequence() {
     local seq="$1"
     [ -z "$seq" ] && return 0
+
+    # Inside tmux a bare OSC 777 is consumed by tmux and never reaches Warp, through either
+    # transport below. Wrap it in tmux's passthrough and write it to the tty of the pane this hook
+    # belongs to (needs `set -g allow-passthrough on`); without a usable pane tty, fall through.
+    if [ -n "${TMUX:-}" ]; then
+        local esc pane_tty
+        esc=$'\033'
+        pane_tty=$(tmux display-message -p ${TMUX_PANE:+-t "$TMUX_PANE"} '#{pane_tty}' 2>/dev/null)
+        if [ -n "$pane_tty" ] && [ -w "$pane_tty" ]; then
+            printf '%s' "${esc}Ptmux;${seq//$esc/$esc$esc}${esc}\\" 2>/dev/null > "$pane_tty" && return 0
+        fi
+    fi
 
     # Classify the running Claude Code version, if we can.
     local raw="${CLAUDE_CODE_VERSION:-}"
