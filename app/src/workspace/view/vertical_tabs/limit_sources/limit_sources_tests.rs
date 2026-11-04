@@ -119,6 +119,34 @@ fn newest_rollouts_walk_the_date_folders() {
     );
 }
 
+#[test]
+fn the_codex_reading_follows_a_change_to_an_older_rollout_file() {
+    let root = tempfile::tempdir().unwrap();
+    let day = root.path().join("2026/10/21");
+    std::fs::create_dir_all(&day).unwrap();
+    let older = day.join("rollout-2026-10-21T07-00-00-a.jsonl");
+    let newer = day.join("rollout-2026-10-21T09-00-00-b.jsonl");
+    std::fs::write(&older, codex_line((300., 10., 1000), None)).unwrap();
+    std::fs::write(&newer, "").unwrap();
+
+    let mut cache = Cache::default();
+    let first = codex(root.path(), &mut cache, 1.).unwrap();
+    assert_eq!(first["used5h"].as_f64(), Some(10.));
+
+    // The older session goes on reporting while the newest one sits idle, untouched.
+    std::fs::write(&older, codex_line((300., 50., 1000), None)).unwrap();
+    let later = SystemTime::now() + std::time::Duration::from_secs(10);
+    std::fs::File::options()
+        .write(true)
+        .open(&older)
+        .unwrap()
+        .set_modified(later)
+        .unwrap();
+
+    let second = codex(root.path(), &mut cache, 2.).unwrap();
+    assert_eq!(second["used5h"].as_f64(), Some(50.));
+}
+
 /// A home with `~/.claude/settings.json` holding `settings`, and a separate state dir that does
 /// not exist yet (the status line command and the installer must create it).
 fn claude_home(settings: Option<&str>) -> (tempfile::TempDir, PathBuf, PathBuf) {

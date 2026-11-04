@@ -11485,10 +11485,15 @@ pub(in crate::workspace::view) mod limit_sources {
         ))
     }
 
+    /// Each Codex rollout file read, with its modification time.
+    type RolloutStamps = Vec<(PathBuf, SystemTime)>;
+
     /// What was read last, so unchanged files are not parsed again on every refresh.
     #[derive(Default)]
     pub(in crate::workspace::view) struct Cache {
-        codex: Option<(PathBuf, SystemTime, Option<Value>)>,
+        /// Every file the reading came from with its modification time (any of them can change),
+        /// then the reading.
+        codex: Option<(RolloutStamps, Option<Value>)>,
         claude: Option<(SystemTime, Option<Value>)>,
     }
 
@@ -11682,13 +11687,18 @@ pub(in crate::workspace::view) mod limit_sources {
 
     fn codex(sessions: &Path, cache: &mut Cache, now: f64) -> Option<Value> {
         let files = newest_rollouts(sessions, CODEX_FILES);
-        let newest = files.last()?.clone();
-        let modified = modified(&newest)?;
-        let unchanged = cache
-            .codex
-            .as_ref()
-            .is_some_and(|(path, seen, _)| *path == newest && *seen == modified);
-        if !unchanged {
+        if files.is_empty() {
+            return None;
+        }
+        // Rate limits can come from any of the files, so a change to any one rereads them all.
+        let seen: RolloutStamps = files
+            .iter()
+            .filter_map(|file| Some((file.clone(), modified(file)?)))
+            .collect();
+        if seen.is_empty() {
+            return None;
+        }
+        if cache.codex.as_ref().is_none_or(|(known, _)| *known != seen) {
             let lines: Vec<String> = files
                 .iter()
                 .filter_map(|file| std::fs::read_to_string(file).ok())
@@ -11699,9 +11709,9 @@ pub(in crate::workspace::view) mod limit_sources {
                         .collect::<Vec<_>>()
                 })
                 .collect();
-            cache.codex = Some((newest, modified, codex_entry(&lines)));
+            cache.codex = Some((seen, codex_entry(&lines)));
         }
-        let mut entry = cache.codex.as_ref()?.2.clone()?;
+        let mut entry = cache.codex.as_ref()?.1.clone()?;
         entry["_ts"] = json!(now);
         Some(entry)
     }
