@@ -535,22 +535,29 @@ impl Element for Scrollable {
                 Some(RectF::new(scrollbar_thumb_origin, scrollbar_thumb_size));
             self.scrollbar_thumb_origin = Some(scrollbar_thumb_origin);
 
-            let hovered = self.state().hovered;
+            // One lock for everything this block reads; the guard is gone before `self` is used again.
+            let (hovered, last_scrolled, dragging, state_child_hovered) = {
+                let state = self.state();
+                (
+                    state.hovered,
+                    state.last_scrolled,
+                    state.started.is_some(),
+                    state.child_hovered,
+                )
+            };
             let child_hovered = if self.scrollbar_only_while_scrolling {
-                let since_scroll = self
-                    .state()
-                    .last_scrolled
-                    .map(|at| Instant::now().saturating_duration_since(at));
+                let since_scroll =
+                    last_scrolled.map(|at| Instant::now().saturating_duration_since(at));
                 match since_scroll {
                     Some(elapsed) if elapsed < SCROLLBAR_LINGER => {
                         // Hide it again once scrolling has stopped for a moment.
                         ctx.repaint_after(SCROLLBAR_LINGER - elapsed);
                         true
                     }
-                    _ => self.state().started.is_some(),
+                    _ => dragging,
                 }
             } else {
-                self.state().child_hovered
+                state_child_hovered
             };
             let background = if hovered {
                 self.active_scrollbar_thumb_background
