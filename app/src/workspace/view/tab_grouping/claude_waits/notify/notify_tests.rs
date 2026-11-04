@@ -1,5 +1,5 @@
 use super::super::dialog::dialog_on_screen;
-use super::super::dialog::tests::{OTHER, PERMISSION, permission_at};
+use super::super::dialog::tests::{permission_at, OTHER, PERMISSION};
 use super::*;
 
 fn permission(screen: &str) -> Card {
@@ -83,10 +83,10 @@ fn each_terminal_gets_its_own_notification() {
         &none(),
         ids(),
     );
-    assert_eq!(changes, [Change::Post(1), Change::Post(2)]);
+    assert_eq!(changes, [1, 2]);
     // A click on terminal 1's notification never finds terminal 2's dialog.
-    assert!(clicked(&mut entries, &2, "n1").is_none());
-    assert!(clicked(&mut entries, &1, "n1").is_some());
+    assert!(clicked(&entries, &2, "n1").is_none());
+    assert!(clicked(&entries, &1, "n1").is_some());
 }
 
 #[test]
@@ -100,7 +100,7 @@ fn the_terminal_in_view_gets_no_notification() {
         &none(),
         ids(),
     );
-    assert_eq!(first, []);
+    assert!(first.is_empty());
     // Looked away: the dialog was seen, so it still does not notify.
     let away = update(
         &mut entries,
@@ -109,8 +109,8 @@ fn the_terminal_in_view_gets_no_notification() {
         &none(),
         ids(),
     );
-    assert_eq!(away, []);
-    // Notified, then its terminal comes into view: taken back.
+    assert!(away.is_empty());
+    // Notified, then its terminal comes into view: nothing more to send.
     let mut entries = HashMap::new();
     update(
         &mut entries,
@@ -127,7 +127,7 @@ fn the_terminal_in_view_gets_no_notification() {
         &none(),
         ids(),
     );
-    assert_eq!(back, [Change::TakeBack("n1".to_owned())]);
+    assert!(back.is_empty());
 }
 
 #[test]
@@ -139,7 +139,7 @@ fn only_the_front_window_s_active_tab_is_in_view() {
 }
 
 #[test]
-fn an_answered_dialog_takes_its_notification_back() {
+fn an_answered_dialog_drops_its_entry() {
     let mut entries = HashMap::new();
     update(
         &mut entries,
@@ -150,10 +150,10 @@ fn an_answered_dialog_takes_its_notification_back() {
     );
     // Answered in the terminal: Claude no longer waits.
     let changes = update(&mut entries, vec![], &none(), &none(), ids());
-    assert_eq!(changes, [Change::TakeBack("n1".to_owned())]);
+    assert!(changes.is_empty());
     assert!(entries.is_empty());
     // A late click on it finds nothing, so Allow refuses.
-    assert!(clicked(&mut entries, &1, "n1").is_none());
+    assert!(clicked(&entries, &1, "n1").is_none());
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn one_dialog_notifies_once() {
         &none(),
         &mut new_id,
     );
-    assert_eq!(first, [Change::Post(1)]);
+    assert_eq!(first, [1]);
     // The user moved the ❯: the same dialog, no second notification.
     let moved = read(permission(&permission_at(1)));
     assert_eq!(
@@ -178,9 +178,9 @@ fn one_dialog_notifies_once() {
             &none(),
             &mut new_id
         ),
-        []
+        Vec::<u32>::new()
     );
-    // Another dialog in its place: the old one goes, the new one posts.
+    // Another dialog in its place: the old entry goes, the new one posts.
     let next = update(
         &mut entries,
         vec![(1, read(permission(OTHER)))],
@@ -188,7 +188,7 @@ fn one_dialog_notifies_once() {
         &none(),
         &mut new_id,
     );
-    assert_eq!(next, [Change::TakeBack("n1".to_owned()), Change::Post(1)]);
+    assert_eq!(next, [1]);
     assert_eq!(entries[&1].id, "n2");
 }
 
@@ -205,7 +205,7 @@ fn a_wait_without_a_dialog_notifies_one_read_later() {
             &none(),
             &mut new_id
         ),
-        []
+        Vec::<u32>::new()
     );
     // Its dialog appears on the next read: only the dialog posts.
     let dialog = read(permission(PERMISSION));
@@ -216,7 +216,7 @@ fn a_wait_without_a_dialog_notifies_one_read_later() {
         &none(),
         &mut new_id,
     );
-    assert_eq!(changes, [Change::Post(1)]);
+    assert_eq!(changes, [1]);
     // Still no dialog on the second read: the wait itself posts, once.
     let mut entries = HashMap::new();
     update(
@@ -233,7 +233,7 @@ fn a_wait_without_a_dialog_notifies_one_read_later() {
         &none(),
         &mut new_id,
     );
-    assert_eq!(second, [Change::Post(1)]);
+    assert_eq!(second, [1]);
     assert_eq!(
         update(
             &mut entries,
@@ -242,7 +242,7 @@ fn a_wait_without_a_dialog_notifies_one_read_later() {
             &none(),
             &mut new_id
         ),
-        []
+        Vec::<u32>::new()
     );
 }
 
@@ -260,7 +260,7 @@ fn a_wait_left_by_an_answer_from_a_notification_never_notifies() {
             &answered,
             &mut new_id
         ),
-        []
+        Vec::<u32>::new()
     );
     // Only the read right after the answer knows it; the wait stays quiet after it.
     assert_eq!(
@@ -271,7 +271,7 @@ fn a_wait_left_by_an_answer_from_a_notification_never_notifies() {
             &none(),
             &mut new_id
         ),
-        []
+        Vec::<u32>::new()
     );
     assert_eq!(
         update(
@@ -281,9 +281,8 @@ fn a_wait_left_by_an_answer_from_a_notification_never_notifies() {
             &none(),
             &mut new_id
         ),
-        []
+        Vec::<u32>::new()
     );
-    assert!(!entries[&1].posted);
 }
 
 #[test]
@@ -297,5 +296,5 @@ fn a_new_dialog_right_after_an_answer_still_notifies() {
         &answered,
         ids(),
     );
-    assert_eq!(changes, [Change::Post(1)]);
+    assert_eq!(changes, [1]);
 }

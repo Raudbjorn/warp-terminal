@@ -1807,7 +1807,7 @@ impl Workspace {
     /// needs-attention notification setting, whose plain notification it replaces for Claude.
     fn sync_claude_notices(&mut self, ctx: &mut ViewContext<Self>) {
         use crate::terminal::session_settings::{NotificationsMode, SessionSettings};
-        use claude_waits::notify::{self, Change};
+        use claude_waits::notify;
         let settings = SessionSettings::as_ref(ctx).notifications.value();
         let enabled =
             settings.mode == NotificationsMode::Enabled && settings.is_needs_attention_enabled;
@@ -1840,19 +1840,14 @@ impl Workspace {
             &answered,
             next_notice_id,
         );
-        for change in changes {
-            match change {
-                Change::TakeBack(id) => ctx.remove_desktop_notification(&id),
-                Change::Post(terminal) => {
-                    let Some(entry) = self.claude_notices.entries.get(&terminal) else {
-                        continue;
-                    };
-                    let (category, body) = notify::content(&entry.card, entry.target.answerable);
-                    let (id, target) = (entry.id.clone(), entry.target.clone());
-                    log::info!("Claude dialog notification {id}: {category}");
-                    self.send_claude_notice(terminal, &target, id, category, body, ctx);
-                }
-            }
+        for terminal in changes {
+            let Some(entry) = self.claude_notices.entries.get(&terminal) else {
+                continue;
+            };
+            let (category, body) = notify::content(&entry.card, entry.target.answerable);
+            let (id, target) = (entry.id.clone(), entry.target.clone());
+            log::info!("Claude dialog notification {id}: {category}");
+            self.send_claude_notice(terminal, &target, id, category, body, ctx);
         }
     }
 
@@ -1954,8 +1949,7 @@ impl Workspace {
         use claude_waits::dialog::Card;
         use claude_waits::notify::{self, Act};
         let terminal = click.terminal_view_id;
-        ctx.remove_desktop_notification(&click.id);
-        let entry = notify::clicked(&mut self.claude_notices.entries, &terminal, &click.id)
+        let entry = notify::clicked(&self.claude_notices.entries, &terminal, &click.id)
             .map(|entry| (entry.card.clone(), entry.target.clone()));
         let answerable = entry.as_ref().is_some_and(|(_, target)| target.answerable);
         let card = entry.as_ref().map(|(card, _)| card);
@@ -3396,8 +3390,6 @@ pub(in crate::workspace::view) mod claude_waits {
             pub id: String,
             /// The dialog as the notification showed it: what an answer must still find.
             pub card: Card,
-            /// Whether the notification is up.
-            pub posted: bool,
             /// A wait without a dialog, read once: it posts on the next read if it still has none.
             pub held: bool,
             /// Where to answer it.
@@ -3408,12 +3400,6 @@ pub(in crate::workspace::view) mod claude_waits {
         pub(in crate::workspace::view) struct Read<X> {
             pub card: Card,
             pub target: X,
-        }
-
-        #[derive(Debug, PartialEq, Eq)]
-        pub(in crate::workspace::view) enum Change<T> {
-            Post(T),
-            TakeBack(String),
         }
 
         /// What a click on a notification does.
@@ -3449,8 +3435,8 @@ pub(in crate::workspace::view) mod claude_waits {
         }
 
         /// Brings `entries` up to `waiting` (each terminal whose Claude waits, and what its screen
-        /// shows) and says which notifications to send and which to take back. A terminal missing
-        /// from `waiting` no longer waits or closed. A dialog first seen while its terminal is in
+        /// shows) and says which terminals' notifications to send. A terminal missing from
+        /// `waiting` no longer waits or closed, and its entry goes. A dialog first seen while its terminal is in
         /// view (`in_view`) is kept unsent: the user saw it, so it never notifies. So is a wait
         /// without a dialog in a terminal whose dialog was just answered from a notification
         /// (`answered`): Claude fires no hook on a denial (nor before a long allowed tool ends),
@@ -3461,20 +3447,15 @@ pub(in crate::workspace::view) mod claude_waits {
             in_view: &HashSet<T>,
             answered: &HashSet<T>,
             mut new_id: impl FnMut() -> String,
-        ) -> Vec<Change<T>> {
+        ) -> Vec<T> {
             let mut changes = Vec::new();
             // New dialogs go out in `waiting`'s order, never a HashMap's: ids and send order stay
             // the same from run to run.
             let order: Vec<T> = waiting.iter().map(|(terminal, _)| *terminal).collect();
             let mut now: HashMap<T, Read<X>> = waiting.into_iter().collect();
             entries.retain(|terminal, entry| {
-                let keep = now
-                    .get(terminal)
-                    .is_some_and(|read| same(&entry.card, &read.card));
-                if !keep && entry.posted {
-                    changes.push(Change::TakeBack(entry.id.clone()));
-                }
-                keep
+                now.get(terminal)
+                    .is_some_and(|read| same(&entry.card, &read.card))
             });
             for terminal in order {
                 let Some(read) = now.remove(&terminal) else {
@@ -3485,14 +3466,9 @@ pub(in crate::workspace::view) mod claude_waits {
                 if let Some(entry) = entries.get_mut(&terminal) {
                     if seen {
                         entry.held = false;
-                        if entry.posted {
-                            entry.posted = false;
-                            changes.push(Change::TakeBack(entry.id.clone()));
-                        }
                     } else if entry.held {
                         entry.held = false;
-                        entry.posted = true;
-                        changes.push(Change::Post(terminal));
+                        changes.push(terminal);
                     }
                     continue;
                 }
@@ -3503,28 +3479,25 @@ pub(in crate::workspace::view) mod claude_waits {
                     Entry {
                         id: new_id(),
                         card: read.card,
-                        posted: post,
                         held,
                         target: read.target,
                     },
                 );
                 if post {
-                    changes.push(Change::Post(terminal));
+                    changes.push(terminal);
                 }
             }
             changes
         }
 
         /// The entry a click on notification `id` of `terminal` is for; `None` once its dialog is
-        /// gone or another took its place. Its notification counts as down: the click took it.
+        /// gone or another took its place.
         pub(in crate::workspace::view) fn clicked<'a, T: Eq + Hash, X>(
-            entries: &'a mut HashMap<T, Entry<X>>,
+            entries: &'a HashMap<T, Entry<X>>,
             terminal: &T,
             id: &str,
         ) -> Option<&'a Entry<X>> {
-            let entry = entries.get_mut(terminal).filter(|entry| entry.id == id)?;
-            entry.posted = false;
-            Some(entry)
+            entries.get(terminal).filter(|entry| entry.id == id)
         }
 
         fn is_permission(card: &Card, answerable: bool) -> bool {

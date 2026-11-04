@@ -19,7 +19,7 @@ pub struct EventDispatchResult {
     pub handled: bool,
     /// Whether the soft keyboard should be shown (mobile WASM only).
     pub soft_keyboard_requested: bool,
-    /// Whether an element asked to start a native window drag with this mouse-down (macOS only).
+    /// Whether an element asked for a native window drag with this mouse-down (the winit backend starts it).
     pub window_drag_requested: bool,
 }
 
