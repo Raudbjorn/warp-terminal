@@ -299,10 +299,11 @@ impl CLIAgentSession {
     }
 
     /// Harp: a status plugin reports for this session. Codex's OSC 9 fallback registers like a
-    /// plugin but carries no plugin version, and only ever reports a turn's end.
+    /// plugin but only ever reports a turn's end, and it never latches the rich flag, so the
+    /// flag alone tells the two apart. A rich Codex notification may carry no plugin version
+    /// and still counts.
     pub fn has_status_plugin(&self) -> bool {
-        self.received_rich_notification
-            && !(self.agent == CLIAgent::Codex && self.plugin_version.is_none())
+        self.supports_rich_status()
     }
 
     /// Harp: the sidebar has a status for this session, from a plugin or from the title.
@@ -730,6 +731,9 @@ struct ExternalWait {
     restore: CLIAgentSessionStatus,
     restore_changed_at: Option<DateTime<Local>>,
     shown: CLIAgentSessionStatus,
+    /// The fallback of a provisional "working" the wait interrupted: what the session shows again
+    /// once it is over, and when that status last changed. Re-armed when the wait ends.
+    provisional: Option<(CLIAgentSessionStatus, Option<DateTime<Local>>)>,
 }
 
 impl Entity for CLIAgentSessionsModel {
@@ -775,7 +779,7 @@ impl CLIAgentSessionsModel {
             return;
         };
         let has_background_work = session.session_context.running_background_tasks().is_some();
-        let (status, announce, entered) = match waiting {
+        let (status, announce, rearm) = match waiting {
             Some(label) => {
                 let known_newer = changed_at.is_some_and(|at| {
                     u64::try_from(at.timestamp_millis()).is_ok_and(|at| at > updated_ms)
@@ -796,18 +800,25 @@ impl CLIAgentSessionsModel {
                     &shown,
                     has_background_work,
                 );
+                // A provisional "working" must not fall back over the wait, but it still has to
+                // resolve afterwards, so its fallback waits here instead of being dropped.
+                let provisional = self.provisional_work.remove(&terminal_view_id).map(|work| {
+                    work.handle.abort();
+                    (work.restore, work.restore_changed_at)
+                });
                 self.external_waits.insert(
                     terminal_view_id,
                     ExternalWait {
                         restore: session.status.clone(),
                         restore_changed_at: changed_at,
                         shown: shown.clone(),
+                        provisional,
                     },
                 );
                 session.status = shown.clone();
                 self.status_changed_at
                     .insert(terminal_view_id, Local::now());
-                (shown, announce, true)
+                (shown, announce, None)
             }
             None => {
                 let Some(wait) = self.external_waits.remove(&terminal_view_id) else {
@@ -822,12 +833,11 @@ impl CLIAgentSessionsModel {
                     Some(at) => self.status_changed_at.insert(terminal_view_id, at),
                     None => self.status_changed_at.remove(&terminal_view_id),
                 };
-                (wait.restore, false, false)
+                (wait.restore, false, wait.provisional)
             }
         };
-        // A provisional "working" must not fall back over the wait.
-        if entered {
-            self.clear_provisional_work(terminal_view_id);
+        if let Some((restore, restore_changed_at)) = rearm {
+            self.arm_provisional_work(terminal_view_id, restore, restore_changed_at, ctx);
         }
         let session = &self.sessions[&terminal_view_id];
         ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {

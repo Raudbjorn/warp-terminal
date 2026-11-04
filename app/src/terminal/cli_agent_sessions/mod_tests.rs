@@ -489,6 +489,29 @@ fn codex_session_not_rich_until_rich_notification() {
 }
 
 #[test]
+fn codex_rich_notification_without_a_plugin_version_has_a_status_plugin() {
+    let mut session = CLIAgentSession {
+        agent: CLIAgent::Codex,
+        status: CLIAgentSessionStatus::InProgress,
+        session_context: CLIAgentSessionContext::default(),
+        input_state: CLIAgentInputState::Closed,
+        should_auto_toggle_input: false,
+        listener: None,
+        plugin_version: None,
+        remote_host: None,
+        draft_text: None,
+        custom_command_prefix: None,
+        received_rich_notification: false,
+    };
+    // The OSC 9 fallback registers a listener but is not a plugin, so titles still count.
+    assert!(!session.has_status_plugin());
+
+    // A rich notification without a version is a plugin: the title must stop overriding it.
+    session.received_rich_notification = true;
+    assert!(session.has_status_plugin());
+}
+
+#[test]
 fn non_codex_session_rich_after_rich_notification() {
     let mut session = CLIAgentSession {
         agent: CLIAgent::Claude,
@@ -2145,6 +2168,55 @@ fn drain<T>(receiver: &async_channel::Receiver<T>) -> Vec<T> {
 
 fn future_ms() -> u64 {
     u64::try_from(chrono::Local::now().timestamp_millis()).unwrap() + 60_000
+}
+
+/// A finished session a tool event provisionally reopened as working keeps its fallback across a
+/// session-file wait: the wait suspends it, and once the wait is over it is armed again, so the row
+/// does not stay "working" for good. Fails if the wait drops the fallback.
+#[test]
+fn a_session_file_wait_keeps_a_provisional_working_fallback() {
+    App::test((), |mut app| async move {
+        let model = app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+        let view_id = EntityId::new();
+        model.update(&mut app, |m, ctx| {
+            m.set_session(
+                view_id,
+                cli_agent_session(CLIAgentSessionStatus::InProgress, true),
+                ctx,
+            );
+            // As after a stray tool event on a finished session: working, falling back to done.
+            m.arm_provisional_work(view_id, CLIAgentSessionStatus::Success, None, ctx);
+        });
+        model.update(&mut app, |m, ctx| {
+            m.set_external_wait(
+                view_id,
+                Some("permission prompt".to_owned()),
+                future_ms(),
+                ctx,
+            )
+        });
+        model.read(&app, |m, _| {
+            assert!(
+                !m.provisional_work.contains_key(&view_id),
+                "the fallback must not fire over the wait"
+            );
+        });
+
+        model.update(&mut app, |m, ctx| {
+            m.set_external_wait(view_id, None, 0, ctx)
+        });
+        model.read(&app, |m, _| {
+            assert_eq!(
+                m.session(view_id).unwrap().status,
+                CLIAgentSessionStatus::InProgress
+            );
+            let work = m
+                .provisional_work
+                .get(&view_id)
+                .expect("the fallback is armed again once the wait is over");
+            assert_eq!(work.restore, CLIAgentSessionStatus::Success);
+        });
+    });
 }
 
 /// WarpOss: a dialog Claude Code records only in its session file ("waiting") shows "needs you",
