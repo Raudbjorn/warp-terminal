@@ -425,7 +425,7 @@ fn configured_https_provider_urls_pass_the_policy_and_others_do_not() {
 }
 
 #[test]
-fn profile_endpoint_urls_collects_every_profile_and_legacy_url() {
+fn profile_endpoint_urls_prefers_the_default_profile_over_legacy_fields() {
     let mut keys = ::ai::api_keys::ApiKeys {
         openai_base_url: Some("https://legacy.example/v1".to_owned()),
         ..Default::default()
@@ -437,7 +437,77 @@ fn profile_endpoint_urls_collects_every_profile_and_legacy_url() {
             ..Default::default()
         },
     );
-    let urls = profile_endpoint_urls(&keys);
-    assert!(urls.contains(&"https://legacy.example/v1".to_owned()));
+    let urls = profile_endpoint_urls(&keys, &[]);
+    assert!(!urls.contains(&"https://legacy.example/v1".to_owned()));
     assert!(urls.contains(&"https://profile.example/v1".to_owned()));
+}
+
+fn custom_endpoint(url: &str) -> ::ai::api_keys::CustomEndpoint {
+    ::ai::api_keys::CustomEndpoint {
+        url: url.to_owned(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn profile_endpoint_urls_reads_the_legacy_base_url_until_a_default_profile_exists() {
+    let keys = ::ai::api_keys::ApiKeys {
+        openai_base_url: Some("https://legacy.example/v1".to_owned()),
+        ..Default::default()
+    };
+    assert_eq!(
+        profile_endpoint_urls(&keys, &[]),
+        vec!["https://legacy.example/v1".to_owned()]
+    );
+}
+
+#[test]
+fn profile_endpoint_urls_takes_other_profiles_custom_endpoints_from_the_profile() {
+    let mut keys = ::ai::api_keys::ApiKeys::default();
+    keys.profile_inference_settings.insert(
+        "work".to_owned(),
+        ::ai::api_keys::ProfileInferenceSettings {
+            custom_endpoints: vec![custom_endpoint("https://work.example/v1")],
+            ..Default::default()
+        },
+    );
+    let urls = profile_endpoint_urls(&keys, &[custom_endpoint("https://active.example/v1")]);
+    assert!(urls.contains(&"https://work.example/v1".to_owned()));
+    assert!(urls.contains(&"https://active.example/v1".to_owned()));
+}
+
+/// Migration to `agents.custom_endpoints` leaves the legacy copies in `ApiKeys`. Once the user
+/// removes the migrated endpoint, the active list is empty and its host must be denied again.
+#[test]
+#[serial_test::serial]
+fn a_removed_migrated_custom_endpoint_is_no_longer_allowed() {
+    let _local_only = LocalOnlyGuard::enter();
+    let migrated = custom_endpoint("https://migrated.example/v1");
+    let mut keys = ::ai::api_keys::ApiKeys {
+        custom_endpoints: vec![migrated.clone()],
+        ..Default::default()
+    };
+    keys.profile_inference_settings.insert(
+        ::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY.to_owned(),
+        ::ai::api_keys::ProfileInferenceSettings {
+            custom_endpoints: vec![migrated.clone()],
+            ..Default::default()
+        },
+    );
+    let check = |url: &str| network_policy::check_url(&Url::parse(url).unwrap(), "test");
+    let publish = |urls: Vec<String>| {
+        network_policy::set_configured_endpoints(
+            network_policy::EndpointSource::ProfileSettings,
+            urls.iter().map(String::as_str),
+        );
+    };
+
+    publish(profile_endpoint_urls(
+        &keys,
+        std::slice::from_ref(&migrated),
+    ));
+    assert!(check("https://migrated.example/v1/chat/completions").is_ok());
+
+    publish(profile_endpoint_urls(&keys, &[]));
+    assert!(check("https://migrated.example/v1/chat/completions").is_err());
 }

@@ -180,11 +180,20 @@ and auto-update configuration unset. Concretely:
 
 - **Requests made through `http_client`** (this includes every Local AI
   single-shot request) are checked against `network_policy` before they are
-  sent. Only loopback hosts pass: `localhost`, `127.0.0.0/8`, `::1` and
-  IPv4-mapped loopback, over `http`, `https`, `ws` or `wss`. Private-network,
-  Tailscale and public addresses are denied with `NetworkPolicyDenied`, and so
-  is a hostname that merely resolves to loopback. Every redirect hop is checked
-  again, and system proxy settings are ignored.
+  sent. Three kinds of destination pass:
+  - loopback hosts (`localhost`, `127.0.0.0/8`, `::1` and IPv4-mapped
+    loopback) over `http`, `https`, `ws` or `wss`;
+  - the private hosts you allowed in `allowed_private_hosts`;
+  - the `https` origin (scheme, host and port) of every AI endpoint you
+    configured: the Local AI base URL, the custom inference endpoints, and the
+    Agent Profile base URLs and custom endpoints. Typing the URL is the opt-in;
+    it is not repeated in a second list. Plain `http` to such a host, other
+    ports, and subdomains stay denied. Removing or changing the endpoint
+    revokes its origin.
+
+  Everything else, public or private, is denied with `NetworkPolicyDenied`, and
+  so is a hostname that merely resolves to loopback. Every redirect hop is
+  checked again, and system proxy settings are ignored.
 - **Warp Agent conversations and the bundled service are not covered by that
   check. This is a known limitation.** The conversation engine
   (`crates/local_agent`) and the service make their own requests to the

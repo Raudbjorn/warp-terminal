@@ -74,7 +74,7 @@ impl ConfiguredEndpoint {
 
     /// Parses the `https://host:port` form produced by `Display`, as a child process receives it.
     pub fn parse(entry: &str) -> Result<Self, EndpointsError> {
-        Self::from_base_url(entry).ok_or_else(|| EndpointsError::Invalid(entry.to_owned()))
+        Self::from_base_url(entry).ok_or(EndpointsError::Invalid)
     }
 }
 
@@ -86,8 +86,9 @@ impl fmt::Display for ConfiguredEndpoint {
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum EndpointsError {
-    #[error("invalid configured endpoint {0:?}: expected https://host:port")]
-    Invalid(String),
+    /// The entry is not echoed: an endpoint URL can carry credentials in its userinfo or query.
+    #[error("invalid configured endpoint: expected https://host:port")]
+    Invalid,
 }
 
 static CONFIGURED_ENDPOINTS: RwLock<BTreeMap<EndpointSource, BTreeSet<ConfiguredEndpoint>>> =
