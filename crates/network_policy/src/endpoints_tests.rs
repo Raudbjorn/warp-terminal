@@ -109,7 +109,7 @@ fn parse_endpoints_rejects_the_whole_list_on_one_bad_entry() {
     assert!(parse_endpoints("").unwrap().is_empty());
     assert_eq!(
         parse_endpoints("https://a.example:443,http://b.example:80"),
-        Err(EndpointsError::Invalid("http://b.example:80".to_owned()))
+        Err(EndpointsError::Invalid)
     );
 }
 

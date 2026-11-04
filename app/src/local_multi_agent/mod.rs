@@ -517,7 +517,8 @@ impl LocalMultiAgentManager {
     /// there are reachable over `https`. The service enforces its allow-list from startup, so a
     /// change restarts it, as a change to the AI settings does.
     pub fn apply_profile_endpoints(&mut self, ctx: &mut ModelContext<Self>) {
-        let urls = profile_endpoint_urls(::ai::api_keys::ApiKeyManager::as_ref(ctx).keys());
+        let manager = ::ai::api_keys::ApiKeyManager::as_ref(ctx);
+        let urls = profile_endpoint_urls(manager.keys(), manager.custom_endpoints());
         network_policy::set_configured_endpoints(
             network_policy::EndpointSource::ProfileSettings,
             urls.iter().map(String::as_str),
@@ -1358,26 +1359,33 @@ fn save_config(config: &LocalMultiAgentConfig, ctx: &AppContext) {
     }
 }
 
-/// Every AI endpoint URL in the per-profile inference settings, including the legacy global
-/// fields that older clients still write.
-fn profile_endpoint_urls(keys: &::ai::api_keys::ApiKeys) -> Vec<String> {
-    let profiles = keys.profile_inference_settings.values();
-    keys.openai_base_url
+/// The AI endpoint URLs that requests can use: every profile's base URL, the active custom
+/// endpoints of the default profile (`default_custom_endpoints`, from
+/// `ApiKeyManager::custom_endpoints`), and the custom endpoints of every other profile.
+///
+/// The legacy `ApiKeys::custom_endpoints` list and the default profile's stored copy are left in
+/// place by the migration to `agents.custom_endpoints` for older clients, but requests no longer
+/// read them, so they are skipped: removing a migrated endpoint must revoke its host.
+fn profile_endpoint_urls(
+    keys: &::ai::api_keys::ApiKeys,
+    default_custom_endpoints: &[::ai::api_keys::CustomEndpoint],
+) -> Vec<String> {
+    let default_key = ::ai::api_keys::DEFAULT_PROFILE_INFERENCE_KEY;
+    let mut urls: Vec<String> = default_custom_endpoints
         .iter()
-        .chain(keys.custom_endpoints.iter().map(|endpoint| &endpoint.url))
-        .chain(
-            profiles
-                .clone()
-                .filter_map(|profile| profile.openai_base_url.as_ref()),
-        )
-        .chain(profiles.flat_map(|profile| {
-            profile
-                .custom_endpoints
-                .iter()
-                .map(|endpoint| &endpoint.url)
-        }))
-        .cloned()
-        .collect()
+        .map(|endpoint| endpoint.url.clone())
+        .collect();
+    urls.extend(keys.profile_settings(default_key).openai_base_url);
+    for (profile_key, profile) in &keys.profile_inference_settings {
+        if profile_key == default_key {
+            continue;
+        }
+        urls.extend(profile.openai_base_url.clone());
+        for endpoint in &profile.custom_endpoints {
+            urls.push(endpoint.url.clone());
+        }
+    }
+    urls
 }
 
 /// Whether the service must be restarted to enforce the current allow-list.
