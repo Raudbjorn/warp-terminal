@@ -8,6 +8,11 @@
 //! - the master writes the shell's pid to `wk-<id>.shell` before it binds the socket;
 //! - the attach holding the session's `wk-<id>.lock` writes its own pid into that file and
 //!   clears it when it ends.
+//!
+//! An attach that is killed leaves its pid behind while the shell lives on, and that pid can go to
+//! another process, so a pid in a lock counts only while that process still holds the lock
+//! (`/proc/locks`, read without taking the lock: a probe could make a recovering attach skip the
+//! session, or fail to lock a new one).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -56,9 +61,45 @@ fn process_alive(pid: u32) -> bool {
     io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Whether `table` (the text of `/proc/locks`) lists a flock held by `pid` on the file with this
+/// device and inode. A line reads `<n>: FLOCK ADVISORY WRITE <pid> <major>:<minor>:<inode> ...`,
+/// the device in hex.
+fn lock_table_has(table: &str, major: u32, minor: u32, inode: u64, pid: u32) -> bool {
+    let file = format!("{major:02x}:{minor:02x}:{inode}");
+    table.lines().any(|line| {
+        let mut fields = line.split_whitespace().skip(1);
+        fields.next() == Some("FLOCK")
+            && fields.nth(2).and_then(|owner| owner.parse::<u32>().ok()) == Some(pid)
+            && fields.next() == Some(file.as_str())
+    })
+}
+
+/// Whether process `pid` holds the flock on `lock`, or `None` where the kernel does not list
+/// locks.
+#[cfg(target_os = "linux")]
+fn lock_held_by(lock: &Path, pid: u32) -> Option<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let table = std::fs::read_to_string("/proc/locks").ok()?;
+    let meta = std::fs::metadata(lock).ok()?;
+    let dev = meta.dev();
+    Some(lock_table_has(
+        &table,
+        libc::major(dev),
+        libc::minor(dev),
+        meta.ino(),
+        pid,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_held_by(_lock: &Path, _pid: u32) -> Option<bool> {
+    None
+}
+
 /// Every attached session in `dir`: the attach worker's pid (what a tab's pty reports) mapped to
-/// the pid of the shell inside. A session whose shell is gone, or that no attach holds, is left
-/// out. Reads a few small files; a missing or unreadable directory gives an empty map.
+/// the pid of the shell inside. A session whose shell is gone, or whose lock its recorded attach
+/// no longer holds, is left out. Reads a few small files; a missing or unreadable directory gives
+/// an empty map. Without `/proc/locks` the attach only has to be alive, a weaker check.
 pub fn shells_by_attach(dir: &Path) -> HashMap<u32, u32> {
     let mut shells = HashMap::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -75,6 +116,10 @@ pub fn shells_by_attach(dir: &Path) -> HashMap<u32, u32> {
         else {
             continue;
         };
+        let attached = lock_held_by(&lock, attach).unwrap_or_else(|| process_alive(attach));
+        if !attached {
+            continue;
+        }
         let Some(shell) = std::fs::read_to_string(shell_path(&lock))
             .ok()
             .and_then(|text| parse_pid(&text))
