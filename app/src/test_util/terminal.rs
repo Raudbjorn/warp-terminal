@@ -91,6 +91,11 @@ pub fn initialize_app_for_terminal_view(app: &mut App) {
     app.add_singleton_model(|_| NetworkStatus::new());
     app.add_singleton_model(|_| SystemStats::new());
     app.add_singleton_model(|_| Prompt::mock());
+    // Registered in `lib.rs` for the app; terminal views read them while rendering.
+    app.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
+    app.add_singleton_model(|_| {
+        crate::workspace::plugin_status_items::PluginStatusItemsModel::new()
+    });
     app.add_singleton_model(SyncQueue::mock);
     app.add_singleton_model(CloudModel::mock);
     app.add_singleton_model(CloudEnvironmentCatalog::new);
