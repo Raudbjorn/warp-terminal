@@ -7,6 +7,7 @@ use crate::ai::predict::local_command_autocomplete::{
     LocalCommandAutocompleteProviderSettings, LocalCommandAutocompleteRequest,
     request_local_command_autocomplete,
 };
+use warpui::App;
 
 /// Sets local-only mode for a test and puts back what it found. The mode and the allow-list are
 /// process-wide and other app tests change them too, so every test that uses this is marked
@@ -386,6 +387,50 @@ fn a_changed_configured_endpoint_restarts_the_service() {
         ["https://api.openai.com/v1"],
     );
     assert!(manager.allow_list_needs_restart());
+}
+
+/// A changed endpoint has to take the running service out of use at once and schedule a restart;
+/// only checking `allow_list_needs_restart` would not notice a broken wiring in
+/// `apply_profile_endpoints`. The debounce timer is not awaited, so no service is started.
+#[test]
+#[serial_test::serial]
+fn applying_a_changed_endpoint_revokes_the_service_and_schedules_a_restart() {
+    let _local_only = LocalOnlyGuard::enter();
+    App::test((), |mut app| async move {
+        app.update(|ctx| warpui_extras::secure_storage::register_noop("test", ctx));
+        app.add_singleton_model(::ai::api_keys::ApiKeyManager::new);
+        network_policy::set_configured_endpoints(
+            network_policy::EndpointSource::AiSettings,
+            ["https://api.minimax.io/v1"],
+        );
+        let mut manager = test_manager();
+        manager.status = LocalMultiAgentStatus::Running {
+            root_url: Url::parse("http://127.0.0.1:8787").unwrap(),
+            pid: None,
+            config_hash: String::new(),
+        };
+        manager.applied_allow_list = network_policy::AllowList::current();
+        let manager = app.add_model(|_| manager);
+        set_global_root_url(Some(Url::parse("http://127.0.0.1:8787").unwrap()));
+
+        // The user points the base URL at another provider.
+        network_policy::set_configured_endpoints(
+            network_policy::EndpointSource::AiSettings,
+            ["https://api.openai.com/v1"],
+        );
+        manager.update(&mut app, |manager, ctx| {
+            manager.apply_profile_endpoints(ctx)
+        });
+
+        manager.read(&app, |manager, _| {
+            assert!(matches!(manager.status, LocalMultiAgentStatus::Restarting));
+            assert!(manager.restart_debounce.is_some());
+        });
+        assert!(
+            LOCAL_ROOT_URL.read().is_none(),
+            "the old service must be unpublished"
+        );
+    });
 }
 
 #[test]
