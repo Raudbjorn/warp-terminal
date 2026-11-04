@@ -14271,11 +14271,13 @@ impl TerminalView {
                 .response
                 .clone()
                 .filter(|response| !response.is_empty())
-                .unwrap_or_else(|| match status {
-                    CLIAgentSessionStatus::Failed { .. } => "The agent encountered an error.",
-                    _ => "Task completed.",
-                }
-                .to_owned())
+                .unwrap_or_else(|| {
+                    match status {
+                        CLIAgentSessionStatus::Failed { .. } => "The agent encountered an error.",
+                        _ => "Task completed.",
+                    }
+                    .to_owned()
+                })
         };
 
         let trigger = if matches!(status, CLIAgentSessionStatus::Blocked { .. }) {

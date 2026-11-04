@@ -1,5 +1,5 @@
 use super::super::dialog::dialog_on_screen;
-use super::super::dialog::tests::{permission_at, OTHER, PERMISSION};
+use super::super::dialog::tests::{OTHER, PERMISSION, permission_at};
 use super::*;
 
 fn permission(screen: &str) -> Card {

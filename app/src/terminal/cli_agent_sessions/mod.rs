@@ -442,7 +442,12 @@ impl CLIAgentSession {
             CLIAgentEventType::Stop => {
                 // WarpOss: a turn's end that carries no prompt (the plugin sends the transcript's
                 // text only when the user opts in) keeps the one the turn began with.
-                if event.payload.query.as_deref().is_some_and(|q| !q.is_empty()) {
+                if event
+                    .payload
+                    .query
+                    .as_deref()
+                    .is_some_and(|q| !q.is_empty())
+                {
                     self.session_context.query = event.payload.query.clone();
                 }
                 self.session_context.response = event.payload.response.clone();
@@ -494,7 +499,12 @@ impl CLIAgentSession {
             CLIAgentEventType::StopFailure => {
                 // WarpOss: a turn's end that carries no prompt (the plugin sends the transcript's
                 // text only when the user opts in) keeps the one the turn began with.
-                if event.payload.query.as_deref().is_some_and(|q| !q.is_empty()) {
+                if event
+                    .payload
+                    .query
+                    .as_deref()
+                    .is_some_and(|q| !q.is_empty())
+                {
                     self.session_context.query = event.payload.query.clone();
                 }
                 self.session_context.response = event.payload.response.clone();
