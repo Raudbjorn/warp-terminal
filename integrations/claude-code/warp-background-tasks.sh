@@ -37,7 +37,7 @@ fi
 transcript=$(printf '%s' "$INPUT" | jq -r '.transcript_path // ""' 2>/dev/null)
 monitor_ids='[]'
 if [ -n "$transcript" ] && [ -f "$transcript" ]; then
-  monitor_ids=$(grep -F 'Monitor' "$transcript" 2>/dev/null | jq -sc '
+  monitor_ids=$(grep -E 'Monitor|"taskId"' "$transcript" 2>/dev/null | jq -sc '
     (map(.message.content? // [] | if type == "array" then .[] else empty end
          | select(.type? == "tool_use" and .name? == "Monitor") | .id)) as $uses
     | [.[] | select(.toolUseResult.taskId? != null)

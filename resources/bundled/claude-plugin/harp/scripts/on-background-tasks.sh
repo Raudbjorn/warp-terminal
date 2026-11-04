@@ -25,7 +25,9 @@ INPUT=$(cat)
 TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)
 MONITOR_IDS='[]'
 if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
-    MONITOR_IDS=$(grep -F 'Monitor' "$TRANSCRIPT_PATH" 2>/dev/null | jq -sc '
+    # The prefilter keeps both kinds of rows the join needs: the Monitor tool calls, and the
+    # tool results that carry a taskId (which need not mention "Monitor" themselves).
+    MONITOR_IDS=$(grep -E 'Monitor|"taskId"' "$TRANSCRIPT_PATH" 2>/dev/null | jq -sc '
         (map(.message.content? // [] | if type == "array" then .[] else empty end
              | select(.type? == "tool_use" and .name? == "Monitor") | .id)) as $uses
         | [.[] | select(.toolUseResult.taskId? != null)
