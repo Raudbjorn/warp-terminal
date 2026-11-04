@@ -352,6 +352,27 @@ pub enum Icon {
     JsonLang,
     PhpLang,
     KotlinLang,
+    // The fork's sidebar: the panel toggle from Phosphor's fill weight (MIT,
+    // bundled/svg/phosphor/LICENSE) and the working spinner drawn for the fork (bundled/svg/warpy).
+    PhSidebarSimpleFill,
+    WarpyLoadingCircle,
+    SidebarDoneRing,
+    SidebarDoneFill,
+    SidebarDoneTick,
+    SidebarDoneTickRead,
+    SidebarWorkingTrack,
+    SidebarWorkingArc,
+    SidebarNeedsRing,
+    SidebarNeedsDot,
+    SidebarIdleMoon,
+    SidebarShell,
+    SidebarClose,
+    SidebarToggle,
+    SidebarPlus,
+    /// The section header's "+", drawn to match `SidebarClose`'s stroke.
+    SidebarAdd,
+    SidebarChevron,
+    SidebarCheck,
 }
 
 impl From<Icon> for &'static str {
@@ -694,6 +715,24 @@ impl From<Icon> for &'static str {
             Icon::JsonLang => "bundled/svg/file_type/json.svg",
             Icon::PhpLang => "bundled/svg/file_type/php.svg",
             Icon::KotlinLang => "bundled/svg/file_type/kotlin.svg",
+            Icon::PhSidebarSimpleFill => "bundled/svg/phosphor/sidebar-simple-fill.svg",
+            Icon::WarpyLoadingCircle => "bundled/svg/warpy/loading-circle.svg",
+            Icon::SidebarDoneRing => "bundled/svg/sidebar/done-ring.svg",
+            Icon::SidebarDoneFill => "bundled/svg/sidebar/done-fill.svg",
+            Icon::SidebarDoneTick => "bundled/svg/sidebar/done-tick.svg",
+            Icon::SidebarDoneTickRead => "bundled/svg/sidebar/done-tick-read.svg",
+            Icon::SidebarWorkingTrack => "bundled/svg/sidebar/working-track.svg",
+            Icon::SidebarWorkingArc => "bundled/svg/sidebar/working-arc.svg",
+            Icon::SidebarNeedsRing => "bundled/svg/sidebar/needs-ring.svg",
+            Icon::SidebarNeedsDot => "bundled/svg/sidebar/needs-dot.svg",
+            Icon::SidebarIdleMoon => "bundled/svg/sidebar/idle-moon.svg",
+            Icon::SidebarShell => "bundled/svg/sidebar/shell.svg",
+            Icon::SidebarClose => "bundled/svg/sidebar/close.svg",
+            Icon::SidebarToggle => "bundled/svg/sidebar/toggle.svg",
+            Icon::SidebarPlus => "bundled/svg/sidebar/plus.svg",
+            Icon::SidebarAdd => "bundled/svg/sidebar/add.svg",
+            Icon::SidebarChevron => "bundled/svg/sidebar/chevron.svg",
+            Icon::SidebarCheck => "bundled/svg/sidebar/check.svg",
         }
     }
 }

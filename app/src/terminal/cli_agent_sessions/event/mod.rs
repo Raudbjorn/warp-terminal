@@ -22,6 +22,18 @@ pub enum CLIAgentEventType {
     QuestionAsked,
     NeedsInput,
     IdlePrompt,
+    /// Background work (subagents, shells, monitors) still in flight after a turn, reported by
+    /// the user's own Stop/SubagentStop hook from Claude Code's `background_tasks` list.
+    BackgroundTasks {
+        count: u32,
+        only_subagents: bool,
+        /// How many of `count` are background shells, from the hook's `kinds`. A report without
+        /// `kinds` (an older hook) counts none, so all of its work keeps the row working.
+        shells: u32,
+        /// When the hook started (Unix ms). Hooks run side by side and a slow one can report
+        /// after a newer one, so a report older than the last one applied is stale.
+        started_ms: Option<u64>,
+    },
     Unknown(String),
 }
 
@@ -32,6 +44,50 @@ pub enum CLIAgentEventSource {
     RichPlugin,
     /// Native Codex OSC 9 fallback notification.
     CodexOsc9Fallback,
+    /// Harp: read from the terminal title the agent sets itself (Claude Code's ◐/✳, Codex's
+    /// braille spinner), for an agent that runs without a status plugin.
+    TerminalTitle,
+}
+
+/// Harp: what an agent's own terminal title says about its turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TitleState {
+    Working,
+    Idle,
+    NeedsYou,
+}
+
+/// Harp: reads the state an agent puts at the front of its terminal title. Claude Code turns a
+/// half-disc (◐ ◑ ◒ ◓) while it works and shows ✳ when idle; while it starts up it already spins
+/// with its default title "Claude Code", which is no turn yet. Codex spins a braille character in
+/// front of the task while it works, drops it when done, and blinks `[ ! ] Action Required` /
+/// `[ . ] Action Required` in front while it waits for an approval or an answer (Codex 0.162).
+/// `None` when the title says nothing.
+pub fn title_state(agent: CLIAgent, title: &str) -> Option<TitleState> {
+    let mut chars = title.chars();
+    let first = chars.next()?;
+    let rest = chars.as_str().trim();
+    match agent {
+        CLIAgent::Claude => match first {
+            '◐' | '◑' | '◒' | '◓' if rest != "Claude Code" => Some(TitleState::Working),
+            '✳' => Some(TitleState::Idle),
+            _ => None,
+        },
+        CLIAgent::Codex if codex_action_required_prefix(title).is_some() => {
+            Some(TitleState::NeedsYou)
+        }
+        CLIAgent::Codex if ('\u{2801}'..='\u{28FF}').contains(&first) => Some(TitleState::Working),
+        CLIAgent::Codex if !title.trim().is_empty() => Some(TitleState::Idle),
+        _ => None,
+    }
+}
+
+/// Harp: the `[ ! ] Action Required | ` (or blinking `[ . ] …`) Codex puts in front of its title
+/// while it waits on the user, when `title` starts with it.
+pub fn codex_action_required_prefix(title: &str) -> Option<&'static str> {
+    ["[ ! ] Action Required | ", "[ . ] Action Required | "]
+        .into_iter()
+        .find(|prefix| title.starts_with(prefix))
 }
 
 /// Event-specific fields that vary by event type.
@@ -52,6 +108,10 @@ pub struct CLIAgentEventPayload {
     /// wakes the agent again when any of them completes or fires, so a stop with pending work is
     /// a pause, not the end of the session. `None` when the plugin predates this field.
     pub pending_background_work_count: Option<u32>,
+    /// Harp: sent by Harp's bundled Claude Code plugin (`"producer":"harp"`). Once a session has
+    /// one, events from any other plugin in the same pane (Warp's own, installed by the user) are
+    /// duplicates and dropped.
+    pub from_harp_plugin: bool,
 }
 
 impl CLIAgentEventPayload {

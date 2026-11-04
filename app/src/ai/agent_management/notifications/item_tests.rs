@@ -99,3 +99,40 @@ fn remove_by_origin_returns_false_when_nothing_to_remove() {
     let removed = items.remove_by_origin(NotificationOrigin::CLISession(terminal_view_id));
     assert!(!removed);
 }
+
+fn cli_notification_of(
+    terminal_view_id: EntityId,
+    category: NotificationCategory,
+) -> NotificationItem {
+    let mut item = make_cli_session_notification(terminal_view_id);
+    item.category = category;
+    item
+}
+
+/// A permission answered while subagents run leaves the blocked state without announcing, and the
+/// "needs attention" request must go; a completion announced earlier stays. Fails if the request
+/// outlives its answer.
+#[test]
+fn remove_request_by_origin_takes_back_only_the_request() {
+    let terminal = EntityId::new();
+    let origin = NotificationOrigin::CLISession(terminal);
+
+    let mut items = NotificationItems::default();
+    items.push(cli_notification_of(terminal, NotificationCategory::Request));
+    assert!(items.remove_request_by_origin(origin));
+    assert!(!items.remove_request_by_origin(origin));
+
+    let mut items = NotificationItems::default();
+    items.push(cli_notification_of(
+        terminal,
+        NotificationCategory::Complete,
+    ));
+    assert!(!items.remove_request_by_origin(origin));
+    assert!(items.remove_by_origin(origin));
+
+    // Another terminal's request is not touched.
+    let other = EntityId::new();
+    let mut items = NotificationItems::default();
+    items.push(cli_notification_of(other, NotificationCategory::Request));
+    assert!(!items.remove_request_by_origin(origin));
+}

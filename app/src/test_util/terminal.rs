@@ -119,6 +119,8 @@ pub fn initialize_app_for_terminal_view(app: &mut App) {
     // history model is in place.
     app.add_singleton_model(|ctx| OrchestrationPillBarModel::new(Default::default(), ctx));
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // display.rs subscribes to PluginPromptModel; lib.rs registers it unconditionally in the app.
+    app.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
     // ConnPanelView reads this on construction, so a harness that builds a
     // Workspace needs it registered as production does.
     app.add_singleton_model(crate::conn::ConnModel::new);

@@ -51,6 +51,7 @@ use crate::terminal::view::PromptPosition;
 use crate::terminal::{CLIAgent, History};
 #[cfg(feature = "local_fs")]
 use crate::util::git::PrInfo;
+use crate::workspace::tab_settings::TabSettings;
 
 #[cfg(feature = "local_fs")]
 fn git_status_metadata(branch: &str) -> GitStatusMetadata {
@@ -619,6 +620,8 @@ fn test_cli_agent_footer_chips_require_a_visible_supported_footer() {
         app.add_singleton_model(|_| crate::settings::manager::SettingsManager::default());
         crate::settings::InputSettings::register(&mut app);
         app.update(crate::settings::AISettings::register_and_subscribe_to_events);
+        // Footer visibility also depends on Harp mode, which lives in TabSettings.
+        TabSettings::register(&mut app);
         app.add_singleton_model(crate::workspaces::user_workspaces::UserWorkspaces::default_mock);
         app.add_singleton_model(|_| CLIAgentSessionsModel::new());
         #[cfg(windows)]
@@ -676,6 +679,23 @@ fn test_cli_agent_footer_chips_require_a_visible_supported_footer() {
                 .unwrap();
         });
         assert!(cli_footer_chips(&app).is_empty());
+
+        // Harp mode hides the footer even with the setting on, so its chips stop too; turning
+        // the mode off brings them back.
+        crate::settings::AISettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings
+                .should_render_cli_agent_footer
+                .set_value(true, ctx)
+                .unwrap();
+        });
+        TabSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.harp_mode.set_value(true, ctx).unwrap();
+        });
+        assert!(cli_footer_chips(&app).is_empty());
+        TabSettings::handle(&app).update(&mut app, |settings, ctx| {
+            settings.harp_mode.set_value(false, ctx).unwrap();
+        });
+        assert!(!cli_footer_chips(&app).is_empty());
     });
 }
 

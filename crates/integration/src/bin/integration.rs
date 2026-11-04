@@ -444,6 +444,7 @@ fn register_tests() -> HashMap<&'static str, BoxedBuilderFn> {
     register_test!(test_settings_search_clear_restores_umbrella_state);
     register_test!(test_settings_search_preserved_on_sidebar_click);
     register_test!(test_settings_agent_mcp_servers_renders_standalone_page);
+    register_test!(test_settings_warpify_page_renders);
 
     register_test!(test_middle_click_paste);
 

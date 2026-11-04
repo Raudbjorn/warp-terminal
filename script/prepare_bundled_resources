@@ -90,8 +90,10 @@ ADDITIONAL_LICENSES=(
     "Hack Font|MIT|app/assets/bundled/fonts/hack/LICENSE.md"
     "Roboto Font|SIL Open Font License|app/assets/bundled/fonts/roboto/LICENSE.txt"
     "Material Icon Theme|MIT|app/assets/bundled/svg/material_icon_theme/LICENSE"
+    "Phosphor Icons|MIT|app/assets/bundled/svg/phosphor/LICENSE"
     "bash-preexec|MIT|app/assets/bundled/bootstrap/bash-preexec-LICENSE.md"
     "Claude API Skill|Apache-2.0|resources/bundled/skills/claude-api/LICENSE.txt"
+    "Harp Claude Code plugin (based on Warp's plugin)|MIT|resources/bundled/claude-plugin/harp/LICENSE-warp"
     "GitHub Desktop|MIT|app/src/code_review/GITHUB-DESKTOP-LICENSE"
     "Windows Terminal|MIT|app/assets/windows/LICENSE-WINDOWS-TERMINAL"
 )

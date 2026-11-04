@@ -542,6 +542,44 @@ fn orchestration_is_enabled_when_ai_is_enabled() {
     });
 }
 
+/// Harp mode's sidebar row shows agent state, so the CLI agent footer hides while the mode is
+/// on; the user's own footer setting still decides everything when the mode is off.
+#[test]
+fn cli_agent_footer_visible_only_with_setting_on_and_harp_mode_off() {
+    let cases = [
+        // (footer setting, harp mode, expected visible)
+        (true, false, true),
+        (true, true, false),
+        (false, false, false),
+        (false, true, false),
+    ];
+    for (footer_setting, harp_mode, expected) in cases {
+        App::test((), |mut app| async move {
+            initialize_settings_for_tests(&mut app);
+            AISettings::handle(&app).update(&mut app, |settings, ctx| {
+                settings
+                    .should_render_cli_agent_footer
+                    .set_value(footer_setting, ctx)
+                    .unwrap();
+            });
+            crate::workspace::tab_settings::TabSettings::handle(&app).update(
+                &mut app,
+                |settings, ctx| {
+                    settings.harp_mode.set_value(harp_mode, ctx).unwrap();
+                },
+            );
+
+            app.read(|ctx| {
+                assert_eq!(
+                    cli_agent_footer_visible(ctx),
+                    expected,
+                    "footer setting {footer_setting}, harp mode {harp_mode}"
+                );
+            });
+        });
+    }
+}
+
 #[test]
 fn test_should_display_quota_reset_banner_with_empty_history() {
     App::test((), |mut app| async move {
@@ -986,9 +1024,9 @@ fn ai_autodetection_defaults_to_opt_in() {
             // NLD is opt-in: a fresh user who never touched the setting has it off.
             // This fails before the default flip (default was `true`) and passes after.
             assert!(!*settings.ai_autodetection_enabled_internal.value());
-            // AI is enabled by default, so the getter reflects the opt-in setting
-            // rather than a disabled-AI state.
-            assert!(settings.is_any_ai_enabled(ctx));
+            // Harp also asserted `!is_any_ai_enabled` here because it ships with AI off; the fork
+            // keeps AI's upstream default (the port leaves that flip out), so only the opt-in
+            // autodetection default is checked.
             assert!(!settings.is_ai_autodetection_enabled(ctx));
         });
     });

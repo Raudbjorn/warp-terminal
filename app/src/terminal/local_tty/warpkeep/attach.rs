@@ -8,23 +8,33 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use instant::Instant;
+
 use anyhow::{Context, Result, bail};
 use nix::fcntl::{FlockArg, flock};
 
-use super::{READ_CHUNK, TAG_DATA, TAG_WINCH, get_winsize, set_nonblocking};
+use super::pump::{
+    NonblockingGuard, PendingWrites, interest, poll_fds, read_fd, readable, write_all_until,
+};
+use super::{
+    FINAL_FLUSH_TIMEOUT, HANDSHAKE_READ_TIMEOUT, PENDING_WRITE_CAP_BYTES, READ_CHUNK,
+    REPLAY_LEN_BYTES, TAG_DATA, TAG_WINCH, encode_winsize, get_winsize, set_nonblocking,
+};
 
 /// Attach entry point. `dir` holds the session sockets; `command` is the shell
 /// (plus its args) to run if a new master must be created.
 pub fn run_attach(dir: PathBuf, command: Vec<String>) -> Result<()> {
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
 
-    let (mut stream, _socket, _lock) = connect_or_spawn(&dir, &command)?;
+    let (mut stream, _socket, lock) = connect_or_spawn(&dir, &command)?;
 
     // Put Warp's PTY (our controlling tty) into raw mode so bytes pass through
     // untouched; restore on exit no matter what.
     let restore = RawModeGuard::enter(libc::STDIN_FILENO)?;
     let status = relay(&mut stream);
     drop(restore);
+    // `process::exit` runs no destructors: say the session is no longer ours.
+    super::shells::clear_attach_pid(&lock._file);
 
     std::process::exit(status);
 }
@@ -54,6 +64,7 @@ fn connect_or_spawn(dir: &Path, command: &[String]) -> Result<(UnixStream, PathB
                     // Master is gone; clean up the stale socket + lock and move on.
                     let _ = std::fs::remove_file(&path);
                     let _ = std::fs::remove_file(lock_path(&path));
+                    let _ = std::fs::remove_file(super::shells::shell_path(&path));
                 }
             }
         }
@@ -114,97 +125,128 @@ fn relay(stream: &mut UnixStream) -> i32 {
     let stdin = libc::STDIN_FILENO;
     let stdout = libc::STDOUT_FILENO;
 
-    // Send our initial window size, then drain the replay block to stdout.
+    // Handshake: send our initial window size, then copy the replay block to
+    // stdout. These steps use plain blocking I/O on purpose; they cannot
+    // deadlock because we send nothing but the header until it's done:
+    // - the header goes into a freshly connected, empty socket buffer;
+    // - the master queues the replay (at most RING_CAPACITY bytes) without
+    //   ever blocking, so it keeps serving its shell while we read; we only
+    //   read it and write to Warp's PTY, whose reader doesn't depend on us.
+    // Socket reads are still bounded by HANDSHAKE_READ_TIMEOUT so a wedged
+    // master (e.g. one started by an older build) can't hang the tab forever.
     let (rows, cols) = get_winsize(stdin);
-    let mut header = Vec::with_capacity(4);
-    header.extend_from_slice(&rows.to_ne_bytes());
-    header.extend_from_slice(&cols.to_ne_bytes());
-    if stream.write_all(&header).is_err() {
+    if stream.write_all(&encode_winsize(rows, cols)).is_err() {
         return 1;
     }
-    if drain_replay(stream, stdout).is_err() {
+    if stream
+        .set_read_timeout(Some(HANDSHAKE_READ_TIMEOUT))
+        .is_err()
+        || drain_replay(stream, stdout).is_err()
+        || stream.set_read_timeout(None).is_err()
+    {
         return 0;
     }
 
     // SIGWINCH self-pipe: the handler writes a byte we poll for.
     let winch_fd = install_winch_pipe();
 
-    // Keep stdin/stdout/socket BLOCKING: reads are gated by `poll` (so they
-    // never block), and writes block until fully drained. A non-blocking
-    // `write_all` of a large burst (e.g. Warp's shell-bootstrap init script)
-    // would hit `WouldBlock` and silently drop bytes, breaking the bootstrap.
+    pump(stream, stdin, stdout, winch_fd)
+}
+
+/// Relay core: pump `stdin`→`stream` (framed) and `stream`→`stdout` (raw),
+/// forwarding window-size changes signalled on `winch_fd` (or none if `-1`).
+/// Returns the process exit status to propagate.
+///
+/// Never blocks on a write (see `pump` module): each direction has a
+/// [`PendingWrites`] buffer flushed on `POLLOUT`, the other direction keeps
+/// being read meanwhile, and a full buffer pauses reading from its source.
+pub(super) fn pump(stream: &mut UnixStream, stdin: RawFd, stdout: RawFd, winch_fd: RawFd) -> i32 {
     let sock_fd = stream.as_raw_fd();
 
+    // stdin is included because on a tty it shares stdout's open file
+    // description anyway; reads are poll-gated and tolerate EAGAIN. The guard
+    // restores the original flags so we don't leave Warp's PTY non-blocking.
+    // Refuse to relay through a blocking fd rather than risk the deadlock.
+    let Ok(_nonblocking) = NonblockingGuard::set(&[stdin, stdout, sock_fd]) else {
+        return 1;
+    };
+    // A 0-byte read on a tty means the terminal hung up (BSD/macOS report
+    // it this way rather than EIO); on a pipe it's plain EOF, after which
+    // output keeps flowing.
+    let stdin_is_tty = unsafe { libc::isatty(stdin) } == 1;
+
+    // Framed packets (data + WINCH, in order) waiting for the master.
+    let mut to_master = PendingWrites::new(PENDING_WRITE_CAP_BYTES);
+    // Raw shell output waiting for Warp's PTY.
+    let mut to_stdout = PendingWrites::new(PENDING_WRITE_CAP_BYTES);
+    let mut stdin_open = true;
     let mut buf = [0u8; READ_CHUNK];
+
     loop {
+        let master_backlogged = to_master.is_full();
         let mut fds = [
-            libc::pollfd {
-                fd: stdin,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: sock_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: winch_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
+            interest(stdin, stdin_open && !master_backlogged, false),
+            interest(stdout, false, !to_stdout.is_empty()),
+            interest(sock_fd, !to_stdout.is_full(), !to_master.is_empty()),
+            // A pending resize stays in the self-pipe and is coalesced into a
+            // single WINCH once the master catches up.
+            interest(winch_fd, !master_backlogged, false),
         ];
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
+        if poll_fds(&mut fds, -1).is_err() {
             return 1;
         }
 
-        // stdin -> master (framed data packet).
-        if fds[0].revents & libc::POLLIN != 0 {
-            match read_fd(stdin, &mut buf) {
-                Ok(0) => {}
-                Ok(len) => {
-                    if send_packet(stream, TAG_DATA, &buf[..len]).is_err() {
-                        return 0;
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => return 1,
-            }
-        }
-
         // master -> stdout (raw).
-        if fds[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
-            match stream.read(&mut buf) {
-                Ok(0) => return 0, // master/shell gone
-                Ok(len) => write_fd(stdout, &buf[..len]),
+        if readable(&fds[2]) {
+            match read_fd(sock_fd, &mut buf) {
+                Ok(0) => return finish(&mut to_stdout, stdout, 0), // master/shell gone
+                Ok(len) => to_stdout.push(&buf[..len]),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => return 0,
+                Err(_) => return finish(&mut to_stdout, stdout, 0),
             }
         }
 
-        // SIGWINCH -> forward new size.
-        if fds[2].revents & libc::POLLIN != 0 {
+        // stdin -> master (framed data packet).
+        if readable(&fds[0]) {
+            match read_fd(stdin, &mut buf) {
+                Ok(0) if stdin_is_tty => return 1, // Warp's PTY went away
+                Ok(0) => stdin_open = false,
+                Ok(len) => to_master.push_frame(TAG_DATA, &buf[..len]),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => return 1, // Warp's PTY went away (EIO)
+            }
+        }
+
+        // SIGWINCH -> forward new size, queued in order with the data packets.
+        if readable(&fds[3]) {
+            // The bytes are only a wake-up signal; the size is read fresh below,
+            // so a failed/short drain just means another (harmless) wake-up.
             let mut drain = [0u8; 16];
             let _ = read_fd(winch_fd, &mut drain);
             let (rows, cols) = get_winsize(stdin);
-            let mut payload = Vec::with_capacity(4);
-            payload.extend_from_slice(&rows.to_ne_bytes());
-            payload.extend_from_slice(&cols.to_ne_bytes());
-            if send_packet(stream, TAG_WINCH, &payload).is_err() {
-                return 0;
-            }
+            to_master.push_frame(TAG_WINCH, &encode_winsize(rows, cols));
+        }
+
+        // Flush both directions as far as they go without blocking.
+        if !to_master.is_empty() && to_master.flush_to(sock_fd).is_err() {
+            return finish(&mut to_stdout, stdout, 0); // master hung up
+        }
+        if !to_stdout.is_empty() && to_stdout.flush_to(stdout).is_err() {
+            return 1; // Warp's PTY went away
         }
     }
 }
 
+/// The master is gone: give output already received a bounded chance to reach
+/// Warp (e.g. the shell's last words before `exit`), then report `status`.
+fn finish(to_stdout: &mut PendingWrites, stdout: RawFd, status: i32) -> i32 {
+    let _ = to_stdout.flush_until(stdout, Some(Instant::now() + FINAL_FLUSH_TIMEOUT));
+    status
+}
+
 /// Read the `[len:u32][bytes]` replay block and write the bytes to stdout.
 fn drain_replay(stream: &mut UnixStream, stdout: RawFd) -> std::io::Result<()> {
-    let mut len_buf = [0u8; 4];
+    let mut len_buf = [0u8; REPLAY_LEN_BYTES];
     stream.read_exact(&mut len_buf)?;
     let mut remaining = u32::from_ne_bytes(len_buf) as usize;
     let mut buf = [0u8; READ_CHUNK];
@@ -214,18 +256,13 @@ fn drain_replay(stream: &mut UnixStream, stdout: RawFd) -> std::io::Result<()> {
         if got == 0 {
             break;
         }
-        write_fd(stdout, &buf[..got]);
+        // No deadline: waiting on Warp's reader can't deadlock (see `relay`),
+        // and giving up would lose the repaint. EAGAIN-safe in case the PTY
+        // was handed to us non-blocking.
+        write_all_until(stdout, &buf[..got], None)?;
         remaining -= got;
     }
     Ok(())
-}
-
-fn send_packet(stream: &mut UnixStream, tag: u8, payload: &[u8]) -> std::io::Result<()> {
-    let mut frame = Vec::with_capacity(5 + payload.len());
-    frame.push(tag);
-    frame.extend_from_slice(&(payload.len() as u32).to_ne_bytes());
-    frame.extend_from_slice(payload);
-    stream.write_all(&frame)
 }
 
 // --- locking -------------------------------------------------------------
@@ -244,7 +281,13 @@ fn try_lock(socket: &Path) -> Option<SessionLock> {
         .open(lock_path(socket))
         .ok()?;
     match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
-        Ok(()) => Some(SessionLock { _file: file }),
+        Ok(()) => {
+            // The app finds this tab's shell through the pid in the lock (see `shells`).
+            if let Err(error) = super::shells::record_attach_pid(&file, std::process::id()) {
+                log::warn!("warpkeep: could not record the attach pid: {error}");
+            }
+            Some(SessionLock { _file: file })
+        }
         Err(_) => None,
     }
 }
@@ -312,33 +355,7 @@ fn install_winch_pipe() -> RawFd {
     read_fd
 }
 
-// --- small fd helpers ----------------------------------------------------
-
-fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-fn write_fd(fd: RawFd, data: &[u8]) {
-    let mut written = 0;
-    while written < data.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                data[written..].as_ptr() as *const libc::c_void,
-                data.len() - written,
-            )
-        };
-        if n <= 0 {
-            break;
-        }
-        written += n as usize;
-    }
-}
+// --- misc ----------------------------------------------------------------
 
 fn nanos_since_epoch() -> u128 {
     std::time::SystemTime::now()
@@ -346,3 +363,7 @@ fn nanos_since_epoch() -> u128 {
         .map(|d| d.as_nanos())
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "attach_tests.rs"]
+mod tests;

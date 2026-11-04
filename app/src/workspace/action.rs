@@ -146,6 +146,9 @@ pub enum WorkspaceAction {
     RenamePane(PaneViewLocator),
     ResetPaneName(PaneViewLocator),
     RenameActiveTab,
+    /// A left click anywhere in the window while a tab or group name field is open (WarpOss):
+    /// ends the rename unless it landed in the field itself.
+    EndRenameOnClick(Vector2F),
     RenameActivePane,
     SetActiveTabName(String),
     CycleActiveTabColor,
@@ -225,6 +228,9 @@ pub enum WorkspaceAction {
     },
     UngroupTabs(TabGroupId),
     NewTabInGroup(TabGroupId),
+    /// A new terminal tab at the end of a framed-sidebar section: the group, or the ungrouped
+    /// "Other" section for `None`. Sent by the "+" on a section header.
+    NewTabAtEndOfSection(Option<TabGroupId>),
     MoveTabGroupUp(TabGroupId),
     MoveTabGroupDown(TabGroupId),
     CloseTabsOutsideGroup(TabGroupId),
@@ -235,6 +241,23 @@ pub enum WorkspaceAction {
     PinTab(usize),
     /// Unpins the tab at the given index.
     UnpinTab(usize),
+    /// Sets or clears the user's unread mark on the tab at the given index.
+    SetTabMarkedUnread {
+        pane_group_id: EntityId,
+        unread: bool,
+    },
+    /// Puts the tab to sleep in the vertical tabs sidebar, or wakes it.
+    SetTabInactive {
+        pane_group_id: EntityId,
+        inactive: bool,
+    },
+    /// Pins the tab's tmux session to the framed sidebar's "Pinned" section, or unpins it.
+    SetTabPinnedInSidebar {
+        pane_group_id: EntityId,
+        pinned: bool,
+    },
+    /// Folds or unfolds the framed sidebar's "Other" section (tabs in no group).
+    ToggleOtherSectionCollapsed,
     /// Pins the active tab.
     PinActiveTab,
     /// Unpins the active tab.
@@ -391,6 +414,9 @@ pub enum WorkspaceAction {
     /// Toggles the vertical tabs panel. This happens as an explicit action from the user.
     ToggleVerticalTabsPanel,
     OpenVerticalTabsPanel,
+    /// Flips Harp mode (`modes.harp.enabled`). Turning it on also turns vertical tabs on and opens
+    /// the sidebar; turning it off leaves vertical tabs as they are.
+    ToggleHarpMode,
     SshManager(crate::ssh_manager::SshManagerAction),
     ToggleVerticalTabsSettingsPopup,
     SetVerticalTabsDisplayGranularity(VerticalTabsDisplayGranularity),
@@ -977,6 +1003,7 @@ impl WorkspaceAction {
             | RenamePane(_)
             | ResetPaneName(_)
             | RenameActiveTab
+            | EndRenameOnClick(_)
             | RenameActivePane
             | SetActiveTabName(_)
             | CycleActiveTabColor
@@ -1000,6 +1027,7 @@ impl WorkspaceAction {
             | RemoveActiveOrSelectedTabsFromGroup
             | UngroupTabs(_)
             | NewTabInGroup(_)
+            | NewTabAtEndOfSection(_)
             | MoveTabGroupUp(_)
             | MoveTabGroupDown(_)
             | CloseTabsOutsideGroup(_)
@@ -1007,6 +1035,10 @@ impl WorkspaceAction {
             | CloseTabsBelowGroup(_)
             | PinTab(_)
             | UnpinTab(_)
+            | SetTabMarkedUnread { .. }
+            | SetTabInactive { .. }
+            | SetTabPinnedInSidebar { .. }
+            | ToggleOtherSectionCollapsed
             | PinActiveTab
             | UnpinActiveTab
             | PinTabGroup(_)
@@ -1039,7 +1071,9 @@ impl WorkspaceAction {
             | OpenRepository { .. }
             | SelectTabConfig(_)
             | ToggleVerticalTabsPanel
-            | OpenVerticalTabsPanel => true, // actions that actually change a state of the state of user's
+            | OpenVerticalTabsPanel
+            // Turning Harp mode on opens the sidebar, which the saved window state records.
+            | ToggleHarpMode => true, // actions that actually change a state of the state of user's
             // workspace would most likely require a save, so that if the app gets
             // restarted, the user can continue working
             AutoupdateFailureLink

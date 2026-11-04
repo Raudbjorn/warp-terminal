@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use ai::index::full_source_code_embedding::manager::CodebaseIndexManager;
@@ -162,6 +163,14 @@ pub(crate) fn initialize_app_with_team_client(app: &mut App, team_client: Arc<dy
     app.add_singleton_model(crate::ai::blocklist::QueuedQueryModel::new);
     app.add_singleton_model(|ctx| OrchestrationPillBarModel::new(Default::default(), ctx));
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // Workspace::new reads both oh-my-warp plugin stores; lib.rs registers them unconditionally.
+    app.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
+    app.add_singleton_model(|_| {
+        crate::workspace::plugin_status_items::PluginStatusItemsModel::new()
+    });
+    // Workspace::new subscribes to PluginHost when the plugin host is built in.
+    #[cfg(feature = "plugin_host")]
+    app.add_singleton_model(|_| crate::plugin::PluginHost::new_for_test());
     // ConnPanelView reads this on construction, so a harness that builds a
     // Workspace needs it registered as production does.
     app.add_singleton_model(crate::conn::ConnModel::new);
@@ -5462,6 +5471,56 @@ fn test_new_tab_in_group_expands_collapsed_group_member_active() {
 }
 
 #[test]
+fn test_new_tab_at_end_of_section_lands_last_and_active() {
+    // The "+" on a sidebar section header: the new tab goes last in that section, never next to
+    // the active tab, and becomes active.
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            // Group [0, 1], then two ungrouped tabs; the first group member is active.
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.handle_action(&WorkspaceAction::NewTabGroupFromTab(0), ctx);
+            let group_id = workspace.tabs[0].group_id.expect("tab 0 in the group");
+            workspace.tabs[1].group_id = Some(group_id);
+            workspace.activate_tab(0, ctx);
+
+            workspace.handle_action(&WorkspaceAction::NewTabAtEndOfSection(Some(group_id)), ctx);
+            assert_eq!(workspace.tab_count(), 5);
+            assert_eq!(
+                workspace.active_tab_index(),
+                2,
+                "last in the group, not after tab 0"
+            );
+            let groups: Vec<_> = workspace.tabs.iter().map(|t| t.group_id).collect();
+            assert_eq!(
+                groups,
+                [Some(group_id), Some(group_id), Some(group_id), None, None]
+            );
+
+            // "Other": ungrouped, at the very end, even while a group member is active.
+            workspace.activate_tab(0, ctx);
+            workspace.handle_action(&WorkspaceAction::NewTabAtEndOfSection(None), ctx);
+            assert_eq!(workspace.tab_count(), 6);
+            assert_eq!(workspace.active_tab_index(), 5);
+            assert_eq!(workspace.tabs[5].group_id, None);
+            assert_eq!(
+                workspace
+                    .tabs
+                    .iter()
+                    .filter(|t| t.group_id == Some(group_id))
+                    .count(),
+                3
+            );
+        });
+    });
+}
+
+#[test]
 fn test_pin_unpin_ungrouped_tab_moves_to_and_from_boundary() {
     let _pinned_guard = FeatureFlag::PinnedTabs.override_enabled(true);
 
@@ -6114,6 +6173,646 @@ fn test_right_panel_state_is_pruned_when_a_tab_closes() {
             assert!(
                 !workspace.right_panel_by_pane.contains_key(&pane),
                 "closed tabs must not leave per-pane panel state behind"
+            );
+        });
+    });
+}
+
+/// WarpOss: in the framed sidebar ⌘N counts the rows as they show; the rows of a collapsed group
+/// do not count, and ⌘9 reaches the last shown row.
+#[test]
+fn test_framed_sidebar_cmd_numbers_skip_collapsed_groups() {
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            assert!(workspace.uses_framed_sidebar_layout(ctx));
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            workspace.add_terminal_tab(false, ctx);
+            // Tab 0 goes into a group that is then collapsed: rows shown are tabs 1, 2, 3.
+            workspace.handle_action(&WorkspaceAction::NewTabGroupFromTab(0), ctx);
+            let group_id = workspace.tabs[0].group_id.expect("tab 0 is grouped");
+            workspace.handle_action(&WorkspaceAction::ToggleTabGroupCollapsed(group_id), ctx);
+            assert_eq!(
+                vertical_tabs::sidebar::shortcut_tabs(workspace),
+                vec![1, 2, 3]
+            );
+
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(1), ctx);
+            assert_eq!(workspace.active_tab_index(), 1);
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(3), ctx);
+            assert_eq!(workspace.active_tab_index(), 3);
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(1), ctx);
+            workspace.handle_action(&WorkspaceAction::ActivateLastTab, ctx);
+            assert_eq!(workspace.active_tab_index(), 3);
+            // No fourth row: nothing changes.
+            workspace.handle_action(&WorkspaceAction::ActivateTabByNumber(4), ctx);
+            assert_eq!(workspace.active_tab_index(), 3);
+        });
+    });
+}
+
+/// The framed sidebar needs Harp mode on as well as vertical tabs (whose panel defaults to the
+/// left).
+fn enable_framed_sidebar(app: &mut App) {
+    app.update(|ctx| {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+            report_if_error!(settings.harp_mode.set_value(true, ctx));
+        });
+    });
+}
+
+/// Plain vertical tabs, Harp mode off: the fork's upstream layout.
+fn enable_vertical_tabs_without_harp_mode(app: &mut App) {
+    app.update(|ctx| {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+            report_if_error!(settings.harp_mode.set_value(false, ctx));
+        });
+    });
+}
+
+/// With Harp mode off, vertical tabs stay the upstream layout: not framed, and the tab menu is
+/// Warp's own ("Pin tab", "New group with tab") without the sidebar's read/active marks.
+#[test]
+fn test_vertical_tabs_without_harp_mode_keep_upstream_layout_and_menu() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+    let _pinned_tabs_guard = FeatureFlag::PinnedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_vertical_tabs_without_harp_mode(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+        });
+
+        workspace.read(&app, |workspace, ctx| {
+            assert!(crate::tab::uses_vertical_tabs(ctx));
+            assert!(!workspace.uses_framed_sidebar_layout(ctx));
+            let mut items = workspace.tabs[0].menu_items(
+                0,
+                workspace.tabs.len(),
+                &workspace.tab_groups,
+                false,
+                false,
+                true,
+                ctx,
+            );
+            // The workspace adds the sidebar's own "Pin" only in Harp mode; here it would repeat
+            // Warp's "Pin tab".
+            workspace.add_sidebar_pin_menu_item(0, &mut items, ctx);
+            for label in ["Pin tab", "New group with tab"] {
+                assert!(menu_has(&items, label), "upstream menu lacks {label}");
+            }
+            for label in ["Pin", "Mark as unread", "Mark inactive"] {
+                assert!(!menu_has(&items, label), "upstream menu shows {label}");
+            }
+        });
+    });
+}
+
+/// The fork keeps Panes as the vertical-tabs default; the framed sidebar is built for one row per
+/// tab, so it reads Tabs while framed and the setting again once Harp mode is off.
+#[test]
+fn test_framed_sidebar_forces_tabs_granularity() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_vertical_tabs_without_harp_mode(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(
+                    settings
+                        .vertical_tabs_display_granularity
+                        .set_value(VerticalTabsDisplayGranularity::Panes, ctx)
+                );
+            });
+        });
+        app.read(|ctx| {
+            assert_eq!(
+                Workspace::vertical_tabs_display_granularity(ctx),
+                VerticalTabsDisplayGranularity::Panes
+            );
+        });
+
+        enable_framed_sidebar(&mut app);
+        app.read(|ctx| {
+            assert_eq!(
+                Workspace::vertical_tabs_display_granularity(ctx),
+                VerticalTabsDisplayGranularity::Tabs
+            );
+        });
+    });
+}
+
+/// "Toggle Harp Mode" from horizontal tabs turns vertical tabs on and opens the sidebar; toggling
+/// it off leaves vertical tabs on but drops the framed layout.
+#[test]
+fn test_toggle_harp_mode_turns_on_vertical_tabs_and_off_keeps_them() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+                report_if_error!(settings.harp_mode.set_value(false, ctx));
+            });
+        });
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::ToggleHarpMode, ctx);
+        });
+        workspace.read(&app, |workspace, ctx| {
+            assert!(crate::tab::harp_mode_enabled(ctx));
+            assert!(*TabSettings::as_ref(ctx).use_vertical_tabs);
+            assert!(workspace.uses_framed_sidebar_layout(ctx));
+            assert!(workspace.vertical_tabs_panel_open);
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::ToggleHarpMode, ctx);
+        });
+        workspace.read(&app, |workspace, ctx| {
+            assert!(!crate::tab::harp_mode_enabled(ctx));
+            assert!(*TabSettings::as_ref(ctx).use_vertical_tabs);
+            assert!(!workspace.uses_framed_sidebar_layout(ctx));
+        });
+    });
+}
+
+/// The Settings switch shares the command's rule, and a header toolbar without the tabs panel
+/// still ends up framed with the sidebar's tab order (grouped tabs before ungrouped ones).
+#[test]
+fn test_harp_mode_setting_places_tabs_panel_and_orders_tabs() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        app.update(|ctx| {
+            TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+                report_if_error!(settings.use_vertical_tabs.set_value(false, ctx));
+                report_if_error!(settings.harp_mode.set_value(false, ctx));
+                report_if_error!(settings.header_toolbar_chip_selection.set_value(
+                    HeaderToolbarChipSelection::Custom {
+                        left: vec![],
+                        right: vec![],
+                    },
+                    ctx,
+                ));
+            });
+        });
+        let workspace = mock_workspace(&mut app);
+        let grouped_tab = workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.handle_action(&WorkspaceAction::NewTabGroupFromTab(1), ctx);
+            assert_eq!(
+                workspace.tabs[0].group_id, None,
+                "ungrouped tab still first"
+            );
+            workspace.tabs[1].pane_group.id()
+        });
+
+        app.update(Workspace::toggle_harp_mode_setting);
+        workspace.read(&app, |workspace, ctx| {
+            assert!(workspace.uses_framed_sidebar_layout(ctx));
+            assert_eq!(workspace.tabs[0].pane_group.id(), grouped_tab);
+        });
+    });
+}
+
+fn vertical_tabs_panel_width(workspace: &Workspace) -> f32 {
+    workspace
+        .vertical_tabs_panel
+        .resizable_state
+        .lock()
+        .expect("panel width lock")
+        .size()
+}
+
+/// The panel takes each mode's default width when Harp mode switches, unless the user dragged
+/// it to a width of their own.
+#[test]
+fn test_harp_mode_switches_default_panel_width_but_keeps_a_dragged_one() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    const DRAGGED_WIDTH: f32 = 300.;
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_vertical_tabs_without_harp_mode(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(
+                vertical_tabs_panel_width(workspace),
+                vertical_tabs::PANEL_WIDTH
+            );
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.handle_action(&WorkspaceAction::ToggleHarpMode, ctx);
+        });
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(
+                vertical_tabs_panel_width(workspace),
+                vertical_tabs::sidebar::SIDEBAR_WIDTH
+            );
+        });
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace
+                .vertical_tabs_panel
+                .resizable_state
+                .lock()
+                .expect("panel width lock")
+                .set_size(DRAGGED_WIDTH);
+            workspace.handle_action(&WorkspaceAction::ToggleHarpMode, ctx);
+        });
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(vertical_tabs_panel_width(workspace), DRAGGED_WIDTH);
+        });
+    });
+}
+
+/// A window opened with Harp mode already on starts at the framed sidebar's width.
+#[test]
+fn test_new_workspace_in_harp_mode_starts_at_sidebar_width() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(
+                vertical_tabs_panel_width(workspace),
+                vertical_tabs::sidebar::SIDEBAR_WIDTH
+            );
+        });
+    });
+}
+
+fn set_full_tab_menu(app: &mut App, full: bool) {
+    app.update(|ctx| {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.vertical_tabs_full_tab_menu.set_value(full, ctx));
+        });
+    });
+}
+
+fn menu_has(items: &[MenuItem<WorkspaceAction>], label: &str) -> bool {
+    let wanted = MenuItemFields::new(label).into_item();
+    items
+        .iter()
+        .any(|item| item.is_approximately_same_item_as(&wanted))
+}
+
+/// WarpOss: `appearance.vertical_tabs.full_tab_menu` picks the tab menu. Full shows Warp's entries
+/// plus the fork's, with one "Move to group" submenu and no duplicate group entries; slim shows
+/// exactly the short menu and nothing from the full one.
+#[test]
+fn test_vertical_tabs_full_tab_menu_setting_switches_tab_menu() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+    let _pinned_tabs_guard = FeatureFlag::PinnedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+        });
+
+        let tab_menu = |workspace: &Workspace, ctx: &AppContext| {
+            workspace.tabs[0].menu_items(
+                0,
+                workspace.tabs.len(),
+                &workspace.tab_groups,
+                false,
+                false,
+                true,
+                ctx,
+            )
+        };
+
+        workspace.read(&app, |workspace, ctx| {
+            let mut items = tab_menu(workspace, ctx);
+            // The sidebar's own "Pin" (Warp's tab pin for a tab without a tmux session) leads the
+            // menu, so Warp's "Pin tab" does not repeat it.
+            assert!(!menu_has(&items, "Pin tab"));
+            workspace.add_sidebar_pin_menu_item(0, &mut items, ctx);
+            assert!(
+                items[0].is_approximately_same_item_as(&MenuItemFields::new("Pin").into_item())
+            );
+            for label in [
+                "Mark as unread",
+                "Mark inactive",
+                MOVE_TO_GROUP_LABEL,
+                "Close tab",
+                "Close other tabs",
+            ] {
+                assert!(menu_has(&items, label), "full menu lacks {label}");
+            }
+            assert!(!menu_has(&items, "New group with tab"));
+            assert!(!menu_has(&items, "Remove from group"));
+        });
+
+        set_full_tab_menu(&mut app, false);
+        workspace.read(&app, |workspace, ctx| {
+            let items = tab_menu(workspace, ctx);
+            let expected = [
+                MenuItemFields::new("Rename tab").into_item(),
+                MenuItemFields::new_submenu(MOVE_TO_GROUP_LABEL).into_item(),
+                MenuItemFields::new("Mark as unread").into_item(),
+                MenuItemFields::new("Mark inactive").into_item(),
+                MenuItem::Separator,
+                MenuItemFields::new("Close tab").into_item(),
+            ];
+            assert_eq!(items.len(), expected.len());
+            for (item, expected) in items.iter().zip(&expected) {
+                assert!(item.is_approximately_same_item_as(expected));
+            }
+        });
+    });
+}
+
+/// Without the tmux integration a tab pins with Warp's own tab pin and lands in the framed
+/// sidebar's "Pinned" section; unpinning takes it out again.
+#[test]
+fn test_tab_without_tmux_session_pins_to_the_sidebar() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _pinned_tabs_guard = FeatureFlag::PinnedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+        });
+        workspace.read(&app, |workspace, _| {
+            assert!(workspace.sidebar_pinned_tabs().is_empty());
+        });
+
+        workspace.update(&mut app, |workspace, ctx| workspace.pin_tab(1, ctx));
+        workspace.read(&app, |workspace, ctx| {
+            assert_eq!(workspace.sidebar_pinned_tabs(), vec![0]);
+            let mut items = Vec::new();
+            workspace.add_sidebar_pin_menu_item(0, &mut items, ctx);
+            assert!(
+                items[0].is_approximately_same_item_as(&MenuItemFields::new("Unpin").into_item())
+            );
+        });
+
+        workspace.update(&mut app, |workspace, ctx| workspace.unpin_tab(0, ctx));
+        workspace.read(&app, |workspace, _| {
+            assert!(workspace.sidebar_pinned_tabs().is_empty());
+        });
+    });
+}
+
+/// WarpOss: the same setting picks the framed sidebar's group menu.
+#[test]
+fn test_vertical_tabs_full_tab_menu_setting_switches_group_menu() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+        let group_id = workspace.update(&mut app, |workspace, ctx| {
+            workspace.add_terminal_tab(false, ctx);
+            workspace.handle_action(&WorkspaceAction::NewTabGroupFromTab(0), ctx);
+            workspace.tabs[0].group_id.expect("tab 0 is grouped")
+        });
+
+        let open_group_menu = |app: &mut App| {
+            workspace.update(app, |workspace, ctx| {
+                workspace.show_tab_group_right_click_menu = None;
+                workspace.toggle_tab_group_right_click_menu(
+                    group_id,
+                    TabContextMenuAnchor::Pointer(Vector2F::zero()),
+                    ctx,
+                );
+                workspace.tab_right_click_menu.clone()
+            })
+        };
+
+        let menu = open_group_menu(&mut app);
+        menu.read(&app, |menu, _| {
+            assert!(menu_has(menu.items(), "Close all tabs in group"));
+            assert!(menu_has(menu.items(), "Rename group"));
+        });
+
+        set_full_tab_menu(&mut app, false);
+        let menu = open_group_menu(&mut app);
+        menu.read(&app, |menu, _| {
+            let items = menu.items();
+            assert_eq!(items.len(), 4);
+            assert!(menu_has(items, "Rename group"));
+            assert!(menu_has(items, "Ungroup tabs"));
+            assert!(!menu_has(items, "Close all tabs in group"));
+        });
+    });
+}
+
+/// WarpOss: hiding the framed sidebar must leave a way back. The toggle action that the
+/// sidebar header, the card header and Cmd/Ctrl+Shift+B all dispatch closes and reopens it, and the
+/// window stays in the framed layout while it is hidden.
+#[test]
+fn test_framed_sidebar_toggle_hides_and_reopens() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        let workspace = mock_workspace(&mut app);
+
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.vertical_tabs_panel_open = true;
+            workspace.handle_action(&WorkspaceAction::ToggleVerticalTabsPanel, ctx);
+            assert!(!workspace.vertical_tabs_panel_open);
+            assert!(workspace.uses_framed_sidebar_layout(ctx));
+
+            workspace.handle_action(&WorkspaceAction::ToggleVerticalTabsPanel, ctx);
+            assert!(workspace.vertical_tabs_panel_open);
+        });
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn adopt_candidate(id: &str, group: Option<&str>) -> tab_grouping::tmux_adopt::Candidate {
+    tab_grouping::tmux_adopt::Candidate {
+        id: id.to_owned(),
+        group: group.map(str::to_owned),
+        pos: None,
+    }
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn set_tmux_sync(app: &mut App, on: bool) {
+    app.update(|ctx| {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.tmux_sync_enabled.set_value(on, ctx));
+        });
+    });
+}
+
+/// WarpOss: a session the phone bridge marked with @warp_adopt gets a tab in the background.
+/// Fails if the adopted tab takes focus or becomes the active tab, lands outside its group, opens
+/// twice for the same session, or the mark is cleared for a session that got no tab.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn test_tmux_adopt_opens_background_tabs_once_without_taking_focus() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+    let _grouped_tabs_guard = FeatureFlag::GroupedTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        set_tmux_sync(&mut app, true);
+        let workspace = mock_workspace(&mut app);
+        let (window_id, active_before, tabs_before) = workspace.read(&app, |workspace, _| {
+            (
+                workspace.window_id,
+                workspace.active_tab_pane_group().id(),
+                workspace.tabs.len(),
+            )
+        });
+        let focused_before = app.focused_view_id(window_id);
+        let unset = Rc::new(RefCell::new(Vec::<String>::new()));
+
+        let record = |unset: &Rc<RefCell<Vec<String>>>| {
+            let unset = unset.clone();
+            move |id: &str| unset.borrow_mut().push(id.to_owned())
+        };
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.adopt_tmux_sessions(
+                vec![
+                    adopt_candidate("$90101", Some("phone")),
+                    adopt_candidate("$90102", None),
+                ],
+                &HashMap::new(),
+                record(&unset),
+                ctx,
+            );
+        });
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), tabs_before + 2);
+            assert_eq!(workspace.active_tab_pane_group().id(), active_before);
+            let grouped: Vec<_> = workspace
+                .tabs
+                .iter()
+                .filter_map(|tab| tab.group_id)
+                .filter_map(|group_id| workspace.tab_groups.get(&group_id))
+                .filter_map(|group| group.name.clone())
+                .collect();
+            assert_eq!(grouped, vec!["phone".to_owned()]);
+        });
+        assert_eq!(app.focused_view_id(window_id), focused_before);
+        assert_eq!(
+            *unset.borrow(),
+            vec!["$90101".to_owned(), "$90102".to_owned()]
+        );
+
+        // A later poll that still sees the session (unset not landed, attach still connecting).
+        workspace.update(&mut app, |workspace, ctx| {
+            workspace.adopt_tmux_sessions(
+                vec![adopt_candidate("$90101", Some("phone"))],
+                &HashMap::new(),
+                record(&unset),
+                ctx,
+            );
+        });
+        workspace.read(&app, |workspace, _| {
+            assert_eq!(workspace.tabs.len(), tabs_before + 2);
+        });
+        assert_eq!(unset.borrow().len(), 2);
+    });
+}
+
+/// WarpOss: with the tmux integration off nothing is adopted and no mark is cleared.
+#[cfg(not(target_family = "wasm"))]
+#[test]
+fn test_tmux_adopt_does_nothing_while_the_integration_is_off() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+        enable_framed_sidebar(&mut app);
+        set_tmux_sync(&mut app, false);
+        let workspace = mock_workspace(&mut app);
+        let unset = Rc::new(RefCell::new(Vec::<String>::new()));
+        let recorder = unset.clone();
+        workspace.update(&mut app, |workspace, ctx| {
+            let tabs_before = workspace.tabs.len();
+            workspace.adopt_tmux_sessions(
+                vec![adopt_candidate("$90201", None)],
+                &HashMap::new(),
+                move |id: &str| recorder.borrow_mut().push(id.to_owned()),
+                ctx,
+            );
+            assert_eq!(workspace.tabs.len(), tabs_before);
+        });
+        assert!(unset.borrow().is_empty());
+    });
+}
+
+/// 0.1.3's Panes view opened this field on a double-click, prefilled with the terminal's live
+/// title ("✳ Claude Code"). Enter or a click away on the untouched field stored that title as a
+/// fixed pane name, which later hid the tab's own name in the Tabs view row.
+#[test]
+fn test_unchanged_pane_rename_does_not_pin_the_terminal_title() {
+    let _vertical_tabs_guard = FeatureFlag::VerticalTabs.override_enabled(true);
+
+    App::test((), |mut app| async move {
+        initialize_app(&mut app);
+
+        let workspace = mock_workspace(&mut app);
+        workspace.update(&mut app, |workspace, ctx| {
+            let pane_group = workspace.active_tab_pane_group();
+            let locator = PaneViewLocator {
+                pane_group_id: pane_group.id(),
+                pane_id: pane_group.as_ref(ctx).pane_id_from_index(0).unwrap(),
+            };
+            let configuration = pane_group
+                .as_ref(ctx)
+                .pane_by_id(locator.pane_id)
+                .unwrap()
+                .pane_configuration();
+            configuration.update(ctx, |configuration, ctx| {
+                configuration.set_title("✳ Claude Code", ctx);
+            });
+
+            workspace.rename_pane(locator, ctx);
+            // Claude Code animates its title while the field is open.
+            configuration.update(ctx, |configuration, ctx| {
+                configuration.set_title("⠂ Claude Code", ctx);
+            });
+            workspace.finish_pane_rename(ctx);
+            assert_eq!(configuration.as_ref(ctx).custom_vertical_tabs_title(), None);
+
+            workspace.rename_pane(locator, ctx);
+            workspace.pane_rename_editor.update(ctx, |editor, ctx| {
+                editor.set_buffer_text("Secure inbox", ctx);
+            });
+            workspace.finish_pane_rename(ctx);
+            assert_eq!(
+                configuration.as_ref(ctx).custom_vertical_tabs_title(),
+                Some("Secure inbox")
             );
         });
     });

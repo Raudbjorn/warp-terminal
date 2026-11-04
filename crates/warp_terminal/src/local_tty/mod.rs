@@ -104,4 +104,9 @@ pub struct PtyOptions {
     /// (gated via the `WARP_PROMPT_NODE_VERSION_ENABLED` env var).
     pub node_version_chip_enabled: bool,
     pub close_fds: bool,
+    /// Harp mode's bundled Claude Code status plugin. `Some` adds it to the shell's
+    /// `CLAUDE_CODE_PLUGIN_DIRS` (and sets `HARP_AGENT_STATUS=1`, the plugin's on-switch); `None`
+    /// injects nothing. Host shells only: the Docker sandbox path ignores it.
+    #[serde(default)]
+    pub claude_code_plugin_dir: Option<PathBuf>,
 }

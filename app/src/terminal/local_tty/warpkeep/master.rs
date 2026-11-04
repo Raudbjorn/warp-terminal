@@ -2,8 +2,8 @@
 //! Unix socket. Detached from Warp's process/PTY (the spawner sets `setsid` and
 //! redirects std fds to `/dev/null`), so it survives the GUI dying.
 
+use instant::Instant;
 use std::collections::VecDeque;
-use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
@@ -12,7 +12,12 @@ use anyhow::{Context, Result};
 use command::blocking::Command;
 use nix::pty::openpty;
 
-use super::{READ_CHUNK, RING_CAPACITY, TAG_DATA, TAG_WINCH, set_winsize};
+use super::pump::{PendingWrites, interest, poll_fds, read_fd, readable};
+use super::{
+    FINAL_FLUSH_TIMEOUT, FRAME_HEADER_BYTES, MASTER_POLL_INTERVAL_MS, MAX_PACKET_PAYLOAD_BYTES,
+    PENDING_WRITE_CAP_BYTES, READ_CHUNK, RING_CAPACITY, TAG_DATA, TAG_WINCH, WINSIZE_BYTES,
+    decode_winsize, set_nonblocking, set_winsize,
+};
 
 /// Run the master event loop: spawn the shell in an inner PTY and relay between
 /// it and (at most one) connected attach client until the shell exits.
@@ -53,14 +58,15 @@ pub fn run_master(socket: PathBuf, command: Vec<String>) -> Result<()> {
         .spawn()
         .context("failed to spawn shell under warpkeep")?;
 
-    // The parent (master) keeps only the PTY master fd. We deliberately keep it
-    // (and the client socket) in BLOCKING mode: reads are gated by `poll`, so
-    // they never block, while writes block until fully drained. That is what
-    // makes the relay lossless — a non-blocking `write_all` of a large burst
-    // (e.g. Warp's multi-KB shell-bootstrap init script) would hit `WouldBlock`
-    // and silently drop bytes, corrupting the bootstrap.
+    // The parent (master) keeps only the PTY master fd.
     unsafe {
         libc::close(slave_fd);
+    }
+
+    // Tell the app which shell this session runs (see `shells`), before the socket exists: the
+    // attach connects as soon as it does.
+    if let Err(error) = super::shells::write_shell_pid(&socket, child.id()) {
+        log::warn!("warpkeep-master: could not record the shell pid: {error}");
     }
 
     // Bind the session socket.
@@ -68,126 +74,244 @@ pub fn run_master(socket: PathBuf, command: Vec<String>) -> Result<()> {
     let listener = UnixListener::bind(&socket).context("warpkeep-master: bind socket")?;
     listener.set_nonblocking(true)?;
 
+    let result = serve(master_fd, &listener, || {
+        matches!(child.try_wait(), Ok(Some(_)))
+    });
+
+    let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(super::shells::shell_path(&socket));
+    let _ = child.wait();
+    result
+}
+
+/// The (single) attach client currently connected.
+struct Client {
+    stream: UnixStream,
+    /// Bytes read from the client but not yet parsed: the window-size header
+    /// and/or a partial packet. Bounded by one read plus one packet.
+    inbox: Vec<u8>,
+    /// The window-size header arrived and the replay block has been queued;
+    /// from here on live PTY output is queued after it.
+    attached: bool,
+    /// Bytes waiting to be written to the client: the replay block, then raw
+    /// PTY output.
+    outbox: PendingWrites,
+}
+
+impl Client {
+    fn new(stream: UnixStream) -> Self {
+        Self {
+            stream,
+            inbox: Vec::new(),
+            attached: false,
+            outbox: PendingWrites::new(PENDING_WRITE_CAP_BYTES),
+        }
+    }
+
+    /// Read what the client sent and act on it. Returns `false` when the
+    /// client is gone (EOF, error) or broke the protocol and must be dropped.
+    fn receive(
+        &mut self,
+        master_fd: RawFd,
+        ring: &VecDeque<u8>,
+        to_pty: &mut PendingWrites,
+        buf: &mut [u8],
+    ) -> bool {
+        match read_fd(self.stream.as_raw_fd(), buf) {
+            Ok(0) => false, // client detached
+            Ok(len) => {
+                self.inbox.extend_from_slice(&buf[..len]);
+                self.process_inbox(master_fd, ring, to_pty)
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+            Err(_) => false,
+        }
+    }
+
+    fn process_inbox(
+        &mut self,
+        master_fd: RawFd,
+        ring: &VecDeque<u8>,
+        to_pty: &mut PendingWrites,
+    ) -> bool {
+        if !self.attached {
+            let Some((rows, cols)) = self.inbox.get(..WINSIZE_BYTES).and_then(decode_winsize)
+            else {
+                return true; // wait for the rest of the header
+            };
+            self.inbox.drain(..WINSIZE_BYTES);
+            set_winsize(master_fd, rows, cols);
+
+            // Replay block: [len:u32][bytes]. Queued instead of written inline so
+            // a slow or stuck client can never wedge the master (and with it the
+            // shell); the snapshot is taken now, and only output read after this
+            // point is queued behind it, so nothing is duplicated or reordered.
+            let (front, back) = ring.as_slices();
+            self.outbox.push(&(ring.len() as u32).to_ne_bytes());
+            self.outbox.push(front);
+            self.outbox.push(back);
+            self.attached = true;
+        }
+
+        // Window-size changes are applied immediately rather than queued behind
+        // pending input: the shell hasn't necessarily read earlier input yet
+        // either way, and resizing promptly is what the user expects.
+        parse_client_packets(&mut self.inbox, |packet| match packet {
+            ClientPacket::Data(data) => to_pty.push(data),
+            ClientPacket::Winch { rows, cols } => set_winsize(master_fd, rows, cols),
+        })
+        .is_ok()
+    }
+}
+
+/// Relay core: serve the inner PTY `master_fd` and attach clients arriving on
+/// `listener` until the shell's PTY closes or `child_exited` reports true.
+///
+/// Never blocks on a write (see `pump`): PTY input and client output each go
+/// through a [`PendingWrites`] buffer flushed on `POLLOUT`, and a full buffer
+/// pauses reading from whatever feeds it.
+pub(super) fn serve(
+    master_fd: RawFd,
+    listener: &UnixListener,
+    mut child_exited: impl FnMut() -> bool,
+) -> Result<()> {
+    set_nonblocking(master_fd);
+
     let mut ring: VecDeque<u8> = VecDeque::with_capacity(RING_CAPACITY);
-    let mut client: Option<UnixStream> = None;
-    let mut client_buf: Vec<u8> = Vec::new();
+    let mut client: Option<Client> = None;
+    // Client input waiting for the shell to read it.
+    let mut to_pty = PendingWrites::new(PENDING_WRITE_CAP_BYTES);
     let mut buf = [0u8; READ_CHUNK];
 
-    let result = loop {
+    loop {
+        // Backpressure: a backlogged client pauses PTY reads (the shell then
+        // blocks on output, as it would on a slow terminal); a backlogged PTY
+        // pauses client reads. With no client, PTY output only feeds the ring.
+        let client_backlogged = client.as_ref().is_some_and(|c| c.outbox.is_full());
         let mut fds = [
-            libc::pollfd {
-                fd: master_fd,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: listener.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: client.as_ref().map_or(-1, |c| c.as_raw_fd()),
-                events: libc::POLLIN,
-                revents: 0,
+            interest(master_fd, !client_backlogged, !to_pty.is_empty()),
+            interest(listener.as_raw_fd(), true, false),
+            // A client that hasn't sent its header yet is always read: the
+            // header (plus at most one read of packets behind it) is tiny, and
+            // gating it on a backlogged shell would leave a new tab waiting
+            // for its replay until the shell next reads input.
+            match &client {
+                Some(c) => interest(
+                    c.stream.as_raw_fd(),
+                    !c.attached || !to_pty.is_full(),
+                    !c.outbox.is_empty(),
+                ),
+                None => interest(-1, false, false),
             },
         ];
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, 1000) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break Err(err).context("warpkeep-master: poll failed");
+        if let Err(err) = poll_fds(&mut fds, MASTER_POLL_INTERVAL_MS) {
+            // Still give the client the shell's last output before failing.
+            finish(master_fd, &mut ring, client, &mut buf);
+            return Err(err).context("warpkeep-master: poll failed");
         }
 
         // Inner PTY -> ring buffer + client.
-        if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
+        if readable(&fds[0]) {
             match read_fd(master_fd, &mut buf) {
-                Ok(0) => break Ok(()), // shell exited
-                Ok(len) => {
-                    let data = &buf[..len];
-                    push_ring(&mut ring, data);
-                    if let Some(stream) = client.as_mut() {
-                        if stream.write_all(data).is_err() {
-                            client = None;
-                        }
-                    }
-                }
+                Ok(0) => break, // shell exited
+                Ok(len) => record_output(&mut ring, client.as_mut(), &buf[..len]),
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => break Ok(()),
+                Err(_) => break, // EIO: every slave fd closed, shell is gone
             }
         }
 
         // New attach client. Single-attach: a new connection replaces any prior
         // one (the natural "reattach after the previous client died" semantics).
-        if fds[1].revents & libc::POLLIN != 0 {
-            if let Ok((stream, _)) = listener.accept() {
-                match handshake_new_client(stream, master_fd, &ring) {
-                    Ok(stream) => {
-                        client = Some(stream);
-                        client_buf.clear();
-                    }
-                    Err(_) => { /* drop the half-open client, keep serving */ }
-                }
-            }
+        // Output still queued for the old client is in the ring and is replayed.
+        // `accept()` may or may not inherit the listener's O_NONBLOCK depending
+        // on the platform; make it explicit.
+        if readable(&fds[1])
+            && let Ok((stream, _)) = listener.accept()
+            && stream.set_nonblocking(true).is_ok()
+        {
+            client = Some(Client::new(stream));
         }
 
         // Client -> inner PTY (framed packets).
-        if client.is_some() && fds[2].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
-        {
-            let stream = client.as_mut().unwrap();
-            match read_stream(stream, &mut buf) {
-                Ok(0) => client = None, // client detached
-                Ok(len) => {
-                    client_buf.extend_from_slice(&buf[..len]);
-                    parse_client_packets(&mut client_buf, master_fd);
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => client = None,
+        if readable(&fds[2]) {
+            let keep = client
+                .as_mut()
+                .is_some_and(|c| c.receive(master_fd, &ring, &mut to_pty, &mut buf));
+            if !keep {
+                client = None;
             }
         }
 
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break Ok(());
+        // Flush both directions as far as they go without blocking.
+        if !to_pty.is_empty() && to_pty.flush_to(master_fd).is_err() {
+            break; // EIO: the shell side of the PTY is gone
         }
-    };
+        if let Some(c) = client.as_mut()
+            && !c.outbox.is_empty()
+            && c.outbox.flush_to(c.stream.as_raw_fd()).is_err()
+        {
+            client = None; // EPIPE etc.: the client went away
+        }
 
-    let _ = std::fs::remove_file(&socket);
-    let _ = child.wait();
-    result
+        if child_exited() {
+            break;
+        }
+    }
+
+    finish(master_fd, &mut ring, client, &mut buf);
+    Ok(())
 }
 
-/// Send the replay buffer to a freshly connected client and apply its initial
-/// window size. The client first sends a 4-byte `[rows:u16][cols:u16]` header.
-fn handshake_new_client(
-    mut stream: UnixStream,
-    master_fd: RawFd,
-    ring: &VecDeque<u8>,
-) -> Result<UnixStream> {
-    // On BSD/macOS `accept()` inherits the listener's non-blocking flag, so force
-    // the accepted stream back to BLOCKING. It stays blocking for the whole event
-    // loop (see `run_master`): reads are gated by `poll` so they never block, and
-    // writes block until fully drained — which is what keeps the relay lossless.
-    stream.set_nonblocking(false)?;
-    let mut header = [0u8; 4];
-    stream.read_exact(&mut header)?;
-    let rows = u16::from_ne_bytes([header[0], header[1]]);
-    let cols = u16::from_ne_bytes([header[2], header[3]]);
-    set_winsize(master_fd, rows, cols);
-
-    // Replay block: [len:u32][bytes].
-    let snapshot: Vec<u8> = ring.iter().copied().collect();
-    stream.write_all(&(snapshot.len() as u32).to_ne_bytes())?;
-    stream.write_all(&snapshot)?;
-
-    Ok(stream)
+/// The shell is gone (or exited while a background job holds the PTY): collect
+/// output it already wrote, then give the client a bounded chance to receive
+/// everything queued for it before the master exits.
+fn finish(master_fd: RawFd, ring: &mut VecDeque<u8>, mut client: Option<Client>, buf: &mut [u8]) {
+    // Bounded by RING_CAPACITY so a chatty orphaned job can't keep us here.
+    let mut drained = 0;
+    while drained < RING_CAPACITY {
+        match read_fd(master_fd, buf) {
+            Ok(len) if len > 0 => {
+                record_output(ring, client.as_mut(), &buf[..len]);
+                drained += len;
+            }
+            _ => break, // EOF, EIO or EAGAIN: nothing more to collect
+        }
+    }
+    if let Some(c) = client.as_mut() {
+        let deadline = Instant::now() + FINAL_FLUSH_TIMEOUT;
+        let _ = c.outbox.flush_until(c.stream.as_raw_fd(), Some(deadline));
+    }
 }
+
+/// Record PTY output in the replay ring (always, so a later reattach repaints
+/// everything) and queue it for the client once its replay is queued.
+fn record_output(ring: &mut VecDeque<u8>, client: Option<&mut Client>, data: &[u8]) {
+    push_ring(ring, data);
+    if let Some(c) = client.filter(|c| c.attached) {
+        c.outbox.push(data);
+    }
+}
+
+/// One decoded client→master packet.
+pub(super) enum ClientPacket<'a> {
+    Data(&'a [u8]),
+    Winch { rows: u16, cols: u16 },
+}
+
+/// The client stream violated the framing protocol.
+#[derive(Debug)]
+pub(super) struct ProtocolError;
 
 /// Parse and consume as many complete `[tag][len:u32][payload]` packets as are
-/// buffered, applying each to the PTY master. Leaves any partial tail in `buf`.
-fn parse_client_packets(buf: &mut Vec<u8>, master_fd: RawFd) {
+/// buffered, handing each to `on_packet`. Leaves any partial tail in `buf`.
+/// A length field above [`MAX_PACKET_PAYLOAD_BYTES`] is a protocol error.
+pub(super) fn parse_client_packets(
+    buf: &mut Vec<u8>,
+    mut on_packet: impl FnMut(ClientPacket<'_>),
+) -> std::result::Result<(), ProtocolError> {
     let mut offset = 0;
-    while buf.len() - offset >= 5 {
+    let mut result = Ok(());
+    while buf.len() - offset >= FRAME_HEADER_BYTES {
         let tag = buf[offset];
         let len = u32::from_ne_bytes([
             buf[offset + 1],
@@ -195,24 +319,28 @@ fn parse_client_packets(buf: &mut Vec<u8>, master_fd: RawFd) {
             buf[offset + 3],
             buf[offset + 4],
         ]) as usize;
-        if buf.len() - offset - 5 < len {
+        if len > MAX_PACKET_PAYLOAD_BYTES {
+            result = Err(ProtocolError);
+            break;
+        }
+        if buf.len() - offset - FRAME_HEADER_BYTES < len {
             break; // wait for the rest of the payload
         }
-        let payload = &buf[offset + 5..offset + 5 + len];
+        let start = offset + FRAME_HEADER_BYTES;
+        let payload = &buf[start..start + len];
         match tag {
-            TAG_DATA => {
-                write_fd(master_fd, payload);
-            }
-            TAG_WINCH if len == 4 => {
-                let rows = u16::from_ne_bytes([payload[0], payload[1]]);
-                let cols = u16::from_ne_bytes([payload[2], payload[3]]);
-                set_winsize(master_fd, rows, cols);
+            TAG_DATA => on_packet(ClientPacket::Data(payload)),
+            TAG_WINCH => {
+                if let Some((rows, cols)) = decode_winsize(payload) {
+                    on_packet(ClientPacket::Winch { rows, cols });
+                }
             }
             _ => {}
         }
-        offset += 5 + len;
+        offset = start + len;
     }
     buf.drain(..offset);
+    result
 }
 
 /// Append bytes to the bounded ring buffer, evicting the oldest as needed.
@@ -233,32 +361,6 @@ fn push_ring(ring: &mut VecDeque<u8>, data: &[u8]) {
     ring.extend(data);
 }
 
-fn read_fd(fd: RawFd, buf: &mut [u8]) -> std::io::Result<usize> {
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-    if n < 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(n as usize)
-    }
-}
-
-fn write_fd(fd: RawFd, data: &[u8]) {
-    let mut written = 0;
-    while written < data.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                data[written..].as_ptr() as *const libc::c_void,
-                data.len() - written,
-            )
-        };
-        if n <= 0 {
-            break;
-        }
-        written += n as usize;
-    }
-}
-
-fn read_stream(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<usize> {
-    stream.read(buf)
-}
+#[cfg(test)]
+#[path = "master_tests.rs"]
+mod tests;

@@ -1639,9 +1639,33 @@ impl EventLoop {
             .for_window(winit_window)
             .dispatch_event(event.clone());
 
+        // A view can ask to move the window from where it was pressed (Harp's empty sidebar space
+        // and the margins around its cards), as a press in the titlebar region does. Double
+        // clicks stay with the app, and touch input does not drag (see below).
+        let mut drag_started = false;
+        if dispatch_result.window_drag_requested
+            && matches!(
+                event,
+                crate::event::Event::LeftMouseDown { click_count: 1, .. }
+            )
+            && window_state.last_touch_purpose.is_none()
+            && !cfg!(target_family = "wasm")
+        {
+            match winit_window.drag_window() {
+                Ok(_) => {
+                    window_state.current_mouse_button_pressed = None;
+                    drag_started = true;
+                }
+                Err(err) => {
+                    report_error!(anyhow::Error::new(err).context("error dragging window"))
+                }
+            }
+        }
+
         // If the app didn't handle the event, warpui might still want to do something
         // with it if it's a click within the "titlebar region" at the top.
-        if !dispatch_result.handled
+        if !drag_started
+            && !dispatch_result.handled
             && let crate::event::Event::LeftMouseDown {
                 click_count,
                 position,

@@ -20,10 +20,10 @@ use super::{
     detail_target_for_hovered_row, group_display_name, group_name_highlight_indices,
     matched_group_ids, merge_group_name_matches, non_terminal_search_text_fragments,
     pane_ids_for_display_granularity, pane_search_text_fragments, preferred_agent_tab_titles,
-    push_normalized_unique_summary_label, resolve_compact_subtitle, search_fragments_contain_query,
+    push_normalized_unique_summary_label, row_custom_name, search_fragments_contain_query,
     select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
     should_show_tab_group_header, shows_synced_inputs_indicator,
-    sort_summary_primary_labels_status_first, subtitle_options_for_primary, summary_overflow_count,
+    sort_summary_primary_labels_status_first, summary_overflow_count,
     summary_search_text_fragments, tab_admitted_by_group_name, terminal_kind_badge_label,
     terminal_primary_line_data, terminal_pull_request_badge_label, terminal_search_text_fragments,
     terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
@@ -1837,4 +1837,103 @@ fn a_running_pane_whose_story_covers_its_prompt_is_told_by_the_story() {
         lines.progress,
         Some(("now", "Check hygiene files".to_owned()))
     );
+}
+
+/// WarpOss: the background-shell dot belongs to a finished turn only; needs-you, working and
+/// inactive rows never carry it, and it goes once the shells are gone.
+#[test]
+fn background_dot_only_on_done_rows_with_shells() {
+    use super::sidebar::{RowStatus, shows_background_dot};
+    assert!(shows_background_dot(RowStatus::Done, true));
+    assert!(!shows_background_dot(RowStatus::Done, false));
+    for status in [
+        RowStatus::Working,
+        RowStatus::Needs,
+        RowStatus::Idle,
+        RowStatus::Shell,
+        RowStatus::Pending,
+    ] {
+        assert!(!shows_background_dot(status, true), "{status:?}");
+    }
+}
+
+/// A user's report: the Tabs view row kept saying "✳ Claude Code" after he renamed it to "Secure
+/// inbox", while the header above the terminal said "Secure inbox". The pane name an older Panes
+/// view had stored outranked the tab name that both the header and this rename write.
+#[test]
+fn test_row_shows_the_tab_name_over_an_older_pane_name() {
+    assert_eq!(
+        row_custom_name(Some("Secure inbox"), Some("✳ Claude Code")),
+        Some("Secure inbox")
+    );
+    // Without a tab name, a pane name still names the row.
+    assert_eq!(row_custom_name(None, Some("build")), Some("build"));
+    assert_eq!(row_custom_name(None, None), None);
+}
+
+#[test]
+fn agent_title_glyph_goes_and_the_rest_of_the_title_stays() {
+    use super::strip_agent_title_glyph as strip;
+    use crate::terminal::CLIAgent::{Claude, Codex, Gemini};
+    assert_eq!(
+        strip(Claude, "◐ Lighthouse keeper story"),
+        "Lighthouse keeper story"
+    );
+    assert_eq!(strip(Claude, "✳ Claude Code"), "Claude Code");
+    assert_eq!(strip(Codex, "⠦ Write story | work"), "Write story | work");
+    assert_eq!(
+        strip(Codex, "[ ! ] Action Required | Create hello.txt | work"),
+        "Create hello.txt | work"
+    );
+    assert_eq!(
+        strip(Codex, "[ . ] Action Required | Create hello.txt | work"),
+        "Create hello.txt | work"
+    );
+    assert_eq!(
+        strip(Claude, "[ ! ] Action Required | x"),
+        "[ ! ] Action Required | x"
+    );
+    // Only one glyph followed by a space, and only the row's own agent's glyphs: a title the
+    // user wrote keeps its characters.
+    assert_eq!(strip(Claude, "◐"), "◐");
+    assert_eq!(strip(Claude, "◐moon notes"), "◐moon notes");
+    assert_eq!(strip(Claude, "✳ ✳ x"), "✳ x");
+    assert_eq!(strip(Claude, "⠂ build"), "⠂ build");
+    assert_eq!(strip(Codex, "◐ notes"), "◐ notes");
+    assert_eq!(strip(Gemini, "◐ notes"), "◐ notes");
+}
+
+/// Harp mode off must look like upstream: the tab wrapper keeps its hover fill and kebab/close
+/// belt in every view. Only the framed sidebar's single tab rows paint their own fill and carry
+/// their own close X, so the wrapper steps back there.
+#[test]
+fn tab_wrapper_keeps_its_chrome_outside_the_framed_sidebar() {
+    use super::tab_wrapper_owns_row_chrome;
+    for granularity in [
+        VerticalTabsDisplayGranularity::Panes,
+        VerticalTabsDisplayGranularity::Tabs,
+    ] {
+        assert!(
+            tab_wrapper_owns_row_chrome(false, granularity),
+            "{granularity:?}"
+        );
+    }
+    assert!(tab_wrapper_owns_row_chrome(
+        true,
+        VerticalTabsDisplayGranularity::Panes
+    ));
+    assert!(!tab_wrapper_owns_row_chrome(
+        true,
+        VerticalTabsDisplayGranularity::Tabs
+    ));
+}
+
+/// Upstream's rows, group containers and drag ghosts are 4 px round; the framed sidebar's 10 px
+/// must not leak into them.
+#[test]
+fn row_corner_radius_is_upstreams_unless_framed() {
+    use super::{FRAMED_ROW_CORNER_RADIUS, ROW_CORNER_RADIUS, row_corner_radius};
+    assert_eq!(ROW_CORNER_RADIUS, 4.);
+    assert_eq!(row_corner_radius(false), ROW_CORNER_RADIUS);
+    assert_eq!(row_corner_radius(true), FRAMED_ROW_CORNER_RADIUS);
 }

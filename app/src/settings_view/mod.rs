@@ -138,6 +138,7 @@ pub use settings_page::{
 };
 pub use teams_page::{OpenTeamsSettingsModalArgs, TeamsInviteOption};
 pub(crate) use warp_agent_page::custom_model_routers_widget_id;
+pub use warpify_page::ssh_settings_widget_id;
 
 /// Original sidebar width used when the settings-file footer is not
 /// enabled. Preserved for Preview/Stable until `FeatureFlag::SettingsFile`
@@ -587,6 +588,8 @@ pub mod flags {
         "Show_Vertical_Tab_Panel_In_Restored_Windows";
     pub const USE_LATEST_USER_PROMPT_AS_CONVERSATION_TITLE_IN_TAB_NAMES_FLAG: &str =
         "Use_Latest_User_Prompt_As_Conversation_Title_In_Tab_Names";
+    pub const VERTICAL_TABS_FULL_TAB_MENU_FLAG: &str = "Vertical_Tabs_Full_Tab_Menu";
+    pub const HARP_MODE_FLAG: &str = "Harp_Mode";
     pub const ALT_SCREEN_PADDING_FLAG: &str = "Alt_Screen_Padding";
     pub const SESSION_CONFIG_TAB_CONFIG_CHIP_OPEN: &str = "Session_Config_Tab_Config_Chip_Open";
     pub const FEATURE_INTRO_MODAL_OPEN: &str = "Feature_Intro_Modal_Open";

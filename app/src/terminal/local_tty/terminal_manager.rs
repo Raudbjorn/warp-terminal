@@ -26,11 +26,11 @@ use warpui::r#async::executor::Background;
 use warpui::{AppContext, Entity, ModelContext, ModelHandle, SingletonEntity, ViewHandle};
 
 use super::event_loop::EventLoop;
+use super::mio_channel;
 use super::shell::{ShellStarter, ShellStarterSource};
 use super::spawner::{PtySpawnHooks, PtySpawnMode};
 #[cfg(unix)]
 use super::terminal_attributes::TerminalAttributesPoller;
-use super::mio_channel;
 use crate::ai::aws_credentials::AwsCredentialRefresher as _;
 use crate::ai::blocklist::SerializedBlockListItem;
 use crate::auth::AuthStateProvider;
@@ -1248,6 +1248,7 @@ impl<S> TerminalManager<S> {
             honor_ps1: is_honor_ps1_enabled,
             node_version_chip_enabled,
             close_fds: true,
+            claude_code_plugin_dir: crate::harp_mode::claude_plugin_dir(ctx),
         };
 
         let hooks = AppPtySpawnHooks;

@@ -369,7 +369,7 @@ use crate::tab::{
     PaneNameMenuTarget, SelectedTabColor, TAB_BAR_BORDER_HEIGHT, TAB_INDICATOR_HEIGHT,
     TAB_PIN_INDICATOR_ICON_SIZE, TAB_PIN_VANISH_THRESHOLD, TabBarState, TabComponent, TabData,
     TabShortcutModifierState, TabTelemetryAction, color_picker_menu_items, next_tab_color,
-    tab_position_id, uses_vertical_tabs,
+    tab_position_id, uses_slim_sidebar_menu, uses_vertical_tabs,
 };
 use crate::tab_configs::action_sidecar::SidecarItemKind;
 use crate::tab_configs::remove_confirmation_dialog::{
@@ -569,6 +569,16 @@ const MAX_FONT_SIZE: f32 = 25.0;
 const FONT_SIZE_INCREMENT: f32 = 1.0;
 
 pub const TAB_BAR_HEIGHT: f32 = 34.;
+/// Corner radius of the active tab's card in the framed sidebar layout. Strictly concentric with the
+/// ~12pt macOS 27 window corner it would be 4, which reads as square once smoothed; it is
+/// kept visibly round.
+const FRAMED_CARD_CORNER_RADIUS: f32 = 10.;
+/// Titlebar height in the framed layout, level with the sidebar's header buttons and the card
+/// header (the button constraint adds 1 px).
+const FRAMED_TITLEBAR_HEIGHT: f32 = 54.;
+/// Card padding left of the terminal under the card header, so tmux text (which brings no inset
+/// of its own) starts 32 px in, under the header's name.
+const FRAMED_CARD_CONTENT_LEFT_PADDING: f32 = 32.;
 /// Height for all panel headers (tab bar, warp drive, resource center, theme chooser, etc.).
 /// This ensures consistent header heights across all UI panels.
 pub const PANEL_HEADER_HEIGHT: f32 = TAB_BAR_HEIGHT;
@@ -722,7 +732,6 @@ const KEYBINDINGS_TO_CACHE: [&str; 4] = [
 
 const WORKFLOW_AND_ENV_VAR_SPLIT_RATIO: f32 = 0.56;
 const NOTEBOOK_SMART_SPLIT_RATIO: f32 = 0.42;
-
 #[cfg(target_family = "wasm")]
 const MOBILE_OVERLAY_PANEL_WIDTH_RATIO: f32 = 0.9;
 #[cfg(target_family = "wasm")]
@@ -1073,7 +1082,14 @@ pub struct Workspace {
     horizontal_tab_group_mouse_states: RefCell<HashMap<TabGroupId, HorizontalTabGroupMouseStates>>,
     tab_rename_editor: ViewHandle<EditorView>,
     pane_rename_editor: ViewHandle<EditorView>,
+    /// The text the pane rename field opened with.
+    pane_rename_prefill: Option<String>,
     tab_group_rename_editor: ViewHandle<EditorView>,
+    /// Enter was pressed on a group name another group already has; cleared on the next edit
+    /// and whenever a group rename starts or ends.
+    tab_group_rename_rejected: bool,
+    /// The sidebar footer's optional limit rings (`vertical_tabs::limit_rings`).
+    limit_rings: vertical_tabs::limit_rings::State,
     vertical_tabs_search_input: ViewHandle<EditorView>,
     tips_completed: ModelHandle<TipsCompleted>,
     user_default_shell_unsupported_banner_model_handle: ModelHandle<BannerState>,
@@ -1211,6 +1227,31 @@ pub struct Workspace {
     left_panel_open: bool,
     vertical_tabs_panel_open: bool,
     vertical_tabs_panel: VerticalTabsPanelState,
+    /// Terminals attached to a tmux session that runs an agent CLI, as last reported by tmux.
+    tmux_agent_terminals: HashSet<EntityId>,
+    /// Per tab matched with its tmux session: its group as last agreed with the session
+    /// (@warp_group). See `sync_tmux_tab_group`.
+    tmux_tab_groups: HashMap<EntityId, tab_grouping::TmuxTabGroup>,
+    /// Per tab: the tmux session name seen at the last poll.
+    tmux_tab_session_names: HashMap<EntityId, String>,
+    /// Per tab: inactive and marked-unread as last agreed with its tmux session
+    /// (@warp_inactive, @warp_unread), and when the app last wrote them there.
+    tmux_tab_flags: HashMap<EntityId, tab_grouping::TmuxTabFlags>,
+    /// Per tab with a tmux session: its pin to the sidebar's "Pinned" section (@warp_pin).
+    tmux_tab_pins: HashMap<EntityId, tab_grouping::TmuxTabPin>,
+    /// Per tab: the folder of its tmux session's active pane, for the card header.
+    tmux_tab_paths: HashMap<EntityId, String>,
+    /// While a sidebar row is dragged: where it would land. Applied on drop.
+    sidebar_drop_target: Option<vertical_tabs::sidebar::DropTarget>,
+    /// A tab group header is being dragged (between `StartGroupDrag` and `DropGroup`).
+    is_group_being_dragged: bool,
+    /// Tabs just renamed by hand: their title is left alone until the session rename landed.
+    tmux_rename_settle: HashMap<EntityId, tab_grouping::TmuxRenameSettle>,
+    /// The sidebar order as last agreed with tmux (`tab_grouping::tmux_layout`).
+    tmux_layout: tab_grouping::TmuxLayoutState,
+    /// Notifications for Claude Code dialogs (`tab_grouping::claude_waits::notify`).
+    #[cfg(not(target_family = "wasm"))]
+    claude_notices: tab_grouping::ClaudeNotices,
     left_panel_view: ViewHandle<LeftPanelView>,
     left_panel_views: Vec<ToolPanelView>,
     ssh_manager: SshManagerWorkspaceState,
@@ -1291,10 +1332,11 @@ impl Workspace {
     }
     fn tab_rename_editor_font_size(ctx: &AppContext, appearance: &Appearance) -> f32 {
         if FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs {
-            match *TabSettings::as_ref(ctx)
-                .vertical_tabs_display_granularity
-                .value()
-            {
+            // The framed sidebar renames in place at its rows' 13 px.
+            if Self::framed_sidebar_configured(ctx) {
+                return vertical_tabs::sidebar::ROW_TITLE_SIZE;
+            }
+            match Self::vertical_tabs_display_granularity(ctx) {
                 VerticalTabsDisplayGranularity::Panes => 10.,
                 VerticalTabsDisplayGranularity::Tabs => 12.,
             }
@@ -1528,6 +1570,11 @@ impl Workspace {
     ) {
         if self.current_workspace_state.is_tab_being_renamed() {
             match event {
+                // A save renames the tab's tmux session, so a blur only saves when it comes from
+                // inside the active window; focus leaving with the window cancels instead.
+                EditorEvent::Blurred if !self.is_active_window(ctx) => {
+                    self.cancel_tab_rename(ctx);
+                }
                 EditorEvent::Blurred | EditorEvent::Enter => {
                     self.finish_tab_rename(ctx);
                 }
@@ -1567,15 +1614,22 @@ impl Workspace {
             .is_any_tab_group_being_renamed()
         {
             match event {
-                EditorEvent::Enter => {
+                // A click outside saves, as it does for a tab. Upstream
+                // discarded on blur because focus can leave without the user ending the
+                // rename (#14241): a save renames every tmux session of the group, so a blur
+                // while the window is not active (Cmd-Tab, a notification, another app)
+                // cancels instead. An empty field still keeps the old name.
+                EditorEvent::Blurred if !self.is_active_window(ctx) => {
+                    self.cancel_tab_group_rename(ctx);
+                }
+                EditorEvent::Edited(_) if self.tab_group_rename_rejected => {
+                    self.tab_group_rename_rejected = false;
+                    ctx.notify();
+                }
+                EditorEvent::Blurred | EditorEvent::Enter => {
                     self.finish_tab_group_rename(ctx);
                 }
-                // Blur discards rather than commits. Focus can leave this editor without
-                // the user ever ending the rename — #14241 is one such case — and
-                // committing then writes a half-typed fragment as the group's real,
-                // persisted name. Discarding loses nothing the user cannot retype, and
-                // Enter remains the way to confirm.
-                EditorEvent::Blurred | EditorEvent::Escape => {
+                EditorEvent::Escape => {
                     self.cancel_tab_group_rename(ctx);
                 }
                 _ => {}
@@ -1583,18 +1637,52 @@ impl Workspace {
         }
     }
 
+    fn end_rename_on_click(&mut self, position: Vector2F, ctx: &mut ViewContext<Self>) {
+        // The field saves its rect every frame it is painted; a click inside it edits the name.
+        let in_field = ctx
+            .element_position_by_id_at_last_frame(
+                self.window_id,
+                vertical_tabs::sidebar::RENAME_FIELD_POSITION_ID,
+            )
+            .is_some_and(|rect| rect.contains_point(position));
+        if in_field {
+            return;
+        }
+        if self.current_workspace_state.is_tab_being_renamed() {
+            self.finish_tab_rename(ctx);
+        }
+        if self
+            .current_workspace_state
+            .is_any_tab_group_being_renamed()
+        {
+            self.finish_tab_group_rename_keep_open(false, ctx);
+        }
+    }
+
+    /// This workspace's window is the key window of the active app.
+    fn is_active_window(&self, ctx: &AppContext) -> bool {
+        ctx.windows().active_window() == Some(self.window_id)
+    }
+
     fn finish_tab_rename(&mut self, ctx: &mut ViewContext<Self>) {
         if let Some(tab_index) = self.current_workspace_state.tab_being_renamed() {
             self.current_workspace_state.clear_tab_being_renamed();
             let title = self.tab_rename_editor.as_ref(ctx).buffer_text(ctx);
             let tab = &self.tabs[tab_index];
-            tab.pane_group.update(ctx, |view, ctx| {
+            let renamed = tab.pane_group.update(ctx, |view, ctx| {
                 // Only update the title if it was actually changed. Otherwise, lets assume
                 // user's intend was to cancel the operation.
                 if view.display_title(ctx) != title {
                     view.set_title(&title, ctx);
+                    true
+                } else {
+                    false
                 }
             });
+            #[cfg(not(target_family = "wasm"))]
+            if renamed {
+                self.rename_tmux_sessions_of_tab(tab_index, &title, ctx);
+            }
             self.clear_tab_name_editor(ctx);
             self.update_window_title(ctx);
             ctx.notify();
@@ -1608,7 +1696,12 @@ impl Workspace {
 
         self.current_workspace_state.clear_pane_being_renamed();
         let title = self.pane_rename_editor.as_ref(ctx).buffer_text(ctx);
-        self.set_custom_pane_name(locator, title, ctx);
+        // Without a name the field opens on the terminal's live title. Saving it untouched would
+        // freeze that title ("✳ Claude Code") as the pane's name, so untouched means cancel, as
+        // in the tab rename.
+        if self.pane_rename_prefill.take().as_deref() != Some(title.trim()) {
+            self.set_custom_pane_name(locator, title, ctx);
+        }
         self.clear_pane_name_editor(ctx);
         self.focus_pane(locator, ctx);
         ctx.dispatch_global_action("workspace:save_app", ());
@@ -1634,12 +1727,44 @@ impl Workspace {
     }
 
     fn finish_tab_group_rename(&mut self, ctx: &mut ViewContext<Self>) {
+        let keep_open = self.tab_group_rename_editor.as_ref(ctx).is_focused();
+        self.finish_tab_group_rename_keep_open(keep_open, ctx);
+    }
+
+    /// `keep_open_on_duplicate`: Enter on a taken name keeps the field open with a note; a click
+    /// away or a blur drops the edit instead.
+    fn finish_tab_group_rename_keep_open(
+        &mut self,
+        keep_open_on_duplicate: bool,
+        ctx: &mut ViewContext<Self>,
+    ) {
         let Some(group_id) = self.current_workspace_state.tab_group_being_renamed() else {
             return;
         };
-        self.current_workspace_state.clear_tab_group_being_renamed();
         let title = self.tab_group_rename_editor.as_ref(ctx).buffer_text(ctx);
         let trimmed = title.trim();
+        // Groups are keyed by name in tmux (`@warp_group`), so taking another group's name would
+        // merge both for good. Enter keeps the field open with the duplicate so it can be fixed;
+        // a click elsewhere drops the edit and keeps the old name. Neither writes to tmux.
+        let lowered = trimmed.to_lowercase();
+        let duplicate = !trimmed.is_empty()
+            && self.tab_groups.values().any(|other| {
+                other.id != group_id
+                    && vertical_tabs::group_display_name(other)
+                        .trim()
+                        .to_lowercase()
+                        == lowered
+            });
+        if duplicate {
+            if keep_open_on_duplicate {
+                self.tab_group_rename_rejected = true;
+                ctx.notify();
+            } else {
+                self.cancel_tab_group_rename(ctx);
+            }
+            return;
+        }
+        self.current_workspace_state.clear_tab_group_being_renamed();
         // If the user cleared the input, keep the existing name (mirror tab/pane rename behavior).
         if !trimmed.is_empty()
             && let Some(group) = self.tab_groups.get_mut(&group_id)
@@ -3639,7 +3764,10 @@ impl Workspace {
             horizontal_tab_group_mouse_states: RefCell::default(),
             tab_rename_editor: Self::tab_rename_editor(ctx),
             pane_rename_editor: Self::pane_rename_editor(ctx),
+            pane_rename_prefill: None,
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
+            tab_group_rename_rejected: false,
+            limit_rings: Default::default(),
             vertical_tabs_search_input: Self::vertical_tabs_search_input(ctx),
             tips_completed,
             user_default_shell_unsupported_banner_model_handle,
@@ -3723,6 +3851,18 @@ impl Workspace {
             left_panel_open: false,
             vertical_tabs_panel_open: false,
             vertical_tabs_panel: Default::default(),
+            tmux_agent_terminals: HashSet::new(),
+            tmux_tab_groups: HashMap::new(),
+            tmux_tab_session_names: HashMap::new(),
+            tmux_tab_flags: HashMap::new(),
+            tmux_tab_pins: HashMap::new(),
+            tmux_tab_paths: HashMap::new(),
+            sidebar_drop_target: None,
+            is_group_being_dragged: false,
+            tmux_rename_settle: HashMap::new(),
+            tmux_layout: Default::default(),
+            #[cfg(not(target_family = "wasm"))]
+            claude_notices: Default::default(),
             left_panel_view,
             left_panel_views,
             ssh_manager,
@@ -3792,6 +3932,13 @@ impl Workspace {
         ws.sync_panel_positions_from_config(ctx);
         ws.sync_window_button_visibility(ctx);
         ws.update_titlebar_height(ctx);
+        ws.limit_rings.refresh(ctx);
+        ws.sync_vertical_tabs_panel_width_to_mode(ctx);
+        ws.schedule_sidebar_time_refresh(ctx);
+        #[cfg(not(target_family = "wasm"))]
+        ws.schedule_tmux_agent_poll(ctx);
+        #[cfg(not(target_family = "wasm"))]
+        ws.schedule_claude_wait_poll(ctx);
         // Seed the settings pane with the initial settings-file error (if
         // any) read from `GlobalResourceHandles`. Subsequent updates are
         // pushed by `subscribe_to_settings_errors` and `dismiss_workspace_banner`.
@@ -3985,6 +4132,15 @@ impl Workspace {
                 | CLIAgentSessionsModelEvent::SessionUpdated { .. }
         ) && self.workspace_contains_terminal_view(event.terminal_view_id(), ctx)
         {
+            // A new prompt means the user picked the tab back up.
+            if let CLIAgentSessionsModelEvent::StatusChanged {
+                terminal_view_id,
+                is_prompt_submit: true,
+                ..
+            } = event
+            {
+                self.clear_inactive_for_terminal(*terminal_view_id, ctx);
+            }
             ctx.notify();
         }
     }
@@ -4059,6 +4215,20 @@ impl Workspace {
                 self.sync_window_button_visibility(ctx);
                 ctx.notify();
             }
+            TabSettingsChangedEvent::LimitRingsEnabled { .. }
+            | TabSettingsChangedEvent::LimitRingsFile { .. } => {
+                self.limit_rings.refresh(ctx);
+                ctx.notify();
+            }
+            // Harp mode switches the sidebar layout. Renderers read the setting; the state the
+            // layout keeps (open panel, tab order, width, titlebar) follows here, so a
+            // settings.toml edit acts like the toggle (minus turning vertical tabs on).
+            TabSettingsChangedEvent::HarpMode { .. } => {
+                self.apply_harp_mode_change(ctx);
+            }
+            // The next tmux poll (every 10 s) reads the new values.
+            TabSettingsChangedEvent::TmuxSyncEnabled { .. }
+            | TabSettingsChangedEvent::TmuxSessionScript { .. } => {}
             TabSettingsChangedEvent::UseVerticalTabs { .. } => {
                 let vertical_tabs_enabled = *TabSettings::as_ref(ctx).use_vertical_tabs;
                 // During HOA onboarding, keep the vertical tabs panel open
@@ -4083,6 +4253,7 @@ impl Workspace {
                 }
                 self.sync_panel_positions_from_config(ctx);
                 self.sync_window_button_visibility(ctx);
+                self.update_titlebar_height(ctx);
                 ctx.notify();
             }
             TabSettingsChangedEvent::ShowVerticalTabPanelInRestoredWindows { .. } => {
@@ -4124,7 +4295,8 @@ impl Workspace {
             }
             | TabSettingsChangedEvent::VerticalTabsShowPrLink { .. }
             | TabSettingsChangedEvent::VerticalTabsShowDiffStats { .. }
-            | TabSettingsChangedEvent::HideTitleBarSearchBarInVerticalTabs { .. } => {
+            | TabSettingsChangedEvent::HideTitleBarSearchBarInVerticalTabs { .. }
+            | TabSettingsChangedEvent::VerticalTabsFullTabMenu { .. } => {
                 ctx.notify();
             }
             TabSettingsChangedEvent::VerticalTabsShowDetailsOnHover { .. } => {
@@ -4143,6 +4315,7 @@ impl Workspace {
             }
             TabSettingsChangedEvent::HeaderToolbarChipSelection { .. } => {
                 self.sync_panel_positions_from_config(ctx);
+                self.update_titlebar_height(ctx);
                 ctx.notify();
             }
         }
@@ -5924,7 +6097,8 @@ impl Workspace {
         // the active tab makes the existing selection stale; clear it.
         self.clear_tab_multi_selection(ctx);
 
-        if let Some(tab) = self.tabs.get(index) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            tab.marked_unread = false;
             let pane_group_id = tab.pane_group.id();
             self.tab_mru_order.retain(|id| *id != pane_group_id);
             self.tab_mru_order.insert(0, pane_group_id);
@@ -6286,6 +6460,7 @@ impl Workspace {
         self.set_active_tab_index(index, ctx);
         self.current_workspace_state.set_pane_being_renamed(locator);
         self.clear_pane_name_editor(ctx);
+        self.pane_rename_prefill = Some(title.clone());
         self.pane_rename_editor.update(ctx, move |editor, ctx| {
             editor.insert_selected_text(&title, ctx);
         });
@@ -7944,6 +8119,14 @@ impl Workspace {
         self.current_workspace_state
             .set_tab_group_being_renamed(group_id);
         self.clear_tab_group_name_editor(ctx);
+        // The framed sidebar renames in place at its section headers' size.
+        let font_size = if self.uses_framed_sidebar_layout(ctx) {
+            vertical_tabs::sidebar::SECTION_TITLE_SIZE
+        } else {
+            12.
+        };
+        self.tab_group_rename_editor
+            .update(ctx, |editor, ctx| editor.set_font_size(font_size, ctx));
         self.tab_group_rename_editor
             .update(ctx, move |editor, ctx| {
                 editor.insert_selected_text(&seed_text, ctx);
@@ -7953,6 +8136,7 @@ impl Workspace {
     }
 
     fn clear_tab_group_name_editor(&mut self, ctx: &mut ViewContext<Self>) {
+        self.tab_group_rename_rejected = false;
         self.tab_group_rename_editor
             .update(ctx, move |editor, ctx| {
                 editor.clear_buffer_and_reset_undo_stack(ctx);
@@ -8163,6 +8347,46 @@ impl Workspace {
             self.move_tab_to_index(new_idx, target_index, ctx);
         }
         self.expand_tab_group(group_id, ctx);
+    }
+
+    /// A new terminal tab, active and focused like the normal new-tab action, placed last in a
+    /// sidebar section: in `group_id`'s group, or ungrouped at the very end (the "Other"
+    /// section) for `None`. Unlike `new_tab_in_group`, it never lands beside the active tab.
+    fn new_tab_at_end_of_section(
+        &mut self,
+        group_id: Option<TabGroupId>,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        if let Some(group_id) = group_id
+            && (!FeatureFlag::GroupedTabs.is_enabled() || !self.tab_groups.contains_key(&group_id))
+        {
+            return;
+        }
+        self.add_new_session_tab_with_default_mode(
+            NewSessionSource::Tab,
+            Some(ctx.window_id()),
+            None,
+            None,
+            false,
+            ctx,
+        );
+        let new_idx = self.active_tab_index;
+        // The creation path may already have put the tab into the active tab's group; take it
+        // out first so the section's end is found among the other members only.
+        if let Some(tab) = self.tabs.get_mut(new_idx) {
+            tab.group_id = None;
+        }
+        let target_index = group_id
+            .and_then(|group_id| self.index_after_group(group_id))
+            .unwrap_or(self.tabs.len());
+        if let Some(tab) = self.tabs.get_mut(new_idx) {
+            tab.group_id = group_id;
+        }
+        self.move_tab_to_index(new_idx, target_index, ctx);
+        if let Some(group_id) = group_id {
+            self.expand_tab_group(group_id, ctx);
+        }
+        self.sync_tmux_tabs_now(ctx);
     }
 
     /// True when the user-initiated reorder of `group_id` in `direction`
@@ -8497,7 +8721,7 @@ impl Workspace {
         let can_move_left = self.can_move_tab(tab_index, TabMovement::Left);
         let can_move_right = self.can_move_tab(tab_index, TabMovement::Right);
         let is_only_member_of_group = self.tab_is_only_member_of_its_group(tab_index);
-        let menu_items = {
+        let mut menu_items = {
             let tab = &self.tabs[tab_index];
             tab.menu_items(
                 tab_index,
@@ -8509,6 +8733,7 @@ impl Workspace {
                 ctx,
             )
         };
+        self.add_sidebar_pin_menu_item(tab_index, &mut menu_items, ctx);
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
             context_menu.set_items(menu_items, view_ctx);
         });
@@ -8533,10 +8758,26 @@ impl Workspace {
             return;
         }
 
-        let terminal_colors = Appearance::as_ref(ctx).theme().terminal_colors().normal;
-        let menu_items =
-            self.tab_group_menu_items(group_id, uses_vertical_tabs(ctx), terminal_colors);
+        let sidebar_style = self
+            .uses_framed_sidebar_layout(ctx)
+            .then(|| vertical_tabs::sidebar::menu_style(ctx));
+        let menu_items = if sidebar_style.is_some() && uses_slim_sidebar_menu(ctx) {
+            self.sidebar_tab_group_menu_items(group_id)
+        } else {
+            let terminal_colors = Appearance::as_ref(ctx).theme().terminal_colors().normal;
+            self.tab_group_menu_items(
+                group_id,
+                uses_vertical_tabs(ctx),
+                sidebar_style.is_some(),
+                terminal_colors,
+            )
+        };
+        // The tab menu shares this view and sets its own look, so both are set every time.
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
+            if sidebar_style.is_some() {
+                context_menu.set_width(vertical_tabs::sidebar::MENU_WIDTH);
+            }
+            context_menu.set_style(sidebar_style);
             context_menu.set_items(menu_items, view_ctx);
         });
         self.show_tab_right_click_menu = None;
@@ -8585,7 +8826,7 @@ impl Workspace {
         let can_move_right = self.can_move_tab(tab_index, TabMovement::Right);
         let is_only_member_of_group = self.tab_is_only_member_of_its_group(tab_index);
         let tab = &self.tabs[tab_index];
-        let menu_items = tab.menu_items_with_pane_name_target(
+        let mut menu_items = tab.menu_items_with_pane_name_target(
             tab_index,
             self.tabs.len(),
             &self.tab_groups,
@@ -8595,8 +8836,16 @@ impl Workspace {
             Some(pane_name_target),
             ctx,
         );
+        self.add_sidebar_pin_menu_item(tab_index, &mut menu_items, ctx);
 
+        let sidebar_style = self
+            .uses_framed_sidebar_layout(ctx)
+            .then(|| vertical_tabs::sidebar::menu_style(ctx));
         ctx.update_view(&self.tab_right_click_menu, |context_menu, view_ctx| {
+            if sidebar_style.is_some() {
+                context_menu.set_width(vertical_tabs::sidebar::MENU_WIDTH);
+            }
+            context_menu.set_style(sidebar_style);
             context_menu.set_items(menu_items, view_ctx);
         });
         self.show_tab_right_click_menu = Some((tab_index, TabContextMenuAnchor::Pointer(position)));
@@ -10393,7 +10642,7 @@ impl Workspace {
                     ) =>
                 {
                     items.push(
-                        MenuItemFields::new("Update and relaunch Warp")
+                        MenuItemFields::new("Update and relaunch Harp")
                             .with_on_select_action(WorkspaceAction::ApplyUpdate)
                             .with_override_text_color(appearance.theme().ansi_fg_red())
                             .into_item(),
@@ -10610,12 +10859,36 @@ impl Workspace {
         }
     }
 
+    /// The framed sidebar's short group menu, in the tab menu's look: rename, collapse, and
+    /// ungroup (members move to "Other"; nothing closes).
+    fn sidebar_tab_group_menu_items(&self, group_id: TabGroupId) -> Vec<MenuItem<WorkspaceAction>> {
+        let collapse_label = if self.tab_groups.get(&group_id).is_some_and(|g| g.collapsed) {
+            "Expand group"
+        } else {
+            "Collapse group"
+        };
+        vec![
+            MenuItemFields::new("Rename group")
+                .with_on_select_action(WorkspaceAction::RenameTabGroup(group_id))
+                .into_item(),
+            MenuItemFields::new(collapse_label)
+                .with_on_select_action(WorkspaceAction::ToggleTabGroupCollapsed(group_id))
+                .into_item(),
+            MenuItem::Separator,
+            MenuItemFields::new("Ungroup tabs")
+                .with_on_select_action(WorkspaceAction::UngroupTabs(group_id))
+                .into_item(),
+        ]
+    }
+
     /// Move/close directional labels read "up/down/above/below" in vertical
-    /// tabs and "left/right" in horizontal tabs; actions are unchanged.
+    /// tabs and "left/right" in horizontal tabs; actions are unchanged. `framed` (Harp's sidebar)
+    /// names the rename entry "Rename group", matching its short group menu.
     fn tab_group_menu_items(
         &self,
         group_id: TabGroupId,
         is_vertical: bool,
+        framed: bool,
         terminal_colors: AnsiColors,
     ) -> Vec<MenuItem<WorkspaceAction>> {
         let Some((first, last)) = group_member_index_range(&self.tabs, group_id) else {
@@ -10741,7 +11014,7 @@ impl Workspace {
             ],
             move_section,
             vec![
-                MenuItemFields::new("Rename")
+                MenuItemFields::new(if framed { "Rename group" } else { "Rename" })
                     .with_on_select_action(WorkspaceAction::RenameTabGroup(group_id))
                     .into_item(),
             ],
@@ -10797,13 +11070,27 @@ impl Workspace {
             let source_tab_index = self
                 .show_tab_right_click_menu
                 .map(|(tab_index, _)| tab_index);
-            let items = self.build_move_to_group_sidecar_items(source_tab_index);
+            // Same condition as the parent menu (`TabData::menu_items`), which drops "New group
+            // with tab" and "Remove from group" for every vertical-tabs menu: this submenu carries
+            // both ("New group…", "Other") wherever the panel sits.
+            let items = match source_tab_index {
+                Some(tab_index) if crate::tab::uses_vertical_tabs(ctx) => {
+                    self.build_sidebar_move_to_group_items(tab_index)
+                }
+                _ => self.build_move_to_group_sidecar_items(source_tab_index),
+            };
             if items.is_empty() {
                 self.hide_move_to_group_sidecar(ctx);
                 return;
             }
+            let sidebar_style = self
+                .uses_framed_sidebar_layout(ctx)
+                .then(|| vertical_tabs::sidebar::menu_style(ctx));
+            let width = self.move_to_group_sidecar_width(ctx);
             self.move_to_group_sidecar_menu
                 .update(ctx, |menu, view_ctx| {
+                    menu.set_width(width);
+                    menu.set_style(sidebar_style);
                     menu.set_items(items, view_ctx);
                 });
             self.show_move_to_group_sidecar = true;
@@ -10834,6 +11121,16 @@ impl Workspace {
         ctx.notify();
     }
 
+    /// The framed sidebar's submenu is narrower than Warp's; the flip-to-the-left check uses the
+    /// width actually rendered.
+    fn move_to_group_sidecar_width(&self, app: &AppContext) -> f32 {
+        if self.uses_framed_sidebar_layout(app) {
+            vertical_tabs::sidebar::SUBMENU_WIDTH
+        } else {
+            MOVE_TO_GROUP_SIDECAR_WIDTH
+        }
+    }
+
     /// Shared between the single-tab pane menu and the multi-tab selection
     /// menu render paths so the two parent menus can't drift apart in how
     /// they position the "move to group" sidecar.
@@ -10848,8 +11145,11 @@ impl Workspace {
         .finish();
 
         // Flip the anchor side when the sidecar would overflow the window.
-        let render_left =
-            self.should_render_sidecar_left(MOVE_TO_GROUP_LABEL, MOVE_TO_GROUP_SIDECAR_WIDTH, app);
+        let render_left = self.should_render_sidecar_left(
+            MOVE_TO_GROUP_LABEL,
+            self.move_to_group_sidecar_width(app),
+            app,
+        );
         let (offset, parent_anchor, child_anchor) = if render_left {
             (
                 vec2f(-4., 0.),
@@ -12522,8 +12822,14 @@ impl Workspace {
         }
     }
 
+    /// Whether the vertical tabs search narrows the tabs. The framed sidebar has no search field,
+    /// so a query typed before switching to it filters nothing there and cannot be cleared.
+    fn tab_search_filters(&self, ctx: &AppContext) -> bool {
+        !self.vertical_tabs_panel.search_query.is_empty() && !self.uses_framed_sidebar_layout(ctx)
+    }
+
     pub fn activate_prev_tab(&mut self, ctx: &mut ViewContext<Self>) {
-        let index = if self.vertical_tabs_panel.search_query.is_empty() {
+        let index = if !self.tab_search_filters(ctx) {
             if self.active_tab_index > 0 {
                 self.active_tab_index - 1
             } else {
@@ -12548,7 +12854,7 @@ impl Workspace {
     }
 
     pub fn activate_next_tab(&mut self, ctx: &mut ViewContext<Self>) {
-        let index = if self.vertical_tabs_panel.search_query.is_empty() {
+        let index = if !self.tab_search_filters(ctx) {
             if self.active_tab_index + 1 < self.tabs.len() {
                 self.active_tab_index + 1
             } else {
@@ -13490,6 +13796,51 @@ impl Workspace {
                 pg.set_left_panel_open(true, ctx);
             });
         }
+    }
+
+    /// Adds a terminal tab at the end that runs `command` in the home folder, without activating
+    /// or focusing it, for a tab opened on another tool's behalf while the user works elsewhere.
+    /// Returns its index.
+    #[cfg(not(target_family = "wasm"))]
+    pub(super) fn add_background_command_tab(
+        &mut self,
+        command: String,
+        ctx: &mut ViewContext<Self>,
+    ) -> usize {
+        use crate::launch_configs::launch_config::{CommandTemplate, PaneMode, PaneTemplateType};
+
+        let panes_layout = PanesLayout::Template(PaneTemplateType::PaneTemplate {
+            cwd: dirs::home_dir().unwrap_or_default(),
+            commands: vec![CommandTemplate { exec: command }],
+            is_focused: None,
+            pane_mode: PaneMode::Terminal,
+            shell: None,
+        });
+        let new_pane_group = ctx.add_typed_action_view(|ctx| {
+            PaneGroup::new_with_panes_layout(
+                self.tips_completed.clone(),
+                self.user_default_shell_unsupported_banner_model_handle
+                    .clone(),
+                self.server_api.clone(),
+                panes_layout,
+                Arc::new(HashMap::new()),
+                self.model_event_sender.clone(),
+                ctx,
+            )
+        });
+        ctx.subscribe_to_view(&new_pane_group, move |me, pane_group, event, ctx| {
+            me.handle_file_tree_event(pane_group, event, ctx)
+        });
+        // Least recently used: the user has not looked at it yet.
+        self.tab_mru_order.push(new_pane_group.id());
+        self.tabs.push(TabData::new(new_pane_group));
+        let index = self.tabs.len() - 1;
+        // A window with no other tab has nothing to keep focused.
+        if index == 0 {
+            self.activate_tab_internal(0, ctx);
+        }
+        ctx.notify();
+        index
     }
 
     pub fn add_tab_from_existing_pane(
@@ -14965,7 +15316,13 @@ impl Workspace {
     /// Updates the titlebar height to match the scaled tab bar height.
     pub fn update_titlebar_height(&self, ctx: &mut ViewContext<Self>) {
         let zoom_factor = WindowSettings::as_ref(ctx).zoom_level.as_zoom_factor();
-        let scaled_tab_bar_height = (TOTAL_TAB_BAR_HEIGHT * zoom_factor) as f64;
+        // The framed sidebar's header is taller than a tab bar.
+        let titlebar_height = if self.uses_framed_sidebar_layout(ctx) {
+            FRAMED_TITLEBAR_HEIGHT
+        } else {
+            TOTAL_TAB_BAR_HEIGHT
+        };
+        let scaled_tab_bar_height = (titlebar_height * zoom_factor) as f64;
 
         if let Some(platform_window) = ctx.windows().platform_window(ctx.window_id()) {
             platform_window
@@ -21055,7 +21412,7 @@ impl Workspace {
                 Align::new(
                     self.render_tab_bar_icon_button(
                         appearance,
-                        icons::Icon::Menu,
+                        icons::Icon::PhSidebarSimpleFill,
                         &self.mouse_states.left_panel_icon,
                         action,
                         tooltip_text.to_string(),
@@ -22015,6 +22372,321 @@ impl Workspace {
                 .filter(|data| data.side == TrafficLightSide::Left)
                 .map(|data| data.width(zoom_factor) + 16.)
                 .unwrap_or(0.)
+        }
+    }
+
+    /// Whether the settings ask for the framed sidebar: Harp mode on, vertical tabs on, and the
+    /// tabs panel on the left. Needs no `Workspace`, so tab menus and row rendering can ask too;
+    /// [`Self::uses_framed_sidebar_layout`] also excludes a tab-drag preview window.
+    pub(crate) fn framed_sidebar_configured(ctx: &AppContext) -> bool {
+        let vertical_tabs_active =
+            FeatureFlag::VerticalTabs.is_enabled() && *TabSettings::as_ref(ctx).use_vertical_tabs;
+        let config = &TabSettings::as_ref(ctx).header_toolbar_chip_selection;
+        // Deliberately independent of `tab_bar_mode`: in fullscreen with hide-on-hover that
+        // flips with the mouse, and the layout must not flip with it.
+        crate::tab::harp_mode_enabled(ctx)
+            && vertical_tabs_active
+            && Self::tabs_panel_side(config) == PanelPosition::Left
+    }
+
+    pub(super) fn uses_framed_sidebar_layout(&self, ctx: &AppContext) -> bool {
+        Self::framed_sidebar_configured(ctx) && !self.is_tab_drag_preview
+    }
+
+    /// The vertical tabs' display granularity as rendered. The framed sidebar shows one row per
+    /// tab (Harp shipped with Tabs as the default), but the fork keeps Panes as the default for
+    /// plain vertical tabs, so the framed layout forces Tabs instead of changing the setting.
+    pub(crate) fn vertical_tabs_display_granularity(
+        ctx: &AppContext,
+    ) -> VerticalTabsDisplayGranularity {
+        if Self::framed_sidebar_configured(ctx) {
+            VerticalTabsDisplayGranularity::Tabs
+        } else {
+            *TabSettings::as_ref(ctx)
+                .vertical_tabs_display_granularity
+                .value()
+        }
+    }
+
+    /// Gives the vertical tabs panel the current layout's default width (the framed sidebar is
+    /// wider than plain vertical tabs). A width the user dragged is kept: only a panel still at
+    /// the other layout's default is resized.
+    fn sync_vertical_tabs_panel_width_to_mode(&self, ctx: &AppContext) {
+        let (other_default, mode_default) = if Self::framed_sidebar_configured(ctx) {
+            (
+                vertical_tabs::PANEL_WIDTH,
+                vertical_tabs::sidebar::SIDEBAR_WIDTH,
+            )
+        } else {
+            (
+                vertical_tabs::sidebar::SIDEBAR_WIDTH,
+                vertical_tabs::PANEL_WIDTH,
+            )
+        };
+        let Ok(mut state) = self.vertical_tabs_panel.resizable_state.lock() else {
+            log::warn!("vertical tabs panel width lock is poisoned; keeping its width");
+            return;
+        };
+        if state.size() == other_default {
+            state.set_size(mode_default);
+        }
+    }
+
+    /// Brings this window in line with Harp mode after it changed (the HarpMode settings event,
+    /// so the toggle command, the Settings switch and a settings.toml edit all land here): the
+    /// framed layout's titlebar, rename font and panel width, and on turning on, an open sidebar
+    /// with its tab order and limit rings.
+    fn apply_harp_mode_change(&mut self, ctx: &mut ViewContext<Self>) {
+        if crate::tab::harp_mode_enabled(ctx) && *TabSettings::as_ref(ctx).use_vertical_tabs {
+            // The UseVerticalTabs event places the tabs panel too, but it may arrive after this
+            // one (the toggles set both settings at once); the framed checks below need it now.
+            Self::ensure_tabs_panel_in_config(ctx);
+            self.open_vertical_tabs_panel_if_enabled(ctx);
+            // The framed sidebar has no settings popup button, so an open popup would be orphaned.
+            self.close_vertical_tabs_settings_popup();
+            self.keep_grouped_tabs_first(ctx);
+            self.limit_rings.refresh(ctx);
+        }
+        self.sync_vertical_tabs_panel_width_to_mode(ctx);
+        let appearance = Appearance::as_ref(ctx);
+        let font_size = Self::tab_rename_editor_font_size(ctx, appearance);
+        self.tab_rename_editor
+            .update(ctx, |editor, ctx| editor.set_font_size(font_size, ctx));
+        self.update_titlebar_height(ctx);
+        ctx.notify();
+    }
+
+    /// Flips Harp mode, for the "Toggle Harp Mode" command and the Settings switch alike. Turning
+    /// it on also turns vertical tabs on (the sidebar is built on them, and the mode would show
+    /// nothing otherwise); turning it off only clears Harp mode, so vertical tabs stay as they
+    /// are. Each window then follows through its HarpMode settings event.
+    pub(crate) fn toggle_harp_mode_setting(ctx: &mut AppContext) {
+        TabSettings::handle(ctx).update(ctx, |settings, ctx| {
+            report_if_error!(settings.harp_mode.toggle_and_save_value(ctx));
+            if *settings.harp_mode && !*settings.use_vertical_tabs {
+                report_if_error!(settings.use_vertical_tabs.set_value(true, ctx));
+            }
+        });
+    }
+
+    /// Wakes the tab holding `terminal_view_id` when its agent gets a new prompt.
+    fn clear_inactive_for_terminal(
+        &mut self,
+        terminal_view_id: EntityId,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        for tab in &mut self.tabs {
+            if tab.inactive
+                && vertical_tabs::tab_terminal_view_ids(tab.pane_group.as_ref(ctx), ctx)
+                    .contains(&terminal_view_id)
+            {
+                tab.inactive = false;
+            }
+        }
+    }
+
+    /// Keeps pinned tabs first, then grouped tabs, then ungrouped ones, so the framed sidebar's
+    /// "other" section is always last and Cmd+1..9 count tabs in the order the sidebar shows.
+    fn keep_grouped_tabs_first(&mut self, ctx: &mut ViewContext<Self>) {
+        if !self.uses_framed_sidebar_layout(ctx) {
+            return;
+        }
+        let rank = |tab: &TabData| {
+            if tab.pinned {
+                0
+            } else if tab
+                .group_id
+                .is_some_and(|group_id| self.tab_groups.contains_key(&group_id))
+            {
+                1
+            } else {
+                2
+            }
+        };
+        let ranks: Vec<u8> = self.tabs.iter().map(rank).collect();
+        if ranks.is_sorted() {
+            return;
+        }
+        let mut order: Vec<(u8, EntityId)> = ranks
+            .into_iter()
+            .zip(self.tabs.iter().map(|tab| tab.pane_group.id()))
+            .collect();
+        // Stable, so tabs keep their relative order and groups stay contiguous.
+        order.sort_by_key(|(rank, _)| *rank);
+        for (to_index, (_, pane_group_id)) in order.into_iter().enumerate() {
+            if let Some(from_index) = self
+                .tabs
+                .iter()
+                .position(|tab| tab.pane_group.id() == pane_group_id)
+                && from_index != to_index
+            {
+                self.hop_tab_to_index(from_index, to_index, ctx);
+            }
+        }
+        ctx.dispatch_global_action("workspace:save_app", ());
+    }
+
+    /// Repaints the framed sidebar every 30 seconds, so "waiting 4m" labels keep counting while
+    /// nothing else changes on screen, and the footer's limit rings follow their file.
+    fn schedule_sidebar_time_refresh(&mut self, ctx: &mut ViewContext<Self>) {
+        ctx.spawn(
+            warpui::r#async::Timer::after(Duration::from_secs(30)),
+            |me, _, ctx| {
+                if me.uses_framed_sidebar_layout(ctx) {
+                    // The limit rings re-read their file here when it changed (or the setting did), and age out.
+                    me.limit_rings.refresh(ctx);
+                    ctx.notify();
+                }
+                me.schedule_sidebar_time_refresh(ctx);
+            },
+        );
+    }
+
+    /// The framed layout's card surface: rounded and hairline-bordered on the terminal background.
+    /// Clicks inside it that no content handles stop here, so only the margin around a card moves
+    /// the window.
+    fn render_framed_card_surface(
+        &self,
+        content: Box<dyn Element>,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Container {
+        self.render_framed_card_surface_with_header(content, None, appearance, ctx)
+    }
+
+    /// The card surface, optionally led by the active session's 40 px header. The card is opaque
+    /// whatever the window opacity, so only the sidebar around it lets the desktop through.
+    fn render_framed_card_surface_with_header(
+        &self,
+        content: Box<dyn Element>,
+        header: Option<Box<dyn Element>>,
+        appearance: &Appearance,
+        _ctx: &AppContext,
+    ) -> Container {
+        // Inner padding keeps the content's square corners inside the rounding (an inset of
+        // 0.3 × radius clears the arc). Under a header the terminal's text starts 32 px in (its
+        // own padding is 16).
+        let inner_padding = (FRAMED_CARD_CORNER_RADIUS * 0.3).ceil();
+        let content = if header.is_some() {
+            Container::new(content)
+                .with_padding(
+                    warpui::elements::Padding::uniform(inner_padding)
+                        .with_left(FRAMED_CARD_CONTENT_LEFT_PADDING)
+                        .with_top(0.),
+                )
+                .finish()
+        } else {
+            Container::new(content)
+                .with_uniform_padding(inner_padding)
+                .finish()
+        };
+        let content = match header {
+            Some(header) => Flex::column()
+                .with_main_axis_size(MainAxisSize::Max)
+                .with_cross_axis_alignment(CrossAxisAlignment::Stretch)
+                .with_child(header)
+                .with_child(Shrinkable::new(1., content).finish())
+                .finish(),
+            None => content,
+        };
+        let guarded_content = EventHandler::new(content)
+            .on_left_mouse_down(|_, _, _| DispatchEventResult::StopPropagation)
+            .finish();
+        Container::new(guarded_content)
+            .with_background(appearance.theme().background())
+            .with_corner_radius(CornerRadius::with_all(Radius::Pixels(
+                FRAMED_CARD_CORNER_RADIUS,
+            )))
+            .with_border(
+                Border::all(0.5).with_border_color(vertical_tabs::sidebar::colors::CARD_EDGE()),
+            )
+            .with_drop_shadow(vertical_tabs::sidebar::css_shadow(
+                vertical_tabs::sidebar::colors::CARD_SHADOW(),
+                4.,
+                16.,
+            ))
+    }
+
+    /// Insets a card from the window edges (left edge excluded: it sits against the sidebar or the
+    /// previous card) and lets its margin drag the window.
+    fn inset_framed_card(card: Container) -> Box<dyn Element> {
+        EventHandler::new(
+            card.with_margin_top(8.)
+                .with_margin_right(8.)
+                .with_margin_bottom(8.)
+                .finish(),
+        )
+        .on_left_mouse_down(|ctx, _, _| {
+            ctx.request_window_drag();
+            DispatchEventResult::PropagateToParent
+        })
+        .finish()
+    }
+
+    /// Wraps the active tab in the framed layout's card, under its header. With the sidebar
+    /// closed the card also keeps 8 px from the window's left edge, and its header carries the
+    /// sidebar toggle (with the "needs you" count) and the plus.
+    fn render_framed_content(
+        &self,
+        content: Box<dyn Element>,
+        appearance: &Appearance,
+        ctx: &AppContext,
+    ) -> Box<dyn Element> {
+        use vertical_tabs::sidebar;
+        let sidebar_closed = !self.vertical_tabs_panel_open;
+        let buttons = sidebar_closed.then(|| {
+            let (needs, _) = sidebar::needs_and_working(self, ctx);
+            Flex::row()
+                .with_cross_axis_alignment(CrossAxisAlignment::Center)
+                .with_spacing(2.)
+                .with_child(sidebar::header_button(
+                    Icon::SidebarToggle,
+                    self.vertical_tabs_panel.card_toggle_mouse_state.clone(),
+                    Some(needs),
+                    WorkspaceAction::ToggleVerticalTabsPanel,
+                    ctx,
+                ))
+                .with_child(sidebar::header_button(
+                    Icon::SidebarPlus,
+                    self.vertical_tabs_panel.card_plus_mouse_state.clone(),
+                    None,
+                    WorkspaceAction::AddDefaultTab,
+                    ctx,
+                ))
+                .finish()
+        });
+        let header = sidebar::card_header(sidebar::card_info(self, ctx), buttons, ctx);
+        let card =
+            self.render_framed_card_surface_with_header(content, Some(header), appearance, ctx);
+        // While the sidebar is still rendered (open or sliding out) its reveal carries this gap.
+        let card = if sidebar_closed && !self.vertical_tabs_panel.reveal.is_shown() {
+            card.with_margin_left(vertical_tabs::sidebar_reveal::CLOSED_GAP)
+        } else {
+            card
+        };
+        Self::inset_framed_card(card)
+    }
+
+    /// Adds a panel to the right of the active tab: its own inset card in the framed layout,
+    /// otherwise behind a separator.
+    fn add_right_panel(
+        &self,
+        panels_view: &mut Flex,
+        prev_panel_added: &mut bool,
+        panel: Option<Box<dyn Element>>,
+        framed: bool,
+        app: &AppContext,
+    ) {
+        if !framed {
+            Self::add_panel_with_separator(panels_view, prev_panel_added, panel, app);
+            return;
+        }
+        if let Some(panel) = panel {
+            let appearance = Appearance::as_ref(app);
+            panels_view.add_child(Self::inset_framed_card(
+                self.render_framed_card_surface(panel, appearance, app),
+            ));
+            *prev_panel_added = true;
         }
     }
 
@@ -23328,7 +24000,8 @@ impl Workspace {
             prev_panel_added = false;
         }
 
-        if prev_panel_added {
+        // In the framed layout the card's own surface already sets it apart from the sidebar.
+        if prev_panel_added && !self.uses_framed_sidebar_layout(app) {
             panels_view.add_child(Self::render_panel_separator(app));
         }
         // The outer workspace container in `render` already paints the terminal
@@ -23336,6 +24009,7 @@ impl Workspace {
         panels_view = panels_view.with_child(Shrinkable::new(1.0, terminal_view).finish());
         prev_panel_added = true;
 
+        let framed = self.uses_framed_sidebar_layout(app);
         if vertical_tabs_active {
             let config = TabSettings::as_ref(app)
                 .header_toolbar_chip_selection
@@ -23343,23 +24017,25 @@ impl Workspace {
             let pane_group = self.active_tab_pane_group().as_ref(app);
 
             for item in config.right_items() {
-                Self::add_panel_with_separator(
+                self.add_right_panel(
                     &mut panels_view,
                     &mut prev_panel_added,
                     self.render_config_panel(&item, pane_group, &config, app),
+                    framed,
                     app,
                 );
             }
 
             if pane_group.right_panel_open && pane_group.is_right_panel_maximized {
-                Self::add_panel_with_separator(
+                self.add_right_panel(
                     &mut panels_view,
                     &mut prev_panel_added,
                     self.render_config_panel_maximized(pane_group, &config, app),
+                    framed,
                     app,
                 );
             } else if !config.contains_item(&HeaderToolbarItemKind::CodeReview) {
-                Self::add_panel_with_separator(
+                self.add_right_panel(
                     &mut panels_view,
                     &mut prev_panel_added,
                     self.render_config_panel(
@@ -23368,6 +24044,7 @@ impl Workspace {
                         &config,
                         app,
                     ),
+                    framed,
                     app,
                 );
             }
@@ -23403,7 +24080,14 @@ impl Workspace {
             };
 
             if let Some(right_panel_content) = right_panel_content {
-                panels_view = panels_view.with_child(right_panel_content);
+                if framed {
+                    let appearance = Appearance::as_ref(app);
+                    panels_view.add_child(Self::inset_framed_card(
+                        self.render_framed_card_surface(right_panel_content, appearance, app),
+                    ));
+                } else {
+                    panels_view = panels_view.with_child(right_panel_content);
+                }
             }
         }
 
@@ -23442,16 +24126,21 @@ impl Workspace {
         }
         match item {
             HeaderToolbarItemKind::TabsPanel => {
-                if !self.vertical_tabs_panel_open {
+                let framed = self.uses_framed_sidebar_layout(app);
+                let reveal = &self.vertical_tabs_panel.reveal;
+                if framed {
+                    reveal.sync(self.vertical_tabs_panel_open);
+                }
+                // The framed sidebar stays rendered while it slides out.
+                if !self.vertical_tabs_panel_open && !(framed && reveal.is_shown()) {
                     return None;
                 }
-                Some(
-                    SavePosition::new(
-                        self.render_vertical_tabs_panel(Self::tabs_panel_side(config), app),
-                        VERTICAL_TABS_PANEL_POSITION_ID,
-                    )
-                    .finish(),
+                let panel = SavePosition::new(
+                    self.render_vertical_tabs_panel(Self::tabs_panel_side(config), app),
+                    VERTICAL_TABS_PANEL_POSITION_ID,
                 )
+                .finish();
+                Some(if framed { reveal.wrap(panel) } else { panel })
             }
             HeaderToolbarItemKind::ToolsPanel => {
                 if !pane_group.left_panel_open || warpui::platform::is_mobile_device() {
@@ -23831,6 +24520,12 @@ impl Workspace {
         }
         if *tab_settings.preserve_active_tab_color.value() {
             context.set.insert(flags::PRESERVE_ACTIVE_TAB_COLOR_FLAG);
+        }
+        if *tab_settings.vertical_tabs_full_tab_menu.value() {
+            context.set.insert(flags::VERTICAL_TABS_FULL_TAB_MENU_FLAG);
+        }
+        if *tab_settings.harp_mode.value() {
+            context.set.insert(flags::HARP_MODE_FLAG);
         }
         if *tab_settings
             .show_vertical_tab_panel_in_restored_windows
@@ -24490,6 +25185,15 @@ impl TypedActionView for Workspace {
     }
 
     fn handle_action(&mut self, action: &Self::Action, ctx: &mut ViewContext<Self>) {
+        self.dispatch_workspace_action(action, ctx);
+        // Groups change through many actions (menus, drag-and-drop, new tabs joining a group), so
+        // the sidebar's order is restored once after every action instead of at each site.
+        self.keep_grouped_tabs_first(ctx);
+    }
+}
+
+impl Workspace {
+    fn dispatch_workspace_action(&mut self, action: &WorkspaceAction, ctx: &mut ViewContext<Self>) {
         use WorkspaceAction::*;
         let window_id = ctx.window_id();
 
@@ -24525,6 +25229,15 @@ impl TypedActionView for Workspace {
                 let _ = command_id;
             }
             ActivateTab(index) => self.activate_tab(*index, ctx),
+            // WarpOss: in the framed sidebar ⌘N follows the rows as they show, top to bottom,
+            // without the rows of collapsed groups (the ⌘N hints say the same).
+            ActivateTabByNumber(num) if self.uses_framed_sidebar_layout(ctx) => {
+                if let Some(index) =
+                    vertical_tabs::sidebar::shortcut_tabs(self).get(num.saturating_sub(1))
+                {
+                    self.activate_tab(*index, ctx);
+                }
+            }
             ActivateTabByNumber(num) => self.activate_tab(num.saturating_sub(1), ctx),
             SetTabShortcutModifierKey { key_code, pressed } => {
                 TabShortcutModifierState::handle(ctx).update(ctx, |state, ctx| {
@@ -24534,6 +25247,11 @@ impl TypedActionView for Workspace {
             ActivatePrevTab => self.activate_prev_tab(ctx),
             OpenLaunchConfigSaveModal => self.open_launch_config_save_modal(ctx),
             ActivateNextTab => self.activate_next_tab(ctx),
+            ActivateLastTab if self.uses_framed_sidebar_layout(ctx) => {
+                if let Some(index) = vertical_tabs::sidebar::shortcut_tabs(self).last() {
+                    self.activate_tab(*index, ctx);
+                }
+            }
             ActivateLastTab => self.activate_last_tab(ctx),
             CyclePrevSession => self.cycle_prev_session(ctx),
             CycleNextSession => self.cycle_next_session(ctx),
@@ -24545,6 +25263,7 @@ impl TypedActionView for Workspace {
             ResetTabName(index) => self.clear_tab_name(*index, ctx),
             RenamePane(locator) => self.rename_pane(*locator, ctx),
             ResetPaneName(locator) => self.clear_pane_name(*locator, ctx),
+            EndRenameOnClick(position) => self.end_rename_on_click(*position, ctx),
             RenameActiveTab => {
                 // In Panes view the tab in a group has no visible top-level name (only pane
                 // rows are shown). Do not allow a tab rename.
@@ -24661,6 +25380,7 @@ impl TypedActionView for Workspace {
             }
             UngroupTabs(group_id) => self.ungroup_tabs(*group_id, ctx),
             NewTabInGroup(group_id) => self.new_tab_in_group(*group_id, ctx),
+            NewTabAtEndOfSection(group_id) => self.new_tab_at_end_of_section(*group_id, ctx),
             MoveTabGroupUp(group_id) => self.move_tab_group(*group_id, TabMovement::Left, ctx),
             MoveTabGroupDown(group_id) => self.move_tab_group(*group_id, TabMovement::Right, ctx),
             CloseTabsOutsideGroup(group_id) => self.close_tabs_outside_group(*group_id, ctx),
@@ -24668,6 +25388,56 @@ impl TypedActionView for Workspace {
             CloseTabsBelowGroup(group_id) => self.close_tabs_below_group(*group_id, ctx),
             PinTab(tab_index) => self.pin_tab(*tab_index, ctx),
             UnpinTab(tab_index) => self.unpin_tab(*tab_index, ctx),
+            SetTabMarkedUnread {
+                pane_group_id,
+                unread,
+            } => {
+                let Some(tab) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.pane_group.id() == *pane_group_id)
+                else {
+                    return;
+                };
+                tab.marked_unread = *unread;
+                let pane_group = tab.pane_group.clone();
+                self.sync_tmux_tabs_now(ctx);
+                if !*unread {
+                    // "Mark as read" also clears Warp's own unread agent notifications, which
+                    // would otherwise keep the same dot on.
+                    let terminal_view_ids =
+                        vertical_tabs::tab_terminal_view_ids(pane_group.as_ref(ctx), ctx);
+                    AgentNotificationsModel::handle(ctx).update(ctx, |model, ctx| {
+                        for terminal_view_id in terminal_view_ids {
+                            model.mark_items_from_terminal_view_read(terminal_view_id, ctx);
+                        }
+                    });
+                }
+                ctx.notify();
+            }
+            SetTabPinnedInSidebar {
+                pane_group_id,
+                pinned,
+            } => self.set_tab_pinned_in_sidebar(*pane_group_id, *pinned, ctx),
+            ToggleOtherSectionCollapsed => {
+                self.vertical_tabs_panel.other_section_collapsed =
+                    !self.vertical_tabs_panel.other_section_collapsed;
+                ctx.notify();
+            }
+            SetTabInactive {
+                pane_group_id,
+                inactive,
+            } => {
+                if let Some(tab) = self
+                    .tabs
+                    .iter_mut()
+                    .find(|tab| tab.pane_group.id() == *pane_group_id)
+                {
+                    tab.inactive = *inactive;
+                    self.sync_tmux_tabs_now(ctx);
+                    ctx.notify();
+                }
+            }
             PinActiveTab => self.pin_tab(self.active_tab_index, ctx),
             UnpinActiveTab => self.unpin_tab(self.active_tab_index, ctx),
             PinTabGroup(group_id) => self.pin_tab_group(*group_id, ctx),
@@ -25278,10 +26048,13 @@ impl TypedActionView for Workspace {
                 // If we are renaming a tab, finish the rename before dragging.
                 self.finish_tab_rename(ctx);
                 self.current_workspace_state.is_tab_being_dragged = true;
+                self.sidebar_drop_target = None;
             }
             StartGroupDrag(_group_id) => {
                 self.clear_tab_multi_selection(ctx);
                 self.finish_tab_group_rename(ctx);
+                self.is_group_being_dragged = true;
+                ctx.notify();
             }
             DragGroup {
                 group_id,
@@ -25291,6 +26064,9 @@ impl TypedActionView for Workspace {
                 self.on_group_drag(*group_id, *position, *cursor_position, ctx);
             }
             DropGroup => {
+                self.is_group_being_dragged = false;
+                // The new group order reaches tmux now rather than at the next poll.
+                self.sync_tmux_tabs_now(ctx);
                 ctx.notify();
             }
             OpenWarpDrive => {
@@ -25389,6 +26165,7 @@ impl TypedActionView for Workspace {
                     self.toggle_vertical_tabs_panel(ctx);
                 }
             }
+            ToggleHarpMode => Self::toggle_harp_mode_setting(ctx),
             SshManager(action) => self.handle_ssh_manager_action(action, ctx),
             ToggleNotificationMailbox { select_first } => {
                 if FeatureFlag::HOANotifications.is_enabled()
@@ -25622,6 +26399,11 @@ impl TypedActionView for Workspace {
             } => self.on_tab_drag(*tab_index, *tab_position, ctx),
             DropTab => {
                 let is_cross_window = CrossWindowTabDrag::as_ref(ctx).is_active();
+                if let Some(target) = self.sidebar_drop_target.take()
+                    && !is_cross_window
+                {
+                    self.apply_sidebar_drop(target, ctx);
+                }
                 let handed_off_tab_index =
                     CrossWindowTabDrag::as_ref(ctx)
                         .handed_off_target()
@@ -27222,7 +28004,6 @@ impl View for Workspace {
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-
         let tab_bar_mode = self.tab_bar_mode(app);
 
         // For WASM simplified tab bar views (Warp Drive objects, shared sessions, conversation transcripts),
@@ -27251,16 +28032,32 @@ impl View for Workspace {
                 .with_background(util::get_terminal_background_fill(self.window_id, app))
                 .finish()
         } else {
+            let framed = self.uses_framed_sidebar_layout(app);
+            if framed {
+                vertical_tabs::sidebar::colors::sync(app);
+            }
             let mut outer_column = Flex::column();
-            if tab_bar_mode == ShowTabBar::Stacked {
+            if tab_bar_mode == ShowTabBar::Stacked && !framed {
                 outer_column.add_child(self.render_tab_bar(self.tab_fixed_width, appearance, app));
             }
-            let content = self.render_banner_and_active_tab(app, appearance);
+            let mut content = self.render_banner_and_active_tab(app, appearance);
+            if framed {
+                content = self.render_framed_content(content, appearance, app);
+            }
             let panels_row = self.render_panels(app, Shrinkable::new(1.0, content).finish(), false);
             outer_column.add_child(Shrinkable::new(1.0, panels_row).finish());
-            Container::new(outer_column.finish())
-                .with_background(util::get_terminal_background_fill(self.window_id, app))
-                .finish()
+            let outer = outer_column.finish();
+            if framed {
+                // The sidebar's surface spans the whole window so the gaps around the card read
+                // as sidebar.
+                Container::new(outer)
+                    .with_background_color(vertical_tabs::sidebar::sidebar_fill())
+                    .finish()
+            } else {
+                Container::new(outer)
+                    .with_background(util::get_terminal_background_fill(self.window_id, app))
+                    .finish()
+            }
         };
         let mut stack = Stack::new();
 
@@ -28356,6 +29153,11 @@ impl View for Workspace {
                 );
                 stack.add_child(workspace.finish());
             }
+            // The framed layout paints its own surfaces (the glass tint, the opaque card); a
+            // window-wide surface under them would hide the glass behind the window.
+            _ if self.uses_framed_sidebar_layout(app) => {
+                stack.add_child(workspace.finish());
+            }
             _ => {
                 stack.add_child(
                     workspace
@@ -28543,7 +29345,24 @@ impl View for Workspace {
                 DispatchEventResult::PropagateToParent
             });
 
-        event_handler.finish()
+        // WarpOss: while a tab or group name field is open, any left click ends the rename (the
+        // handler skips clicks in the field). Most clicks do not move focus, so blur alone only
+        // ended it from the terminal. Runs after the children and lets the click through.
+        let mut root = event_handler.finish();
+        if self.current_workspace_state.is_tab_being_renamed()
+            || self
+                .current_workspace_state
+                .is_any_tab_group_being_renamed()
+        {
+            root = EventHandler::new(root)
+                .with_always_handle()
+                .on_left_mouse_down(|ctx, _, position| {
+                    ctx.dispatch_typed_action(WorkspaceAction::EndRenameOnClick(position));
+                    DispatchEventResult::PropagateToParent
+                })
+                .finish();
+        }
+        root
     }
 
     fn on_focus(&mut self, focus_ctx: &FocusContext, ctx: &mut ViewContext<Self>) {
@@ -29162,6 +29981,14 @@ impl Workspace {
             })
         };
 
+        // Off the sidebar (or handed to the cross-window drag) a release must not land on the
+        // last in-sidebar target.
+        if (is_drag_outside_tab_bar || CrossWindowTabDrag::as_ref(ctx).is_active())
+            && self.sidebar_drop_target.take().is_some()
+        {
+            ctx.notify();
+        }
+
         if CrossWindowTabDrag::as_ref(ctx).is_active() {
             let window_id = ctx.window_id();
             let drag_result = CrossWindowTabDrag::handle(ctx)
@@ -29321,6 +30148,17 @@ impl Workspace {
             }
 
             ctx.notify();
+            return;
+        }
+
+        // The framed sidebar moves nothing while dragging: it shows where the row would land and
+        // applies that on drop, so rows and group counts hold still under the pointer.
+        if self.uses_framed_sidebar_layout(ctx) {
+            let target = self.sidebar_drop_target_at(current_index, position.center().y(), ctx);
+            if self.sidebar_drop_target != target {
+                self.sidebar_drop_target = target;
+                ctx.notify();
+            }
             return;
         }
 
@@ -29582,6 +30420,137 @@ impl Workspace {
     ///
     /// Uses midpoint-of-neighbor thresholds rather than edge thresholds to prevent
     /// oscillation when groups have different heights.
+    /// Where a row dragged in the framed sidebar would land, from the pointer's height against
+    /// last frame's row positions. None when the drop would change nothing.
+    fn sidebar_drop_target_at(
+        &self,
+        dragged_index: usize,
+        y: f32,
+        ctx: &mut ViewContext<Self>,
+    ) -> Option<vertical_tabs::sidebar::DropTarget> {
+        let dragged = self.tabs.get(dragged_index)?;
+        let group_of = |index: usize| {
+            self.tabs
+                .get(index)
+                .and_then(|tab| tab.group_id)
+                .filter(|group_id| self.tab_groups.contains_key(group_id))
+        };
+        let id_at = |index: usize| self.tabs.get(index).map(|tab| tab.pane_group.id());
+        // A collapsed section shows no rows (or only the active one), so its header is the drop
+        // zone: the row joins that section at its end.
+        let collapsed_sections = self
+            .tab_groups
+            .values()
+            .filter(|group| group.collapsed)
+            .map(|group| Some(group.id))
+            .chain(
+                self.vertical_tabs_panel
+                    .other_section_collapsed
+                    .then_some(None),
+            );
+        for section in collapsed_sections {
+            let on_header = ctx
+                .element_position_by_id(vertical_tabs::vtab_section_header_position_id(section))
+                .is_some_and(|rect| (rect.min_y()..=rect.max_y()).contains(&y));
+            if !on_header {
+                continue;
+            }
+            let last_member = (0..self.tabs.len())
+                .rev()
+                .find(|&index| group_of(index) == section);
+            let Some(last_member) = last_member else {
+                continue;
+            };
+            if section == group_of(dragged_index) {
+                return None;
+            }
+            return Some(vertical_tabs::sidebar::DropTarget {
+                dragged: dragged.pane_group.id(),
+                before: id_at(last_member + 1),
+                group: section,
+            });
+        }
+        // "Pinned" takes no drops; its rows stand above every section, out of the tab order.
+        let on_pinned = ctx
+            .element_position_by_id(vertical_tabs::PINNED_SECTION_POSITION_ID)
+            .is_some_and(|rect| (rect.min_y()..=rect.max_y()).contains(&y));
+        if on_pinned {
+            return None;
+        }
+        let mut rows: Vec<(usize, RectF)> = (0..self.tabs.len())
+            .filter(|&index| self.sidebar_pin(&self.tabs[index]).is_none())
+            .filter_map(|index| {
+                ctx.element_position_by_id(tab_position_id(index))
+                    .map(|rect| (index, rect))
+            })
+            .collect();
+        rows.sort_by(|a, b| a.1.min_y().total_cmp(&b.1.min_y()));
+        let below = rows
+            .iter()
+            .find(|(_, rect)| y < rect.center().y())
+            .map(|(i, _)| *i);
+        let above = rows
+            .iter()
+            .rev()
+            .find(|(_, rect)| rect.center().y() <= y)
+            .map(|(i, _)| *i);
+        let before = below.unwrap_or(self.tabs.len());
+        let below_group = below.and_then(group_of);
+        let group = match above {
+            None => below_group,
+            Some(above) if below.is_some() && group_of(above) == below_group => below_group,
+            Some(above) => {
+                // Between two sections: inside the upper group's block joins it at its end.
+                let inside_above = group_of(above).is_some_and(|group_id| {
+                    ctx.element_position_by_id(vtab_group_position_id(group_id))
+                        .is_some_and(|rect| y <= rect.max_y())
+                });
+                if inside_above {
+                    group_of(above)
+                } else {
+                    below_group
+                }
+            }
+        };
+        let unchanged = (before == dragged_index || before == dragged_index + 1)
+            && group == group_of(dragged_index);
+        (!unchanged).then_some(vertical_tabs::sidebar::DropTarget {
+            dragged: dragged.pane_group.id(),
+            before: id_at(before),
+            group,
+        })
+    }
+
+    /// Moves the dropped row to its target slot and group.
+    fn apply_sidebar_drop(
+        &mut self,
+        target: vertical_tabs::sidebar::DropTarget,
+        ctx: &mut ViewContext<Self>,
+    ) {
+        let Some(from) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.pane_group.id() == target.dragged)
+        else {
+            return;
+        };
+        // Resolved now, against the tabs as they are at the drop.
+        let Some(before) = target.before_index(&self.tabs) else {
+            return;
+        };
+        let group = target
+            .group
+            .filter(|group_id| self.tab_groups.contains_key(group_id));
+        let to =
+            if before > from { before - 1 } else { before }.min(self.tabs.len().saturating_sub(1));
+        self.hop_tab_to_index(from, to, ctx);
+        self.assign_tab_to_group(to, group, ctx);
+        ctx.dispatch_global_action("workspace:save_app", ());
+        // The new order reaches tmux now rather than at the next poll.
+        self.sync_tmux_tabs_now(ctx);
+        ctx.notify();
+    }
+
     fn calculate_updated_tab_index_vertical(
         &self,
         current_index: usize,

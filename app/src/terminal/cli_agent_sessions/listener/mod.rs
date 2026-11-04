@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use instant::Instant;
 use warpui::{EntityId, ModelContext, ModelHandle, SingletonEntity};
 
 use super::{CLIAgentEvent, CLIAgentSessionsModel};
@@ -159,12 +162,92 @@ impl CLIAgentSessionHandler for Osc9FallbackSessionHandler {
     }
 }
 
+/// How soon after a Warp plugin's event Harp's copy of the same hook still counts as that
+/// event's duplicate. Both plugins fire from one hook, a few milliseconds apart.
+const HANDOVER_DUPLICATE_WINDOW: Duration = Duration::from_secs(2);
+
+/// What identifies a hook in an event, whichever plugin sent it.
+type HookKey = (
+    CLIAgentEventType,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn hook_key(event: &CLIAgentEvent) -> HookKey {
+    (
+        event.event.clone(),
+        event.session_id.clone(),
+        event.payload.tool_name.clone(),
+        event.payload.tool_input_preview.clone(),
+    )
+}
+
+/// Harp: which plugin a session's events are taken from.
+#[derive(Default)]
+struct PluginChoice {
+    /// The agent session the choice below was made for. A terminal can run another session after
+    /// this one (switching inside `tmux attach`), and the choice is not the new one's.
+    session_id: Option<String>,
+    /// This session's events come from Harp's bundled plugin; another plugin's are ignored.
+    harp_plugin_seen: bool,
+    /// The last event accepted from another plugin, and when, until Harp's plugin speaks.
+    last_other: Option<(Instant, HookKey)>,
+}
+
+impl PluginChoice {
+    /// The choice after `first`, the event that created the listener: it is applied without
+    /// asking, so the listener's own filter never sees it. Without this, a session first heard
+    /// from through a permission request (a reattach to a running agent) would take the other
+    /// plugin's copy of it as well.
+    fn after(first: &CLIAgentEvent, now: Instant) -> Self {
+        let mut choice = Self::default();
+        keep_from_one_plugin(&mut choice, first, now);
+        choice
+    }
+}
+
+/// Harp: whether a parsed event counts. Harp's bundled plugin and a Warp plugin the user installed
+/// both report the same hooks from one pane; once Harp's has spoken, the other plugin's events are
+/// duplicates. Until then (Harp's plugin not loaded, e.g. Claude started before Harp) they count.
+/// Harp's first event is itself a duplicate when the other plugin's copy of that hook was just
+/// counted: counting both would add a permission request twice, and one completion clears one.
+fn keep_from_one_plugin(choice: &mut PluginChoice, event: &CLIAgentEvent, now: Instant) -> bool {
+    if let Some(session_id) = &event.session_id
+        && choice.session_id.as_ref() != Some(session_id)
+    {
+        // Another session than the one the choice was made for starts afresh. An event without a
+        // session id (an older plugin) changes nothing here.
+        *choice = PluginChoice {
+            session_id: Some(session_id.clone()),
+            ..PluginChoice::default()
+        };
+    }
+    if event.payload.from_harp_plugin {
+        let first = !choice.harp_plugin_seen;
+        choice.harp_plugin_seen = true;
+        let handover_duplicate = first
+            && choice.last_other.take().is_some_and(|(at, key)| {
+                now.saturating_duration_since(at) <= HANDOVER_DUPLICATE_WINDOW
+                    && key == hook_key(event)
+            });
+        return !handover_duplicate;
+    }
+    if choice.harp_plugin_seen && event.source == CLIAgentEventSource::RichPlugin {
+        return false;
+    }
+    choice.last_other = Some((now, hook_key(event)));
+    true
+}
+
 /// Per-agent listener that subscribes to PTY events and forwards them to the
 /// sessions model. Stored on [`super::CLIAgentSession`] so its lifetime is
 /// tied to the session; dropping the handle cleans up the subscription.
 pub struct CLIAgentSessionListener {
     terminal_view_id: EntityId,
     inner: Box<dyn CLIAgentSessionHandler>,
+    /// Harp: which plugin this session's events are taken from.
+    plugin_choice: PluginChoice,
 }
 
 impl warpui::Entity for CLIAgentSessionListener {
@@ -172,6 +255,11 @@ impl warpui::Entity for CLIAgentSessionListener {
 }
 
 impl CLIAgentSessionListener {
+    /// Tells the listener which event created it, so its plugin filter starts from there.
+    pub fn seed_plugin_choice(&mut self, first: &CLIAgentEvent) {
+        self.plugin_choice = PluginChoice::after(first, Instant::now());
+    }
+
     pub fn new(
         terminal_view_id: EntityId,
         agent: CLIAgent,
@@ -196,6 +284,9 @@ impl CLIAgentSessionListener {
                 else {
                     return;
                 };
+                if !keep_from_one_plugin(&mut me.plugin_choice, &parsed, Instant::now()) {
+                    return;
+                }
                 if let Some(event) = me.inner.handle_event(parsed) {
                     CLIAgentSessionsModel::handle(ctx).update(ctx, |sessions_model, ctx| {
                         sessions_model.update_from_event(view_id, &event, ctx);
@@ -207,6 +298,7 @@ impl CLIAgentSessionListener {
         Self {
             terminal_view_id,
             inner: handler,
+            plugin_choice: PluginChoice::default(),
         }
     }
 }

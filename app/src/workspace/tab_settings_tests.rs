@@ -128,3 +128,47 @@ fn header_toolbar_chip_selection_custom_empty_reports_all_absent() {
         assert!(!config.contains_item(&item));
     }
 }
+
+// Public builds show the full tab menu unless the user opts into the slim one.
+#[test]
+fn vertical_tabs_full_tab_menu_defaults_to_true() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        TabSettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(*settings.vertical_tabs_full_tab_menu);
+        });
+    });
+}
+
+#[test]
+fn vertical_tabs_full_tab_menu_uses_vertical_tabs_path() {
+    assert_eq!(
+        VerticalTabsFullTabMenu::toml_path(),
+        Some("appearance.vertical_tabs.full_tab_menu")
+    );
+    assert_eq!(
+        VerticalTabsFullTabMenu::hierarchy(),
+        Some("appearance.vertical_tabs")
+    );
+    assert_eq!(VerticalTabsFullTabMenu::toml_key(), "full_tab_menu");
+}
+
+// Harp mode is opt-in: a fresh profile keeps the fork's upstream tab layout.
+#[test]
+fn harp_mode_defaults_to_false() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+
+        TabSettings::handle(&app).read(&app, |settings, _ctx| {
+            assert!(!*settings.harp_mode);
+        });
+    });
+}
+
+#[test]
+fn harp_mode_uses_modes_harp_path() {
+    assert_eq!(HarpMode::toml_path(), Some("modes.harp.enabled"));
+    assert_eq!(HarpMode::hierarchy(), Some("modes.harp"));
+    assert_eq!(HarpMode::toml_key(), "enabled");
+}

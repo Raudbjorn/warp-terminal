@@ -37,6 +37,8 @@ mod external_secrets;
 mod font_fallback;
 mod global_resource_handles;
 mod gpu_state;
+#[cfg(not(target_family = "wasm"))]
+mod harp_mode;
 mod input_classifier;
 mod interval_timer;
 mod linear;
@@ -1918,6 +1920,8 @@ pub(crate) fn initialize_app(
     }
 
     experiments::init(ctx);
+    #[cfg(not(target_family = "wasm"))]
+    harp_mode::init(ctx);
 
     // Initialize timestamp for session id and last active event
     App::record_last_active_timestamp();
@@ -1976,6 +1980,15 @@ pub(crate) fn initialize_app(
         let extra_meta_keys = *KeysSettings::as_ref(ctx).extra_meta_keys;
         apply_extra_meta_keys(event, extra_meta_keys);
         apply_scroll_multiplier(event, ctx);
+        // WarpOss: a key pressed while ⌘ is held (⌘1, ⌘T, ...) hides the tabs' ⌘N hints until
+        // ⌘ is pressed again. Bound keys never reach the views, so it is here.
+        if matches!(event, warpui::event::Event::KeyDown { .. }) {
+            TabShortcutModifierState::handle(ctx).update(ctx, |state, ctx| {
+                if state.clear_held_keys() {
+                    ctx.notify();
+                }
+            });
+        }
     });
 
     // Rewrite recognized Warp web URLs (sessions, Drive, settings, home) into local

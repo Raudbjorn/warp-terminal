@@ -740,6 +740,14 @@ impl SettingsWidget for SubshellsWidget {
     }
 }
 
+/// Widget id of the SSH section, which hosts the page's editors. Exposed so
+/// integration tests can prove the section was actually laid out and painted.
+/// The id is the type's full path, so callers go through this function rather
+/// than spelling the path out and breaking when the widget moves modules.
+pub fn ssh_settings_widget_id() -> &'static str {
+    SSHWidget::static_widget_id()
+}
+
 #[derive(Default)]
 struct SSHWidget {
     enable_ssh_warpification_switch_state: SwitchStateHandle,
