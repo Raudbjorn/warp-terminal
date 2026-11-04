@@ -186,6 +186,9 @@ fn hook_key(event: &CLIAgentEvent) -> HookKey {
 /// Harp: which plugin a session's events are taken from.
 #[derive(Default)]
 struct PluginChoice {
+    /// The agent session the choice below was made for. A terminal can run another session after
+    /// this one (switching inside `tmux attach`), and the choice is not the new one's.
+    session_id: Option<String>,
     /// This session's events come from Harp's bundled plugin; another plugin's are ignored.
     harp_plugin_seen: bool,
     /// The last event accepted from another plugin, and when, until Harp's plugin speaks.
@@ -210,6 +213,16 @@ impl PluginChoice {
 /// Harp's first event is itself a duplicate when the other plugin's copy of that hook was just
 /// counted: counting both would add a permission request twice, and one completion clears one.
 fn keep_from_one_plugin(choice: &mut PluginChoice, event: &CLIAgentEvent, now: Instant) -> bool {
+    if let Some(session_id) = &event.session_id
+        && choice.session_id.as_ref() != Some(session_id)
+    {
+        // Another session than the one the choice was made for starts afresh. An event without a
+        // session id (an older plugin) changes nothing here.
+        *choice = PluginChoice {
+            session_id: Some(session_id.clone()),
+            ..PluginChoice::default()
+        };
+    }
     if event.payload.from_harp_plugin {
         let first = !choice.harp_plugin_seen;
         choice.harp_plugin_seen = true;

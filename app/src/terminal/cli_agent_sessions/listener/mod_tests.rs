@@ -523,3 +523,33 @@ fn only_harps_producer_marks_an_event_as_harps() {
             .from_harp_plugin
     );
 }
+
+/// A terminal can go from a Claude session that Harp's plugin reports to one only the Warp plugin
+/// reports (switching inside `tmux attach`); the first session's choice must not silence the
+/// second. Fails if the choice outlives its session.
+#[test]
+fn another_session_in_the_terminal_starts_with_a_fresh_plugin_choice() {
+    let event = |session: &str, producer: &str| {
+        claude_event(&format!(
+            r#"{{"v":1,"agent":"claude"{producer},"event":"prompt_submit","session_id":"{session}"}}"#
+        ))
+    };
+    let now = Instant::now();
+    let mut choice = PluginChoice::default();
+    assert!(keep_from_one_plugin(
+        &mut choice,
+        &event("a", r#","producer":"harp""#),
+        now
+    ));
+    assert!(!keep_from_one_plugin(&mut choice, &event("a", ""), now));
+    // Session b only has the Warp plugin: its events count.
+    assert!(keep_from_one_plugin(&mut choice, &event("b", ""), now));
+    assert!(keep_from_one_plugin(&mut choice, &event("b", ""), now));
+    // And back: a's Harp events start a's choice over.
+    assert!(keep_from_one_plugin(
+        &mut choice,
+        &event("a", r#","producer":"harp""#),
+        now
+    ));
+    assert!(!keep_from_one_plugin(&mut choice, &event("a", ""), now));
+}
