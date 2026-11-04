@@ -1,3 +1,6 @@
+use std::time::Duration;
+
+use instant::Instant;
 use warpui::{EntityId, ModelContext, ModelHandle, SingletonEntity};
 
 use super::{CLIAgentEvent, CLIAgentSessionsModel};
@@ -159,15 +162,57 @@ impl CLIAgentSessionHandler for Osc9FallbackSessionHandler {
     }
 }
 
+/// How soon after a Warp plugin's event Harp's copy of the same hook still counts as that
+/// event's duplicate. Both plugins fire from one hook, a few milliseconds apart.
+const HANDOVER_DUPLICATE_WINDOW: Duration = Duration::from_secs(2);
+
+/// What identifies a hook in an event, whichever plugin sent it.
+type HookKey = (
+    CLIAgentEventType,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+fn hook_key(event: &CLIAgentEvent) -> HookKey {
+    (
+        event.event.clone(),
+        event.session_id.clone(),
+        event.payload.tool_name.clone(),
+        event.payload.tool_input_preview.clone(),
+    )
+}
+
+/// Harp: which plugin a session's events are taken from.
+#[derive(Default)]
+struct PluginChoice {
+    /// This session's events come from Harp's bundled plugin; another plugin's are ignored.
+    harp_plugin_seen: bool,
+    /// The last event accepted from another plugin, and when, until Harp's plugin speaks.
+    last_other: Option<(Instant, HookKey)>,
+}
+
 /// Harp: whether a parsed event counts. Harp's bundled plugin and a Warp plugin the user installed
 /// both report the same hooks from one pane; once Harp's has spoken, the other plugin's events are
 /// duplicates. Until then (Harp's plugin not loaded, e.g. Claude started before Harp) they count.
-fn keep_from_one_plugin(harp_plugin_seen: &mut bool, event: &CLIAgentEvent) -> bool {
+/// Harp's first event is itself a duplicate when the other plugin's copy of that hook was just
+/// counted: counting both would add a permission request twice, and one completion clears one.
+fn keep_from_one_plugin(choice: &mut PluginChoice, event: &CLIAgentEvent, now: Instant) -> bool {
     if event.payload.from_harp_plugin {
-        *harp_plugin_seen = true;
-        return true;
+        let first = !choice.harp_plugin_seen;
+        choice.harp_plugin_seen = true;
+        let handover_duplicate = first
+            && choice.last_other.take().is_some_and(|(at, key)| {
+                now.saturating_duration_since(at) <= HANDOVER_DUPLICATE_WINDOW
+                    && key == hook_key(event)
+            });
+        return !handover_duplicate;
     }
-    !(*harp_plugin_seen && event.source == CLIAgentEventSource::RichPlugin)
+    if choice.harp_plugin_seen && event.source == CLIAgentEventSource::RichPlugin {
+        return false;
+    }
+    choice.last_other = Some((now, hook_key(event)));
+    true
 }
 
 /// Per-agent listener that subscribes to PTY events and forwards them to the
@@ -176,8 +221,8 @@ fn keep_from_one_plugin(harp_plugin_seen: &mut bool, event: &CLIAgentEvent) -> b
 pub struct CLIAgentSessionListener {
     terminal_view_id: EntityId,
     inner: Box<dyn CLIAgentSessionHandler>,
-    /// Harp: this session's events come from Harp's bundled plugin; another plugin's are ignored.
-    harp_plugin_seen: bool,
+    /// Harp: which plugin this session's events are taken from.
+    plugin_choice: PluginChoice,
 }
 
 impl warpui::Entity for CLIAgentSessionListener {
@@ -209,7 +254,7 @@ impl CLIAgentSessionListener {
                 else {
                     return;
                 };
-                if !keep_from_one_plugin(&mut me.harp_plugin_seen, &parsed) {
+                if !keep_from_one_plugin(&mut me.plugin_choice, &parsed, Instant::now()) {
                     return;
                 }
                 if let Some(event) = me.inner.handle_event(parsed) {
@@ -223,7 +268,7 @@ impl CLIAgentSessionListener {
         Self {
             terminal_view_id,
             inner: handler,
-            harp_plugin_seen: false,
+            plugin_choice: PluginChoice::default(),
         }
     }
 }

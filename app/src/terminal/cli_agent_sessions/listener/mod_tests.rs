@@ -430,15 +430,50 @@ fn claude_event(body: &str) -> CLIAgentEvent {
 #[test]
 fn warp_plugin_events_count_until_harps_plugin_speaks() {
     let warp = claude_event(r#"{"v":1,"agent":"claude","event":"prompt_submit"}"#);
-    let harp =
-        claude_event(r#"{"v":1,"agent":"claude","producer":"harp","event":"prompt_submit"}"#);
-    let mut seen = false;
+    let harp = claude_event(r#"{"v":1,"agent":"claude","producer":"harp","event":"stop"}"#);
+    let now = Instant::now();
+    let mut choice = PluginChoice::default();
     // Only the Warp plugin is loaded (Claude started before Harp): its events are the status.
-    assert!(keep_from_one_plugin(&mut seen, &warp));
-    // Both plugins report the same hook: Harp's wins from now on, the Warp copy is dropped.
-    assert!(keep_from_one_plugin(&mut seen, &harp));
-    assert!(!keep_from_one_plugin(&mut seen, &warp));
-    assert!(keep_from_one_plugin(&mut seen, &harp));
+    assert!(keep_from_one_plugin(&mut choice, &warp, now));
+    // Harp's plugin speaks (a different hook): from now on Harp's win, the Warp copy is dropped.
+    assert!(keep_from_one_plugin(&mut choice, &harp, now));
+    assert!(!keep_from_one_plugin(&mut choice, &warp, now));
+    assert!(keep_from_one_plugin(&mut choice, &harp, now));
+}
+
+/// Both plugins report one hook; if the Warp copy was counted just before Harp's first event,
+/// Harp's copy must not count again (two permission requests, one completion, a row stuck on
+/// "needs you"). Fails if the handover event is counted.
+#[test]
+fn harps_first_event_is_dropped_when_the_warp_plugin_just_reported_the_same_hook() {
+    let request = |producer: &str| {
+        claude_event(&format!(
+            r#"{{"v":1,"agent":"claude"{producer},"event":"permission_request","session_id":"s","tool_name":"Bash","tool_input_preview":"ls"}}"#
+        ))
+    };
+    let warp = request("");
+    let harp = request(r#","producer":"harp""#);
+    let now = Instant::now();
+
+    let mut choice = PluginChoice::default();
+    assert!(keep_from_one_plugin(&mut choice, &warp, now));
+    assert!(!keep_from_one_plugin(&mut choice, &harp, now));
+    // Harp has spoken even though that copy was dropped: the Warp plugin is ignored now, and the
+    // next Harp event counts.
+    assert!(!keep_from_one_plugin(&mut choice, &warp, now));
+    assert!(keep_from_one_plugin(&mut choice, &harp, now));
+
+    // A different tool, or a Warp event from long before, is not the same hook.
+    let other = claude_event(
+        r#"{"v":1,"agent":"claude","producer":"harp","event":"permission_request","session_id":"s","tool_name":"Edit","tool_input_preview":"ls"}"#,
+    );
+    let mut choice = PluginChoice::default();
+    assert!(keep_from_one_plugin(&mut choice, &warp, now));
+    assert!(keep_from_one_plugin(&mut choice, &other, now));
+    let mut choice = PluginChoice::default();
+    assert!(keep_from_one_plugin(&mut choice, &warp, now));
+    let later = now + HANDOVER_DUPLICATE_WINDOW + Duration::from_secs(1);
+    assert!(keep_from_one_plugin(&mut choice, &harp, later));
 }
 
 #[test]
