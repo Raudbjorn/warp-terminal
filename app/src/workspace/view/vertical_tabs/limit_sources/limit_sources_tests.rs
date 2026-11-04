@@ -147,6 +147,94 @@ fn the_codex_reading_follows_a_change_to_an_older_rollout_file() {
     assert_eq!(second["used5h"].as_f64(), Some(50.));
 }
 
+/// `codex_line` as Codex logs it, with the event's time.
+fn codex_line_at(
+    timestamp: &str,
+    primary: (f64, f64, i64),
+    secondary: Option<(f64, f64, i64)>,
+) -> String {
+    let mut line: Value = serde_json::from_str(&codex_line(primary, secondary)).unwrap();
+    line["timestamp"] = json!(timestamp);
+    line.to_string()
+}
+
+/// An older session that keeps working after a newer one went idle reports later than it, and its
+/// numbers are the current ones however the files are ordered. Fails if the file order decides.
+#[test]
+fn the_codex_reading_follows_event_time_across_session_files() {
+    let root = tempfile::tempdir().unwrap();
+    let day = root.path().join("2026/10/21");
+    std::fs::create_dir_all(&day).unwrap();
+    // The newer session (by name) last reported 20% at 09:30; the older one 70% at 11:00.
+    std::fs::write(
+        day.join("rollout-2026-10-21T07-00-00-a.jsonl"),
+        codex_line_at("2026-10-21T11:00:00.000Z", (300., 70., 1000), None),
+    )
+    .unwrap();
+    std::fs::write(
+        day.join("rollout-2026-10-21T09-00-00-b.jsonl"),
+        codex_line_at("2026-10-21T09:30:00.000Z", (300., 20., 1000), None),
+    )
+    .unwrap();
+    let entry = codex(root.path(), &mut Cache::default(), 1.).unwrap();
+    assert_eq!(entry["used5h"].as_f64(), Some(70.));
+}
+
+#[test]
+fn read_tail_starts_at_a_line_and_reads_a_small_file_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("log.jsonl");
+    // "aaaa\n" is bytes 0-4, "bbbb\n" 5-9, "cccc\n" 10-14.
+    std::fs::write(&path, "aaaa\nbbbb\ncccc\n").unwrap();
+    // The cut lands inside "bbbb": its rest is dropped.
+    assert_eq!(read_tail(&path, 7).as_deref(), Some("cccc\n"));
+    // The cut lands exactly on the start of "cccc": the line is kept.
+    assert_eq!(read_tail(&path, 5).as_deref(), Some("cccc\n"));
+    // The cut lands exactly on the start of "bbbb".
+    assert_eq!(read_tail(&path, 10).as_deref(), Some("bbbb\ncccc\n"));
+    // A file shorter than the limit is read whole, first line included.
+    assert_eq!(
+        read_tail(&path, 1000).as_deref(),
+        Some("aaaa\nbbbb\ncccc\n")
+    );
+    // A cut inside a multi-byte character neither panics nor keeps the broken line.
+    std::fs::write(&path, "é\nok\n").unwrap();
+    assert_eq!(read_tail(&path, 5).as_deref(), Some("ok\n"));
+}
+
+/// A huge rollout is not read whole: the readings at its end still count.
+#[test]
+fn the_codex_reading_comes_from_the_end_of_a_large_rollout() {
+    let root = tempfile::tempdir().unwrap();
+    let day = root.path().join("2026/10/21");
+    std::fs::create_dir_all(&day).unwrap();
+    let mut text = codex_line_at(
+        "2026-10-21T07:00:00.000Z",
+        (300., 5., 1000),
+        Some((10080., 30., 2000)),
+    );
+    text.push('\n');
+    // Far more filler than the tail covers; the readings above must be out of reach.
+    let filler = format!(
+        "{}\n",
+        json!({"type": "event_msg", "payload": {"text": "x".repeat(1000)}})
+    );
+    for _ in 0..(CODEX_TAIL_BYTES as usize / filler.len() + 10) {
+        text.push_str(&filler);
+    }
+    text.push_str(&codex_line_at(
+        "2026-10-21T08:00:00.000Z",
+        (300., 42., 1000),
+        None,
+    ));
+    text.push('\n');
+    std::fs::write(day.join("rollout-2026-10-21T07-00-00-a.jsonl"), text).unwrap();
+    let entry = codex(root.path(), &mut Cache::default(), 1.).unwrap();
+    assert_eq!(entry["used5h"].as_f64(), Some(42.));
+    // The week's 30% was logged only before the tail, so a read of the whole file would show it.
+    assert_eq!(entry.get("usedWeek"), None);
+}
+
 /// A home with `~/.claude/settings.json` holding `settings`, and a separate state dir that does
 /// not exist yet (the status line command and the installer must create it).
 fn claude_home(settings: Option<&str>) -> (tempfile::TempDir, PathBuf, PathBuf) {

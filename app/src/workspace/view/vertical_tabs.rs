@@ -11438,6 +11438,7 @@ pub(in crate::workspace::view) mod working_rings {
 /// 4. Claude Code is pointed at a relative path and writes into whatever directory it runs in:
 ///    `a_relative_state_dir_gives_no_status_line_command`.
 pub(in crate::workspace::view) mod limit_sources {
+    use std::io::{Read, Seek, SeekFrom};
     use std::path::{Path, PathBuf};
     use std::time::SystemTime;
 
@@ -11445,6 +11446,10 @@ pub(in crate::workspace::view) mod limit_sources {
 
     /// How many of the newest Codex session files are read for a reading.
     const CODEX_FILES: usize = 3;
+    /// How much of the end of each Codex session file is read. A reading is logged with every
+    /// token count, so the latest ones sit at the end, while a long session's file can run to
+    /// hundreds of MB and this runs on the UI thread.
+    const CODEX_TAIL_BYTES: u64 = 512 * 1024;
     /// Claude Code's status line input, as the status line command stores it in the state dir.
     const CLAUDE_STATUS_FILE_NAME: &str = "claude-statusline.json";
     /// In the state dir: the app set Claude Code's status line once, so a status line the user
@@ -11701,7 +11706,7 @@ pub(in crate::workspace::view) mod limit_sources {
         if cache.codex.as_ref().is_none_or(|(known, _)| *known != seen) {
             let lines: Vec<String> = files
                 .iter()
-                .filter_map(|file| std::fs::read_to_string(file).ok())
+                .filter_map(|file| read_tail(file, CODEX_TAIL_BYTES))
                 .flat_map(|text| {
                     text.lines()
                         .filter(|line| line.contains("\"rate_limits\""))
@@ -11709,11 +11714,56 @@ pub(in crate::workspace::view) mod limit_sources {
                         .collect::<Vec<_>>()
                 })
                 .collect();
-            cache.codex = Some((seen, codex_entry(&lines)));
+            cache.codex = Some((seen, codex_entry(&by_event_time(lines))));
         }
         let mut entry = cache.codex.as_ref()?.1.clone()?;
         entry["_ts"] = json!(now);
         Some(entry)
+    }
+
+    /// The last `max` bytes of the file as text, from the start of a line: a cut that lands inside
+    /// a line drops that line's end.
+    pub(in crate::workspace::view) fn read_tail(path: &Path, max: u64) -> Option<String> {
+        let mut file = std::fs::File::open(path).ok()?;
+        let start = file.metadata().ok()?.len().saturating_sub(max);
+        // One byte before the cut tells whether it landed on a line start.
+        file.seek(SeekFrom::Start(start.saturating_sub(1))).ok()?;
+        let mut bytes = Vec::new();
+        file.take(max + 1).read_to_end(&mut bytes).ok()?;
+        if start == 0 {
+            // `take` started at the file's first byte, so this is everything it holds.
+            return Some(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        let (before, rest) = bytes.split_first()?;
+        let from_a_line_start = if *before == b'\n' {
+            rest
+        } else {
+            rest.iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(&[][..], |newline| &rest[newline + 1..])
+        };
+        Some(String::from_utf8_lossy(from_a_line_start).into_owned())
+    }
+
+    /// The lines oldest first by the `timestamp` Codex logs on each, whichever session file they
+    /// came from: an older session can report after a newer one went idle. Lines without one keep
+    /// their place (the sort is stable) among the others.
+    pub(in crate::workspace::view) fn by_event_time(lines: Vec<String>) -> Vec<String> {
+        fn at(line: &str) -> i64 {
+            #[derive(serde::Deserialize)]
+            struct Stamped {
+                timestamp: Option<String>,
+            }
+            serde_json::from_str::<Stamped>(line)
+                .ok()
+                .and_then(|stamped| stamped.timestamp)
+                .and_then(|stamp| chrono::DateTime::parse_from_rfc3339(&stamp).ok())
+                .map_or(i64::MIN, |time| time.timestamp_millis())
+        }
+        let mut stamped: Vec<(i64, String)> =
+            lines.into_iter().map(|line| (at(&line), line)).collect();
+        stamped.sort_by_key(|(at, _)| *at);
+        stamped.into_iter().map(|(_, line)| line).collect()
     }
 
     /// The newest `count` session files, oldest first. Codex sorts them into `YYYY/MM/DD` folders
@@ -12195,7 +12245,8 @@ pub(in crate::workspace::view) mod limit_rings {
             }
             // The app's own readings first; an entry of the file under the same key replaces one.
             // An empty (relative) state dir would read from the working directory, so it is skipped.
-            let mut providers = if enabled(ctx) {
+            // The rings show only in Harp mode, so with it off nothing is read.
+            let mut providers = if enabled(ctx) && crate::tab::harp_mode_enabled(ctx) {
                 limit_sources::providers(
                     Some(state_dir.as_path()).filter(|dir| dir.is_absolute()),
                     codex_sessions_root().ok().as_deref(),
