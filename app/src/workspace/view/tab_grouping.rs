@@ -946,6 +946,23 @@ pub(in crate::workspace::view) mod sidebar_pins {
         pins.into_iter().map(|(index, _, _)| index).collect()
     }
 
+    /// Drops the entries of tabs whose terminals were all checked (`polled`) and none of them is
+    /// attached to a tmux session (`attached`): a pin is the session's, so it ends with the
+    /// attachment, and the tab falls back to Warp's own pin. Tabs that were not checked keep
+    /// theirs. Returns whether any entry was dropped.
+    pub fn forget_detached<K, V>(
+        pins: &mut std::collections::HashMap<K, V>,
+        polled: &std::collections::HashSet<K>,
+        attached: &std::collections::HashSet<K>,
+    ) -> bool
+    where
+        K: Eq + std::hash::Hash,
+    {
+        let before = pins.len();
+        pins.retain(|tab, _| attached.contains(tab) || !polled.contains(tab));
+        pins.len() != before
+    }
+
     #[cfg(test)]
     #[path = "sidebar_pins_tests.rs"]
     mod tests;
@@ -1190,6 +1207,10 @@ impl Workspace {
 
             regrouped |= self.sync_tmux_tab_group(index, session, read_at, ctx);
         }
+        // A tab that returned to a plain shell no longer has its session's pin: without this the
+        // menu would go on pinning and unpinning the session it left.
+        let polled: HashSet<EntityId> = shells.iter().map(|&(id, _)| id).collect();
+        flags_changed |= sidebar_pins::forget_detached(&mut self.tmux_tab_pins, &polled, &synced);
         if self.tmux_tab_paths != paths_before || flags_changed {
             ctx.notify();
         }
