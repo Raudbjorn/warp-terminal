@@ -112,6 +112,33 @@ pub(crate) fn status_change_is_announced(
     }
 }
 
+/// [`status_change_is_announced`] for a session that reports through events. A session with no
+/// status source (an agent known only by its OSC 9 text, which says a turn ended and never that
+/// one began) never shows "working" between two turns, so every end it reports would read as a
+/// repeat of the last: each end it reports is news instead.
+pub(crate) fn event_status_change_is_announced(
+    shows_status: bool,
+    previous: &CLIAgentSessionStatus,
+    previous_has_background_work: bool,
+    new: &CLIAgentSessionStatus,
+    new_has_background_work: bool,
+) -> bool {
+    if shows_status {
+        return status_change_is_announced(
+            previous,
+            previous_has_background_work,
+            new,
+            new_has_background_work,
+        );
+    }
+    matches!(
+        new,
+        CLIAgentSessionStatus::Blocked { .. }
+            | CLIAgentSessionStatus::Success
+            | CLIAgentSessionStatus::Failed { .. }
+    )
+}
+
 /// How far a background-tasks report may start before the last one applied and still be dropped
 /// as stale (see `is_stale_background_report`).
 const STALE_REPORT_WINDOW_MS: u64 = 30_000;
@@ -168,6 +195,9 @@ pub struct CLIAgentSessionContext {
     /// Harp: the agent runs without a status plugin, and its status comes from the terminal title
     /// it sets (see `CLIAgentEventSource::TerminalTitle`). A plugin event takes over for good.
     pub status_from_title: bool,
+    /// Harp: Harp's bundled plugin reports for this session. Its version is Harp's own, not a
+    /// Warp plugin's, so it says nothing about whether Warp's plugin needs an update.
+    pub reported_by_harp: bool,
 }
 
 /// State of the rich input editor for composing a prompt to send to a CLI agent.
@@ -384,6 +414,7 @@ impl CLIAgentSession {
         if event.event != CLIAgentEventType::SessionStart {
             self.session_context.had_activity = true;
         }
+        self.session_context.reported_by_harp |= event.payload.from_harp_plugin;
 
         let new_status = match &event.event {
             CLIAgentEventType::PromptSubmit => {
@@ -1196,7 +1227,8 @@ impl CLIAgentSessionsModel {
             }
         }
         if let Some(new_status) = new_status {
-            let announce = status_change_is_announced(
+            let announce = event_status_change_is_announced(
+                session.shows_status(),
                 &previous_status,
                 had_background_work,
                 &new_status,

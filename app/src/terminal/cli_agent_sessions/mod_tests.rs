@@ -11,7 +11,7 @@ use super::event::{
 use super::{
     BlockedSource, CLIAgentInputEntrypoint, CLIAgentInputState, CLIAgentSession,
     CLIAgentSessionContext, CLIAgentSessionStatus, CLIAgentSessionsModel,
-    CLIAgentSessionsModelEvent,
+    CLIAgentSessionsModelEvent, event_status_change_is_announced,
 };
 use crate::ai::blocklist::{InputConfig, InputType};
 use crate::terminal::CLIAgent;
@@ -2641,4 +2641,70 @@ fn a_stop_without_a_prompt_keeps_the_turns_prompt() {
         session.session_context.query.as_deref(),
         Some("and a limerick")
     );
+}
+
+/// An agent reporting only through OSC 9 never says a turn began, so the row never reads "working"
+/// between turns; each end it reports must still be announced. Fails if the second end of a
+/// session without a status source is taken for a repeat.
+#[test]
+fn a_session_without_a_status_source_announces_every_turn_end() {
+    let done = CLIAgentSessionStatus::Success;
+    // No status source: every end counts, even after another one.
+    assert!(event_status_change_is_announced(
+        false, &done, false, &done, false
+    ));
+    assert!(event_status_change_is_announced(
+        false,
+        &CLIAgentSessionStatus::InProgress,
+        false,
+        &done,
+        false
+    ));
+    assert!(!event_status_change_is_announced(
+        false,
+        &done,
+        false,
+        &CLIAgentSessionStatus::InProgress,
+        false
+    ));
+    // A plugin or title status keeps the repeat rule.
+    assert!(!event_status_change_is_announced(
+        true, &done, false, &done, false
+    ));
+    assert!(event_status_change_is_announced(
+        true,
+        &CLIAgentSessionStatus::InProgress,
+        false,
+        &done,
+        false
+    ));
+}
+
+/// Harp's plugin reports its own version, which the update chip must not read as Warp's plugin
+/// being old. The session remembers who reports; fails if a Harp event leaves it unset or a Warp
+/// plugin event sets it.
+#[test]
+fn a_session_remembers_that_harps_plugin_reports_for_it() {
+    let mut session = blocked_claude_session_with_permission_state();
+    let event = |from_harp_plugin: bool| CLIAgentEvent {
+        source: CLIAgentEventSource::RichPlugin,
+        v: 1,
+        agent: CLIAgent::Claude,
+        event: CLIAgentEventType::SessionStart,
+        session_id: Some("abc".to_owned()),
+        cwd: None,
+        project: None,
+        payload: CLIAgentEventPayload {
+            plugin_version: Some("0.1.8".to_owned()),
+            from_harp_plugin,
+            ..Default::default()
+        },
+    };
+    session.apply_event(&event(false));
+    assert!(!session.session_context.reported_by_harp);
+    session.apply_event(&event(true));
+    assert!(session.session_context.reported_by_harp);
+    // Once Harp's plugin has spoken, a later Warp plugin event does not take it back.
+    session.apply_event(&event(false));
+    assert!(session.session_context.reported_by_harp);
 }
