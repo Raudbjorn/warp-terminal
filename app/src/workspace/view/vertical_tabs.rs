@@ -3818,7 +3818,7 @@ fn render_grouped_tab_container(
                 is_collapsed.then(|| workspace.compute_group_member_kinds(group.id, app));
             render_grouped_tabs_header(
                 &group,
-                &state.search_query,
+                effective_search_query(state, workspace, app),
                 member_count,
                 &mouse_states,
                 is_collapsed,

@@ -12825,8 +12825,14 @@ impl Workspace {
         }
     }
 
+    /// Whether the vertical tabs search narrows the tabs. The framed sidebar has no search field,
+    /// so a query typed before switching to it filters nothing there and cannot be cleared.
+    fn tab_search_filters(&self, ctx: &AppContext) -> bool {
+        !self.vertical_tabs_panel.search_query.is_empty() && !self.uses_framed_sidebar_layout(ctx)
+    }
+
     pub fn activate_prev_tab(&mut self, ctx: &mut ViewContext<Self>) {
-        let index = if self.vertical_tabs_panel.search_query.is_empty() {
+        let index = if !self.tab_search_filters(ctx) {
             if self.active_tab_index > 0 {
                 self.active_tab_index - 1
             } else {
@@ -12851,7 +12857,7 @@ impl Workspace {
     }
 
     pub fn activate_next_tab(&mut self, ctx: &mut ViewContext<Self>) {
-        let index = if self.vertical_tabs_panel.search_query.is_empty() {
+        let index = if !self.tab_search_filters(ctx) {
             if self.active_tab_index + 1 < self.tabs.len() {
                 self.active_tab_index + 1
             } else {
