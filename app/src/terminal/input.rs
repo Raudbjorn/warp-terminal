@@ -7201,8 +7201,10 @@ impl Input {
             UniversalDeveloperInputButtonBarEvent::OpenSlashCommandMenu => {
                 self.focus_input_box(ctx);
                 if !FeatureFlag::AgentView.is_enabled() {
+                    // Clicking the button is an explicit request for the slash menu, so it
+                    // overrides a shell lock: slash commands only work in AI mode here.
                     self.ensure_agent_mode_for_ai_features(
-                        false,
+                        true,
                         Some(InputTypeAutoDetectionSource::SlashCommand),
                         ctx,
                     );
