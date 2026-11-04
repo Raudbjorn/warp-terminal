@@ -1018,7 +1018,9 @@ impl<A: Action + Clone> MenuItemFields<A> {
         style: MenuStyle,
         is_hovered: bool,
         is_selected: bool,
+        menu_width: f32,
         appearance: &Appearance,
+        app: &AppContext,
     ) -> Box<dyn Element> {
         let highlighted =
             (is_hovered || is_selected) && !self.disabled && !self.no_interaction_on_hover;
@@ -1047,16 +1049,34 @@ impl<A: Action + Clone> MenuItemFields<A> {
         if self.checked {
             row.add_child(glyph(warp_core::ui::Icon::SidebarCheck, text_color));
         }
-        row.add_child(
-            Expanded::new(
-                1.,
+        // Plain text takes the style's own look. Every other label (an icon, a hint, a custom
+        // element such as the colour picker's dots with their click handlers) draws itself, as
+        // it does in an unstyled menu, instead of being reduced to an empty text.
+        let label = match &self.element {
+            MenuItemLabel::Text(_)
+            | MenuItemLabel::MultilineText { .. }
+            | MenuItemLabel::StackedText { .. } => {
                 Text::new_inline(self.label().to_string(), font, style.font_size)
                     .with_clip(ClipConfig::ellipsis())
                     .with_color(text_color)
-                    .finish(),
-            )
-            .finish(),
-        );
+                    .finish()
+            }
+            _ => self.element.render(
+                Fill::Solid(text_color),
+                Fill::Solid(style.secondary_text),
+                font,
+                style.font_size,
+                0.,
+                0.,
+                menu_width,
+                is_selected,
+                is_hovered,
+                self.clip_config,
+                appearance,
+                app,
+            ),
+        };
+        row.add_child(Expanded::new(1., label).finish());
         if self.has_submenu {
             row.add_child(glyph(
                 warp_core::ui::Icon::SidebarChevron,
@@ -1329,7 +1349,9 @@ impl<A: Action + Clone> MenuItemFields<A> {
                     style,
                     state.is_hovered() && !safe_zone_suppresses_hover,
                     is_selected || submenu_being_shown_for_item,
+                    menu_width,
                     appearance,
+                    app,
                 );
             }
             let is_hovered = state.is_hovered() && !safe_zone_suppresses_hover;
