@@ -583,6 +583,8 @@ pub fn initialize_app(app: &mut App) {
         )
     });
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // context_chips/display.rs subscribes to it; lib.rs registers it unconditionally.
+    app.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
     // The blocklist controller created during terminal bootstrap subscribes to
     // OrchestrationEventService and OrchestrationEventStreamer unconditionally,
     // so both singletons must be registered before bootstrap.

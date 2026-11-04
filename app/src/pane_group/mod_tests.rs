@@ -189,6 +189,8 @@ fn initialize_app_with_history(app: &mut App, conversations: Vec<AgentConversati
         )
     });
     app.add_singleton_model(|_| CLIAgentSessionsModel::new());
+    // context_chips/display.rs subscribes to it; lib.rs registers it unconditionally.
+    app.add_singleton_model(|_| crate::context_chips::plugin_prompt::PluginPromptModel::new());
     // Subscribes to `CLIAgentSessionsModel` on construction, so it is
     // registered after it, and closing a pane reads it.
     app.add_singleton_model(crate::conn::ConnModel::new);
