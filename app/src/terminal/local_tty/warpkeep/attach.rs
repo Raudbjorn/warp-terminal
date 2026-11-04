@@ -26,13 +26,15 @@ use super::{
 pub fn run_attach(dir: PathBuf, command: Vec<String>) -> Result<()> {
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
 
-    let (mut stream, _socket, _lock) = connect_or_spawn(&dir, &command)?;
+    let (mut stream, _socket, lock) = connect_or_spawn(&dir, &command)?;
 
     // Put Warp's PTY (our controlling tty) into raw mode so bytes pass through
     // untouched; restore on exit no matter what.
     let restore = RawModeGuard::enter(libc::STDIN_FILENO)?;
     let status = relay(&mut stream);
     drop(restore);
+    // `process::exit` runs no destructors: say the session is no longer ours.
+    super::shells::clear_attach_pid(&lock._file);
 
     std::process::exit(status);
 }
@@ -62,6 +64,7 @@ fn connect_or_spawn(dir: &Path, command: &[String]) -> Result<(UnixStream, PathB
                     // Master is gone; clean up the stale socket + lock and move on.
                     let _ = std::fs::remove_file(&path);
                     let _ = std::fs::remove_file(lock_path(&path));
+                    let _ = std::fs::remove_file(super::shells::shell_path(&path));
                 }
             }
         }
@@ -278,7 +281,13 @@ fn try_lock(socket: &Path) -> Option<SessionLock> {
         .open(lock_path(socket))
         .ok()?;
     match flock(file.as_raw_fd(), FlockArg::LockExclusiveNonblock) {
-        Ok(()) => Some(SessionLock { _file: file }),
+        Ok(()) => {
+            // The app finds this tab's shell through the pid in the lock (see `shells`).
+            if let Err(error) = super::shells::record_attach_pid(&file, std::process::id()) {
+                log::warn!("warpkeep: could not record the attach pid: {error}");
+            }
+            Some(SessionLock { _file: file })
+        }
         Err(_) => None,
     }
 }

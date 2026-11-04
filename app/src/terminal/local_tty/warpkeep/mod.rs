@@ -24,9 +24,11 @@ use std::time::Duration;
 mod attach;
 mod master;
 mod pump;
+mod shells;
 
 pub use attach::run_attach;
 pub use master::run_master;
+pub use shells::shells_by_attach;
 
 /// Framed-packet tags for the client→master direction. The master→client
 /// direction is the raw PTY byte stream (preceded once by the replay block).

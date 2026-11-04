@@ -280,6 +280,16 @@ pub(super) fn spawn(options: PtyOptions) -> Result<PtySpawnInfo> {
 /// nothing to find on `$PATH`. It is byte-transparent — it does not redraw or
 /// interpret the screen — so Warp keeps rendering blocks/AI normally, unlike a
 /// multiplexer such as tmux. See `crate::terminal::local_tty::warpkeep`.
+/// Where warpkeep keeps its session sockets, locks and pid files (the app reads them to find the
+/// shell of a tab, see `warpkeep::shells_by_attach`).
+pub fn warpkeep_sessions_dir() -> Option<PathBuf> {
+    // `dirs::home_dir` is cross-platform (uses `HOME` on Unix, `USERPROFILE` on
+    // Windows) and never panics if the env var is unset.
+    let mut sessions_dir = dirs::home_dir()?;
+    sessions_dir.push(".warp/oh-my-warp/sessions");
+    Some(sessions_dir)
+}
+
 fn omw_warpkeep_wrap(
     shell_path: &Path,
     shell_args: &[OsString],
@@ -292,10 +302,7 @@ fn omw_warpkeep_wrap(
     }
 
     let exe = std::env::current_exe().ok()?;
-    // `dirs::home_dir` is cross-platform (uses `HOME` on Unix, `USERPROFILE` on
-    // Windows) and never panics if the env var is unset.
-    let mut sessions_dir = dirs::home_dir()?;
-    sessions_dir.push(".warp/oh-my-warp/sessions");
+    let sessions_dir = warpkeep_sessions_dir()?;
 
     let mut args: Vec<OsString> = vec![
         "warpkeep".into(),

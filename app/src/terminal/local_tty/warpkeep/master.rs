@@ -63,6 +63,12 @@ pub fn run_master(socket: PathBuf, command: Vec<String>) -> Result<()> {
         libc::close(slave_fd);
     }
 
+    // Tell the app which shell this session runs (see `shells`), before the socket exists: the
+    // attach connects as soon as it does.
+    if let Err(error) = super::shells::write_shell_pid(&socket, child.id()) {
+        log::warn!("warpkeep-master: could not record the shell pid: {error}");
+    }
+
     // Bind the session socket.
     let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).context("warpkeep-master: bind socket")?;
@@ -73,6 +79,7 @@ pub fn run_master(socket: PathBuf, command: Vec<String>) -> Result<()> {
     });
 
     let _ = std::fs::remove_file(&socket);
+    let _ = std::fs::remove_file(super::shells::shell_path(&socket));
     let _ = child.wait();
     result
 }

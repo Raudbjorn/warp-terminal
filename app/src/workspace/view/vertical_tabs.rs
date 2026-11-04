@@ -1289,11 +1289,15 @@ pub(super) fn tab_terminal_views(
 }
 
 /// Each visible terminal's view id with the pid of its shell, for terminals whose shell is alive.
+/// With warpkeep the pty runs its attach worker and the shell sits under a detached master, so
+/// that pid is swapped for the shell's (`warpkeep::shells_by_attach`): the tmux sync finds a
+/// terminal's tmux client by the shell it was started from.
 pub(super) fn tab_terminal_shell_pids(
     pane_group: &PaneGroup,
     app: &AppContext,
 ) -> Vec<(EntityId, u32)> {
-    pane_group
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut shells: Vec<(EntityId, u32)> = pane_group
         .visible_pane_ids()
         .into_iter()
         .filter_map(|pane_id| {
@@ -1306,7 +1310,19 @@ pub(super) fn tab_terminal_shell_pids(
             let shell_pid = terminal_view.model.lock().shell_process_info()?.pid;
             Some((terminal_view.id(), shell_pid))
         })
-        .collect()
+        .collect();
+    #[cfg(unix)]
+    if !shells.is_empty()
+        && let Some(dir) = crate::terminal::local_tty::warpkeep_sessions_dir()
+    {
+        let inner = crate::terminal::local_tty::warpkeep::shells_by_attach(&dir);
+        for (_, pid) in &mut shells {
+            if let Some(&shell) = inner.get(pid) {
+                *pid = shell;
+            }
+        }
+    }
+    shells
 }
 
 /// True when an agent in one of the tab's visible terminals is blocked waiting on the user.
