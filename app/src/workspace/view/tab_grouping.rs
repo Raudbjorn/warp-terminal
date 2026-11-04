@@ -7,17 +7,17 @@ use warpui::{EntityId, UpdateView, ViewContext};
 use super::{Workspace, group_member_indices};
 use crate::menu::{MenuItem, MenuItemFields};
 use crate::tab::{MOVE_TO_GROUP_LABEL, TabData};
+#[cfg(not(target_family = "wasm"))]
+use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
 use crate::workspace::action::{TabContextMenuAnchor, WorkspaceAction};
 use crate::workspace::tab_group::{TabGroup, TabGroupId};
 #[cfg(not(target_family = "wasm"))]
-use crate::terminal::cli_agent_sessions::CLIAgentSessionsModel;
-#[cfg(not(target_family = "wasm"))]
 use crate::workspace::tab_settings::TabSettings;
+use crate::workspace::util::PaneViewLocator;
 #[cfg(not(target_family = "wasm"))]
 use settings::Setting as _;
 #[cfg(not(target_family = "wasm"))]
 use warpui::SingletonEntity as _;
-use crate::workspace::util::PaneViewLocator;
 
 // TODO(johnturcoo) move tab grouping helpers here from workspace/view.rs.
 impl Workspace {
@@ -962,7 +962,11 @@ fn tmux_sync_enabled(ctx: &warpui::AppContext) -> bool {
 /// renames and regroups sessions with plain tmux commands.
 #[cfg(not(target_family = "wasm"))]
 fn tmux_session_script(ctx: &warpui::AppContext) -> Option<std::path::PathBuf> {
-    let script = TabSettings::as_ref(ctx).tmux_session_script.value().trim().to_owned();
+    let script = TabSettings::as_ref(ctx)
+        .tmux_session_script
+        .value()
+        .trim()
+        .to_owned();
     if script.is_empty() {
         return None;
     }
@@ -970,7 +974,10 @@ fn tmux_session_script(ctx: &warpui::AppContext) -> Option<std::path::PathBuf> {
     if path.exists() {
         Some(path)
     } else {
-        log::warn!("tmux session script {} does not exist; using tmux commands", path.display());
+        log::warn!(
+            "tmux session script {} does not exist; using tmux commands",
+            path.display()
+        );
         None
     }
 }
@@ -1132,16 +1139,19 @@ impl Workspace {
         read_at: std::time::Instant,
         ctx: &mut ViewContext<Self>,
     ) {
-        let open_tabs: HashSet<EntityId> = self.tabs.iter().map(|tab| tab.pane_group.id()).collect();
+        let open_tabs: HashSet<EntityId> =
+            self.tabs.iter().map(|tab| tab.pane_group.id()).collect();
         let mut tab_sessions: std::collections::HashMap<EntityId, tmux_agents::ClientSession> =
             std::collections::HashMap::new();
         self.tmux_tab_groups.retain(|id, _| open_tabs.contains(id));
-        self.tmux_tab_session_names.retain(|id, _| open_tabs.contains(id));
+        self.tmux_tab_session_names
+            .retain(|id, _| open_tabs.contains(id));
         self.tmux_tab_flags.retain(|id, _| open_tabs.contains(id));
         self.tmux_tab_pins.retain(|id, _| open_tabs.contains(id));
         let mut flags_changed = false;
         let paths_before = std::mem::take(&mut self.tmux_tab_paths);
-        self.tmux_rename_settle.retain(|id, _| open_tabs.contains(id));
+        self.tmux_rename_settle
+            .retain(|id, _| open_tabs.contains(id));
         let mut regrouped = false;
         let mut synced = HashSet::new();
         for &(pane_group_id, pid) in shells {
@@ -1231,8 +1241,8 @@ impl Workspace {
         if self.current_workspace_state.is_tab_being_dragged || self.is_group_being_dragged {
             return;
         }
-        let fresh = !self.tmux_layout.writing
-            && read_sees_write(self.tmux_layout.written_at, read_at);
+        let fresh =
+            !self.tmux_layout.writing && read_sees_write(self.tmux_layout.written_at, read_at);
         if tmux_layout::should_adopt(read_rev, self.tmux_layout.rev, fresh) {
             let tabs = self.layout_tabs(tab_sessions);
             let order: Vec<EntityId> = tmux_layout::adopted_order(&tabs, &tmux_groups)
@@ -1347,7 +1357,11 @@ impl Workspace {
             (tab.inactive, tab.marked_unread) = in_tmux;
             self.tmux_tab_flags.insert(
                 pane_group_id,
-                TmuxTabFlags { inactive: in_tmux.0, unread: in_tmux.1, written_at: None },
+                TmuxTabFlags {
+                    inactive: in_tmux.0,
+                    unread: in_tmux.1,
+                    written_at: None,
+                },
             );
             return changed;
         };
@@ -1355,8 +1369,18 @@ impl Workspace {
         let mut changed = false;
         let mut wrote = false;
         for (option, in_app, in_tmux, last) in [
-            ("@warp_inactive", &mut tab.inactive, in_tmux.0, &mut agreed.inactive),
-            ("@warp_unread", &mut tab.marked_unread, in_tmux.1, &mut agreed.unread),
+            (
+                "@warp_inactive",
+                &mut tab.inactive,
+                in_tmux.0,
+                &mut agreed.inactive,
+            ),
+            (
+                "@warp_unread",
+                &mut tab.marked_unread,
+                in_tmux.1,
+                &mut agreed.unread,
+            ),
         ] {
             if *in_app != *last {
                 tmux_agents::set_session_flag(&session.id, option, *in_app);
@@ -1497,10 +1521,13 @@ impl Workspace {
             }
         };
         if !take_tmux {
-            let agreed = self.tmux_tab_groups.entry(pane_group_id).or_insert(TmuxTabGroup {
-                name: session.group.clone(),
-                written_at: None,
-            });
+            let agreed = self
+                .tmux_tab_groups
+                .entry(pane_group_id)
+                .or_insert(TmuxTabGroup {
+                    name: session.group.clone(),
+                    written_at: None,
+                });
             // New to the app (first match) or changed in the app: the session takes it. A push
             // that failed is not retried; the next fresh read then takes the session's group.
             if agreed.name != current {
@@ -1542,7 +1569,10 @@ impl Workspace {
         }
         self.tmux_tab_groups.insert(
             pane_group_id,
-            TmuxTabGroup { name: session.group.clone(), written_at: None },
+            TmuxTabGroup {
+                name: session.group.clone(),
+                written_at: None,
+            },
         );
         true
     }
@@ -1564,7 +1594,9 @@ impl Workspace {
         }
         if !settle.warned && settle.started.elapsed() >= TMUX_RENAME_WARN {
             settle.warned = true;
-            log::warn!("tmux session {session_name} did not take the tab's new name; keeping the typed title");
+            log::warn!(
+                "tmux session {session_name} did not take the tab's new name; keeping the typed title"
+            );
         }
         true
     }
@@ -1710,10 +1742,16 @@ fn claude_screen(view: &crate::terminal::TerminalView) -> (String, bool) {
     let block = model.block_list().active_block();
     if model.is_alt_screen_active() {
         let answerable = !claude_waits::dialog::runs_multiplexer(&block.command_to_string());
-        return (model.alt_screen().output_to_string(), ANSWER_FROM_NOTIFICATIONS && answerable);
+        return (
+            model.alt_screen().output_to_string(),
+            ANSWER_FROM_NOTIFICATIONS && answerable,
+        );
     }
     let rows = model.block_list().size().rows();
-    (block.output_grid().contents_to_string(false, Some(rows)), ANSWER_FROM_NOTIFICATIONS)
+    (
+        block.output_grid().contents_to_string(false, Some(rows)),
+        ANSWER_FROM_NOTIFICATIONS,
+    )
 }
 
 /// ponytail: Allow and Deny type keys into the pty, which can race the user's own keys, reach
@@ -1900,12 +1938,14 @@ impl Workspace {
         match notify::act(click.action.as_deref(), card, answerable) {
             Act::Open => true,
             Act::Refuse(reason) => {
-                let target = entry.map(|(_, target)| target).unwrap_or_else(|| NoticeTarget {
-                    pane_group_id: click.pane_group_id,
-                    pane_id: click.pane_id,
-                    title: "Claude Code".to_owned(),
-                    answerable: false,
-                });
+                let target = entry
+                    .map(|(_, target)| target)
+                    .unwrap_or_else(|| NoticeTarget {
+                        pane_group_id: click.pane_group_id,
+                        pane_id: click.pane_id,
+                        title: "Claude Code".to_owned(),
+                        answerable: false,
+                    });
                 self.claude_notice_refused(terminal, &target, reason, ctx);
                 false
             }
@@ -1969,9 +2009,12 @@ impl Workspace {
             };
             view.update(ctx, |view, ctx| view.write_to_pty(bytes, ctx));
         }
-        ctx.spawn(warpui::r#async::Timer::after(KEY_STEP), move |me, _, ctx| {
-            me.step_claude_answer(terminal, target, answer, ctx);
-        });
+        ctx.spawn(
+            warpui::r#async::Timer::after(KEY_STEP),
+            move |me, _, ctx| {
+                me.step_claude_answer(terminal, target, answer, ctx);
+            },
+        );
     }
 
     /// The terminal a notification points at, if it is still shown in its tab.
@@ -2000,10 +2043,16 @@ impl Workspace {
         ctx: &mut ViewContext<Self>,
     ) {
         let category = claude_waits::notify::OPEN_ONLY;
-        self.send_claude_notice(terminal, target, next_notice_id(), category, reason.to_owned(), ctx);
+        self.send_claude_notice(
+            terminal,
+            target,
+            next_notice_id(),
+            category,
+            reason.to_owned(),
+            ctx,
+        );
     }
 }
-
 
 /// Sessions any window of this app opened a tab for recently (`tmux_adopt::AdoptGuard`).
 #[cfg(not(target_family = "wasm"))]
@@ -2090,7 +2139,9 @@ impl Workspace {
         // The framework takes the view being updated out of its window's view map, so this
         // workspace is missing from views_of_type above; without counting it here no window
         // ever adopted.
-        let own_tabs = self.uses_framed_sidebar_layout(ctx).then(|| self.tabs.len());
+        let own_tabs = self
+            .uses_framed_sidebar_layout(ctx)
+            .then(|| self.tabs.len());
         tmux_adopt::count_own_window(&mut windows, self.window_id, own_tabs);
         tmux_adopt::pick_adopter(&windows) == Some(self.window_id)
     }
@@ -2187,8 +2238,10 @@ mod tmux_agents {
     /// as no tmux or no server, yields an empty set.
     pub(super) fn tmux_agent_shell_pids() -> HashSet<u32> {
         let tmux = tmux_binary();
-        let Some(panes) = run(tmux, &["list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"])
-        else {
+        let Some(panes) = run(
+            tmux,
+            &["list-panes", "-a", "-F", "#{session_name}\t#{pane_pid}"],
+        ) else {
             return HashSet::new();
         };
         let Some(processes) = run("/bin/ps", &["-A", "-o", "pid=,ppid=,comm="]) else {
@@ -2212,8 +2265,10 @@ mod tmux_agents {
             return HashSet::new();
         }
 
-        let Some(clients) = run(tmux, &["list-clients", "-F", "#{client_pid}\t#{session_name}"])
-        else {
+        let Some(clients) = run(
+            tmux,
+            &["list-clients", "-F", "#{client_pid}\t#{session_name}"],
+        ) else {
             return HashSet::new();
         };
         let mut shells = HashSet::new();
@@ -2698,7 +2753,10 @@ pub(in crate::workspace::view) mod tmux_layout {
             .iter()
             .map(|name| {
                 if app.contains(name) {
-                    known_in_list.next().cloned().unwrap_or_else(|| name.clone())
+                    known_in_list
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| name.clone())
                 } else {
                     name.clone()
                 }
@@ -3085,7 +3143,9 @@ pub(in crate::workspace::view) mod claude_waits {
         /// The lowest ❯ list on `screen`, read as warp-mobile's bridge reads it (`dialogOnScreen`).
         pub(in crate::workspace::view) fn dialog_on_screen(screen: &str) -> Option<ScreenDialog> {
             let lines: Vec<&str> = screen.split('\n').map(str::trim_end).collect();
-            let c = lines.iter().rposition(|line| cursor_column(line).is_some())?;
+            let c = lines
+                .iter()
+                .rposition(|line| cursor_column(line).is_some())?;
             let col = cursor_column(lines[c])?;
             let edge = |line: &str| {
                 line.trim().is_empty()
@@ -3194,10 +3254,12 @@ pub(in crate::workspace::view) mod claude_waits {
             let question = dialog.body.last().unwrap_or(&dialog.title);
             // An AskUserQuestion dialog can ask "Do you want to …?" too; it always offers
             // "Type something.", which a permission never does.
-            let asks = dialog
-                .options
-                .iter()
-                .any(|option| option.trim_start_matches("[ ]").trim().starts_with("Type something"));
+            let asks = dialog.options.iter().any(|option| {
+                option
+                    .trim_start_matches("[ ]")
+                    .trim()
+                    .starts_with("Type something")
+            });
             if !asks && question.starts_with("Do you want to ") && question.ends_with('?') {
                 return Some(Card::Approval(dialog));
             }
@@ -3212,7 +3274,10 @@ pub(in crate::workspace::view) mod claude_waits {
                 .find(|word| !word.contains('=') && !matches!(*word, "exec" | "command" | "env"))
                 .and_then(|program| program.rsplit('/').next())
                 .is_some_and(|program| {
-                    matches!(program, "tmux" | "screen" | "zellij" | "byobu" | "dtach" | "abduco")
+                    matches!(
+                        program,
+                        "tmux" | "screen" | "zellij" | "byobu" | "dtach" | "abduco"
+                    )
                 })
         }
 
@@ -3330,7 +3395,9 @@ pub(in crate::workspace::view) mod claude_waits {
             window_active: bool,
             active_tab: Option<T>,
         ) -> Option<T> {
-            (app_active && window_active).then_some(active_tab).flatten()
+            (app_active && window_active)
+                .then_some(active_tab)
+                .flatten()
         }
 
         /// Brings `entries` up to `waiting` (each terminal whose Claude waits, and what its screen
@@ -3426,7 +3493,9 @@ pub(in crate::workspace::view) mod claude_waits {
         ) -> Act {
             let answer = matches!(action, Some(ALLOW | DENY));
             match card {
-                Some(card @ Card::Approval(dialog)) if answer && is_permission(card, answerable) => {
+                Some(card @ Card::Approval(dialog))
+                    if answer && is_permission(card, answerable) =>
+                {
                     Act::Pick(if action == Some(ALLOW) {
                         0
                     } else {
@@ -3450,11 +3519,15 @@ pub(in crate::workspace::view) mod claude_waits {
                     } else {
                         OPEN_ONLY
                     },
-                    format!("Needs you: Allow {}?", cut(dialog::approval_subject(dialog), 200)),
+                    format!(
+                        "Needs you: Allow {}?",
+                        cut(dialog::approval_subject(dialog), 200)
+                    ),
                 ),
-                Card::Dialog(dialog) => {
-                    (OPEN_ONLY, cut(dialog.body.last().unwrap_or(&dialog.title), 300))
-                }
+                Card::Dialog(dialog) => (
+                    OPEN_ONLY,
+                    cut(dialog.body.last().unwrap_or(&dialog.title), 300),
+                ),
                 Card::Waiting(message) => (OPEN_ONLY, cut(message, 300)),
             }
         }

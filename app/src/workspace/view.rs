@@ -96,8 +96,7 @@ use warpui::elements::Percentage;
 use warpui::elements::{
     Align, Border, CacheOption, ChildAnchor, ChildView, Clipped, ConstrainedBox, Container,
     CornerRadius, CrossAxisAlignment, Dismiss, DispatchEventResult, DragAxis, Draggable,
-    DraggableState, DropTarget, Element, Empty, EventHandler, Expanded,
-    Fill as ElementFill, Flex,
+    DraggableState, DropTarget, Element, Empty, EventHandler, Expanded, Fill as ElementFill, Flex,
     Highlight, Hoverable, Icon as WarpUiIcon, Image, MainAxisAlignment, MainAxisSize,
     MouseInBehavior, MouseStateHandle, OffsetPositioning, ParentAnchor, ParentElement,
     ParentOffsetBounds, PositionedElementAnchor, PositionedElementOffsetBounds, Radius, Rect,
@@ -1654,7 +1653,10 @@ impl Workspace {
         if self.current_workspace_state.is_tab_being_renamed() {
             self.finish_tab_rename(ctx);
         }
-        if self.current_workspace_state.is_any_tab_group_being_renamed() {
+        if self
+            .current_workspace_state
+            .is_any_tab_group_being_renamed()
+        {
             self.finish_tab_group_rename_keep_open(false, ctx);
         }
     }
@@ -1750,7 +1752,10 @@ impl Workspace {
         let duplicate = !trimmed.is_empty()
             && self.tab_groups.values().any(|other| {
                 other.id != group_id
-                    && vertical_tabs::group_display_name(other).trim().to_lowercase() == lowered
+                    && vertical_tabs::group_display_name(other)
+                        .trim()
+                        .to_lowercase()
+                        == lowered
             });
         if duplicate {
             if keep_open_on_duplicate {
@@ -28035,7 +28040,9 @@ impl View for Workspace {
         let ring_window = app
             .windows()
             .platform_window(self.window_id)
-            .filter(|window| window.supports_working_rings() && self.uses_framed_sidebar_layout(app));
+            .filter(|window| {
+                window.supports_working_rings() && self.uses_framed_sidebar_layout(app)
+            });
         // The native rings sit above everything the app paints, so while a menu, drag or modal
         // could cover a row the icons draw their static arc instead and the layers go away.
         vertical_tabs::working_rings::set_native(
@@ -29397,7 +29404,9 @@ impl View for Workspace {
         // ended it from the terminal. Runs after the children and lets the click through.
         let mut root = event_handler.finish();
         if self.current_workspace_state.is_tab_being_renamed()
-            || self.current_workspace_state.is_any_tab_group_being_renamed()
+            || self
+                .current_workspace_state
+                .is_any_tab_group_being_renamed()
         {
             root = EventHandler::new(root)
                 .with_always_handle()
@@ -30518,7 +30527,9 @@ impl Workspace {
             if !on_header {
                 continue;
             }
-            let last_member = (0..self.tabs.len()).rev().find(|&index| group_of(index) == section);
+            let last_member = (0..self.tabs.len())
+                .rev()
+                .find(|&index| group_of(index) == section);
             let Some(last_member) = last_member else {
                 continue;
             };
@@ -30546,7 +30557,10 @@ impl Workspace {
             })
             .collect();
         rows.sort_by(|a, b| a.1.min_y().total_cmp(&b.1.min_y()));
-        let below = rows.iter().find(|(_, rect)| y < rect.center().y()).map(|(i, _)| *i);
+        let below = rows
+            .iter()
+            .find(|(_, rect)| y < rect.center().y())
+            .map(|(i, _)| *i);
         let above = rows
             .iter()
             .rev()
@@ -30599,8 +30613,8 @@ impl Workspace {
         let group = target
             .group
             .filter(|group_id| self.tab_groups.contains_key(group_id));
-        let to = if before > from { before - 1 } else { before }
-            .min(self.tabs.len().saturating_sub(1));
+        let to =
+            if before > from { before - 1 } else { before }.min(self.tabs.len().saturating_sub(1));
         self.hop_tab_to_index(from, to, ctx);
         self.assign_tab_to_group(to, group, ctx);
         ctx.dispatch_global_action("workspace:save_app", ());

@@ -1952,8 +1952,20 @@ fn a_stop_without_any_hook_report_is_done() {
 fn without_the_hook_a_stop_is_announced_at_once() {
     use Replay::*;
     // No background-tasks hook installed: the plugin's count alone never delays the "done".
-    replay(CLIAgentSessionStatus::Success, false, &[Prompt, Stop(3)], false, 1);
-    replay(CLIAgentSessionStatus::Success, false, &[Prompt, Stop(0)], false, 1);
+    replay(
+        CLIAgentSessionStatus::Success,
+        false,
+        &[Prompt, Stop(3)],
+        false,
+        1,
+    );
+    replay(
+        CLIAgentSessionStatus::Success,
+        false,
+        &[Prompt, Stop(0)],
+        false,
+        1,
+    );
     // Once the hook reports, later stops wait for its count as usual.
     replay(
         CLIAgentSessionStatus::Success,
@@ -1989,18 +2001,40 @@ fn a_stop_after_a_ctrl_c_stays_silent_when_its_report_settles_it() {
 #[test]
 fn a_stale_hook_report_does_not_undo_the_turn_end() {
     use Replay::*;
-    assert_replay(&[Prompt, Tool, HookAt(0, 300), Stop(1), HookAt(1, 200)], false, 1);
+    assert_replay(
+        &[Prompt, Tool, HookAt(0, 300), Stop(1), HookAt(1, 200)],
+        false,
+        1,
+    );
     // In order, the later report wins.
-    assert_replay(&[Prompt, Tool, HookAt(0, 200), Stop(1), HookAt(1, 300)], true, 1);
+    assert_replay(
+        &[Prompt, Tool, HookAt(0, 200), Stop(1), HookAt(1, 300)],
+        true,
+        1,
+    );
     // Astra: a stale report must not settle a stop that waits for its turn's count.
     assert_replay(
-        &[HookAt(0, 300), Prompt, Stop(1), HookAt(0, 200), HookAt(1, 400)],
+        &[
+            HookAt(0, 300),
+            Prompt,
+            Stop(1),
+            HookAt(0, 200),
+            HookAt(1, 400),
+        ],
         true,
         0,
     );
     // A clock set back by more than a slow hook could lag still reports "nothing runs".
     assert_replay(
-        &[Prompt, HookAt(1, 100_000), Stop(1), Prompt, Tool, HookAt(0, 50_000), Stop(0)],
+        &[
+            Prompt,
+            HookAt(1, 100_000),
+            Stop(1),
+            Prompt,
+            Tool,
+            HookAt(0, 50_000),
+            Stop(0),
+        ],
         false,
         1,
     );
@@ -2291,13 +2325,25 @@ fn another_agents_edit_of_another_file_leaves_the_dialog_open() {
     };
     let mut session = cli_agent_session(CLIAgentSessionStatus::InProgress, true);
     session.apply_event(&background_report(2));
-    session.apply_event(&target("Edit", "/w/worker.js", CLIAgentEventType::PermissionRequest));
-    session.apply_event(&target("Edit", "/d/dashboard.html", CLIAgentEventType::ToolComplete));
+    session.apply_event(&target(
+        "Edit",
+        "/w/worker.js",
+        CLIAgentEventType::PermissionRequest,
+    ));
+    session.apply_event(&target(
+        "Edit",
+        "/d/dashboard.html",
+        CLIAgentEventType::ToolComplete,
+    ));
     assert!(
         is_permission_blocked(&session),
         "an edit of another file ended the dialog"
     );
-    session.apply_event(&target("Edit", "/w/worker.js", CLIAgentEventType::ToolComplete));
+    session.apply_event(&target(
+        "Edit",
+        "/w/worker.js",
+        CLIAgentEventType::ToolComplete,
+    ));
     assert!(!is_permission_blocked(&session));
 }
 
@@ -2336,11 +2382,17 @@ fn title_state_reads_the_agents_own_glyph_only() {
     assert_eq!(title_state(CLIAgent::Codex, ""), None);
     // Codex 0.162 blinks this in front of the task while an approval or a question waits.
     assert_eq!(
-        title_state(CLIAgent::Codex, "[ ! ] Action Required | Create hello.txt | work"),
+        title_state(
+            CLIAgent::Codex,
+            "[ ! ] Action Required | Create hello.txt | work"
+        ),
         Some(TitleState::NeedsYou)
     );
     assert_eq!(
-        title_state(CLIAgent::Codex, "[ . ] Action Required | Create hello.txt | work"),
+        title_state(
+            CLIAgent::Codex,
+            "[ . ] Action Required | Create hello.txt | work"
+        ),
         Some(TitleState::NeedsYou)
     );
     assert_eq!(title_state(CLIAgent::Gemini, "◐ anything"), None);
@@ -2393,9 +2445,16 @@ fn a_title_drives_status_until_a_plugin_reports() {
             m.update_from_event(view_id, &title_event(CLIAgentEventType::PromptSubmit), ctx)
         });
         model.update(&mut app, |m, ctx| {
-            m.update_from_event(view_id, &title_event(CLIAgentEventType::PermissionRequest), ctx)
+            m.update_from_event(
+                view_id,
+                &title_event(CLIAgentEventType::PermissionRequest),
+                ctx,
+            )
         });
-        assert!(matches!(read(&app).2, CLIAgentSessionStatus::Blocked { .. }));
+        assert!(matches!(
+            read(&app).2,
+            CLIAgentSessionStatus::Blocked { .. }
+        ));
         model.update(&mut app, |m, ctx| {
             m.update_from_event(view_id, &title_event(CLIAgentEventType::PromptSubmit), ctx)
         });

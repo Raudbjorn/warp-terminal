@@ -21,12 +21,12 @@ use super::{
     matched_group_ids, merge_group_name_matches, non_terminal_search_text_fragments,
     pane_ids_for_display_granularity, pane_search_text_fragments, preferred_agent_tab_titles,
     push_normalized_unique_summary_label, resolve_compact_subtitle, row_custom_name,
-    search_fragments_contain_query,
-    select_summary_pane_kind_icons, should_keep_detail_sidecar_visible_for_mouse_position,
-    should_show_tab_group_header, shows_synced_inputs_indicator,
-    sort_summary_primary_labels_status_first, subtitle_options_for_primary, summary_overflow_count,
-    summary_search_text_fragments, tab_admitted_by_group_name, terminal_kind_badge_label,
-    terminal_primary_line_data, terminal_pull_request_badge_label, terminal_search_text_fragments,
+    search_fragments_contain_query, select_summary_pane_kind_icons,
+    should_keep_detail_sidecar_visible_for_mouse_position, should_show_tab_group_header,
+    shows_synced_inputs_indicator, sort_summary_primary_labels_status_first,
+    subtitle_options_for_primary, summary_overflow_count, summary_search_text_fragments,
+    tab_admitted_by_group_name, terminal_kind_badge_label, terminal_primary_line_data,
+    terminal_pull_request_badge_label, terminal_search_text_fragments,
     terminal_title_fallback_font, uses_outer_group_container, visible_pane_ids_for_detail_target,
     vtab_diff_stats_text,
 };
@@ -1882,9 +1882,18 @@ fn agent_title_glyph_goes_and_the_rest_of_the_title_stays() {
     );
     assert_eq!(strip(Claude, "✳ Claude Code"), "Claude Code");
     assert_eq!(strip(Codex, "⠦ Write story | work"), "Write story | work");
-    assert_eq!(strip(Codex, "[ ! ] Action Required | Create hello.txt | work"), "Create hello.txt | work");
-    assert_eq!(strip(Codex, "[ . ] Action Required | Create hello.txt | work"), "Create hello.txt | work");
-    assert_eq!(strip(Claude, "[ ! ] Action Required | x"), "[ ! ] Action Required | x");
+    assert_eq!(
+        strip(Codex, "[ ! ] Action Required | Create hello.txt | work"),
+        "Create hello.txt | work"
+    );
+    assert_eq!(
+        strip(Codex, "[ . ] Action Required | Create hello.txt | work"),
+        "Create hello.txt | work"
+    );
+    assert_eq!(
+        strip(Claude, "[ ! ] Action Required | x"),
+        "[ ! ] Action Required | x"
+    );
     // Only one glyph followed by a space, and only the row's own agent's glyphs: a title the
     // user wrote keeps its characters.
     assert_eq!(strip(Claude, "◐"), "◐");

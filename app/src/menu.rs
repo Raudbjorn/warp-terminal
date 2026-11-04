@@ -1058,7 +1058,10 @@ impl<A: Action + Clone> MenuItemFields<A> {
             .finish(),
         );
         if self.has_submenu {
-            row.add_child(glyph(warp_core::ui::Icon::SidebarChevron, style.secondary_text));
+            row.add_child(glyph(
+                warp_core::ui::Icon::SidebarChevron,
+                style.secondary_text,
+            ));
         } else if let Some(shortcut) = &self.key_shortcut_label {
             row.add_child(
                 Text::new_inline(shortcut.clone(), font, style.font_size)
@@ -1750,9 +1753,7 @@ impl<A: Action + Clone> MenuItem<A> {
                 let style = style.expect("checked above");
                 Container::new(
                     ConstrainedBox::new(
-                        Rect::new()
-                            .with_background_color(style.separator)
-                            .finish(),
+                        Rect::new().with_background_color(style.separator).finish(),
                     )
                     .with_height(1.)
                     .finish(),

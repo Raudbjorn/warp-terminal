@@ -242,11 +242,20 @@ pub enum WorkspaceAction {
     /// Unpins the tab at the given index.
     UnpinTab(usize),
     /// Sets or clears the user's unread mark on the tab at the given index.
-    SetTabMarkedUnread { pane_group_id: EntityId, unread: bool },
+    SetTabMarkedUnread {
+        pane_group_id: EntityId,
+        unread: bool,
+    },
     /// Puts the tab to sleep in the vertical tabs sidebar, or wakes it.
-    SetTabInactive { pane_group_id: EntityId, inactive: bool },
+    SetTabInactive {
+        pane_group_id: EntityId,
+        inactive: bool,
+    },
     /// Pins the tab's tmux session to the framed sidebar's "Pinned" section, or unpins it.
-    SetTabPinnedInSidebar { pane_group_id: EntityId, pinned: bool },
+    SetTabPinnedInSidebar {
+        pane_group_id: EntityId,
+        pinned: bool,
+    },
     /// Folds or unfolds the framed sidebar's "Other" section (tabs in no group).
     ToggleOtherSectionCollapsed,
     /// Pins the active tab.

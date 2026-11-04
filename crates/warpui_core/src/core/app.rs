@@ -2407,7 +2407,8 @@ impl AppContext {
 
     /// Takes back a desktop notification sent with an identifier.
     pub fn remove_desktop_notification(&self, identifier: &str) {
-        self.platform_delegate.remove_desktop_notification(identifier);
+        self.platform_delegate
+            .remove_desktop_notification(identifier);
     }
 
     /// Delegates to the OS to send a desktop notification.

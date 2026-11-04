@@ -412,7 +412,9 @@ impl CLIAgentSession {
                             let Some(index) = event.payload.tool_name.as_ref().and_then(|tool| {
                                 pending.iter().position(|(name, asked)| {
                                     name == tool
-                                        && (asked.is_none() || target.is_none() || asked.as_ref() == target)
+                                        && (asked.is_none()
+                                            || target.is_none()
+                                            || asked.as_ref() == target)
                                 })
                             }) else {
                                 return None;
@@ -499,10 +501,10 @@ impl CLIAgentSession {
                 // Claude Code reminds of a dialog that waits with a second request naming no
                 // tool; the first one already said what it asks about.
                 match &event.payload.tool_name {
-                    Some(tool) => self.session_context.pending_permission_tools.push((
-                        tool.clone(),
-                        event.payload.tool_input_preview.clone(),
-                    )),
+                    Some(tool) => self
+                        .session_context
+                        .pending_permission_tools
+                        .push((tool.clone(), event.payload.tool_input_preview.clone())),
                     None if matches!(
                         self.status,
                         CLIAgentSessionStatus::Blocked {
@@ -1133,7 +1135,8 @@ impl CLIAgentSessionsModel {
         });
         if waits_for_report {
             // The row shows done from this stop on; the announcement waits for the hook.
-            self.status_changed_at.insert(terminal_view_id, Local::now());
+            self.status_changed_at
+                .insert(terminal_view_id, Local::now());
         } else if let Some(before) = settled_done {
             // The hook says nothing runs: the quiet stop was the turn ending after all, announced
             // as that stop would have been (a turn after a Ctrl-C stays silent).
@@ -1151,7 +1154,8 @@ impl CLIAgentSessionsModel {
                 ),
             });
         } else if new_status.is_none() && background_flipped {
-            self.status_changed_at.insert(terminal_view_id, Local::now());
+            self.status_changed_at
+                .insert(terminal_view_id, Local::now());
             // WarpOss: background work running out after the turn turns the row from working
             // to done without a status change of its own; that is news like a turn ending.
             if had_background_work {
@@ -1188,11 +1192,17 @@ impl CLIAgentSessionsModel {
                 );
             if reopened_finished_turn {
                 let restore_changed_at = self.status_changed_at(terminal_view_id);
-                self.arm_provisional_work(terminal_view_id, previous_status, restore_changed_at, ctx);
+                self.arm_provisional_work(
+                    terminal_view_id,
+                    previous_status,
+                    restore_changed_at,
+                    ctx,
+                );
             } else {
                 self.clear_provisional_work(terminal_view_id);
             }
-            self.status_changed_at.insert(terminal_view_id, Local::now());
+            self.status_changed_at
+                .insert(terminal_view_id, Local::now());
         } else if is_tool_complete {
             // Continued tool activity keeps a provisionally working session working.
             if let Some(work) = self.provisional_work.remove(&terminal_view_id) {
@@ -1400,7 +1410,8 @@ impl CLIAgentSessionsModel {
         let agent = session.agent;
         let session_context = Box::new(session.session_context.clone());
         self.clear_provisional_work(terminal_view_id);
-        self.status_changed_at.insert(terminal_view_id, Local::now());
+        self.status_changed_at
+            .insert(terminal_view_id, Local::now());
         ctx.emit(CLIAgentSessionsModelEvent::StatusChanged {
             terminal_view_id,
             agent,
@@ -1496,7 +1507,8 @@ impl CLIAgentSessionsModel {
         self.abort_pending_cancel(terminal_view_id);
         self.ctrl_c_cancel_state.remove(&terminal_view_id);
         self.clear_provisional_work(terminal_view_id);
-        self.status_changed_at.insert(terminal_view_id, Local::now());
+        self.status_changed_at
+            .insert(terminal_view_id, Local::now());
         if let Some(old) = self.sessions.insert(terminal_view_id, session) {
             ctx.emit(CLIAgentSessionsModelEvent::Ended {
                 terminal_view_id,

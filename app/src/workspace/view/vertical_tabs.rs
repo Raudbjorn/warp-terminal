@@ -1303,7 +1303,10 @@ pub(super) fn tab_terminal_views(
 }
 
 /// Each visible terminal's view id with the pid of its shell, for terminals whose shell is alive.
-pub(super) fn tab_terminal_shell_pids(pane_group: &PaneGroup, app: &AppContext) -> Vec<(EntityId, u32)> {
+pub(super) fn tab_terminal_shell_pids(
+    pane_group: &PaneGroup,
+    app: &AppContext,
+) -> Vec<(EntityId, u32)> {
     pane_group
         .visible_pane_ids()
         .into_iter()
@@ -3725,7 +3728,9 @@ fn render_framed_group_header(
             member_count,
             needs_attention_count,
             is_collapsed,
-            hovered.then(|| sidebar::section_new_tab_button(Some(group_id), mouse_states.new_tab.clone())),
+            hovered.then(|| {
+                sidebar::section_new_tab_button(Some(group_id), mouse_states.new_tab.clone())
+            }),
             app,
         ),
     };
@@ -3825,9 +3830,7 @@ fn render_framed_other_section(
     app: &AppContext,
 ) -> Box<dyn Element> {
     let collapsed = show_header && state.other_section_collapsed;
-    if !show_header
-        && let Ok(mut header_state) = state.other_section_header_mouse_state.lock()
-    {
+    if !show_header && let Ok(mut header_state) = state.other_section_header_mouse_state.lock() {
         // Unmounted header: drop a hover it can no longer see end (see the group header).
         header_state.reset_interaction_state();
     }
@@ -4093,9 +4096,8 @@ fn render_grouped_tab_container(
 
         if framed
             && let Some((last_index, _)) = members.last()
-            && live_drop.is_some_and(|(before, group)| {
-                group == Some(group_id) && before == last_index + 1
-            })
+            && live_drop
+                .is_some_and(|(before, group)| group == Some(group_id) && before == last_index + 1)
         {
             content.add_child(sidebar::insert_line());
         }
@@ -9441,8 +9443,8 @@ pub(super) mod sidebar {
         /// Follows the active theme: a theme with light text on a dark background gets the dark
         /// palette. Every window shares the one theme, so one switch serves them all.
         pub fn sync(app: &AppContext) {
-            let dark = Appearance::as_ref(app).theme().inferred_color_scheme()
-                == ColorScheme::LightOnDark;
+            let dark =
+                Appearance::as_ref(app).theme().inferred_color_scheme() == ColorScheme::LightOnDark;
             DARK.store(dark, Ordering::Relaxed);
         }
 
@@ -9451,7 +9453,12 @@ pub(super) mod sidebar {
         }
 
         const fn white(alpha: u8) -> ColorU {
-            ColorU { r: 255, g: 255, b: 255, a: alpha }
+            ColorU {
+                r: 255,
+                g: 255,
+                b: 255,
+                a: alpha,
+            }
         }
 
         macro_rules! tokens {
@@ -9649,9 +9656,7 @@ pub(super) mod sidebar {
         let status = match framed_summary_conversation_status_for_terminal(terminal_view, app) {
             _ if props.is_inactive => RowStatus::Idle,
             Some(status) => status_from_conversation(&status),
-            None if props.hosts_tmux_agent
-                || agent_waiting_for_first_turn(terminal_view, app) =>
-            {
+            None if props.hosts_tmux_agent || agent_waiting_for_first_turn(terminal_view, app) => {
                 RowStatus::Pending
             }
             None => RowStatus::Shell,
@@ -9842,9 +9847,11 @@ pub(super) mod sidebar {
                     stack.add_child(glyph(WarpIcon::SidebarDoneTickRead, colors::RING(), 15.));
                 }
             }
-            RowStatus::Pending => {
-                stack.add_child(glyph(WarpIcon::SidebarDoneRing, colors::PENDING_RING(), 15.))
-            }
+            RowStatus::Pending => stack.add_child(glyph(
+                WarpIcon::SidebarDoneRing,
+                colors::PENDING_RING(),
+                15.,
+            )),
             RowStatus::Working => {
                 stack.add_child(glyph(WarpIcon::SidebarWorkingTrack, colors::TRACK(), 15.));
                 // The turning arc is a native layer where the window has one (working_rings);
@@ -10166,7 +10173,9 @@ pub(super) mod sidebar {
         .with_corner_radius(CornerRadius::with_all(Radius::Pixels(3.)))
         .finish();
         // Capped, so a long group name ellipsizes instead of widening the sidebar.
-        let badge = ConstrainedBox::new(badge).with_max_width(GROUP_BADGE_MAX_WIDTH).finish();
+        let badge = ConstrainedBox::new(badge)
+            .with_max_width(GROUP_BADGE_MAX_WIDTH)
+            .finish();
         Flex::row()
             .with_main_axis_size(MainAxisSize::Min)
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
@@ -10624,8 +10633,7 @@ pub(super) mod sidebar {
         let mut rows = Vec::with_capacity(2);
         for names in [true, false] {
             let mut row = Flex::row().with_cross_axis_alignment(CrossAxisAlignment::Center);
-            for (index, (ring, mouse_state)) in rings.iter().zip(&state.mouse_states).enumerate()
-            {
+            for (index, (ring, mouse_state)) in rings.iter().zip(&state.mouse_states).enumerate() {
                 let picture = ConstrainedBox::new(
                     warpui::elements::Image::new(
                         warpui::assets::asset_cache::AssetSource::Raw {
@@ -11072,7 +11080,11 @@ pub(super) mod sidebar {
         workspace: &Workspace,
     ) -> Option<(usize, Option<crate::workspace::tab_group::TabGroupId>)> {
         let target = workspace.sidebar_drop_target?;
-        if !workspace.tabs.iter().any(|tab| tab.draggable_state.is_dragging()) {
+        if !workspace
+            .tabs
+            .iter()
+            .any(|tab| tab.draggable_state.is_dragging())
+        {
             return None;
         }
         Some((target.before_index(&workspace.tabs)?, target.group))
@@ -11125,15 +11137,18 @@ pub(super) mod sidebar {
             .get(&tab.pane_group.id())
             .map(|path| tilde_path(path))
             .or_else(|| {
-                pane_group.visible_pane_ids().into_iter().find_map(|pane_id| {
-                    let TypedPane::Terminal(terminal_pane) =
-                        pane_group.resolve_pane_type(pane_id, app)
-                    else {
-                        return None;
-                    };
-                    let terminal_view = terminal_pane.terminal_view(app);
-                    resolved_terminal_working_directory(terminal_view.as_ref(app), app)
-                })
+                pane_group
+                    .visible_pane_ids()
+                    .into_iter()
+                    .find_map(|pane_id| {
+                        let TypedPane::Terminal(terminal_pane) =
+                            pane_group.resolve_pane_type(pane_id, app)
+                        else {
+                            return None;
+                        };
+                        let terminal_view = terminal_pane.terminal_view(app);
+                        resolved_terminal_working_directory(terminal_view.as_ref(app), app)
+                    })
             })
             .unwrap_or_default();
         let time = status_time(status, terminal_view_id, app);
@@ -11572,7 +11587,9 @@ pub(in crate::workspace::view) mod limit_sources {
         let (current, permissions) = match std::fs::read_to_string(&settings) {
             Ok(text) => (
                 Some(text),
-                std::fs::metadata(&settings).ok().map(|meta| meta.permissions()),
+                std::fs::metadata(&settings)
+                    .ok()
+                    .map(|meta| meta.permissions()),
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
             Err(error) => return Err(error),

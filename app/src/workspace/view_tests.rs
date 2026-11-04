@@ -5491,9 +5491,16 @@ fn test_new_tab_at_end_of_section_lands_last_and_active() {
 
             workspace.handle_action(&WorkspaceAction::NewTabAtEndOfSection(Some(group_id)), ctx);
             assert_eq!(workspace.tab_count(), 5);
-            assert_eq!(workspace.active_tab_index(), 2, "last in the group, not after tab 0");
+            assert_eq!(
+                workspace.active_tab_index(),
+                2,
+                "last in the group, not after tab 0"
+            );
             let groups: Vec<_> = workspace.tabs.iter().map(|t| t.group_id).collect();
-            assert_eq!(groups, [Some(group_id), Some(group_id), Some(group_id), None, None]);
+            assert_eq!(
+                groups,
+                [Some(group_id), Some(group_id), Some(group_id), None, None]
+            );
 
             // "Other": ungrouped, at the very end, even while a group member is active.
             workspace.activate_tab(0, ctx);
@@ -5502,7 +5509,11 @@ fn test_new_tab_at_end_of_section_lands_last_and_active() {
             assert_eq!(workspace.active_tab_index(), 5);
             assert_eq!(workspace.tabs[5].group_id, None);
             assert_eq!(
-                workspace.tabs.iter().filter(|t| t.group_id == Some(group_id)).count(),
+                workspace
+                    .tabs
+                    .iter()
+                    .filter(|t| t.group_id == Some(group_id))
+                    .count(),
                 3
             );
         });
@@ -6502,7 +6513,9 @@ fn test_vertical_tabs_full_tab_menu_setting_switches_tab_menu() {
             // menu, so Warp's "Pin tab" does not repeat it.
             assert!(!menu_has(&items, "Pin tab"));
             workspace.add_sidebar_pin_menu_item(0, &mut items, ctx);
-            assert!(items[0].is_approximately_same_item_as(&MenuItemFields::new("Pin").into_item()));
+            assert!(
+                items[0].is_approximately_same_item_as(&MenuItemFields::new("Pin").into_item())
+            );
             for label in [
                 "Mark as unread",
                 "Mark inactive",
