@@ -440,7 +440,7 @@ pub struct LocalMultiAgentManager {
 impl LocalMultiAgentManager {
     pub fn new(ctx: &mut ModelContext<Self>) -> Self {
         let config = load_config_with_legacy_migration(ctx);
-        let status = if ChannelState::is_local_only() {
+        let status = if network_policy::is_local_only() {
             LocalMultiAgentStatus::Starting
         } else {
             LocalMultiAgentStatus::Disabled
@@ -460,13 +460,13 @@ impl LocalMultiAgentManager {
             original_server_root_url: None,
             failed_with_allow_list: None,
         };
-        if ChannelState::is_local_only() {
+        if network_policy::is_local_only() {
             manager.schedule_restart(ctx);
         }
         ctx.subscribe_to_model(&AISettings::handle(ctx), |manager, _, _, ctx| {
             // Another subscriber may not have applied the new setting yet; applying is idempotent.
             AISettings::as_ref(ctx).apply_network_policy();
-            if ChannelState::is_local_only() && manager.allow_list_needs_restart() {
+            if network_policy::is_local_only() && manager.allow_list_needs_restart() {
                 // The running service still enforces the old allow-list, so it must not take
                 // requests while the debounce waits to start its replacement.
                 manager.revoke_running_service();
@@ -523,7 +523,7 @@ impl LocalMultiAgentManager {
             network_policy::EndpointSource::ProfileSettings,
             urls.iter().map(String::as_str),
         );
-        if ChannelState::is_local_only() && self.allow_list_needs_restart() {
+        if network_policy::is_local_only() && self.allow_list_needs_restart() {
             self.revoke_running_service();
             self.schedule_restart(ctx);
         }
@@ -795,7 +795,7 @@ impl LocalMultiAgentManager {
     }
 
     fn schedule_restart(&mut self, ctx: &mut ModelContext<Self>) {
-        if !ChannelState::is_local_only() {
+        if !network_policy::is_local_only() {
             self.stop_child();
             self.status = LocalMultiAgentStatus::Disabled;
             self.unpublish_service_url();

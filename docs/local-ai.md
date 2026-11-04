@@ -19,7 +19,7 @@ known to be incomplete, the text says so and links the tracking issue.
 | Where the code runs | In the app: `LocalOpenAIClient` (`app/src/ai/local_openai.rs`) | In the app: the `local_agent` crate (`crates/local_agent`), chosen by `app/src/ai/agent/api/local_route.rs` | A bundled child process, `warp-local-multi-agent` (`crates/local_multi_agent_service`), started by `app/src/local_multi_agent` when the app starts. It listens on `127.0.0.1:8787` by default |
 | Where you configure it | **Settings → Local AI**, or `[agents.local_openai]` in `settings.toml` | **Settings → Agents → Warp Agent → Custom Inference → Add custom endpoint** (base URL, API key, model names), when the workspace policy allows it | **Settings → Agents → Agent Profiles**, section *LOCAL INFERENCE* (API key, *OpenAI Base URL*, model aliases, *Autocomplete* switch) |
 | Providers | OpenAI-compatible Chat Completions, or OpenCode | Custom endpoints that use the OpenAI Chat Completions schema | OpenAI-compatible Chat Completions |
-| Network policy | Enforced: loopback, allowed private hosts, and the `https` host of the configured base URL (see [Network behavior](#network-behavior-in-the-oss-build)) | Not enforced: the engine uses a plain `reqwest` client | Not enforced: the service and the app's health and `/models` calls use plain `reqwest` clients ([#32](https://github.com/Raudbjorn/warp-terminal/issues/32)) |
+| Network policy | Enforced: loopback, allowed private hosts, and the `https` host of the configured base URL (see [Network behavior](#network-behavior-in-the-oss-build)) | Enforced: the engine's requests go through `network_policy` | Enforced: the service's provider calls and the app's health, `/models` and autocomplete calls go through `network_policy`; the app passes its policy to the service when it starts it |
 
 > **Turn on *Use Local AI provider* first.** In the OSS build AI counts as
 > enabled only while `agents.local_openai.enabled` is on: `is_any_ai_enabled`
@@ -194,17 +194,13 @@ and auto-update configuration unset. Concretely:
   Everything else, public or private, is denied with `NetworkPolicyDenied`, and
   so is a hostname that merely resolves to loopback. Every redirect hop is
   checked again, and system proxy settings are ignored.
-- **Warp Agent conversations and the bundled service are not covered by that
-  check. This is a known limitation.** The conversation engine
-  (`crates/local_agent`) and the service make their own requests to the
-  provider, and the app's health check, model-list refresh and autocomplete
-  calls to the service use plain `reqwest` clients too. None of them applies
-  `network_policy`, re-validates redirects or bypasses system proxies. A
-  provider URL you configure can therefore point at a non-loopback host, and the
-  API key and prompt content go there, possibly through `HTTP(S)_PROXY` and
-  after redirects. Routing the app and service calls through the policy is
-  tracked in [#32](https://github.com/Raudbjorn/warp-terminal/issues/32). Whether
-  LAN and Tailscale endpoints should become an explicit opt-in is open in
+- **Warp Agent conversations and the bundled service follow the same policy.**
+  The conversation engine (`crates/local_agent`), the service's provider calls
+  and the app's health check, model-list refresh and autocomplete calls apply
+  `network_policy`, re-validate redirects and ignore system proxy settings. The
+  app passes its policy to the service through the environment and restarts the
+  service when the allowed hosts or configured endpoints change. Whether LAN and
+  Tailscale endpoints should become an explicit opt-in is open in
   [#33](https://github.com/Raudbjorn/warp-terminal/issues/33).
 - **No account or Warp server.** There is no login step, and Warp server URLs
   are the local-only configuration.
@@ -219,8 +215,8 @@ and auto-update configuration unset. Concretely:
 |---|---|
 | Single-shot Local AI, OpenAI-compatible | Loopback, allowed private hosts, and the `https` origin of the configured base URL |
 | Single-shot Local AI, OpenCode | Loopback to the sidecar; the sidecar reaches whatever its configured provider uses |
-| Warp Agent conversations | Whatever base URL the custom endpoint sets (not policy-checked) |
-| Bundled service (autocomplete, *Test*, model discovery) | Whatever base URL the profile sets (not policy-checked; `https://api.openai.com/v1` when empty) |
+| Warp Agent conversations | Loopback, allowed private hosts, and the `https` origins of the configured custom endpoints |
+| Bundled service (autocomplete, *Test*, model discovery) | Loopback, allowed private hosts, and the `https` origins of the profile base URLs and custom endpoints; an empty base URL targets `https://api.openai.com/v1`, which is denied until you configure it |
 | Telemetry, auto-update | Not configured in the OSS channel |
 
 ## Keeping this page accurate
