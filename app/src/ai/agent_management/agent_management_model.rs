@@ -159,7 +159,18 @@ impl AgentNotificationsModel {
                 }
                 // WarpOss: a toast only for a change the sidebar shows, like the desktop
                 // notification (repeats, fall-backs under background work and Ctrl-C stay quiet).
-                _ if !*announce => {}
+                // A quiet change that leaves the blocked state still takes the earlier request
+                // back (a permission answered while subagents run): it is no longer true. A
+                // repeat of the blocked state keeps its request.
+                _ if !*announce => {
+                    if !matches!(status, CLIAgentSessionStatus::Blocked { .. })
+                        && self.notifications.remove_request_by_origin(
+                            NotificationOrigin::CLISession(*terminal_view_id),
+                        )
+                    {
+                        ctx.emit(AgentManagementEvent::NotificationUpdated);
+                    }
+                }
                 CLIAgentSessionStatus::Success => {
                     let title = session_context
                         .display_title()

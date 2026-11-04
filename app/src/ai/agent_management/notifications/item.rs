@@ -150,6 +150,15 @@ impl NotificationItems {
         self.items.len() != before
     }
 
+    /// Removes only the "needs attention" request of `key`, keeping what it announced before or
+    /// after (a completion, an error).
+    pub(crate) fn remove_request_by_origin(&mut self, key: NotificationOrigin) -> bool {
+        let before = self.items.len();
+        self.items
+            .retain(|item| item.origin != key || item.category != NotificationCategory::Request);
+        self.items.len() != before
+    }
+
     pub(crate) fn items_filtered(
         &self,
         filter: NotificationFilter,
