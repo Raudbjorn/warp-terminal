@@ -22,7 +22,11 @@ file = "~/.cache/limit-rings.json"
 The file is one JSON object. A top-level key is one provider when its value is an object with at
 least one of `_ts`, `used5h` or `usedWeek`; the footer shows providers sorted by key. Keys that
 start with `_` and any other values are ignored, so metadata such as `"_version": 1` or
-`"_meta": {...}` can sit next to the providers. A provider that is not in the file has no ring.
+`"_meta": {...}` can sit next to the providers. A provider that is not in the file keeps whatever ring the app's own reading gives it: Claude
+and Codex rings come from the app and stay unless the file has an entry under the same key
+(`claude`, `codex`), which replaces the app's reading. To hide one of them, give its key an object
+with none of `_ts`, `used5h` and `usedWeek`, for example `"claude": {}`. Any other provider has a
+ring only if the file lists it.
 
 ```json
 {
