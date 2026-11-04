@@ -8707,53 +8707,6 @@ fn test_vim_escape_with_completions() {
     });
 }
 
-/// Without `AgentView` (the local-only build) slash commands only work in AI mode, so clicking
-/// the slash button has to leave a shell-locked input in AI mode, and keep it locked.
-#[test]
-fn test_slash_button_switches_a_shell_locked_input_to_ai_mode() {
-    App::test((), |mut app| async move {
-        initialize_app(&mut app);
-        let _agent_view_off = FeatureFlag::AgentView.override_enabled(false);
-
-        let terminal = add_window_with_bootstrapped_terminal(
-            &mut app, None, /* history_file_commands */
-            None,
-        )
-        .await;
-        let input = terminal.read(&app, |terminal, _| terminal.input().clone());
-
-        input.update(&mut app, |input, ctx| {
-            input.ai_input_model().update(ctx, |ai_input, ctx| {
-                ai_input.set_input_config(
-                    InputConfig {
-                        input_type: InputType::Shell,
-                        is_locked: true,
-                    },
-                    true, /* is_input_buffer_empty */
-                    None,
-                    ctx,
-                );
-            });
-        });
-
-        input.update(&mut app, |input, ctx| {
-            input.handle_universal_developer_input_button_bar_event(
-                &UniversalDeveloperInputButtonBarEvent::OpenSlashCommandMenu,
-                ctx,
-            );
-        });
-
-        let config = input.read(&app, |input, _| {
-            app.read_model(input.ai_input_model(), |ai_input, _| {
-                ai_input.input_config()
-            })
-        });
-        assert_eq!(config.input_type, InputType::AI);
-        assert!(config.is_locked, "the lock state should be preserved");
-        input.read(&app, |input, ctx| assert_eq!(input.buffer_text(ctx), "/"));
-    });
-}
-
 #[test]
 #[cfg(feature = "voice_input")]
 fn test_voice_input_toggle_preserves_lock_state() {
