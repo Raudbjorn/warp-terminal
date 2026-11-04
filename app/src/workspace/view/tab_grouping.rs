@@ -1723,10 +1723,6 @@ impl Workspace {
 #[derive(Default)]
 pub(super) struct ClaudeNotices {
     entries: std::collections::HashMap<EntityId, claude_waits::notify::Entry<NoticeTarget>>,
-    /// Terminals an Allow or Deny is being typed into: one answer at a time each.
-    answering: HashSet<EntityId>,
-    /// Terminals whose answer from a notification closed their dialog since the last sync.
-    answered: HashSet<EntityId>,
 }
 
 /// Where a Claude dialog's notification points.
@@ -1737,8 +1733,6 @@ pub(super) struct NoticeTarget {
     pane_id: crate::pane_group::PaneId,
     /// The session's name, the notification's title.
     title: String,
-    /// The dialog was read from the normal screen, where the pty's keys reach Claude itself.
-    answerable: bool,
 }
 
 /// Notification identifiers, unique across the app's windows.
@@ -1757,33 +1751,21 @@ fn next_notice_id() -> String {
     format!("harp-claude-{}-{n}", std::process::id())
 }
 
-/// The visible rows of a terminal's screen, from Warp's own grid, and whether keys written to
-/// its pty reach what it shows: not through a multiplexer, which can draw one pane and send
-/// them to another. Claude Code 2.1 draws on the alternate screen, so that one is read too.
+/// The visible rows of a terminal's screen, from Warp's own grid. Claude Code 2.1 draws on the
+/// alternate screen, so that one is read too.
 #[cfg(not(target_family = "wasm"))]
-fn claude_screen(view: &crate::terminal::TerminalView) -> (String, bool) {
+fn claude_screen(view: &crate::terminal::TerminalView) -> String {
     let model = view.model.lock();
-    let block = model.block_list().active_block();
     if model.is_alt_screen_active() {
-        let answerable = !claude_waits::dialog::runs_multiplexer(&block.command_to_string());
-        return (
-            model.alt_screen().output_to_string(),
-            ANSWER_FROM_NOTIFICATIONS && answerable,
-        );
+        return model.alt_screen().output_to_string();
     }
     let rows = model.block_list().size().rows();
-    (
-        block.output_grid().contents_to_string(false, Some(rows)),
-        ANSWER_FROM_NOTIFICATIONS,
-    )
+    model
+        .block_list()
+        .active_block()
+        .output_grid()
+        .contents_to_string(false, Some(rows))
 }
-
-/// ponytail: Allow and Deny type keys into the pty, which can race the user's own keys, reach
-/// another pane of a multiplexer started through a wrapper, or answer a repeat of the same dialog
-/// (review, 26 Oct). Until an answer is bound to one permission request, notifications only open
-/// the chat.
-#[cfg(not(target_family = "wasm"))]
-const ANSWER_FROM_NOTIFICATIONS: bool = false;
 
 /// Whether the sidebar shows this terminal's Claude Code as "needs you".
 #[cfg(not(target_family = "wasm"))]
@@ -1803,7 +1785,7 @@ fn claude_needs_you(view: &crate::terminal::TerminalView, ctx: &warpui::AppConte
 impl Workspace {
     /// With the Claude wait poll (2 s): reads the screen of every shown terminal whose Claude
     /// Code needs the user, sends one notification per new dialog unless its terminal is in
-    /// view, and takes back those answered elsewhere or whose terminal closed. Follows the
+    /// view, and forgets those answered elsewhere or whose terminal closed. Follows the
     /// needs-attention notification setting, whose plain notification it replaces for Claude.
     fn sync_claude_notices(&mut self, ctx: &mut ViewContext<Self>) {
         use crate::terminal::session_settings::{NotificationsMode, SessionSettings};
@@ -1828,16 +1810,10 @@ impl Workspace {
         .unwrap_or_default()
         .into_iter()
         .collect();
-        // An answer still being typed counts too: a sync can fall between its Enter and its end.
-        let answered: HashSet<EntityId> = std::mem::take(&mut self.claude_notices.answered)
-            .into_iter()
-            .chain(self.claude_notices.answering.iter().copied())
-            .collect();
         let changes = notify::update(
             &mut self.claude_notices.entries,
             waiting,
             &in_view,
-            &answered,
             next_notice_id,
         );
         for terminal in changes {
@@ -1847,7 +1823,7 @@ impl Workspace {
             let body = notify::content(&entry.card);
             let (id, target) = (entry.id.clone(), entry.target.clone());
             log::info!("Claude dialog notification {id}");
-            self.send_claude_notice(terminal, &target, id, body, ctx);
+            self.send_claude_notice(&target, body, ctx);
         }
     }
 
@@ -1878,13 +1854,12 @@ impl Workspace {
                 let title = session
                     .and_then(|session| session.session_context.display_title())
                     .unwrap_or_else(|| "Claude Code".to_owned());
-                let (screen, answerable) = claude_screen(view);
+                let screen = claude_screen(view);
                 let card = dialog::card_on_screen(&screen).unwrap_or(Card::Waiting(message));
                 let target = NoticeTarget {
                     pane_group_id: tab.pane_group.id(),
                     pane_id,
                     title,
-                    answerable,
                 };
                 waiting.push((view.id(), claude_waits::notify::Read { card, target }));
             }
@@ -1892,23 +1867,14 @@ impl Workspace {
         waiting
     }
 
-    /// Sends one Claude notification; its data names the window, the pane and its own id.
-    fn send_claude_notice(
-        &self,
-        terminal: EntityId,
-        target: &NoticeTarget,
-        id: String,
-        body: String,
-        ctx: &mut ViewContext<Self>,
-    ) {
+    /// Sends one Claude notification; a click on it focuses the pane that showed the dialog.
+    fn send_claude_notice(&self, target: &NoticeTarget, body: String, ctx: &mut ViewContext<Self>) {
         use crate::terminal::session_settings::SessionSettings;
         use warpui::notification::UserNotification;
-        let data = crate::notification::NotificationContext::ClaudeWait {
+        let data = crate::notification::NotificationContext::BlockOrigin {
             window_id: ctx.window_id(),
             pane_group_id: target.pane_group_id,
             pane_id: target.pane_id,
-            terminal_view_id: terminal,
-            id: id.clone(),
         };
         let Ok(data) = serde_json::to_string(&data) else {
             return;
@@ -1917,8 +1883,7 @@ impl Workspace {
             .notifications
             .play_notification_sound;
         let content =
-            UserNotification::new_with_sound(target.title.clone(), body, Some(data), play_sound)
-                .with_identifier(id);
+            UserNotification::new_with_sound(target.title.clone(), body, Some(data), play_sound);
         let failed = |_: &mut Self,
                       error: warpui::notification::NotificationSendError,
                       _: &mut ViewContext<Self>| {
@@ -1932,133 +1897,6 @@ impl Workspace {
                 ctx.send_desktop_notification(content, failed);
             });
         }
-    }
-
-    /// A click on a Claude notification (lib.rs `on_notification_clicked`). Allow or Deny
-    /// types the answer into the terminal that showed the dialog, re-reading its screen before
-    /// every key; a dialog that is gone or changed gets no key and a notification saying so.
-    /// Returns whether the pane should be focused (Open chat, or a click on the notification).
-    pub(crate) fn claude_notice_clicked(
-        &mut self,
-        click: &crate::notification::ClaudeNoticeClick,
-        ctx: &mut ViewContext<Self>,
-    ) -> bool {
-        use claude_waits::answer::Answer;
-        use claude_waits::dialog::Card;
-        use claude_waits::notify::{self, Act};
-        let terminal = click.terminal_view_id;
-        let entry = notify::clicked(&self.claude_notices.entries, &terminal, &click.id)
-            .map(|entry| (entry.card.clone(), entry.target.clone()));
-        let answerable = entry.as_ref().is_some_and(|(_, target)| target.answerable);
-        let card = entry.as_ref().map(|(card, _)| card);
-        match notify::act(click.action.as_deref(), card, answerable) {
-            Act::Open => true,
-            Act::Refuse(reason) => {
-                let target = entry
-                    .map(|(_, target)| target)
-                    .unwrap_or_else(|| NoticeTarget {
-                        pane_group_id: click.pane_group_id,
-                        pane_id: click.pane_id,
-                        title: "Claude Code".to_owned(),
-                        answerable: false,
-                    });
-                self.claude_notice_refused(terminal, &target, reason, ctx);
-                false
-            }
-            Act::Pick(index) => {
-                let Some((Card::Approval(dialog), target)) = entry else {
-                    return false;
-                };
-                if self.claude_notices.answering.insert(terminal) {
-                    self.step_claude_answer(terminal, target, Answer::new(dialog, index), ctx);
-                }
-                false
-            }
-        }
-    }
-
-    /// One step of an Allow or Deny: reads the terminal, presses the next key through its
-    /// pty, and comes back after `KEY_STEP` until the dialog closed or the answer refused.
-    fn step_claude_answer(
-        &mut self,
-        terminal: EntityId,
-        target: NoticeTarget,
-        mut answer: claude_waits::answer::Answer,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        use crate::terminal::model::escape_sequences::EscCodes;
-        use claude_waits::answer::{KEY_STEP, Key, Step, TERMINAL_GONE};
-        let view = self.claude_terminal(terminal, &target, ctx);
-        let step = match &view {
-            None => Step::Refuse(TERMINAL_GONE),
-            Some(view) => {
-                let view = view.as_ref(ctx);
-                let (screen, answerable) = claude_screen(view);
-                let now = claude_waits::dialog::dialog_on_screen(&screen);
-                answer.next(now.as_ref(), answerable && claude_needs_you(view, ctx))
-            }
-        };
-        let press = match step {
-            Step::Press(key) => Some(key),
-            Step::Wait => None,
-            Step::Done => {
-                log::info!("Claude dialog answered from its notification");
-                self.claude_notices.answering.remove(&terminal);
-                self.claude_notices.answered.insert(terminal);
-                return;
-            }
-            Step::Refuse(reason) => {
-                log::info!("Claude dialog answer refused: {reason}");
-                self.claude_notices.answering.remove(&terminal);
-                self.claude_notice_refused(terminal, &target, reason, ctx);
-                return;
-            }
-        };
-        if let (Some(key), Some(view)) = (press, &view) {
-            let bytes = {
-                let model = view.as_ref(ctx).model.lock();
-                match key {
-                    Key::Up => EscCodes::build_escape_sequence(&*model, &[EscCodes::ARROW_UP]),
-                    Key::Down => EscCodes::build_escape_sequence(&*model, &[EscCodes::ARROW_DOWN]),
-                    Key::Enter => b"\r".to_vec(),
-                }
-            };
-            view.update(ctx, |view, ctx| view.write_to_pty(bytes, ctx));
-        }
-        ctx.spawn(
-            warpui::r#async::Timer::after(KEY_STEP),
-            move |me, _, ctx| {
-                me.step_claude_answer(terminal, target, answer, ctx);
-            },
-        );
-    }
-
-    /// The terminal a notification points at, if it is still shown in its tab.
-    fn claude_terminal(
-        &self,
-        terminal: EntityId,
-        target: &NoticeTarget,
-        ctx: &ViewContext<Self>,
-    ) -> Option<warpui::ViewHandle<crate::terminal::TerminalView>> {
-        let tab = self
-            .tabs
-            .iter()
-            .find(|tab| tab.pane_group.id() == target.pane_group_id)?;
-        super::vertical_tabs::tab_terminal_views(tab.pane_group.as_ref(ctx), ctx)
-            .into_iter()
-            .find(|(pane_id, view)| *pane_id == target.pane_id && view.id() == terminal)
-            .map(|(_, view)| view)
-    }
-
-    /// A refused answer: nothing was typed, and a notification of its own says why.
-    fn claude_notice_refused(
-        &self,
-        terminal: EntityId,
-        target: &NoticeTarget,
-        reason: &str,
-        ctx: &mut ViewContext<Self>,
-    ) {
-        self.send_claude_notice(terminal, target, next_notice_id(), reason.to_owned(), ctx);
     }
 }
 
@@ -3115,8 +2953,6 @@ pub(in crate::workspace::view) mod claude_waits {
     /// Claude Code's open dialog read from Warp's own terminal grid (no tmux needed), for the
     /// notifications in `notify`.
     pub(in crate::workspace::view) mod dialog {
-        pub(in crate::workspace::view) const DIALOG_CHANGED: &str =
-            "The question changed in the terminal; nothing was sent";
 
         /// A ❯ list Claude Code draws (warp-mobile bridge's `Dialog`).
         #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3298,21 +3134,6 @@ pub(in crate::workspace::view) mod claude_waits {
             Some(Card::Dialog(dialog))
         }
 
-        /// Whether `command` (a terminal's running command) is a terminal multiplexer, which can
-        /// draw one pane and send the keys it gets to another.
-        pub(in crate::workspace::view) fn runs_multiplexer(command: &str) -> bool {
-            command
-                .split_whitespace()
-                .find(|word| !word.contains('=') && !matches!(*word, "exec" | "command" | "env"))
-                .and_then(|program| program.rsplit('/').next())
-                .is_some_and(|program| {
-                    matches!(
-                        program,
-                        "tmux" | "screen" | "zellij" | "byobu" | "dtach" | "abduco"
-                    )
-                })
-        }
-
         /// What a permission names from the screen alone: the first line under the dialog's
         /// title, never Claude's "Tip: …" line.
         pub(in crate::workspace::view) fn approval_subject(dialog: &ScreenDialog) -> &str {
@@ -3329,36 +3150,21 @@ pub(in crate::workspace::view) mod claude_waits {
         pub(in crate::workspace::view) mod tests;
     }
 
-    /// Desktop notifications for Claude Code dialogs, with Allow, Deny and Open chat. The trigger
-    /// is the one the sidebar paints "needs you" from: a Claude Code session in a visible terminal
-    /// that is blocked. Pure logic only; reading the grid, posting and pressing keys is in
-    /// `Workspace::sync_claude_notices` and `Workspace::claude_notice_clicked`.
+    /// Desktop notifications for Claude Code dialogs; a click focuses the pane that showed one.
+    /// The trigger is the one the sidebar paints "needs you" from: a Claude Code session in a
+    /// visible terminal that is blocked. Pure logic only; reading the grid and posting is in
+    /// `Workspace::sync_claude_notices`.
     ///
     /// How this can go wrong, and the test that pins each case:
-    /// 1. Stale dialog: the notification showed one dialog, the screen now shows another (or the
-    ///    same title with another command), or none. An answer must press nothing:
-    ///    `an_action_answers_only_the_dialog_its_notification_showed`,
-    ///    `answer::tests::an_answer_presses_nothing_once_the_dialog_changed`,
-    ///    `answer::tests::an_answer_stops_when_the_dialog_changes_mid_selection`.
-    /// 2. Wrong pane: keys may only go to the terminal whose screen showed the dialog, never to a
-    ///    split next to it, and never through a full-screen program (tmux, screen) that can route
-    ///    them to a pane other than the one it draws: entries are kept per terminal
-    ///    (`each_terminal_gets_its_own_notification`), an answer re-reads that very terminal
-    ///    before every key, and a dialog behind a multiplexer only opens the chat
-    ///    (`a_dialog_behind_a_full_screen_program_only_opens_the_chat`,
-    ///    `dialog::tests::a_multiplexer_is_never_typed_through`).
-    /// 3. App in the background: a dialog notifies only while its terminal is out of view, one
-    ///    first seen in view never notifies, and one that comes into view is taken back:
+    /// 1. A second notification for the same dialog, or one for a terminal's dialog that shows
+    ///    another terminal's: entries are kept per terminal and a moved ❯ is no new dialog
+    ///    (`each_terminal_gets_its_own_notification`, `one_dialog_notifies_once`).
+    /// 2. App in the background: a dialog notifies only while its terminal is out of view, and one
+    ///    first seen in view never notifies:
     ///    `the_terminal_in_view_gets_no_notification`, `only_the_front_window_s_active_tab_is_in_view`.
-    ///    Allow and Deny answer without bringing the app forward (notifications.m).
-    /// 4. Answered in the terminal: once Claude stops waiting or the dialog leaves the screen the
-    ///    notification is taken back, and a late click on it refuses:
-    ///    `an_answered_dialog_takes_its_notification_back`, `one_dialog_notifies_once`,
-    ///    `answer::tests::a_claude_that_stopped_waiting_gets_no_key`.
-    /// 5. Keys that do not land are reported, not repeated:
-    ///    `answer::tests::a_selection_that_does_not_move_is_reported`,
-    ///    `answer::tests::enter_that_leaves_the_dialog_open_is_reported`.
-    /// 6. A hook that reports the wait before Claude drew its dialog must not post a generic
+    /// 3. Answered in the terminal: once Claude stops waiting or the dialog leaves the screen its
+    ///    entry goes, so the next dialog notifies: `an_answered_dialog_drops_its_entry`.
+    /// 4. A hook that reports the wait before Claude drew its dialog must not post a generic
     ///    notification right before the real one: `a_wait_without_a_dialog_notifies_one_read_later`.
     pub(in crate::workspace::view) mod notify {
         use std::collections::{HashMap, HashSet};
@@ -3366,19 +3172,16 @@ pub(in crate::workspace::view) mod claude_waits {
 
         use super::dialog::{self, Card};
 
-        const ALLOW: &str = "approve-0";
-        const DENY: &str = "approve-deny";
-
         /// A dialog notified, or seen in view and so never notified, per terminal.
         #[derive(Clone, Debug)]
         pub(in crate::workspace::view) struct Entry<X> {
-            /// The notification's identifier, also in its data.
+            /// The notification's own id, for the log.
             pub id: String,
-            /// The dialog as the notification showed it: what an answer must still find.
+            /// The dialog as the notification showed it: a different one is a new notification.
             pub card: Card,
             /// A wait without a dialog, read once: it posts on the next read if it still has none.
             pub held: bool,
-            /// Where to answer it.
+            /// Where its notification points.
             pub target: X,
         }
 
@@ -3386,16 +3189,6 @@ pub(in crate::workspace::view) mod claude_waits {
         pub(in crate::workspace::view) struct Read<X> {
             pub card: Card,
             pub target: X,
-        }
-
-        /// What a click on a notification does.
-        #[derive(Debug, PartialEq, Eq)]
-        pub(in crate::workspace::view) enum Act {
-            /// Pick this option of the dialog the notification showed.
-            Pick(usize),
-            Open,
-            /// Allow or Deny for a dialog that is gone: nothing is sent, the reason shows.
-            Refuse(&'static str),
         }
 
         fn same(a: &Card, b: &Card) -> bool {
@@ -3422,16 +3215,12 @@ pub(in crate::workspace::view) mod claude_waits {
 
         /// Brings `entries` up to `waiting` (each terminal whose Claude waits, and what its screen
         /// shows) and says which terminals' notifications to send. A terminal missing from
-        /// `waiting` no longer waits or closed, and its entry goes. A dialog first seen while its terminal is in
-        /// view (`in_view`) is kept unsent: the user saw it, so it never notifies. So is a wait
-        /// without a dialog in a terminal whose dialog was just answered from a notification
-        /// (`answered`): Claude fires no hook on a denial (nor before a long allowed tool ends),
-        /// so its need, and the denied command's text, outlive the dialog.
+        /// `waiting` no longer waits or closed, and its entry goes. A dialog first seen while its
+        /// terminal is in view (`in_view`) is kept unsent: the user saw it, so it never notifies.
         pub(in crate::workspace::view) fn update<T: Copy + Eq + Hash, X>(
             entries: &mut HashMap<T, Entry<X>>,
             waiting: Vec<(T, Read<X>)>,
             in_view: &HashSet<T>,
-            answered: &HashSet<T>,
             mut new_id: impl FnMut() -> String,
         ) -> Vec<T> {
             let mut changes = Vec::new();
@@ -3447,8 +3236,7 @@ pub(in crate::workspace::view) mod claude_waits {
                 let Some(read) = now.remove(&terminal) else {
                     continue;
                 };
-                let seen = in_view.contains(&terminal)
-                    || (answered.contains(&terminal) && matches!(read.card, Card::Waiting(_)));
+                let seen = in_view.contains(&terminal);
                 if let Some(entry) = entries.get_mut(&terminal) {
                     if seen {
                         entry.held = false;
@@ -3476,44 +3264,6 @@ pub(in crate::workspace::view) mod claude_waits {
             changes
         }
 
-        /// The entry a click on notification `id` of `terminal` is for; `None` once its dialog is
-        /// gone or another took its place.
-        pub(in crate::workspace::view) fn clicked<'a, T: Eq + Hash, X>(
-            entries: &'a HashMap<T, Entry<X>>,
-            terminal: &T,
-            id: &str,
-        ) -> Option<&'a Entry<X>> {
-            entries.get(terminal).filter(|entry| entry.id == id)
-        }
-
-        fn is_permission(card: &Card, answerable: bool) -> bool {
-            answerable && matches!(card, Card::Approval(dialog) if dialog.options.len() >= 2)
-        }
-
-        /// What `action` does on `card` (the dialog its notification showed, `None` when gone):
-        /// Allow picks the first option and Deny the last, only on a permission the app can answer
-        /// (`answerable`); Open chat or a click on the notification itself opens the chat.
-        pub(in crate::workspace::view) fn act(
-            action: Option<&str>,
-            card: Option<&Card>,
-            answerable: bool,
-        ) -> Act {
-            let answer = matches!(action, Some(ALLOW | DENY));
-            match card {
-                Some(card @ Card::Approval(dialog))
-                    if answer && is_permission(card, answerable) =>
-                {
-                    Act::Pick(if action == Some(ALLOW) {
-                        0
-                    } else {
-                        dialog.options.len() - 1
-                    })
-                }
-                _ if answer => Act::Refuse(dialog::DIALOG_CHANGED),
-                _ => Act::Open,
-            }
-        }
-
         /// The body of a dialog's notification.
         pub(in crate::workspace::view) fn content(card: &Card) -> String {
             match card {
@@ -3536,106 +3286,6 @@ pub(in crate::workspace::view) mod claude_waits {
 
         #[cfg(test)]
         #[path = "notify_tests.rs"]
-        mod tests;
-    }
-
-    /// Allow or Deny as timed key presses, one step per main-thread tick: the pty is only written
-    /// there, and every key waits for Claude to redraw before the screen is read again.
-    pub(in crate::workspace::view) mod answer {
-        use super::dialog::{DIALOG_CHANGED, ScreenDialog};
-
-        /// The pause between keys and between the checks after Enter.
-        pub(in crate::workspace::view) const KEY_STEP: std::time::Duration =
-            std::time::Duration::from_millis(200);
-        const CHECKS_AFTER_ENTER: usize = 10;
-
-        pub(in crate::workspace::view) const NOT_MOVED: &str =
-            "The selection did not move; check the terminal";
-        pub(in crate::workspace::view) const STILL_OPEN: &str =
-            "Enter was sent but the question is still open; check the terminal";
-        pub(in crate::workspace::view) const TERMINAL_GONE: &str =
-            "The terminal of that question is gone; nothing was sent";
-
-        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-        pub(in crate::workspace::view) enum Key {
-            Up,
-            Down,
-            Enter,
-        }
-
-        #[derive(Debug, PartialEq, Eq)]
-        pub(in crate::workspace::view) enum Step {
-            Press(Key),
-            /// Read again after the next pause.
-            Wait,
-            Done,
-            Refuse(&'static str),
-        }
-
-        /// Picking option `index` of `shown`, the dialog the notification showed.
-        #[derive(Clone, Debug)]
-        pub(in crate::workspace::view) struct Answer {
-            shown: ScreenDialog,
-            index: usize,
-            moves: usize,
-            entered: bool,
-            checks: usize,
-        }
-
-        impl Answer {
-            pub(in crate::workspace::view) fn new(shown: ScreenDialog, index: usize) -> Self {
-                Self {
-                    shown,
-                    index,
-                    moves: 0,
-                    entered: false,
-                    checks: 0,
-                }
-            }
-
-            /// The next step for what the terminal shows now (`now`: its dialog, `None` without
-            /// one) while its Claude still waits (`waits`). Before Enter, anything but the very
-            /// dialog the notification showed stops the answer without a key.
-            pub(in crate::workspace::view) fn next(
-                &mut self,
-                now: Option<&ScreenDialog>,
-                waits: bool,
-            ) -> Step {
-                if self.entered {
-                    if !now.is_some_and(|now| now.same_as(&self.shown)) {
-                        return Step::Done;
-                    }
-                    self.checks += 1;
-                    return if self.checks >= CHECKS_AFTER_ENTER {
-                        Step::Refuse(STILL_OPEN)
-                    } else {
-                        Step::Wait
-                    };
-                }
-                let Some(now) = now.filter(|now| waits && now.same_as(&self.shown)) else {
-                    return Step::Refuse(DIALOG_CHANGED);
-                };
-                if now.selected == self.index {
-                    // ponytail: the read and the Enter are one tick apart, but a key the user typed
-                    // that is still in the pty can land first. Closing it needs Claude Code to take
-                    // an answer by dialog id instead of by key.
-                    self.entered = true;
-                    return Step::Press(Key::Enter);
-                }
-                if self.moves > self.shown.options.len() {
-                    return Step::Refuse(NOT_MOVED);
-                }
-                self.moves += 1;
-                Step::Press(if now.selected < self.index {
-                    Key::Down
-                } else {
-                    Key::Up
-                })
-            }
-        }
-
-        #[cfg(test)]
-        #[path = "answer_tests.rs"]
         mod tests;
     }
 

@@ -100,16 +100,6 @@ fn only_a_tool_permission_gets_allow_and_deny() {
 }
 
 #[test]
-fn a_multiplexer_is_never_typed_through() {
-    assert!(runs_multiplexer("tmux attach -t 3"));
-    assert!(runs_multiplexer("TERM=xterm /opt/homebrew/bin/tmux new"));
-    assert!(runs_multiplexer("exec screen -r"));
-    assert!(!runs_multiplexer("claude --permission-mode default"));
-    assert!(!runs_multiplexer("HOME=/Users/x claude 'run tmux ls'"));
-    assert!(!runs_multiplexer(""));
-}
-
-#[test]
 fn a_permission_names_what_claude_wants_never_the_tip() {
     assert_eq!(
         approval_subject(&dialog_on_screen(PERMISSION).unwrap()),

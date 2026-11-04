@@ -15,9 +15,6 @@ pub struct UserNotification {
     data: Option<String>,
     // Whether to play sound with the notification.
     play_sound: bool,
-    /// The OS identifier, so the notification can be taken back; `None` = one fixed identifier,
-    /// a newer notification replaces the older (macOS).
-    identifier: Option<String>,
 }
 
 impl UserNotification {
@@ -35,7 +32,6 @@ impl UserNotification {
             body,
             data,
             play_sound: true,
-            identifier: None,
         }
     }
 
@@ -50,22 +46,12 @@ impl UserNotification {
             body,
             data,
             play_sound,
-            identifier: None,
         }
     }
 
     pub fn with_data(mut self, data: impl Into<String>) -> Self {
         self.data = Some(data.into());
         self
-    }
-
-    pub fn with_identifier(mut self, identifier: impl Into<String>) -> Self {
-        self.identifier = Some(identifier.into());
-        self
-    }
-
-    pub fn identifier(&self) -> Option<&str> {
-        self.identifier.as_deref()
     }
 
     pub fn title(&self) -> &str {
@@ -94,27 +80,11 @@ pub struct NotificationResponse {
     /// The data associated with the notification, if any. This matches the data included in the
     /// `NotificationContent` when the notification was sent.  
     data: Option<String>,
-
-    /// The action button that was clicked; `None` for a click on the notification itself.
-    action: Option<String>,
 }
 
 impl NotificationResponse {
     pub fn new(sent_date: NaiveDateTime, data: Option<String>) -> Self {
-        NotificationResponse {
-            sent_date,
-            data,
-            action: None,
-        }
-    }
-
-    pub fn with_action(mut self, action: Option<String>) -> Self {
-        self.action = action;
-        self
-    }
-
-    pub fn action(&self) -> Option<&str> {
-        self.action.as_deref()
+        NotificationResponse { sent_date, data }
     }
 
     pub fn sent_date(&self) -> NaiveDateTime {

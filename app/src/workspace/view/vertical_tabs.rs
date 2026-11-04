@@ -9224,8 +9224,6 @@ pub(super) mod sidebar {
     pub(super) const SECTION_HEADER_HEIGHT: f32 = 28.;
     pub(in crate::workspace::view) const SECTION_TITLE_SIZE: f32 = 11.5;
     pub(in crate::workspace::view) const CARD_HEADER_HEIGHT: f32 = 40.;
-    /// The card header's text starts here, clear of the traffic lights, when the sidebar is closed.
-    pub(in crate::workspace::view) const CARD_HEADER_PAD_CLOSED: f32 = 84.;
     pub(in crate::workspace::view) const CARD_HEADER_PAD_OPEN: f32 = 32.;
 
     const fn rgb(hex: u32) -> ColorU {
@@ -9652,15 +9650,6 @@ pub(super) mod sidebar {
             )),
             RowStatus::Working => {
                 stack.add_child(glyph(WarpIcon::SidebarWorkingTrack, colors::TRACK(), 15.));
-                // The turning arc is a native layer where the window has one (working_rings);
-                // elsewhere the static arc stays.
-                if super::working_rings::native() {
-                    let marked = super::working_rings::Marker::new(stack.finish()).finish();
-                    return ConstrainedBox::new(Align::new(marked).finish())
-                        .with_width(16.)
-                        .with_height(16.)
-                        .finish();
-                }
                 stack.add_child(glyph(
                     WarpIcon::SidebarWorkingArc,
                     colors::ICON_STRONG(),
@@ -10995,13 +10984,11 @@ pub(super) mod sidebar {
         let mut left = Flex::row()
             .with_cross_axis_alignment(CrossAxisAlignment::Center)
             .with_spacing(10.);
-        // Closed: the buttons sit right of the traffic lights and the name follows them.
-        let pad_left = if let Some(buttons) = buttons {
+        // Closed: the buttons lead the header and the name follows them.
+        if let Some(buttons) = buttons {
             left.add_child(Container::new(buttons).with_margin_right(4.).finish());
-            CARD_HEADER_PAD_CLOSED
-        } else {
-            CARD_HEADER_PAD_OPEN
-        };
+        }
+        let pad_left = CARD_HEADER_PAD_OPEN;
         left.add_child(text(info.title, 12.5, colors::INK(), Weight::Semibold, app).finish());
         left.add_child(
             Shrinkable::new(
@@ -11040,192 +11027,6 @@ pub(super) mod sidebar {
 #[cfg(test)]
 #[path = "vertical_tabs_tests.rs"]
 mod tests;
-
-/// WarpOss: the "working" ring turns as a native layer (`set_working_rings` in window.m), so the
-/// window never repaints to animate it (Warp repaints the whole window per frame; a Rust-side
-/// spinner was tried and rejected). Each working icon is wrapped in a [`Marker`] that records
-/// where it was painted; the [`Sink`] at the workspace root hands the list to the window only
-/// when it changed. Where the platform has no rings, the app keeps drawing the static arc.
-/// ponytail: the rings sit above everything the app paints, so a menu or drag preview over a
-/// working row shows the ring through it; upgrade path: skip icons covered by an overlay layer.
-pub(in crate::workspace::view) mod working_rings {
-    use std::any::Any;
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-
-    use pathfinder_geometry::rect::RectF;
-    use warpui::elements::Point;
-    use warpui::event::DispatchedEvent;
-    use warpui::geometry::vector::Vector2F;
-    use warpui::platform::Window as PlatformWindow;
-    use warpui::zoom::Scale;
-    use warpui::{
-        AfterLayoutContext, AppContext, Element, EventContext, LayoutContext, PaintContext,
-        SizeConstraint,
-    };
-
-    thread_local! {
-        /// Rings painted in the frame the current [`Sink`] is painting.
-        static FRAME: RefCell<Vec<(RectF, RectF)>> = const { RefCell::new(Vec::new()) };
-        /// Set by the workspace before it builds its elements: rings are native in this window.
-        static NATIVE: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Whether the window being rendered draws native rings (the icon then leaves its arc out).
-    pub(in crate::workspace::view) fn native() -> bool {
-        NATIVE.with(Cell::get)
-    }
-
-    pub(in crate::workspace::view) fn set_native(native: bool) {
-        NATIVE.with(|cell| cell.set(native));
-    }
-
-    /// The rings (and dark flag) last handed to one window; kept by its workspace across frames.
-    pub(in crate::workspace::view) type Sent = Rc<RefCell<(bool, Vec<(RectF, RectF)>)>>;
-
-    /// Records where a working icon was painted, and which part of it the list clip lets show.
-    pub(in crate::workspace::view) struct Marker {
-        child: Box<dyn Element>,
-    }
-
-    impl Marker {
-        pub(in crate::workspace::view) fn new(child: Box<dyn Element>) -> Self {
-            Self { child }
-        }
-    }
-
-    impl Element for Marker {
-        fn layout(
-            &mut self,
-            constraint: SizeConstraint,
-            ctx: &mut LayoutContext,
-            app: &AppContext,
-        ) -> Vector2F {
-            self.child.layout(constraint, ctx, app)
-        }
-
-        fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
-            self.child.after_layout(ctx, app);
-        }
-
-        fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
-            self.child.paint(origin, ctx, app);
-            let Some(size) = self.child.size() else {
-                return;
-            };
-            let point = Point::from_vec2f(origin, ctx.scene.z_index());
-            if let Some(visible) = ctx.scene.visible_rect(point, size)
-                && visible.width() > 0.
-                && visible.height() > 0.
-            {
-                FRAME.with(|frame| frame.borrow_mut().push((RectF::new(origin, size), visible)));
-            }
-        }
-
-        fn size(&self) -> Option<Vector2F> {
-            self.child.size()
-        }
-
-        fn origin(&self) -> Option<Point> {
-            self.child.origin()
-        }
-
-        fn parent_data(&self) -> Option<&dyn Any> {
-            self.child.parent_data()
-        }
-
-        fn dispatch_event(
-            &mut self,
-            event: &DispatchedEvent,
-            ctx: &mut EventContext,
-            app: &AppContext,
-        ) -> bool {
-            self.child.dispatch_event(event, ctx, app)
-        }
-    }
-
-    /// Wraps the workspace root: collects the frame's markers and pushes them on change.
-    pub(in crate::workspace::view) struct Sink {
-        child: Box<dyn Element>,
-        window: Rc<dyn PlatformWindow>,
-        sent: Sent,
-        dark: bool,
-    }
-
-    impl Sink {
-        pub(in crate::workspace::view) fn new(
-            child: Box<dyn Element>,
-            window: Rc<dyn PlatformWindow>,
-            sent: Sent,
-            dark: bool,
-        ) -> Self {
-            Self {
-                child,
-                window,
-                sent,
-                dark,
-            }
-        }
-    }
-
-    impl Element for Sink {
-        fn layout(
-            &mut self,
-            constraint: SizeConstraint,
-            ctx: &mut LayoutContext,
-            app: &AppContext,
-        ) -> Vector2F {
-            self.child.layout(constraint, ctx, app)
-        }
-
-        fn after_layout(&mut self, ctx: &mut AfterLayoutContext, app: &AppContext) {
-            self.child.after_layout(ctx, app);
-        }
-
-        fn paint(&mut self, origin: Vector2F, ctx: &mut PaintContext, app: &AppContext) {
-            FRAME.with(|frame| frame.borrow_mut().clear());
-            self.child.paint(origin, ctx, app);
-            // Scene units are window points divided by the UI zoom; the native layer wants
-            // points, and a zoom change then reads as a changed list and is resent.
-            let zoom = 1f32.scale_up(app.zoom_factor());
-            FRAME.with(|frame| {
-                let frame: Vec<(RectF, RectF)> = frame
-                    .borrow()
-                    .iter()
-                    .map(|(full, visible)| (*full * zoom, *visible * zoom))
-                    .collect();
-                let mut sent = self.sent.borrow_mut();
-                // The dark flag rides along: a theme switch must recolor the rings.
-                if sent.1 != frame || (sent.0 != self.dark && !frame.is_empty()) {
-                    self.window.set_working_rings(&frame, self.dark);
-                    sent.0 = self.dark;
-                    sent.1.clone_from(&frame);
-                }
-            });
-        }
-
-        fn size(&self) -> Option<Vector2F> {
-            self.child.size()
-        }
-
-        fn origin(&self) -> Option<Point> {
-            self.child.origin()
-        }
-
-        fn parent_data(&self) -> Option<&dyn Any> {
-            self.child.parent_data()
-        }
-
-        fn dispatch_event(
-            &mut self,
-            event: &DispatchedEvent,
-            ctx: &mut EventContext,
-            app: &AppContext,
-        ) -> bool {
-            self.child.dispatch_event(event, ctx, app)
-        }
-    }
-}
 
 /// WarpOss: the rings' own sources, so the footer shows Claude and Codex on a fresh install with
 /// no tool writing a file. Both read what the agent already leaves on disk; nothing is fetched

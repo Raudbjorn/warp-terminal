@@ -573,8 +573,8 @@ pub const TAB_BAR_HEIGHT: f32 = 34.;
 /// ~12pt macOS 27 window corner it would be 4, which reads as square once smoothed; it is
 /// kept visibly round.
 const FRAMED_CARD_CORNER_RADIUS: f32 = 10.;
-/// Titlebar height in the framed layout: the traffic lights center 28 px from the top, level with
-/// the sidebar's header buttons and the card header (the button constraint adds 1 px).
+/// Titlebar height in the framed layout, level with the sidebar's header buttons and the card
+/// header (the button constraint adds 1 px).
 const FRAMED_TITLEBAR_HEIGHT: f32 = 54.;
 /// Card padding left of the terminal under the card header, so tmux text (which brings no inset
 /// of its own) starts 32 px in, under the header's name.
@@ -1088,8 +1088,6 @@ pub struct Workspace {
     /// Enter was pressed on a group name another group already has; cleared on the next edit
     /// and whenever a group rename starts or ends.
     tab_group_rename_rejected: bool,
-    /// The working rings last handed to this window (see `vertical_tabs::working_rings`).
-    working_rings_sent: vertical_tabs::working_rings::Sent,
     /// The sidebar footer's optional limit rings (`vertical_tabs::limit_rings`).
     limit_rings: vertical_tabs::limit_rings::State,
     vertical_tabs_search_input: ViewHandle<EditorView>,
@@ -3769,7 +3767,6 @@ impl Workspace {
             pane_rename_prefill: None,
             tab_group_rename_editor: Self::tab_group_rename_editor(ctx),
             tab_group_rename_rejected: false,
-            working_rings_sent: Default::default(),
             limit_rings: Default::default(),
             vertical_tabs_search_input: Self::vertical_tabs_search_input(ctx),
             tips_completed,
@@ -15319,7 +15316,7 @@ impl Workspace {
     /// Updates the titlebar height to match the scaled tab bar height.
     pub fn update_titlebar_height(&self, ctx: &mut ViewContext<Self>) {
         let zoom_factor = WindowSettings::as_ref(ctx).zoom_level.as_zoom_factor();
-        // The framed sidebar's header is taller than a tab bar; the traffic lights center on it.
+        // The framed sidebar's header is taller than a tab bar.
         let titlebar_height = if self.uses_framed_sidebar_layout(ctx) {
             FRAMED_TITLEBAR_HEIGHT
         } else {
@@ -22378,23 +22375,6 @@ impl Workspace {
         }
     }
 
-    /// True when vertical tabs sit on the left, so the window drops the full-width tab bar: the
-    /// panel carries the traffic lights and its toggle, and the active tab renders as an inset
-    /// card beside it. Closing the panel keeps this layout; the card then fills the window and its
-    /// header takes over the sidebar toggle.
-    /// Whether something the app draws on top (a menu, a drag ghost or a modal) may cover sidebar
-    /// rows.
-    fn has_overlay_over_sidebar(&self, app: &AppContext) -> bool {
-        self.show_tab_right_click_menu.is_some()
-            || self.show_tab_group_right_click_menu.is_some()
-            || self.show_tab_selection_right_click_menu.is_some()
-            || self.show_new_session_dropdown_menu.is_some()
-            || self.show_tab_bar_overflow_menu
-            || self.is_group_being_dragged
-            || self.current_workspace_state.is_tab_being_dragged
-            || self.current_workspace_state.is_any_modal_open(app)
-    }
-
     /// Whether the settings ask for the framed sidebar: Harp mode on, vertical tabs on, and the
     /// tabs panel on the left. Needs no `Workspace`, so tab menus and row rendering can ask too;
     /// [`Self::uses_framed_sidebar_layout`] also excludes a tab-drag preview window.
@@ -28024,20 +28004,6 @@ impl View for Workspace {
 
     fn render(&self, app: &AppContext) -> Box<dyn Element> {
         let appearance = Appearance::as_ref(app);
-        // Native working rings only in the framed sidebar of a window that can draw them; the
-        // row icons read this while they are built below.
-        let ring_window = app
-            .windows()
-            .platform_window(self.window_id)
-            .filter(|window| {
-                window.supports_working_rings() && self.uses_framed_sidebar_layout(app)
-            });
-        // The native rings sit above everything the app paints, so while a menu, drag or modal
-        // could cover a row the icons draw their static arc instead and the layers go away.
-        vertical_tabs::working_rings::set_native(
-            ring_window.is_some() && !self.has_overlay_over_sidebar(app),
-        );
-
         let tab_bar_mode = self.tab_bar_mode(app);
 
         // For WASM simplified tab bar views (Warp Drive objects, shared sessions, conversation transcripts),
@@ -29396,21 +29362,7 @@ impl View for Workspace {
                 })
                 .finish();
         }
-        // The sink stays even without rings so a sidebar that closes or leaves the framed
-        // layout clears the rings it showed.
-        match app.windows().platform_window(self.window_id) {
-            Some(window) if window.supports_working_rings() => {
-                let dark = ring_window.is_some() && vertical_tabs::sidebar::colors::is_dark();
-                vertical_tabs::working_rings::Sink::new(
-                    root,
-                    window,
-                    self.working_rings_sent.clone(),
-                    dark,
-                )
-                .finish()
-            }
-            _ => root,
-        }
+        root
     }
 
     fn on_focus(&mut self, focus_ctx: &FocusContext, ctx: &mut ViewContext<Self>) {

@@ -23,44 +23,12 @@ fn none() -> HashSet<u32> {
 }
 
 #[test]
-fn an_action_answers_only_the_dialog_its_notification_showed() {
-    let card = permission(PERMISSION);
-    assert_eq!(act(Some(ALLOW), Some(&card), true), Act::Pick(0));
-    assert_eq!(act(Some(DENY), Some(&card), true), Act::Pick(2));
-    // The dialog is gone or was replaced: nothing is pressed.
-    assert_eq!(
-        act(Some(ALLOW), None, true),
-        Act::Refuse(dialog::DIALOG_CHANGED)
-    );
-    assert_eq!(
-        act(Some(DENY), None, true),
-        Act::Refuse(dialog::DIALOG_CHANGED)
-    );
-    assert_eq!(act(Some("open"), None, true), Act::Open);
-    assert_eq!(act(None, Some(&card), true), Act::Open);
-}
-
-#[test]
-fn allow_and_deny_only_on_a_permission() {
-    let other = Card::Dialog(dialog_on_screen(OTHER).unwrap());
-    assert_eq!(
-        act(Some(ALLOW), Some(&other), true),
-        Act::Refuse(dialog::DIALOG_CHANGED)
-    );
+fn a_notification_says_what_the_dialog_asks() {
     let waiting = Card::Waiting("Claude needs your input".to_owned());
     assert_eq!(content(&waiting), "Claude needs your input");
     assert_eq!(
         content(&permission(OTHER)),
         "Needs you: Allow rm -rf build?"
-    );
-}
-
-#[test]
-fn a_dialog_behind_a_full_screen_program_only_opens_the_chat() {
-    let card = permission(PERMISSION);
-    assert_eq!(
-        act(Some(ALLOW), Some(&card), false),
-        Act::Refuse(dialog::DIALOG_CHANGED)
     );
 }
 
@@ -74,13 +42,11 @@ fn each_terminal_gets_its_own_notification() {
             (2, read(permission(OTHER))),
         ],
         &none(),
-        &none(),
         ids(),
     );
     assert_eq!(changes, [1, 2]);
-    // A click on terminal 1's notification never finds terminal 2's dialog.
-    assert!(clicked(&entries, &2, "n1").is_none());
-    assert!(clicked(&entries, &1, "n1").is_some());
+    assert_eq!(entries[&1].id, "n1");
+    assert_eq!(entries[&2].id, "n2");
 }
 
 #[test]
@@ -91,7 +57,6 @@ fn the_terminal_in_view_gets_no_notification() {
         &mut entries,
         vec![(1, read(permission(PERMISSION)))],
         &seen,
-        &none(),
         ids(),
     );
     assert!(first.is_empty());
@@ -99,7 +64,6 @@ fn the_terminal_in_view_gets_no_notification() {
     let away = update(
         &mut entries,
         vec![(1, read(permission(PERMISSION)))],
-        &none(),
         &none(),
         ids(),
     );
@@ -110,7 +74,6 @@ fn the_terminal_in_view_gets_no_notification() {
         &mut entries,
         vec![(2, read(permission(OTHER)))],
         &none(),
-        &none(),
         ids(),
     );
     let seen = HashSet::from([2]);
@@ -118,7 +81,6 @@ fn the_terminal_in_view_gets_no_notification() {
         &mut entries,
         vec![(2, read(permission(OTHER)))],
         &seen,
-        &none(),
         ids(),
     );
     assert!(back.is_empty());
@@ -139,15 +101,12 @@ fn an_answered_dialog_drops_its_entry() {
         &mut entries,
         vec![(1, read(permission(PERMISSION)))],
         &none(),
-        &none(),
         ids(),
     );
     // Answered in the terminal: Claude no longer waits.
-    let changes = update(&mut entries, vec![], &none(), &none(), ids());
+    let changes = update(&mut entries, vec![], &none(), ids());
     assert!(changes.is_empty());
     assert!(entries.is_empty());
-    // A late click on it finds nothing, so Allow refuses.
-    assert!(clicked(&entries, &1, "n1").is_none());
 }
 
 #[test]
@@ -158,27 +117,19 @@ fn one_dialog_notifies_once() {
         &mut entries,
         vec![(1, read(permission(PERMISSION)))],
         &none(),
-        &none(),
         &mut new_id,
     );
     assert_eq!(first, [1]);
     // The user moved the ❯: the same dialog, no second notification.
     let moved = read(permission(&permission_at(1)));
     assert_eq!(
-        update(
-            &mut entries,
-            vec![(1, moved)],
-            &none(),
-            &none(),
-            &mut new_id
-        ),
+        update(&mut entries, vec![(1, moved)], &none(), &mut new_id),
         Vec::<u32>::new()
     );
     // Another dialog in its place: the old entry goes, the new one posts.
     let next = update(
         &mut entries,
         vec![(1, read(permission(OTHER)))],
-        &none(),
         &none(),
         &mut new_id,
     );
@@ -192,103 +143,20 @@ fn a_wait_without_a_dialog_notifies_one_read_later() {
     let mut entries = HashMap::new();
     let mut new_id = ids();
     assert_eq!(
-        update(
-            &mut entries,
-            vec![(1, waiting())],
-            &none(),
-            &none(),
-            &mut new_id
-        ),
+        update(&mut entries, vec![(1, waiting())], &none(), &mut new_id),
         Vec::<u32>::new()
     );
     // Its dialog appears on the next read: only the dialog posts.
     let dialog = read(permission(PERMISSION));
-    let changes = update(
-        &mut entries,
-        vec![(1, dialog)],
-        &none(),
-        &none(),
-        &mut new_id,
-    );
+    let changes = update(&mut entries, vec![(1, dialog)], &none(), &mut new_id);
     assert_eq!(changes, [1]);
     // Still no dialog on the second read: the wait itself posts, once.
     let mut entries = HashMap::new();
-    update(
-        &mut entries,
-        vec![(1, waiting())],
-        &none(),
-        &none(),
-        &mut new_id,
-    );
-    let second = update(
-        &mut entries,
-        vec![(1, waiting())],
-        &none(),
-        &none(),
-        &mut new_id,
-    );
+    update(&mut entries, vec![(1, waiting())], &none(), &mut new_id);
+    let second = update(&mut entries, vec![(1, waiting())], &none(), &mut new_id);
     assert_eq!(second, [1]);
     assert_eq!(
-        update(
-            &mut entries,
-            vec![(1, waiting())],
-            &none(),
-            &none(),
-            &mut new_id
-        ),
+        update(&mut entries, vec![(1, waiting())], &none(), &mut new_id),
         Vec::<u32>::new()
     );
-}
-
-#[test]
-fn a_wait_left_by_an_answer_from_a_notification_never_notifies() {
-    let stale = || read(Card::Waiting("Wants to run Bash: mkdir x".to_owned()));
-    let answered = HashSet::from([1]);
-    let mut entries = HashMap::new();
-    let mut new_id = ids();
-    assert_eq!(
-        update(
-            &mut entries,
-            vec![(1, stale())],
-            &none(),
-            &answered,
-            &mut new_id
-        ),
-        Vec::<u32>::new()
-    );
-    // Only the read right after the answer knows it; the wait stays quiet after it.
-    assert_eq!(
-        update(
-            &mut entries,
-            vec![(1, stale())],
-            &none(),
-            &none(),
-            &mut new_id
-        ),
-        Vec::<u32>::new()
-    );
-    assert_eq!(
-        update(
-            &mut entries,
-            vec![(1, stale())],
-            &none(),
-            &none(),
-            &mut new_id
-        ),
-        Vec::<u32>::new()
-    );
-}
-
-#[test]
-fn a_new_dialog_right_after_an_answer_still_notifies() {
-    let answered = HashSet::from([1]);
-    let mut entries = HashMap::new();
-    let changes = update(
-        &mut entries,
-        vec![(1, read(permission(OTHER)))],
-        &none(),
-        &answered,
-        ids(),
-    );
-    assert_eq!(changes, [1]);
 }
