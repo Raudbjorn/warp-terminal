@@ -13938,7 +13938,11 @@ impl TerminalView {
         let view_id = self.view_id;
         let agent = notification.agent;
         let listener = ctx.add_model(|ctx| {
-            CLIAgentSessionListener::new(view_id, agent, &model_events_handle, ctx)
+            let mut listener =
+                CLIAgentSessionListener::new(view_id, agent, &model_events_handle, ctx);
+            // This event is applied below without passing the listener's plugin filter.
+            listener.seed_plugin_choice(notification);
+            listener
         });
         let remote_host = self.active_session_remote_host(ctx);
         let should_auto_toggle_input = agent.supports_cli_agent_footer()

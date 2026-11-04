@@ -476,6 +476,35 @@ fn harps_first_event_is_dropped_when_the_warp_plugin_just_reported_the_same_hook
     assert!(keep_from_one_plugin(&mut choice, &harp, later));
 }
 
+/// The event that creates the listener is applied without the filter. A reattach to a running
+/// agent that is waiting on a permission starts with that request; Harp's copy of it must not
+/// count a second time. Fails if the listener starts with an empty choice.
+#[test]
+fn the_event_that_creates_the_listener_seeds_the_plugin_choice() {
+    let request = |producer: &str| {
+        claude_event(&format!(
+            r#"{{"v":1,"agent":"claude"{producer},"event":"permission_request","session_id":"s","tool_name":"Bash","tool_input_preview":"ls"}}"#
+        ))
+    };
+    let (warp, harp) = (request(""), request(r#","producer":"harp""#));
+    let now = Instant::now();
+
+    // Created by the Warp plugin's request: Harp's copy a moment later is the duplicate.
+    let mut choice = PluginChoice::after(&warp, now);
+    assert!(!keep_from_one_plugin(&mut choice, &harp, now));
+    assert!(keep_from_one_plugin(&mut choice, &harp, now));
+    assert!(!keep_from_one_plugin(&mut choice, &warp, now));
+
+    // Created by Harp's request: the Warp plugin's copy is ignored from the start.
+    let mut choice = PluginChoice::after(&harp, now);
+    assert!(!keep_from_one_plugin(&mut choice, &warp, now));
+    assert!(keep_from_one_plugin(&mut choice, &harp, now));
+
+    // Unseeded, the creating request is unknown to the filter and Harp's copy counts again.
+    let mut choice = PluginChoice::default();
+    assert!(keep_from_one_plugin(&mut choice, &harp, now));
+}
+
 #[test]
 fn only_harps_producer_marks_an_event_as_harps() {
     assert!(

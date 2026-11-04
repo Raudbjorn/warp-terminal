@@ -192,6 +192,18 @@ struct PluginChoice {
     last_other: Option<(Instant, HookKey)>,
 }
 
+impl PluginChoice {
+    /// The choice after `first`, the event that created the listener: it is applied without
+    /// asking, so the listener's own filter never sees it. Without this, a session first heard
+    /// from through a permission request (a reattach to a running agent) would take the other
+    /// plugin's copy of it as well.
+    fn after(first: &CLIAgentEvent, now: Instant) -> Self {
+        let mut choice = Self::default();
+        keep_from_one_plugin(&mut choice, first, now);
+        choice
+    }
+}
+
 /// Harp: whether a parsed event counts. Harp's bundled plugin and a Warp plugin the user installed
 /// both report the same hooks from one pane; once Harp's has spoken, the other plugin's events are
 /// duplicates. Until then (Harp's plugin not loaded, e.g. Claude started before Harp) they count.
@@ -230,6 +242,11 @@ impl warpui::Entity for CLIAgentSessionListener {
 }
 
 impl CLIAgentSessionListener {
+    /// Tells the listener which event created it, so its plugin filter starts from there.
+    pub fn seed_plugin_choice(&mut self, first: &CLIAgentEvent) {
+        self.plugin_choice = PluginChoice::after(first, Instant::now());
+    }
+
     pub fn new(
         terminal_view_id: EntityId,
         agent: CLIAgent,
