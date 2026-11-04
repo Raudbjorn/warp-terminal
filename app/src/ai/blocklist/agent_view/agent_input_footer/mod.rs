@@ -1231,6 +1231,11 @@ impl AgentInputFooter {
             }
 
             let session = CLIAgentSessionsModel::as_ref(app).session(self.terminal_view_id)?;
+            // Harp's plugin reports its own version (0.1.x); judging it against Warp's minimum
+            // would ask for an update that updating Warp's plugin cannot answer.
+            if session.session_context.reported_by_harp {
+                return None;
+            }
 
             let manager = plugin_manager_for(session.agent)?;
             let min_version = manager.minimum_plugin_version();
